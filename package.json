@@ -1,0 +1,33 @@
+{
+  "name": "cdpilot",
+  "version": "0.1.1",
+  "description": "Zero-dependency browser automation from your terminal. One command, full control.",
+  "bin": {
+    "cdpilot": "./bin/cdpilot.js",
+    "bctl": "./bin/cdpilot.js"
+  },
+  "scripts": {
+    "test": "node test/test.js",
+    "start": "node bin/cdpilot.js"
+  },
+  "keywords": [
+    "browser", "automation", "cdp", "chrome-devtools-protocol", "cli",
+    "devtools", "headless", "screenshot", "testing", "web-scraping",
+    "ai-agent", "mcp", "claude", "brave"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mehmetnadir/cdpilot"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ]
+}
