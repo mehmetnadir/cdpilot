@@ -6,7 +6,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 <div align="center">
-  <video src="https://github.com/mehmetnadir/cdpilot/raw/main/cdpilot-video.mp4" width="600" autoplay loop muted playsinline></video>
+  <a href="https://github.com/mehmetnadir/cdpilot/releases/download/v0.1.2/cdpilot-video.mp4">
+    <img src="https://github.com/mehmetnadir/cdpilot/raw/main/cdpilot-poster.png" alt="cdpilot demo" width="600" />
+  </a>
+  <br />
+  <sub>Click to watch the demo video</sub>
 </div>
 
 ## Quick Start
