@@ -5,7 +5,9 @@
 [![npm version](https://img.shields.io/npm/v/cdpilot.svg)](https://www.npmjs.com/package/cdpilot)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-https://github.com/mehmetnadir/cdpilot/raw/main/cdpilot-video.mp4
+<div align="center">
+  <video src="https://github.com/mehmetnadir/cdpilot/raw/main/cdpilot-video.mp4" width="600" autoplay loop muted playsinline></video>
+</div>
 
 ## Quick Start
 
