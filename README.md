@@ -5,7 +5,7 @@
 [![npm version](https://img.shields.io/npm/v/cdpilot.svg)](https://www.npmjs.com/package/cdpilot)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-<!-- Demo GIF will be added after first release -->
+https://github.com/mehmetnadir/cdpilot/raw/main/cdpilot-video.mp4
 
 ## Quick Start
 
@@ -260,6 +260,16 @@ Future paid offerings:
 - **cdpilot cloud** — Remote browser instances, no local browser needed
 - **Team dashboard** — Shared sessions, audit logs, usage analytics
 - **Priority support** — Direct help for enterprise integrations
+
+## Security
+
+- **Isolated browser profile** — cdpilot runs in `~/.cdpilot/profile`, separate from your daily browser. Your cookies, passwords, and history are never exposed.
+- **No arbitrary file access** — MCP screenshot filenames are sanitized and restricted to the screenshots directory. Path traversal is blocked.
+- **Safe CSS selectors** — All selectors passed to `querySelector` are JSON-escaped to prevent injection.
+- **No network exposure** — CDP listens on `127.0.0.1` only. Remote connections are not possible by default.
+- **No dependencies** — Zero npm/Python runtime dependencies means zero supply-chain attack surface.
+
+Found a vulnerability? Please email the maintainer directly instead of opening a public issue.
 
 ## Contributing
 

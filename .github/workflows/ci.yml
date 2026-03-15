@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node-version: 18
+            python-version: '3.9'
+          - os: ubuntu-latest
+            node-version: 18
+            python-version: '3.11'
+          - os: ubuntu-latest
+            node-version: 18
+            python-version: '3.12'
+          - os: ubuntu-latest
+            node-version: 20
+            python-version: '3.9'
+          - os: ubuntu-latest
+            node-version: 20
+            python-version: '3.11'
+          - os: ubuntu-latest
+            node-version: 20
+            python-version: '3.12'
+          - os: ubuntu-latest
+            node-version: 22
+            python-version: '3.9'
+          - os: ubuntu-latest
+            node-version: 22
+            python-version: '3.11'
+          - os: ubuntu-latest
+            node-version: 22
+            python-version: '3.12'
+          - os: macos-latest
+            node-version: 20
+            python-version: '3.11'
+          - os: windows-latest
+            node-version: 20
+            python-version: '3.11'
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run npm tests
+        run: npm test
+      - name: Compile Python
+        run: python -m py_compile src/cdpilot.py
+      - name: Python version check
+        run: python src/cdpilot.py --version

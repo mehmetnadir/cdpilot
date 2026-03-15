@@ -11,10 +11,10 @@ Usage:
 Environment:
   CDP_PORT             CDP debugging port (default: 9222)
   CHROME_BIN           Browser binary path (auto-detected if not set)
-  BROWSERCTL_PROFILE   Isolated browser profile directory
+  CDPILOT_PROFILE      Isolated browser profile directory
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 import asyncio
 import json
@@ -25,6 +25,9 @@ import time
 import urllib.request
 import subprocess
 import shutil
+import platform
+import socket
+import difflib
 
 # ─── Session Configuration ───
 # cdpilot runs in its own Chrome instance on the configured CDP port.
@@ -34,7 +37,10 @@ CDP_PORT = int(os.environ.get("CDP_PORT", "9222"))
 CDP_BASE = f"http://127.0.0.1:{CDP_PORT}"
 CHROME_BIN = os.environ.get("CHROME_BIN")
 PROFILE_DIR = os.environ.get("CDPILOT_PROFILE", os.path.expanduser("~/.cdpilot/profile"))
-SCREENSHOT_DIR = "/tmp"
+if platform.system() == "Windows":
+    SCREENSHOT_DIR = os.path.expandvars(r"%TEMP%")
+else:
+    SCREENSHOT_DIR = "/tmp"
 
 DEV_EXTENSIONS_FILE = os.path.join(PROFILE_DIR, 'dev-extensions.json')
 PROXY_CONFIG_FILE = os.path.join(PROFILE_DIR, 'proxy.json')
@@ -421,22 +427,32 @@ async def cdp_send(ws_url, commands, timeout=15):
     """Send multiple CDP commands and collect results."""
     import websockets
     results = {}
-    async with websockets.connect(ws_url, max_size=100 * 1024 * 1024) as ws:
-        for cmd_id, method, params in commands:
-            await ws.send(json.dumps({"id": cmd_id, "method": method, "params": params or {}}))
+    try:
+        async with websockets.connect(ws_url, max_size=100 * 1024 * 1024) as ws:
+            for cmd_id, method, params in commands:
+                await ws.send(json.dumps({"id": cmd_id, "method": method, "params": params or {}}))
 
-        pending = {c[0] for c in commands}
-        start = time.time()
-        while pending and (time.time() - start) < timeout:
-            try:
-                resp = await asyncio.wait_for(ws.recv(), timeout=2)
-                data = json.loads(resp)
-                if "id" in data and data["id"] in pending:
-                    pending.discard(data["id"])
-                    results[data["id"]] = data.get("result", data.get("error", {}))
-            except asyncio.TimeoutError:
-                continue
-    return results
+            pending = {c[0] for c in commands}
+            start = time.time()
+            while pending and (time.time() - start) < timeout:
+                try:
+                    resp = await asyncio.wait_for(ws.recv(), timeout=2)
+                    data = json.loads(resp)
+                    if "id" in data and data["id"] in pending:
+                        pending.discard(data["id"])
+                        results[data["id"]] = data.get("result", data.get("error", {}))
+                except asyncio.TimeoutError:
+                    continue
+        return results
+    except ConnectionRefusedError:
+        print(f'Browser is not running. Run \'cdpilot launch\' first.', file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        err = str(e)
+        if "websocket" in err.lower() or "connect" in err.lower() or "ws://" in err.lower():
+            print(f'Browser is not running or CDP port {CDP_PORT} is unreachable. Run \'cdpilot launch\' first.', file=sys.stderr)
+            sys.exit(1)
+        raise
 
 
 async def navigate_collect(ws_url, url, network=False, console=False, glow=True):
@@ -555,6 +571,55 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
     return content, events
 
 # ─── Helper Functions ───
+
+def _find_browser():
+    """İşletim sistemine göre tarayıcı ikili dosyasını otomatik olarak bulur."""
+    for b in ["brave-browser", "google-chrome", "chromium-browser", "chromium"]:
+        found = shutil.which(b)
+        if found:
+            return found
+
+    system = platform.system()
+    if system == "Darwin":
+        paths = [
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+    elif system == "Linux":
+        paths = [
+            "/usr/bin/brave-browser",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/snap/bin/chromium",
+        ]
+    elif system == "Windows":
+        paths = [
+            os.path.expandvars(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            os.path.expandvars(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"C:\Program Files\Chromium\Application\chromium.exe"),
+        ]
+    else:
+        return None
+
+    for path in paths:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _is_port_in_use(port):
+    """Bir portun aktif olarak dinlenip dinlenmediğini kontrol eder."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", port))
+            return False
+        except OSError:
+            return True
+
 
 def get_dev_extensions():
     """Read registered dev mode extension paths."""
@@ -741,13 +806,21 @@ def get_headless_config():
 
 def cmd_launch():
     """Launch the browser with CDP enabled (isolated session — does not touch existing browser)."""
+    global CHROME_BIN
     if cdp_get('/json/version'):
         print(f'Browser already running on port {CDP_PORT}.')
         return
+    if _is_port_in_use(CDP_PORT):
+        print(f'Error: Port {CDP_PORT} is in use by another process. Set CDP_PORT to a different port.', file=sys.stderr)
+        sys.exit(1)
 
     if not CHROME_BIN:
-        print('Error: CHROME_BIN is not set. Export CHROME_BIN=/path/to/browser.', file=sys.stderr)
-        sys.exit(1)
+        bin_path = _find_browser()
+        if not bin_path:
+            print('No supported browser found. Install Brave, Chrome, or Chromium and ensure it is in PATH or set CHROME_BIN.', file=sys.stderr)
+            sys.exit(1)
+        CHROME_BIN = bin_path
+        print(f'Browser found: {bin_path}')
 
     os.makedirs(PROFILE_DIR, exist_ok=True)
 
@@ -850,19 +923,25 @@ async def cmd_go(url):
 async def cmd_content():
     ws, _ = get_page_ws()
     r = await cdp_send(ws, [(1, "Runtime.evaluate", {
-        "expression": "document.body.innerText.substring(0, 10000)",
+        "expression": "document.body.innerText.substring(0, 1048576)",
         "returnByValue": True,
     })])
-    print(r.get(1, {}).get("result", {}).get("value", "(empty)"))
+    content = r.get(1, {}).get("result", {}).get("value", "(empty)")
+    print(content)
+    if len(content) >= 1048576:
+        print("[Output truncated at 1MB]")
 
 
 async def cmd_html():
     ws, _ = get_page_ws()
     r = await cdp_send(ws, [(1, "Runtime.evaluate", {
-        "expression": "document.documentElement.outerHTML.substring(0, 30000)",
+        "expression": "document.documentElement.outerHTML.substring(0, 1048576)",
         "returnByValue": True,
     })])
-    print(r.get(1, {}).get("result", {}).get("value", "(empty)"))
+    html_content = r.get(1, {}).get("result", {}).get("value", "(empty)")
+    print(html_content)
+    if len(html_content) >= 1048576:
+        print("[Output truncated at 1MB]")
 
 
 async def cmd_shot(output=None):
@@ -903,9 +982,10 @@ async def cmd_eval(js_code):
 
 async def cmd_click(selector):
     ws, _ = get_page_ws()
+    safe_sel = json.dumps(selector)
     js = f"""(function() {{
-        const el = document.querySelector('{selector}');
-        if (!el) return 'Not found: {selector}';
+        const el = document.querySelector({safe_sel});
+        if (!el) return 'Not found: ' + {safe_sel};
         el.scrollIntoView({{behavior:'smooth', block:'center'}});
         el.click();
         return 'Clicked: ' + el.tagName + ' ' + (el.textContent || '').substring(0, 60).trim();
@@ -917,10 +997,11 @@ async def cmd_click(selector):
 async def cmd_fill(selector, value):
     """Fill an input field (React/Vue compatible)."""
     ws, _ = get_page_ws()
+    safe_sel = json.dumps(selector)
     safe_value = json.dumps(value)
     js = f"""(function() {{
-        const el = document.querySelector('{selector}');
-        if (!el) return 'Not found: {selector}';
+        const el = document.querySelector({safe_sel});
+        if (!el) return 'Not found: ' + {safe_sel};
         el.focus();
         const nativeSet = Object.getOwnPropertyDescriptor(
             window.HTMLInputElement.prototype, 'value'
@@ -936,9 +1017,10 @@ async def cmd_fill(selector, value):
 
 async def cmd_submit(selector="form"):
     ws, _ = get_page_ws()
+    safe_sel = json.dumps(selector)
     js = f"""(function() {{
-        const form = document.querySelector('{selector}');
-        if (!form) return 'Form not found: {selector}';
+        const form = document.querySelector({safe_sel});
+        if (!form) return 'Form not found: ' + {safe_sel};
         const btn = form.querySelector('button[type=submit], input[type=submit], button:last-of-type');
         if (btn) {{ btn.click(); return 'Submit clicked: ' + btn.textContent.trim(); }}
         form.submit();
@@ -950,15 +1032,16 @@ async def cmd_submit(selector="form"):
 
 async def cmd_wait(selector, timeout=5):
     ws, _ = get_page_ws()
+    safe_sel = json.dumps(selector)
     js = f"""new Promise((resolve) => {{
-        const el = document.querySelector('{selector}');
+        const el = document.querySelector({safe_sel});
         if (el) return resolve('Found: ' + el.tagName + ' ' + (el.textContent||'').substring(0,60).trim());
         const obs = new MutationObserver(() => {{
-            const el = document.querySelector('{selector}');
+            const el = document.querySelector({safe_sel});
             if (el) {{ obs.disconnect(); resolve('Found: ' + el.tagName + ' ' + (el.textContent||'').substring(0,60).trim()); }}
         }});
         obs.observe(document.body, {{childList:true, subtree:true}});
-        setTimeout(() => {{ obs.disconnect(); resolve('Timeout: {selector} not found ({timeout}s)'); }}, {int(timeout)*1000});
+        setTimeout(() => {{ obs.disconnect(); resolve('Timeout: ' + {safe_sel} + ' not found ({timeout}s)'); }}, {int(timeout)*1000});
     }})"""
     r = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})])
     print(r.get(1, {}).get("result", {}).get("value", "?"))
@@ -1615,18 +1698,45 @@ def cmd_headless(state=None):
 
 def cmd_stop():
     """Stop the browser instance managed by cdpilot."""
+    if platform.system() == "Windows":
+        browser_procs = ["brave.exe", "chrome.exe", "chromium.exe"]
+        stopped_any = False
+        for proc in browser_procs:
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/IM", proc],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    print(f"  {proc} terminated")
+                    stopped_any = True
+            except Exception:
+                pass
+        if stopped_any:
+            print(f"Browser stopped (port {CDP_PORT}).")
+        else:
+            print(f"No browser process found (port {CDP_PORT}).", file=sys.stderr)
+        return
+
     import signal
     try:
         result = subprocess.run(
             ["lsof", "-ti", f":{CDP_PORT}"],
             capture_output=True, text=True
         )
-        pids = result.stdout.strip().split("\n")
-        for pid in pids:
-            if pid.strip():
-                os.kill(int(pid.strip()), signal.SIGTERM)
-                print(f"  PID {pid.strip()} terminated")
-        print(f"Browser stopped (port {CDP_PORT}).")
+        pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
+        if pids:
+            for pid in pids:
+                os.kill(int(pid), signal.SIGTERM)
+                print(f"  PID {pid} terminated")
+            print(f"Browser stopped (port {CDP_PORT}).")
+        else:
+            # lsof bulamazsa pkill ile dene
+            subprocess.run(
+                ["pkill", "-f", f"remote-debugging-port={CDP_PORT}"],
+                capture_output=True, text=True
+            )
+            print(f"Browser stopped (port {CDP_PORT}).")
     except Exception as e:
         print(f"Stop error: {e}", file=sys.stderr)
 
@@ -2270,11 +2380,20 @@ class MCPServer:
         else:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
 
+    @staticmethod
+    def _safe_filename(name):
+        import re
+        base = os.path.basename(name)
+        base = re.sub(r'[^\w.\-]', '_', base)
+        if not base.lower().endswith('.png'):
+            base += '.png'
+        return os.path.join(SCREENSHOT_DIR, base)
+
     def _execute_tool(self, req_id, tool_name, args):
         import io, subprocess
         tool_map = {
             "browser_navigate": lambda a: ["go", a.get("url", "")],
-            "browser_screenshot": lambda a: ["shot"] + ([a["filename"]] if a.get("filename") else []),
+            "browser_screenshot": lambda a: ["shot"] + ([self._safe_filename(a["filename"])] if a.get("filename") else []),
             "browser_click": lambda a: ["click", a.get("selector", "")],
             "browser_type": lambda a: ["type", a.get("selector", ""), a.get("text", "")],
             "browser_content": lambda a: ["content"],
@@ -2470,5 +2589,10 @@ if __name__ == "__main__":
             asyncio.run(_wrapped())
             _update_session_timestamp()
     else:
-        print(f"Unknown command: {cmd}")
-        print(__doc__)
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        all_cmds = sorted(set(list(sync_cmds.keys()) + list(async_map.keys())))
+        matches = difflib.get_close_matches(cmd, all_cmds, n=1, cutoff=0.6)
+        if matches:
+            print(f"Did you mean: {matches[0]}?", file=sys.stderr)
+        print(f"\nAvailable commands: {', '.join(all_cmds)}", file=sys.stderr)
+        sys.exit(1)

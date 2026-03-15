@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+test/
+.git/
+.gitignore
+.npmrc
+CONTRIBUTING.md

@@ -3,8 +3,8 @@ dist/
 *.log
 .DS_Store
 demo/out/
-*.mp4
 *.gif
 __pycache__/
 *.pyc
 .env
+.npmrc

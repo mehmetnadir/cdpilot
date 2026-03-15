@@ -1,6 +1,6 @@
 {
   "name": "cdpilot",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Zero-dependency browser automation from your terminal. One command, full control.",
   "bin": {
     "cdpilot": "./bin/cdpilot.js",
@@ -15,7 +15,7 @@
     "devtools", "headless", "screenshot", "testing", "web-scraping",
     "ai-agent", "mcp", "claude", "brave"
   ],
-  "author": "",
+  "author": "Mehmet Nadir",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -26,7 +26,7 @@
   },
   "files": [
     "bin/",
-    "src/",
+    "src/cdpilot.py",
     "README.md",
     "LICENSE"
   ]
