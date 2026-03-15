@@ -5,7 +5,8 @@
 [![npm version](https://img.shields.io/npm/v/cdpilot.svg)](https://www.npmjs.com/package/cdpilot)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-[![Watch the video]([https://i.sstatic.net/Vp2cE.png](https://github.com/mehmetnadir/cdpilot/raw/main/cdpilot-poster.png))]([https://youtu.be/vt5fpE0bzSY](https://github.com/mehmetnadir/cdpilot/releases/download/v0.1.2/cdpilot-video.mp4))
+[![Watch the video](https://github.com/mehmetnadir/cdpilot/raw/main/cdpilot-poster.png)](https://github.com/mehmetnadir/cdpilot/releases/download/v0.1.2/cdpilot-video.mp4)
+
 
 
 ## Quick Start
