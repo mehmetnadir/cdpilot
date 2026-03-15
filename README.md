@@ -3,7 +3,10 @@
 > Zero-dependency browser automation from your terminal. One command, full control.
 
 [![npm version](https://img.shields.io/npm/v/cdpilot.svg)](https://www.npmjs.com/package/cdpilot)
+[![npm downloads](https://img.shields.io/npm/dm/cdpilot.svg)](https://www.npmjs.com/package/cdpilot)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933)](https://nodejs.org)
+[![MCP Compatible](https://img.shields.io/badge/MCP-Compatible-blue)](https://modelcontextprotocol.io)
 
 <div align="center">
   <img src="cdpilot-demo.gif" alt="cdpilot demo" width="600" />
