@@ -5,6 +5,9 @@
 [![npm version](https://img.shields.io/npm/v/cdpilot.svg)](https://www.npmjs.com/package/cdpilot)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+<div align="center">
+  <img src="cdpilot-demo.gif" alt="cdpilot demo" width="600" />
+</div>
 
 ## Quick Start
 

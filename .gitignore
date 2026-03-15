@@ -3,7 +3,6 @@ dist/
 *.log
 .DS_Store
 demo/out/
-*.gif
 __pycache__/
 *.pyc
 .env
