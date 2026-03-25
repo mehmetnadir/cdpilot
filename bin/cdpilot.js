@@ -85,14 +85,13 @@ function findPython() {
 
 function runSetup() {
   const browser = findBrowser();
-  const profileDir = process.env.CDPILOT_PROFILE
-    || path.join(os.homedir(), '.cdpilot', 'profile');
-  const port = process.env.CDP_PORT || '9222';
+  const config = resolveProjectConfig();
 
   console.log('\n  cdpilot setup\n');
   console.log(`  Browser:  ${browser || '❌ Not found'}`);
-  console.log(`  Profile:  ${profileDir}`);
-  console.log(`  CDP Port: ${port}`);
+  console.log(`  Profile:  ${config.profileDir}`);
+  console.log(`  CDP Port: ${config.port === '0' ? 'auto' : config.port}`);
+  console.log(`  Project:  ${config.projectId || 'manual mode'}`);
   console.log(`  Python:   ${findPython() || '❌ Not found'}`);
 
   if (!browser) {
@@ -109,11 +108,11 @@ function runSetup() {
   }
 
   // Create profile directory
-  if (!fs.existsSync(profileDir)) {
-    fs.mkdirSync(profileDir, { recursive: true });
-    console.log(`\n  ✓ Created profile: ${profileDir}`);
+  if (!fs.existsSync(config.profileDir)) {
+    fs.mkdirSync(config.profileDir, { recursive: true });
+    console.log(`\n  ✓ Created profile: ${config.profileDir}`);
   } else {
-    console.log(`\n  ✓ Profile exists: ${profileDir}`);
+    console.log(`\n  ✓ Profile exists: ${config.profileDir}`);
   }
 
   console.log('  ✓ Setup complete! Run: cdpilot launch\n');
@@ -122,8 +121,10 @@ function runSetup() {
 // ── Status Command ──
 
 function runStatus() {
-  const port = process.env.CDP_PORT || '9222';
-  console.log(`\n  cdpilot status (port ${port})\n`);
+  const config = resolveProjectConfig();
+  const port = config.port === '0' ? '9222' : config.port;
+  const projLabel = config.projectId ? ` [${config.projectId}]` : '';
+  console.log(`\n  cdpilot status (port ${port})${projLabel}\n`);
 
   try {
     const http = require('http');
@@ -160,6 +161,52 @@ function runStatus() {
 
 function showVersion() {
   console.log(`cdpilot v${VERSION}`);
+}
+
+// ── Project-Based Multi-Instance ──
+
+function getProjectId() {
+  const cwd = process.cwd();
+  const dirName = path.basename(cwd).replace(/[^a-zA-Z0-9-]/g, '').slice(0, 20);
+  const crypto = require('crypto');
+  const hash = crypto.createHash('md5').update(cwd).digest('hex').slice(0, 6);
+  return dirName ? `${dirName}-${hash}` : hash;
+}
+
+function resolveProjectConfig() {
+  const envPort = process.env.CDP_PORT;
+  const envProfile = process.env.CDPILOT_PROFILE;
+
+  // Full manual override
+  if (envPort && envProfile) {
+    return { port: envPort, profileDir: envProfile, projectId: null };
+  }
+
+  const projectId = getProjectId();
+  const registryFile = path.join(os.homedir(), '.cdpilot', 'registry.json');
+  const defaultProfile = path.join(os.homedir(), '.cdpilot', 'projects', projectId, 'profile');
+
+  let registry = {};
+  try {
+    const data = JSON.parse(fs.readFileSync(registryFile, 'utf-8'));
+    registry = data.projects || {};
+  } catch {}
+
+  const info = registry[projectId];
+  if (info) {
+    return {
+      port: envPort || String(info.port || 9222),
+      profileDir: envProfile || info.profile_dir || defaultProfile,
+      projectId,
+    };
+  }
+
+  // New project: let Python allocate port (pass 0 for auto)
+  return {
+    port: envPort || '0',
+    profileDir: envProfile || defaultProfile,
+    projectId,
+  };
 }
 
 // ── Help ──
@@ -203,6 +250,11 @@ function showHelp() {
     new-tab [url]      Open new tab
     close-tab [id]     Close tab
 
+  PROJECTS
+    projects           List all project browser instances
+    project-stop <id>  Stop a specific project's browser
+    stop-all           Stop all browser instances
+
   AI AGENT
     mcp                Start MCP server (stdin/stdout JSON-RPC)
 
@@ -242,15 +294,21 @@ if (cmd === 'status') {
   }
 
   const browser = findBrowser();
-  const profileDir = process.env.CDPILOT_PROFILE
-    || path.join(os.homedir(), '.cdpilot', 'profile');
-  const port = process.env.CDP_PORT || '9222';
+  const config = resolveProjectConfig();
 
   const env = {
     ...process.env,
-    CDP_PORT: port,
-    CDPILOT_PROFILE: profileDir,
+    CDPILOT_PROFILE: config.profileDir,
   };
+
+  // Only pass CDP_PORT if explicitly set or resolved from registry (not 0)
+  if (config.port !== '0') {
+    env.CDP_PORT = config.port;
+  }
+
+  if (config.projectId) {
+    env.CDPILOT_PROJECT_ID = config.projectId;
+  }
 
   if (browser && !process.env.CHROME_BIN) {
     env.CHROME_BIN = browser;

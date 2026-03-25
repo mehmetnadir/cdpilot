@@ -28,15 +28,168 @@ import shutil
 import platform
 import socket
 import difflib
+import hashlib
+import re as _re
 
-# ─── Session Configuration ───
-# cdpilot runs in its own Chrome instance on the configured CDP port.
-# The user's existing Chrome/browser session is not affected.
+# ─── Project-Based Multi-Instance Configuration ───
+# Each project directory (cwd) gets its own browser instance with
+# a unique CDP port and isolated profile directory. Zero-config.
 
-CDP_PORT = int(os.environ.get("CDP_PORT", "9222"))
+CDPILOT_HOME = os.path.expanduser("~/.cdpilot")
+REGISTRY_FILE = os.path.join(CDPILOT_HOME, "registry.json")
+CDPILOT_PORT_RANGE_START = 9222
+CDPILOT_PORT_RANGE_END = 9322
+
+
+def _get_project_id():
+    """Derive a deterministic project ID from the current working directory."""
+    cwd = os.getcwd()
+    dir_name = os.path.basename(cwd)
+    safe_name = _re.sub(r'[^a-zA-Z0-9-]', '', dir_name)[:20]
+    hash_suffix = hashlib.md5(cwd.encode()).hexdigest()[:6]
+    return f"{safe_name}-{hash_suffix}" if safe_name else hash_suffix
+
+
+def _is_port_free(port):
+    """Check if a port is available for binding."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _load_registry():
+    """Read the global project registry."""
+    try:
+        with open(REGISTRY_FILE) as f:
+            data = json.load(f)
+            return data.get("projects", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_registry(projects):
+    """Write the global project registry."""
+    os.makedirs(os.path.dirname(REGISTRY_FILE), exist_ok=True)
+    with open(REGISTRY_FILE, 'w') as f:
+        json.dump({"version": 1, "projects": projects}, f, indent=2)
+
+
+def _register_project(project_id, port, profile_dir, pid=None):
+    """Register or update a project in the global registry."""
+    registry = _load_registry()
+    existing = registry.get(project_id, {})
+    registry[project_id] = {
+        "cwd": os.getcwd(),
+        "port": port,
+        "profile_dir": profile_dir,
+        "pid": pid,
+        "created": existing.get("created", time.strftime("%Y-%m-%dT%H:%M:%S")),
+        "last_used": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "status": "running" if pid else "stopped",
+    }
+    _save_registry(registry)
+
+
+def _cleanup_registry():
+    """Update status for dead processes and return cleaned registry."""
+    registry = _load_registry()
+    changed = False
+    for pid_key, info in registry.items():
+        if info.get("status") == "running":
+            port = info.get("port")
+            if port and _is_port_free(port):
+                info["status"] = "stopped"
+                info["pid"] = None
+                changed = True
+    if changed:
+        _save_registry(registry)
+    return registry
+
+
+def _allocate_port(project_id):
+    """Find a free port for the given project."""
+    registry = _load_registry()
+
+    # Reuse existing port if still free
+    if project_id in registry:
+        existing_port = registry[project_id].get("port")
+        if existing_port and _is_port_free(existing_port):
+            return existing_port
+
+    # Collect ports used by other active projects
+    used_ports = set()
+    for pid, info in registry.items():
+        if pid != project_id and info.get("port"):
+            used_ports.add(info["port"])
+
+    # Find first free port in range
+    for port in range(CDPILOT_PORT_RANGE_START, CDPILOT_PORT_RANGE_END):
+        if port not in used_ports and _is_port_free(port):
+            return port
+
+    raise RuntimeError(
+        f"No free port in range {CDPILOT_PORT_RANGE_START}-{CDPILOT_PORT_RANGE_END}"
+    )
+
+
+def _resolve_project_config():
+    """Determine port, profile dir, and project ID based on cwd + env vars."""
+    env_port = os.environ.get("CDP_PORT")
+    env_profile = os.environ.get("CDPILOT_PROFILE")
+
+    # Treat CDP_PORT=0 as "auto-allocate"
+    has_explicit_port = env_port and env_port != "0"
+
+    # Full manual override (legacy behavior)
+    if has_explicit_port and env_profile:
+        return int(env_port), env_profile, None
+
+    project_id = _get_project_id()
+    registry = _load_registry()
+    default_profile = os.path.join(CDPILOT_HOME, "projects", project_id, "profile")
+
+    if project_id in registry:
+        info = registry[project_id]
+        port = int(env_port) if has_explicit_port else info.get("port", 9222)
+        profile = env_profile or info.get("profile_dir", default_profile)
+        return port, profile, project_id
+
+    # New project: allocate port
+    try:
+        port = int(env_port) if has_explicit_port else _allocate_port(project_id)
+    except RuntimeError:
+        port = 9222  # fallback
+    profile = env_profile or default_profile
+    return port, profile, project_id
+
+
+def _migrate_legacy_profile():
+    """Migrate old single-profile layout to project-based layout."""
+    legacy_profile = os.path.join(CDPILOT_HOME, "profile")
+    if (os.path.isdir(legacy_profile) and not os.path.islink(legacy_profile)
+            and not os.path.exists(REGISTRY_FILE)):
+        project_id = _get_project_id()
+        new_dir = os.path.join(CDPILOT_HOME, "projects", project_id)
+        new_profile = os.path.join(new_dir, "profile")
+        if not os.path.exists(new_profile):
+            os.makedirs(new_dir, exist_ok=True)
+            os.rename(legacy_profile, new_profile)
+            os.symlink(new_profile, legacy_profile)
+
+
+# Resolve project config at module load time
+try:
+    _migrate_legacy_profile()
+except Exception:
+    pass
+CDP_PORT, PROFILE_DIR, PROJECT_ID = _resolve_project_config()
 CDP_BASE = f"http://127.0.0.1:{CDP_PORT}"
 CHROME_BIN = os.environ.get("CHROME_BIN")
-PROFILE_DIR = os.environ.get("CDPILOT_PROFILE", os.path.expanduser("~/.cdpilot/profile"))
+
 if platform.system() == "Windows":
     SCREENSHOT_DIR = os.path.expandvars(r"%TEMP%")
 else:
@@ -99,36 +252,76 @@ _current_session_id = None  # lazy init
 
 GLOW_CSS = """
 (function() {
-  if (document.getElementById('cdpilot-glow')) return 'already active';
-  const style = document.createElement('style');
-  style.id = 'cdpilot-glow';
+  if (document.getElementById('cdpilot-glow-overlay')) {
+    document.getElementById('cdpilot-glow-overlay').style.opacity = '1';
+    clearTimeout(window.__cdpilot_glow_timeout);
+    return 'glow refreshed';
+  }
+  var style = document.createElement('style');
+  style.id = 'cdpilot-glow-style';
   style.textContent = `
     @keyframes cdpilot-pulse {
-      0%, 100% { box-shadow: inset 0 0 20px 4px rgba(34, 197, 94, 0.25), inset 0 0 60px 8px rgba(34, 197, 94, 0.08); }
-      50% { box-shadow: inset 0 0 30px 6px rgba(34, 197, 94, 0.35), inset 0 0 80px 12px rgba(34, 197, 94, 0.12); }
+      0%, 100% { box-shadow: inset 0 0 20px 4px rgba(34,197,94,0.25), inset 0 0 60px 8px rgba(34,197,94,0.08); }
+      50% { box-shadow: inset 0 0 30px 6px rgba(34,197,94,0.35), inset 0 0 80px 12px rgba(34,197,94,0.12); }
     }
-    body::after {
-      content: '';
-      position: fixed;
-      top: 0; left: 0; right: 0; bottom: 0;
-      pointer-events: none;
-      z-index: 2147483647;
+    #cdpilot-glow-overlay {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      pointer-events: none; z-index: 2147483646;
       animation: cdpilot-pulse 2s ease-in-out infinite;
-      border: 2px solid rgba(34, 197, 94, 0.3);
-      border-radius: 0;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+      border: 2px solid rgba(34,197,94,0.3);
+      transition: opacity 1s ease;
+      opacity: 1;
+    }
+    #cdpilot-ai-toast {
+      position: fixed; bottom: -80px; left: 50%; transform: translateX(-50%);
+      z-index: 2147483647; background: rgba(15,0,0,0.92); color: #ef4444;
+      padding: 14px 28px; border-radius: 12px;
+      font: 600 14px/1.4 system-ui,-apple-system,sans-serif;
+      transition: bottom 0.4s cubic-bezier(0.34,1.56,0.64,1);
+      border: 1px solid rgba(239,68,68,0.4);
+      box-shadow: 0 4px 24px rgba(0,0,0,0.5), 0 0 20px rgba(239,68,68,0.15);
+      pointer-events: none; white-space: nowrap; backdrop-filter: blur(8px);
     }
   `;
   document.head.appendChild(style);
+  var overlay = document.createElement('div');
+  overlay.id = 'cdpilot-glow-overlay';
+  document.body.appendChild(overlay);
+  var toast = document.createElement('div');
+  toast.id = 'cdpilot-ai-toast';
+  toast.textContent = '\\u26A0\\uFE0F  Browser is controlled by AI — please wait';
+  document.body.appendChild(toast);
+  var _tt, _throttle = 0;
+  function _showWarn() {
+    if (!document.getElementById('cdpilot-glow-overlay')) return;
+    var now = Date.now();
+    if (now - _throttle < 2000) return;
+    _throttle = now;
+    toast.style.bottom = '24px';
+    clearTimeout(_tt);
+    _tt = setTimeout(function() { toast.style.bottom = '-80px'; }, 3000);
+  }
+  window.__cdpilot_warn = _showWarn;
+  document.addEventListener('mousemove', _showWarn, true);
+  clearTimeout(window.__cdpilot_glow_timeout);
   return 'glow active';
 })()
 """
 
 GLOW_OFF_CSS = """
 (function() {
-  const el = document.getElementById('cdpilot-glow');
-  if (el) { el.remove(); return 'glow off'; }
-  return 'already off';
+  var overlay = document.getElementById('cdpilot-glow-overlay');
+  var style = document.getElementById('cdpilot-glow-style');
+  var toast = document.getElementById('cdpilot-ai-toast');
+  if (overlay) { overlay.style.opacity = '0'; setTimeout(function() { overlay.remove(); }, 1000); }
+  if (style) setTimeout(function() { style.remove(); }, 1100);
+  if (toast) toast.remove();
+  if (window.__cdpilot_warn) {
+    document.removeEventListener('mousemove', window.__cdpilot_warn, true);
+    delete window.__cdpilot_warn;
+  }
+  clearTimeout(window.__cdpilot_glow_timeout);
+  return overlay ? 'glow fading' : 'already off';
 })()
 """
 
@@ -137,38 +330,36 @@ GLOW_OFF_CSS = """
 INPUT_BLOCKER_ON = """
 (function() {
   if (document.getElementById('cdpilot-input-blocker')) return 'blocker already active';
-  const overlay = document.createElement('div');
+  var overlay = document.createElement('div');
   overlay.id = 'cdpilot-input-blocker';
-  overlay.style.cssText = `
-    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-    z-index: 2147483646; cursor: not-allowed;
-    background: transparent;
-  `;
-  overlay.addEventListener('mousedown', e => { e.stopPropagation(); e.preventDefault(); }, true);
-  overlay.addEventListener('mouseup', e => { e.stopPropagation(); e.preventDefault(); }, true);
-  overlay.addEventListener('click', e => { e.stopPropagation(); e.preventDefault(); }, true);
-  overlay.addEventListener('dblclick', e => { e.stopPropagation(); e.preventDefault(); }, true);
-  overlay.addEventListener('contextmenu', e => { e.stopPropagation(); e.preventDefault(); }, true);
-  overlay.addEventListener('wheel', e => { e.stopPropagation(); e.preventDefault(); }, {capture: true, passive: false});
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483646;cursor:not-allowed;background:transparent;';
+  var toast = document.createElement('div');
+  toast.id = 'cdpilot-warning-toast';
+  toast.textContent = '\\u26A0\\uFE0F  Browser is controlled by AI \\u2014 please wait';
+  toast.style.cssText = 'position:fixed;bottom:-80px;left:50%;transform:translateX(-50%);z-index:2147483647;background:rgba(15,0,0,0.92);color:#ef4444;padding:14px 28px;border-radius:12px;font:600 14px/1.4 system-ui,-apple-system,sans-serif;transition:bottom 0.4s cubic-bezier(0.34,1.56,0.64,1);border:1px solid rgba(239,68,68,0.4);box-shadow:0 4px 24px rgba(0,0,0,0.5),0 0 20px rgba(239,68,68,0.15);pointer-events:none;white-space:nowrap;backdrop-filter:blur(8px);';
+  document.body.appendChild(toast);
+  var _tt;
+  function _warn() {
+    toast.style.bottom = '24px';
+    clearTimeout(_tt);
+    _tt = setTimeout(function() { toast.style.bottom = '-80px'; }, 3000);
+  }
+  overlay.addEventListener('mousedown', function(e) { e.stopPropagation(); e.preventDefault(); _warn(); }, true);
+  overlay.addEventListener('mouseup', function(e) { e.stopPropagation(); e.preventDefault(); }, true);
+  overlay.addEventListener('click', function(e) { e.stopPropagation(); e.preventDefault(); _warn(); }, true);
+  overlay.addEventListener('dblclick', function(e) { e.stopPropagation(); e.preventDefault(); }, true);
+  overlay.addEventListener('contextmenu', function(e) { e.stopPropagation(); e.preventDefault(); }, true);
+  overlay.addEventListener('wheel', function(e) { e.stopPropagation(); e.preventDefault(); }, {capture:true, passive:false});
   document.addEventListener('keydown', function _cb(e) {
-    if (!document.getElementById('cdpilot-input-blocker')) {
-      document.removeEventListener('keydown', _cb, true);
-      return;
-    }
-    e.stopPropagation(); e.preventDefault();
+    if (!document.getElementById('cdpilot-input-blocker')) { document.removeEventListener('keydown', _cb, true); return; }
+    e.stopPropagation(); e.preventDefault(); _warn();
   }, true);
   document.addEventListener('keyup', function _cb(e) {
-    if (!document.getElementById('cdpilot-input-blocker')) {
-      document.removeEventListener('keyup', _cb, true);
-      return;
-    }
+    if (!document.getElementById('cdpilot-input-blocker')) { document.removeEventListener('keyup', _cb, true); return; }
     e.stopPropagation(); e.preventDefault();
   }, true);
   document.addEventListener('keypress', function _cb(e) {
-    if (!document.getElementById('cdpilot-input-blocker')) {
-      document.removeEventListener('keypress', _cb, true);
-      return;
-    }
+    if (!document.getElementById('cdpilot-input-blocker')) { document.removeEventListener('keypress', _cb, true); return; }
     e.stopPropagation(); e.preventDefault();
   }, true);
   document.body.appendChild(overlay);
@@ -178,56 +369,191 @@ INPUT_BLOCKER_ON = """
 
 INPUT_BLOCKER_OFF = """
 (function() {
-  const el = document.getElementById('cdpilot-input-blocker');
-  if (el) { el.remove(); return 'input blocker off'; }
-  return 'blocker already off';
+  var el = document.getElementById('cdpilot-input-blocker');
+  if (el) el.remove();
+  var toast = document.getElementById('cdpilot-warning-toast');
+  if (toast) toast.remove();
+  return el ? 'input blocker off' : 'blocker already off';
 })()
+"""
+
+# ─── Visual Feedback System (cursor, ripple, keystroke) ───
+
+VISUAL_FEEDBACK_JS = """
+(function() {
+  if (window.__cdpilot_vfx) return 'vfx already active';
+  var style = document.createElement('style');
+  style.id = 'cdpilot-vfx-style';
+  style.textContent = `
+    @keyframes cdpilot-ripple-anim {
+      0% { transform: translate(-50%,-50%) scale(0); opacity: 1; }
+      100% { transform: translate(-50%,-50%) scale(1); opacity: 0; }
+    }
+    .cdpilot-ripple {
+      position: fixed; width: 50px; height: 50px;
+      border: 2.5px solid #22c55e; border-radius: 50%;
+      pointer-events: none; z-index: 2147483647;
+      animation: cdpilot-ripple-anim 0.6s ease-out forwards;
+      box-shadow: 0 0 12px rgba(34,197,94,0.4);
+    }
+    .cdpilot-ripple-inner {
+      position: fixed; width: 8px; height: 8px;
+      background: #22c55e; border-radius: 50%;
+      pointer-events: none; z-index: 2147483647;
+      transform: translate(-50%,-50%);
+      opacity: 0.8;
+      animation: cdpilot-ripple-anim 0.4s ease-out 0.1s forwards;
+    }
+    #cdpilot-cursor {
+      position: fixed; pointer-events: none; z-index: 2147483647;
+      transition: left 0.2s cubic-bezier(0.25,0.8,0.25,1), top 0.2s cubic-bezier(0.25,0.8,0.25,1);
+      filter: drop-shadow(0 0 4px rgba(34,197,94,0.6));
+    }
+    #cdpilot-keystroke {
+      position: fixed; bottom: 80px; left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.88); color: #22c55e;
+      padding: 10px 20px; border-radius: 8px;
+      font: 700 15px/1.4 'SF Mono',Monaco,Menlo,monospace;
+      pointer-events: none; z-index: 2147483647;
+      border: 1px solid rgba(34,197,94,0.4);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4), 0 0 15px rgba(34,197,94,0.1);
+      opacity: 0; transition: opacity 0.3s ease;
+      backdrop-filter: blur(8px);
+    }
+  `;
+  document.head.appendChild(style);
+  var cursor = document.createElement('div');
+  cursor.id = 'cdpilot-cursor';
+  cursor.style.display = 'none';
+  cursor.innerHTML = '<svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M5.5 3.21V20.8l5.71-5.71h8.3L5.5 3.21z" fill="#22c55e" stroke="#15803d" stroke-width="1.2"/></svg>';
+  document.body.appendChild(cursor);
+  var ks = document.createElement('div');
+  ks.id = 'cdpilot-keystroke';
+  document.body.appendChild(ks);
+  window.__cdpilot_vfx = {
+    ripple: function(x, y) {
+      var el = document.createElement('div');
+      el.className = 'cdpilot-ripple';
+      el.style.left = x + 'px'; el.style.top = y + 'px';
+      document.body.appendChild(el);
+      var inner = document.createElement('div');
+      inner.className = 'cdpilot-ripple-inner';
+      inner.style.left = x + 'px'; inner.style.top = y + 'px';
+      document.body.appendChild(inner);
+      setTimeout(function() { el.remove(); inner.remove(); }, 700);
+    },
+    moveCursor: function(x, y) {
+      cursor.style.display = 'block';
+      cursor.style.left = (x - 3) + 'px';
+      cursor.style.top = (y - 2) + 'px';
+    },
+    hideCursor: function() { cursor.style.display = 'none'; },
+    keystroke: function(text) {
+      ks.textContent = text;
+      ks.style.opacity = '1';
+      clearTimeout(ks.__tid);
+      ks.__tid = setTimeout(function() { ks.style.opacity = '0'; }, 2000);
+    }
+  };
+  return 'vfx active';
+})()
+"""
+
+VISUAL_FEEDBACK_OFF = """
+(function() {
+  delete window.__cdpilot_vfx;
+  ['cdpilot-vfx-style','cdpilot-cursor','cdpilot-keystroke'].forEach(function(id) {
+    var el = document.getElementById(id); if (el) el.remove();
+  });
+  document.querySelectorAll('.cdpilot-ripple,.cdpilot-ripple-inner').forEach(function(el) { el.remove(); });
+  return 'vfx off';
+})()
+"""
+
+# ─── Glow Auto-Timeout (fade out after 10s idle) ───
+
+GLOW_TIMEOUT_JS = """
+clearTimeout(window.__cdpilot_glow_timeout);
+window.__cdpilot_glow_timeout = setTimeout(function() {
+  var o = document.getElementById('cdpilot-glow-overlay');
+  if (o) { o.style.opacity = '0'; setTimeout(function() { o.remove(); }, 1000); }
+  var s = document.getElementById('cdpilot-glow-style');
+  if (s) setTimeout(function() { s.remove(); }, 1100);
+  var t = document.getElementById('cdpilot-ai-toast');
+  if (t) t.remove();
+  if (window.__cdpilot_warn) {
+    document.removeEventListener('mousemove', window.__cdpilot_warn, true);
+    delete window.__cdpilot_warn;
+  }
+  ['cdpilot-vfx-style','cdpilot-cursor','cdpilot-keystroke'].forEach(function(id) {
+    var el = document.getElementById(id); if (el) el.remove();
+  });
+  delete window.__cdpilot_vfx;
+}, 10000);
 """
 
 # ─── Automation Indicator Wrapper ───
 
 _glow_script_id = None  # addScriptToEvaluateOnNewDocument identifier
 
-GLOW_ACTIVATE_JS = "document.documentElement.dataset.cdpilotActive = 'true';"
-GLOW_DEACTIVATE_JS = """
-document.documentElement.removeAttribute('data-cdpilot-active');
-var _go = document.getElementById('cdpilot-glow-overlay');
-var _gs = document.getElementById('cdpilot-glow-style');
-if (_go) _go.remove();
-if (_gs) _gs.remove();
-"""
-
 async def _control_start(ws_url):
-    """Enable visual indicator and input blocker at command start."""
+    """Enable glow, input blocker, and visual feedback at command start."""
     global _glow_script_id
     try:
-        # Inject activation marker on every new page load
+        persistent_source = GLOW_CSS + "\n" + VISUAL_FEEDBACK_JS
         r = await cdp_send(ws_url, [
-            (901, "Page.addScriptToEvaluateOnNewDocument", {"source": GLOW_ACTIVATE_JS}),
-            (902, "Runtime.evaluate", {"expression": GLOW_ACTIVATE_JS, "returnByValue": True}),
-            (903, "Runtime.evaluate", {"expression": INPUT_BLOCKER_ON, "returnByValue": True}),
+            (901, "Page.addScriptToEvaluateOnNewDocument", {"source": persistent_source}),
+            (902, "Runtime.evaluate", {"expression": GLOW_CSS, "returnByValue": True}),
+            (903, "Runtime.evaluate", {"expression": VISUAL_FEEDBACK_JS, "returnByValue": True}),
+            (904, "Runtime.evaluate", {"expression": INPUT_BLOCKER_ON, "returnByValue": True}),
         ])
-        # Save script identifier for cleanup
-        if 901 in r and "identifier" in r.get(901, {}):
-            _glow_script_id = r[901]["identifier"]
+        resp_901 = r.get(901, {})
+        result = resp_901.get("result", {})
+        if isinstance(result, dict) and "identifier" in result:
+            _glow_script_id = result["identifier"]
     except Exception:
-        pass  # Silent fail if no connection
+        pass
 
 async def _control_end(ws_url):
-    """Disable visual indicator and input blocker at command end."""
+    """Remove input blocker, set glow/vfx auto-timeout (10s)."""
     global _glow_script_id
     try:
         cmds = [
-            (903, "Runtime.evaluate", {"expression": GLOW_DEACTIVATE_JS, "returnByValue": True}),
-            (904, "Runtime.evaluate", {"expression": INPUT_BLOCKER_OFF, "returnByValue": True}),
+            (903, "Runtime.evaluate", {"expression": INPUT_BLOCKER_OFF, "returnByValue": True}),
+            (904, "Runtime.evaluate", {"expression": GLOW_TIMEOUT_JS, "returnByValue": True}),
         ]
-        # Remove the persistent new-document script
         if _glow_script_id:
             cmds.append((905, "Page.removeScriptToEvaluateOnNewDocument", {"identifier": _glow_script_id}))
             _glow_script_id = None
         await cdp_send(ws_url, cmds)
     except Exception:
-        pass  # Silent fail if no connection
+        pass
+
+async def _vfx_ripple(ws_url, x, y):
+    """Show click ripple + move cursor at (x, y)."""
+    js = f"if(window.__cdpilot_vfx){{window.__cdpilot_vfx.moveCursor({x},{y});window.__cdpilot_vfx.ripple({x},{y});}}"
+    try:
+        await cdp_send(ws_url, [(999, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    except Exception:
+        pass
+
+async def _vfx_keystroke(ws_url, text):
+    """Show keystroke display."""
+    safe = json.dumps(text)
+    js = f"if(window.__cdpilot_vfx){{window.__cdpilot_vfx.keystroke({safe});}}"
+    try:
+        await cdp_send(ws_url, [(999, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    except Exception:
+        pass
+
+async def _vfx_move_cursor(ws_url, x, y):
+    """Move fake cursor to (x, y)."""
+    js = f"if(window.__cdpilot_vfx){{window.__cdpilot_vfx.moveCursor({x},{y});}}"
+    try:
+        await cdp_send(ws_url, [(999, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    except Exception:
+        pass
 
 # ─── Connection Helpers ───
 
@@ -511,11 +837,16 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
                 if loaded:
                     break
 
-        # Inject visual indicator (sets data-cdpilot-active attribute)
+        # Inject visual indicator (glow overlay + visual feedback)
         if glow:
             await ws.send(json.dumps({
                 "id": 200, "method": "Runtime.evaluate",
-                "params": {"expression": GLOW_ACTIVATE_JS, "returnByValue": True}
+                "params": {"expression": GLOW_CSS, "returnByValue": True}
+            }))
+            sid += 1
+            await ws.send(json.dumps({
+                "id": sid, "method": "Runtime.evaluate",
+                "params": {"expression": VISUAL_FEEDBACK_JS, "returnByValue": True}
             }))
 
         # Inject dev extension content scripts via the existing WS connection
@@ -611,14 +942,8 @@ def _find_browser():
 
 
 def _is_port_in_use(port):
-    """Bir portun aktif olarak dinlenip dinlenmediğini kontrol eder."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", port))
-            return False
-        except OSError:
-            return True
+    """Check if a port is actively in use."""
+    return not _is_port_free(port)
 
 
 def get_dev_extensions():
@@ -806,13 +1131,21 @@ def get_headless_config():
 
 def cmd_launch():
     """Launch the browser with CDP enabled (isolated session — does not touch existing browser)."""
-    global CHROME_BIN
+    global CHROME_BIN, CDP_PORT, CDP_BASE
     if cdp_get('/json/version'):
-        print(f'Browser already running on port {CDP_PORT}.')
+        proj_label = f' [{PROJECT_ID}]' if PROJECT_ID else ''
+        print(f'Browser already running on port {CDP_PORT}{proj_label}.')
         return
     if _is_port_in_use(CDP_PORT):
-        print(f'Error: Port {CDP_PORT} is in use by another process. Set CDP_PORT to a different port.', file=sys.stderr)
-        sys.exit(1)
+        if PROJECT_ID:
+            # Auto-allocate a new port
+            new_port = _allocate_port(PROJECT_ID)
+            print(f'Port {CDP_PORT} busy, using {new_port}.')
+            CDP_PORT = new_port
+            CDP_BASE = f"http://127.0.0.1:{CDP_PORT}"
+        else:
+            print(f'Error: Port {CDP_PORT} is in use. Set CDP_PORT to a different port.', file=sys.stderr)
+            sys.exit(1)
 
     if not CHROME_BIN:
         bin_path = _find_browser()
@@ -824,7 +1157,8 @@ def cmd_launch():
 
     os.makedirs(PROFILE_DIR, exist_ok=True)
 
-    print(f'Launching browser (isolated session, port {CDP_PORT})...')
+    proj_label = f' [{PROJECT_ID}]' if PROJECT_ID else ''
+    print(f'Launching browser (isolated session, port {CDP_PORT}){proj_label}...')
 
     chrome_args = [
         CHROME_BIN,
@@ -889,12 +1223,15 @@ def cmd_launch():
         chrome_args.append('--headless=new')
         print('  Mode: headless')
 
-    subprocess.Popen(chrome_args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(chrome_args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     for _ in range(20):
         time.sleep(0.5)
         if cdp_get('/json/version'):
-            print(f'CDP ready! (port {CDP_PORT})')
+            if PROJECT_ID:
+                _register_project(PROJECT_ID, CDP_PORT, PROFILE_DIR, pid=proc.pid)
+            proj_label = f' [{PROJECT_ID}]' if PROJECT_ID else ''
+            print(f'CDP ready! (port {CDP_PORT}){proj_label}')
             return
     print('Failed to start CDP (timeout).', file=sys.stderr)
     sys.exit(1)
@@ -984,9 +1321,15 @@ async def cmd_click(selector):
     ws, _ = get_page_ws()
     safe_sel = json.dumps(selector)
     js = f"""(function() {{
-        const el = document.querySelector({safe_sel});
+        var el = document.querySelector({safe_sel});
         if (!el) return 'Not found: ' + {safe_sel};
         el.scrollIntoView({{behavior:'smooth', block:'center'}});
+        if (window.__cdpilot_vfx) {{
+            var r = el.getBoundingClientRect();
+            var cx = Math.round(r.left + r.width/2), cy = Math.round(r.top + r.height/2);
+            window.__cdpilot_vfx.moveCursor(cx, cy);
+            window.__cdpilot_vfx.ripple(cx, cy);
+        }}
         el.click();
         return 'Clicked: ' + el.tagName + ' ' + (el.textContent || '').substring(0, 60).trim();
     }})()"""
@@ -1000,10 +1343,15 @@ async def cmd_fill(selector, value):
     safe_sel = json.dumps(selector)
     safe_value = json.dumps(value)
     js = f"""(function() {{
-        const el = document.querySelector({safe_sel});
+        var el = document.querySelector({safe_sel});
         if (!el) return 'Not found: ' + {safe_sel};
         el.focus();
-        const nativeSet = Object.getOwnPropertyDescriptor(
+        if (window.__cdpilot_vfx) {{
+            var r = el.getBoundingClientRect();
+            window.__cdpilot_vfx.moveCursor(Math.round(r.left + r.width/2), Math.round(r.top + r.height/2));
+            window.__cdpilot_vfx.keystroke('\\u2328 ' + {safe_value}.substring(0, 30));
+        }}
+        var nativeSet = Object.getOwnPropertyDescriptor(
             window.HTMLInputElement.prototype, 'value'
         ).set;
         nativeSet.call(el, {safe_value});
@@ -1159,8 +1507,16 @@ async def cmd_emulate(device):
 
 async def cmd_glow(state="on"):
     ws, page = get_page_ws()
-    js = GLOW_ACTIVATE_JS if state == "on" else GLOW_DEACTIVATE_JS
-    r = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    if state == "on":
+        await cdp_send(ws, [
+            (1, "Runtime.evaluate", {"expression": GLOW_CSS, "returnByValue": True}),
+            (2, "Runtime.evaluate", {"expression": VISUAL_FEEDBACK_JS, "returnByValue": True}),
+        ])
+    else:
+        await cdp_send(ws, [
+            (1, "Runtime.evaluate", {"expression": GLOW_OFF_CSS, "returnByValue": True}),
+            (2, "Runtime.evaluate", {"expression": VISUAL_FEEDBACK_OFF, "returnByValue": True}),
+        ])
     print(f"Visual indicator {'on' if state == 'on' else 'off'}")
 
 
@@ -1696,6 +2052,29 @@ def cmd_headless(state=None):
     print('Restart browser (stop → launch).')
 
 
+def _stop_browser_on_port(port):
+    """Stop the browser process listening on the given port."""
+    import signal
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}"],
+            capture_output=True, text=True
+        )
+        pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
+        if pids:
+            for pid in pids:
+                os.kill(int(pid), signal.SIGTERM)
+            return True
+        else:
+            subprocess.run(
+                ["pkill", "-f", f"remote-debugging-port={port}"],
+                capture_output=True, text=True
+            )
+            return True
+    except Exception:
+        return False
+
+
 def cmd_stop():
     """Stop the browser instance managed by cdpilot."""
     if platform.system() == "Windows":
@@ -1740,10 +2119,91 @@ def cmd_stop():
     except Exception as e:
         print(f"Stop error: {e}", file=sys.stderr)
 
+    # Update registry
+    if PROJECT_ID:
+        registry = _load_registry()
+        if PROJECT_ID in registry:
+            registry[PROJECT_ID]["status"] = "stopped"
+            registry[PROJECT_ID]["pid"] = None
+            _save_registry(registry)
+
 
 def cmd_version():
     """Show cdpilot version."""
     print(f"cdpilot v{__version__}")
+
+
+def cmd_projects():
+    """List all registered cdpilot project instances."""
+    registry = _cleanup_registry()
+    if not registry:
+        print("No registered projects.")
+        return
+
+    current = PROJECT_ID
+    print(f"{'Project':<28} {'Port':<7} {'Status':<10} {'CWD'}")
+    print("\u2500" * 90)
+
+    for pid, info in sorted(registry.items(),
+                            key=lambda x: x[1].get("last_used", ""), reverse=True):
+        port = info.get("port", "?")
+        status = info.get("status", "?")
+        cwd = info.get("cwd", "?")
+        # Live check
+        if status == "running" and _is_port_free(port):
+            status = "stopped"
+        icon = "\U0001f7e2" if status == "running" else "\u26ab"
+        marker = " \u2190 current" if pid == current else ""
+        if len(cwd) > 45:
+            cwd = "..." + cwd[-42:]
+        print(f"  {pid:<26} {port:<7} {icon} {status:<8} {cwd}{marker}")
+
+    print(f"\nTotal: {len(registry)} project(s)")
+
+
+def cmd_project_stop(name):
+    """Stop a specific project's browser instance."""
+    registry = _load_registry()
+    target_id = None
+    for pid, info in registry.items():
+        if name in pid or name in info.get("cwd", ""):
+            target_id = pid
+            break
+
+    if not target_id:
+        print(f"Project not found: {name}", file=sys.stderr)
+        sys.exit(1)
+
+    info = registry[target_id]
+    port = info.get("port")
+    if port and not _is_port_free(port):
+        _stop_browser_on_port(port)
+        print(f"Stopped: {target_id} (port {port})")
+    else:
+        print(f"Project already stopped: {target_id}")
+
+    info["status"] = "stopped"
+    info["pid"] = None
+    _save_registry(registry)
+
+
+def cmd_stop_all():
+    """Stop all active cdpilot browser instances."""
+    registry = _cleanup_registry()
+    stopped = 0
+    for pid, info in registry.items():
+        port = info.get("port")
+        if port and info.get("status") == "running" and not _is_port_free(port):
+            _stop_browser_on_port(port)
+            info["status"] = "stopped"
+            info["pid"] = None
+            stopped += 1
+            print(f"  Stopped: {pid} (port {port})")
+    _save_registry(registry)
+    if stopped:
+        print(f"\n{stopped} instance(s) stopped.")
+    else:
+        print("No active instances.")
 
 
 # ─── New CDP Commands ───
@@ -1970,6 +2430,7 @@ async def cmd_hover(selector):
     """Move the mouse cursor to the specified element."""
     ws_url, _ = get_page_ws()
     x, y = await _get_element_center(ws_url, selector)
+    await _vfx_move_cursor(ws_url, x, y)
     await cdp_send(ws_url, [(1, "Input.dispatchMouseEvent",
         {"type": "mouseMoved", "x": x, "y": y, "button": "none", "modifiers": 0})])
     print(f"Hover: {selector} ({x}, {y})")
@@ -1979,6 +2440,7 @@ async def cmd_dblclick(selector):
     """Double-click the specified element."""
     ws_url, _ = get_page_ws()
     x, y = await _get_element_center(ws_url, selector)
+    await _vfx_ripple(ws_url, x, y)
     cmds = [
         (1, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1}),
         (2, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1}),
@@ -1993,6 +2455,7 @@ async def cmd_rightclick(selector):
     """Right-click the specified element."""
     ws_url, _ = get_page_ws()
     x, y = await _get_element_center(ws_url, selector)
+    await _vfx_ripple(ws_url, x, y)
     cmds = [
         (1, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "right", "clickCount": 1}),
         (2, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "right", "clickCount": 1}),
@@ -2006,6 +2469,7 @@ async def cmd_drag(from_selector, to_selector):
     ws_url, _ = get_page_ws()
     fx, fy = await _get_element_center(ws_url, from_selector)
     tx, ty = await _get_element_center(ws_url, to_selector)
+    await _vfx_ripple(ws_url, fx, fy)
 
     import websockets
     async with websockets.connect(ws_url, max_size=100 * 1024 * 1024) as ws:
@@ -2019,6 +2483,7 @@ async def cmd_drag(from_selector, to_selector):
         for i in range(1, steps + 1):
             ix = int(fx + (tx - fx) * i / steps)
             iy = int(fy + (ty - fy) * i / steps)
+            await _vfx_move_cursor(ws_url, ix, iy)
             await send_mouse(10 + i, "mouseMoved", ix, iy)
             await asyncio.sleep(0.05)
         await send_mouse(20, "mouseReleased", tx, ty)
@@ -2063,6 +2528,7 @@ async def cmd_keys(combo):
         print("Error: specify a valid key (e.g. ctrl+a, enter, tab).", file=sys.stderr)
         sys.exit(1)
 
+    await _vfx_keystroke(ws_url, combo.upper())
     cmds = [
         (1, "Input.dispatchKeyEvent", {"type": "keyDown", "modifiers": modifiers,
             "key": key_name, "windowsVirtualKeyCode": key_code, "nativeVirtualKeyCode": key_code}),
@@ -2479,6 +2945,9 @@ if __name__ == "__main__":
         'session': cmd_session,
         'sessions': cmd_sessions,
         'session-close': lambda: cmd_session_close(args[0] if args else None),
+        'projects': cmd_projects,
+        'project-stop': lambda: cmd_project_stop(args[0] if args else ''),
+        'stop-all': cmd_stop_all,
     }
 
     if cmd == "mcp":
