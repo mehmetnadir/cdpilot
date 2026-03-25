@@ -196,6 +196,23 @@ else:
     SCREENSHOT_DIR = "/tmp"
 
 DEV_EXTENSIONS_FILE = os.path.join(PROFILE_DIR, 'dev-extensions.json')
+
+# ─── Auto-Wait JS Helper ───────────────────────────────────────────────────────
+# Tarayıcıya inject edilir; MutationObserver ile element görünene kadar bekler.
+WAIT_AND_QUERY_JS = """
+window.__cdpilot_waitFor = function(selector, timeout) {
+  return new Promise(function(resolve) {
+    var el = document.querySelector(selector);
+    if (el) { resolve(el); return; }
+    var obs = new MutationObserver(function() {
+      var found = document.querySelector(selector);
+      if (found) { obs.disconnect(); resolve(found); }
+    });
+    obs.observe(document.documentElement, {childList: true, subtree: true});
+    setTimeout(function() { obs.disconnect(); resolve(null); }, timeout || 5000);
+  });
+};
+"""
 PROXY_CONFIG_FILE = os.path.join(PROFILE_DIR, 'proxy.json')
 HEADLESS_CONFIG_FILE = os.path.join(PROFILE_DIR, 'headless.json')
 DOWNLOAD_CONFIG_FILE = os.path.join(PROFILE_DIR, 'download-config.json')
@@ -1314,6 +1331,87 @@ async def cmd_shot(output=None):
         print("Screenshot failed", file=sys.stderr)
 
 
+async def cmd_shot_annotated(output=None):
+    """Etkileşimli elementler üzerine @N badge eklenmiş annotated screenshot al."""
+    if not output:
+        output = f"{SCREENSHOT_DIR}/screenshot-annotated.png"
+    ws_url, _ = get_page_ws()
+
+    # A11y tree'den etkileşimli node'ları topla
+    await cdp_send(ws_url, [
+        (0, "Accessibility.enable", {}),
+        (9, "DOM.enable", {}),
+    ])
+    res = await cdp_send(ws_url, [(1, "Accessibility.getFullAXTree", {})])
+    nodes = res.get(1, {}).get("nodes", [])
+
+    interactive_roles = {
+        "button", "link", "textbox", "textField", "combobox", "comboBox",
+        "checkbox", "radio", "menuitem", "menuItem", "searchbox", "searchBox",
+        "spinbutton", "spinButton", "switch", "tab", "slider",
+    }
+    targets = [
+        n for n in nodes
+        if not n.get("ignored")
+        and n.get("role", {}).get("value", "") in interactive_roles
+        and n.get("backendDOMNodeId")
+    ]
+
+    # Her node için ekran koordinatlarını al
+    badge_count = 0
+    inject_parts = []
+    for idx, node in enumerate(targets, start=1):
+        backend_id = node["backendDOMNodeId"]
+        res_b = await cdp_send(ws_url, [(11, "DOM.getBoxModel", {"backendNodeId": backend_id})])
+        model = res_b.get(11, {}).get("model")
+        if not model:
+            continue
+        content = model.get("content", model.get("border", []))
+        if len(content) < 8:
+            continue
+        left = int(content[0])
+        top = int(content[1])
+        width = int(content[2] - content[0])
+        height = int(content[5] - content[1])
+        if width == 0 or height == 0:
+            continue
+        label = json.dumps(f"@{idx}")
+        inject_parts.append(
+            f"(function(){{"
+            f"var b=document.createElement('span');"
+            f"b.textContent={label};"
+            f"b.setAttribute('data-cdpilot-badge','1');"
+            f"b.style.cssText='position:fixed;left:{left}px;top:{top}px;"
+            f"background:#22c55e;color:#fff;font-size:11px;font-weight:bold;"
+            f"padding:1px 4px;border-radius:3px;z-index:99999;"
+            f"pointer-events:none;line-height:1.4;';"
+            f"document.body.appendChild(b);"
+            f"}})();"
+        )
+        badge_count += 1
+
+    # Badge'leri inject et
+    if inject_parts:
+        inject_js = "\n".join(inject_parts)
+        await cdp_send(ws_url, [(20, "Runtime.evaluate", {"expression": inject_js})])
+
+    # Screenshot al
+    r = await cdp_send(ws_url, [(21, "Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})])
+    b64 = r.get(21, {}).get("data", "")
+
+    # Badge'leri temizle
+    await cdp_send(ws_url, [(22, "Runtime.evaluate", {
+        "expression": "document.querySelectorAll('[data-cdpilot-badge]').forEach(function(e){e.remove();})"
+    })])
+
+    if b64:
+        with open(output, "wb") as f:
+            f.write(base64.b64decode(b64))
+        print(f"{output} ({badge_count} badge)")
+    else:
+        print("Screenshot failed", file=sys.stderr)
+
+
 async def cmd_eval(js_code):
     ws, _ = get_page_ws()
     r = await cdp_send(ws, [(1, "Runtime.evaluate", {
@@ -1339,9 +1437,10 @@ async def cmd_eval(js_code):
 async def cmd_click(selector):
     ws, _ = get_page_ws()
     safe_sel = json.dumps(selector)
-    js = f"""(function() {{
-        var el = document.querySelector({safe_sel});
-        if (!el) return 'Not found: ' + {safe_sel};
+    js = WAIT_AND_QUERY_JS + f"""
+(function() {{
+    return window.__cdpilot_waitFor({safe_sel}, 5000).then(function(el) {{
+        if (!el) return 'Timeout waiting for: ' + {safe_sel};
         el.scrollIntoView({{behavior:'smooth', block:'center'}});
         if (window.__cdpilot_vfx) {{
             var r = el.getBoundingClientRect();
@@ -1351,19 +1450,21 @@ async def cmd_click(selector):
         }}
         el.click();
         return 'Clicked: ' + el.tagName + ' ' + (el.textContent || '').substring(0, 60).trim();
-    }})()"""
-    r = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    }});
+}})()"""
+    r = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})])
     print(r.get(1, {}).get("result", {}).get("value", "?"))
 
 
 async def cmd_fill(selector, value):
-    """Fill an input field (React/Vue compatible)."""
+    """Fill an input field with auto-wait (React/Vue compatible)."""
     ws, _ = get_page_ws()
     safe_sel = json.dumps(selector)
     safe_value = json.dumps(value)
-    js = f"""(function() {{
-        var el = document.querySelector({safe_sel});
-        if (!el) return 'Not found: ' + {safe_sel};
+    js = WAIT_AND_QUERY_JS + f"""
+(function() {{
+    return window.__cdpilot_waitFor({safe_sel}, 5000).then(function(el) {{
+        if (!el) return 'Timeout waiting for: ' + {safe_sel};
         el.focus();
         if (window.__cdpilot_vfx) {{
             var r = el.getBoundingClientRect();
@@ -1372,13 +1473,18 @@ async def cmd_fill(selector, value):
         }}
         var nativeSet = Object.getOwnPropertyDescriptor(
             window.HTMLInputElement.prototype, 'value'
-        ).set;
-        nativeSet.call(el, {safe_value});
+        );
+        if (nativeSet && nativeSet.set) {{
+            nativeSet.set.call(el, {safe_value});
+        }} else {{
+            el.value = {safe_value};
+        }}
         el.dispatchEvent(new Event('input', {{bubbles: true}}));
         el.dispatchEvent(new Event('change', {{bubbles: true}}));
         return 'Filled: ' + el.tagName + ' = ' + el.value.substring(0, 50);
-    }})()"""
-    r = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    }});
+}})()"""
+    r = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})])
     print(r.get(1, {}).get("result", {}).get("value", "?"))
 
 
@@ -1412,6 +1518,55 @@ async def cmd_wait(selector, timeout=5):
     }})"""
     r = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})])
     print(r.get(1, {}).get("result", {}).get("value", "?"))
+
+
+async def cmd_batch():
+    """stdin'den JSON komut dizisi oku, sırayla çalıştır, sonuçları JSON olarak yaz.
+
+    Kullanım:
+      echo '[{"cmd":"go","args":["https://example.com"]},{"cmd":"shot","args":["/tmp/out.png"]}]' | cdpilot batch
+    """
+    try:
+        raw = sys.stdin.read()
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            print(json.dumps({"error": "Input must be a JSON array"}), file=sys.stderr)
+            sys.exit(1)
+    except json.JSONDecodeError as exc:
+        print(json.dumps({"error": f"JSON parse error: {exc}"}), file=sys.stderr)
+        sys.exit(1)
+
+    results = []
+    for item in data:
+        cmd_name = item.get("cmd", "")
+        cmd_args = item.get("args", [])
+        try:
+            if cmd_name == "go":
+                await cmd_go(cmd_args[0] if cmd_args else "")
+            elif cmd_name == "click":
+                await cmd_click(cmd_args[0] if cmd_args else "")
+            elif cmd_name in ("fill", "type"):
+                await cmd_fill(cmd_args[0] if cmd_args else "", cmd_args[1] if len(cmd_args) > 1 else "")
+            elif cmd_name == "shot":
+                await cmd_shot(cmd_args[0] if cmd_args else None)
+            elif cmd_name == "shot-annotated":
+                await cmd_shot_annotated(cmd_args[0] if cmd_args else None)
+            elif cmd_name == "wait":
+                await cmd_wait(cmd_args[0] if cmd_args else "body", int(cmd_args[1]) if len(cmd_args) > 1 else 5)
+            elif cmd_name == "eval":
+                await cmd_eval(" ".join(cmd_args) if cmd_args else "")
+            elif cmd_name == "submit":
+                await cmd_submit(cmd_args[0] if cmd_args else "form")
+            else:
+                results.append({"cmd": cmd_name, "status": "error", "error": f"Unsupported command: {cmd_name}"})
+                continue
+            results.append({"cmd": cmd_name, "status": "ok"})
+        except SystemExit:
+            results.append({"cmd": cmd_name, "status": "error", "error": "Command exited with error"})
+        except Exception as exc:
+            results.append({"cmd": cmd_name, "status": "error", "error": str(exc)})
+
+    print(json.dumps(results, indent=2, ensure_ascii=False))
 
 
 async def cmd_network(url=None):
@@ -3199,6 +3354,8 @@ if __name__ == "__main__":
         "content": cmd_content,
         "html": cmd_html,
         "shot": lambda: cmd_shot(args[0] if args else None),
+        "shot-annotated": lambda: cmd_shot_annotated(args[0] if args else None),
+        "batch": cmd_batch,
         "eval": lambda: (require_args(1, "eval <js>"), None)[1] if not args else cmd_eval(" ".join(args)),
         "click": lambda: (require_args(1, "click <selector>"), None)[1] if not args else cmd_click(args[0]),
         "fill": lambda: (require_args(2, "fill <selector> <value>"), None)[1] if len(args) < 2 else cmd_fill(args[0], " ".join(args[1:])),
@@ -3240,7 +3397,8 @@ if __name__ == "__main__":
 
     # Commands that do not require the visual indicator / input blocker
     NO_CONTROL_CMDS = {'glow', 'stop', 'tabs', 'close', 'close-tab', 'new-tab',
-                       'dialog', 'download', 'throttle', 'permission', 'intercept'}
+                       'dialog', 'download', 'throttle', 'permission', 'intercept',
+                       'batch'}
     # Clean up idle sessions before running any command
     _cleanup_idle_sessions()
 
