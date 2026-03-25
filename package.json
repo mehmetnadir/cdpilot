@@ -11,9 +11,12 @@
     "start": "node bin/cdpilot.js"
   },
   "keywords": [
-    "browser", "automation", "cdp", "chrome-devtools-protocol", "cli",
-    "devtools", "headless", "screenshot", "testing", "web-scraping",
-    "ai-agent", "mcp", "claude", "brave"
+    "browser-automation", "cdp", "chrome-devtools-protocol", "cli",
+    "mcp", "ai-agent", "web-scraping", "zero-dependency",
+    "headless-browser", "puppeteer-alternative", "playwright-alternative",
+    "screenshot", "pdf", "automation", "devtools", "browser",
+    "model-context-protocol", "claude", "brave", "testing",
+    "web-testing", "accessibility", "a11y"
   ],
   "author": "Mehmet Nadir",
   "license": "MIT",
