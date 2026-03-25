@@ -31,6 +31,9 @@ AI agents and developers need browser control that **just works**:
 - **40+ commands** — Navigate, click, type, screenshot, network, console, accessibility, and more
 - **AI-agent friendly** — Designed for Claude, GPT, Gemini, and any LLM tool-use workflow
 - **Isolated sessions** — Your personal browser stays untouched. cdpilot runs in its own profile
+- **Visual feedback** — Green glow overlay, cursor visualization, click ripples, and keystroke display keep you informed during automation
+- **Multi-project isolation** — Each project gets its own browser instance and port automatically, no conflicts
+- **AI control warning** — Red toast notification appears when you hover during active automation
 - **Privacy-first** — Everything runs locally. No data leaves your machine
 
 ### Why Brave?
@@ -275,6 +278,27 @@ Future paid offerings:
 - **No dependencies** — Zero npm/Python runtime dependencies means zero supply-chain attack surface.
 
 Found a vulnerability? Please email the maintainer directly instead of opening a public issue.
+
+## Roadmap
+
+We're building cdpilot into the lightweight alternative to Playwright MCP for AI agents. Here's what's coming:
+
+- [x] 40+ CLI commands (navigate, click, fill, screenshot, PDF, console, network...)
+- [x] MCP server for AI agent integration (Claude Code, etc.)
+- [x] Visual feedback system (green glow, cursor visualization, click ripples, keystroke display)
+- [x] AI control warning toast (appears when user tries to interact during automation)
+- [x] Multi-project browser isolation (each project gets its own port + profile automatically)
+- [x] DevExtension system (native JS injection without browser store)
+- [ ] **Accessibility tree snapshot** — structured a11y data for AI agents (like Playwright MCP but 4x lighter)
+- [ ] **Annotated screenshots** — element references (@e1, @e2) overlaid on screenshots for precise AI clicking
+- [ ] **Auto-wait** — automatically wait for elements before interaction (reduce flakiness)
+- [ ] **Batch commands** — pipe JSON arrays via stdin for multi-step automation in one call
+- [ ] **iframe & Shadow DOM** support — interact with elements inside iframes and shadow roots
+- [ ] **Claude Code Skill mode** — run as a `.claude/skills/` skill in addition to MCP
+- [ ] **Session recording & replay** — record browser sessions and replay them deterministically
+- [ ] **Stealth mode** — anti-detection flags for web scraping scenarios
+
+Have an idea? [Open an issue](https://github.com/mehmetnadir/cdpilot/issues) or submit a PR!
 
 ## Contributing
 
