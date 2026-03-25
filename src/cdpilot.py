@@ -247,6 +247,25 @@ def _cleanup_stale_sessions():
 INTERCEPT_RULES = []  # list of (pattern, action, data) tuples
 DIALOG_MODE = None    # 'accept', 'dismiss', or None
 _current_session_id = None  # lazy init
+_A11Y_REF_MAP = {}  # ref_num -> backendNodeId mapping
+_A11Y_REF_FILE = os.path.join(PROFILE_DIR, 'a11y-refs.json')
+
+
+def _save_a11y_refs(ref_map):
+    """Persist a11y ref map to disk for cross-process access."""
+    os.makedirs(os.path.dirname(_A11Y_REF_FILE), exist_ok=True)
+    with open(_A11Y_REF_FILE, 'w') as f:
+        json.dump(ref_map, f)
+
+
+def _load_a11y_refs():
+    """Load a11y ref map from disk."""
+    try:
+        with open(_A11Y_REF_FILE) as f:
+            data = json.load(f)
+            return {int(k): v for k, v in data.items()}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
 # ─── Visual Indicator Overlay CSS ───
 
@@ -2424,6 +2443,196 @@ async def cmd_a11y(subcmd=""):
         sys.exit(1)
 
 
+async def cmd_a11y_snapshot():
+    """Output a compact accessibility snapshot for AI agent navigation.
+
+    Each line: @ref [role] "name" attributes...
+    Use 'click-ref @N' to click an element by its reference number.
+    """
+    global _A11Y_REF_MAP
+    _A11Y_REF_MAP = {}
+    ws_url, _ = get_page_ws()
+    await cdp_send(ws_url, [(0, "Accessibility.enable", {})])
+    res = await cdp_send(ws_url, [(1, "Accessibility.getFullAXTree", {})])
+    nodes = res.get(1, {}).get("nodes", [])
+    if not nodes:
+        print("Could not get accessibility tree.", file=sys.stderr)
+        sys.exit(1)
+
+    ROLE_NORMALIZE = {
+        "textField": "textbox",
+        "comboBox": "combobox",
+        "checkBox": "checkbox",
+        "radioButton": "radio",
+    }
+
+    SKIP_ROLES = {
+        "none", "presentation", "generic", "LineBreak", "InlineTextBox",
+        "ignored", "unknown"
+    }
+
+    INTERACTIVE_ROLES = {
+        "button", "link", "textbox", "checkbox", "radio", "combobox", "listbox",
+        "menuitem", "menuitemcheckbox", "menuitemradio", "option", "spinbutton",
+        "slider", "switch", "tab", "treeitem"
+    }
+
+    STRUCTURAL_ROLES = {
+        "heading", "img", "navigation", "menu", "list", "listitem", "table",
+        "grid", "row", "cell", "columnheader", "rowheader", "dialog", "alert",
+        "main", "banner", "contentinfo", "region", "figure", "article", "section"
+    }
+
+    def _get_prop(node, prop_name):
+        for p in node.get("properties", []):
+            if p.get("name") == prop_name:
+                return p.get("value", {}).get("value", "")
+        return ""
+
+    ref_count = 0
+    interactive_count = 0
+    output_lines = []
+
+    for node in nodes:
+        backend_node_id = node.get("backendDOMNodeId") or node.get("backendNodeId")
+        role = node.get("role", {}).get("value")
+        name = node.get("name", {}).get("value")
+        description = node.get("description", {}).get("value")
+        ignored = node.get("ignored", False)
+
+        if ignored:
+            continue
+        if not role or role in SKIP_ROLES:
+            continue
+        if not backend_node_id:
+            continue
+        if not name and not description and role in {"staticText", "text", "paragraph"}:
+            continue
+
+        normalized = ROLE_NORMALIZE.get(role, role)
+
+        # heading/N format
+        if normalized == "heading":
+            level = _get_prop(node, "level")
+            if level:
+                normalized = f"heading/{level}"
+
+        # Determine inclusion
+        base_role = normalized.split("/")[0]
+        is_interactive = base_role in INTERACTIVE_ROLES
+        is_structural = base_role in STRUCTURAL_ROLES
+        if not (is_interactive or (is_structural and (name or description))):
+            continue
+
+        display_name = name or description or ""
+
+        attrs = []
+
+        if base_role == "link":
+            href = _get_prop(node, "url")
+            if href:
+                attrs.append(f"href={href}")
+
+        if _get_prop(node, "disabled") == "true":
+            attrs.append("disabled")
+
+        if _get_prop(node, "required") == "true":
+            attrs.append("required")
+
+        if base_role in {"textbox", "combobox"}:
+            val = _get_prop(node, "value")
+            if val:
+                attrs.append(f"value={val!r}")
+            ph = _get_prop(node, "placeholder")
+            if ph:
+                attrs.append(f"placeholder={ph!r}")
+
+        if base_role in {"checkbox", "radio"}:
+            if _get_prop(node, "checked") == "true":
+                attrs.append("checked")
+
+        if _get_prop(node, "expanded") == "true":
+            attrs.append("expanded")
+
+        ref_count += 1
+        _A11Y_REF_MAP[ref_count] = backend_node_id
+
+        if is_interactive:
+            interactive_count += 1
+
+        attr_str = (" " + " ".join(attrs)) if attrs else ""
+        line = f"@{ref_count} [{normalized}] \"{display_name}\"{attr_str}"
+        output_lines.append(line)
+
+    _save_a11y_refs(_A11Y_REF_MAP)
+
+    for line in output_lines:
+        print(line)
+    print(f"\n[{interactive_count} interactive, {ref_count} total shown]")
+
+
+async def cmd_click_ref(ref_str):
+    """Click an element by its @N reference from the last a11y-snapshot."""
+    ws_url, _ = get_page_ws()
+
+    try:
+        ref_num = int(ref_str.lstrip("@"))
+    except ValueError:
+        print(f"Error: Invalid reference '{ref_str}'. Expected @N (e.g. @3).", file=sys.stderr)
+        sys.exit(1)
+
+    ref_map = _A11Y_REF_MAP or _load_a11y_refs()
+    backend_node_id = ref_map.get(ref_num)
+    if not backend_node_id:
+        print(f"Error: Reference '@{ref_num}' not found. Run 'a11y-snapshot' first.", file=sys.stderr)
+        sys.exit(1)
+
+    # Get element box model via backendNodeId directly
+    await cdp_send(ws_url, [(0, "DOM.enable", {})])
+    res1 = await cdp_send(ws_url, [(1, "DOM.getBoxModel", {"backendNodeId": backend_node_id})])
+    model = res1.get(1, {}).get("model")
+    if not model:
+        # Fallback: resolve to objectId and use JS
+        res_r = await cdp_send(ws_url, [(10, "DOM.resolveNode", {"backendNodeId": backend_node_id})])
+        oid = res_r.get(10, {}).get("object", {}).get("objectId")
+        if oid:
+            res_js = await cdp_send(ws_url, [(11, "Runtime.callFunctionOn", {
+                "functionDeclaration": "function(){var r=this.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};}",
+                "objectId": oid, "returnByValue": True,
+            })])
+            val = res_js.get(11, {}).get("result", {}).get("value")
+            if val and "x" in val:
+                model = None  # skip box model path
+                x, y = val["x"], val["y"]
+    if model:
+        # content quad: [x1,y1, x2,y2, x3,y3, x4,y4]
+        content = model.get("content", model.get("border", []))
+        if len(content) >= 8:
+            x = int((content[0] + content[2] + content[4] + content[6]) / 4)
+            y = int((content[1] + content[3] + content[5] + content[7]) / 4)
+            val = {"x": x, "y": y}
+        else:
+            val = None
+    elif not model and 'x' not in dir():
+        val = None
+
+    if not val or "x" not in val:
+        print(f"Error: Could not get coordinates for @{ref_num}.", file=sys.stderr)
+        sys.exit(1)
+
+    x, y = val["x"], val["y"]
+    await _vfx_ripple(ws_url, x, y)
+    await cdp_send(ws_url, [
+        (3, "Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1
+        }),
+        (4, "Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1
+        }),
+    ])
+    print(f"Clicked @{ref_num} (backendNodeId={backend_node_id}): ({x}, {y})")
+
+
 # ─── 3. Advanced Input Commands ───
 
 async def cmd_hover(selector):
@@ -3013,6 +3222,8 @@ if __name__ == "__main__":
         'multi-eval': lambda: (require_args(1, 'multi-eval <js>'), None)[1] if not args else cmd_multi_eval(' '.join(args)),
         'intercept': lambda: (require_args(1, 'intercept [block|mock|headers|clear|list] ...'), None)[1] if not args else cmd_intercept(args[0], *args[1:]),
         'a11y': lambda: cmd_a11y(' '.join(args)),
+        'a11y-snapshot': cmd_a11y_snapshot,
+        'click-ref': lambda: (require_args(1, 'click-ref <@N>'), None)[1] if not args else cmd_click_ref(args[0]),
         'hover': lambda: (require_args(1, 'hover <selector>'), None)[1] if not args else cmd_hover(args[0]),
         'dblclick': lambda: (require_args(1, 'dblclick <selector>'), None)[1] if not args else cmd_dblclick(args[0]),
         'rightclick': lambda: (require_args(1, 'rightclick <selector>'), None)[1] if not args else cmd_rightclick(args[0]),
