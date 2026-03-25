@@ -2598,6 +2598,165 @@ async def cmd_a11y(subcmd=""):
         sys.exit(1)
 
 
+async def cmd_describe():
+    """Full page description for AI agents — structured data + screenshot fallback.
+
+    Outputs URL/title, accessibility snapshot, screenshot path, and text content.
+    AI agents can use the a11y snapshot for cheap navigation; fall back to the
+    screenshot with a vision model when the snapshot is insufficient (canvas, WebGL).
+    """
+    global _A11Y_REF_MAP
+    _A11Y_REF_MAP = {}
+    ws_url, page = get_page_ws()
+
+    print("=== Page Description ===")
+    print(f"URL: {page.get('url', 'N/A')}")
+    print(f"Title: {page.get('title', 'N/A')}")
+    print()
+
+    # ── Accessibility Snapshot ──────────────────────────────────────────────
+    print("=== Accessibility Snapshot ===")
+
+    ROLE_NORMALIZE = {
+        "textField": "textbox",
+        "comboBox": "combobox",
+        "checkBox": "checkbox",
+        "radioButton": "radio",
+    }
+
+    SKIP_ROLES = {
+        "none", "presentation", "generic", "LineBreak", "InlineTextBox",
+        "ignored", "unknown"
+    }
+
+    INTERACTIVE_ROLES = {
+        "button", "link", "textbox", "checkbox", "radio", "combobox", "listbox",
+        "menuitem", "menuitemcheckbox", "menuitemradio", "option", "spinbutton",
+        "slider", "switch", "tab", "treeitem"
+    }
+
+    STRUCTURAL_ROLES = {
+        "heading", "img", "navigation", "menu", "list", "listitem", "table",
+        "grid", "row", "cell", "columnheader", "rowheader", "dialog", "alert",
+        "main", "banner", "contentinfo", "region", "figure", "article", "section"
+    }
+
+    def _get_prop(node, prop_name):
+        for p in node.get("properties", []):
+            if p.get("name") == prop_name:
+                return p.get("value", {}).get("value", "")
+        return ""
+
+    await cdp_send(ws_url, [(0, "Accessibility.enable", {})])
+    res = await cdp_send(ws_url, [(1, "Accessibility.getFullAXTree", {})])
+    nodes = res.get(1, {}).get("nodes", [])
+
+    if not nodes:
+        print("Could not get accessibility tree.", file=sys.stderr)
+
+    ref_count = 0
+    interactive_count = 0
+    output_lines = []
+
+    for node in nodes:
+        backend_node_id = node.get("backendDOMNodeId") or node.get("backendNodeId")
+        role = node.get("role", {}).get("value")
+        name = node.get("name", {}).get("value")
+        description = node.get("description", {}).get("value")
+        ignored = node.get("ignored", False)
+
+        if ignored:
+            continue
+        if not role or role in SKIP_ROLES:
+            continue
+        if not backend_node_id:
+            continue
+        if not name and not description and role in {"staticText", "text", "paragraph"}:
+            continue
+
+        normalized = ROLE_NORMALIZE.get(role, role)
+
+        if normalized == "heading":
+            level = _get_prop(node, "level")
+            if level:
+                normalized = f"heading/{level}"
+
+        base_role = normalized.split("/")[0]
+        is_interactive = base_role in INTERACTIVE_ROLES
+        is_structural = base_role in STRUCTURAL_ROLES
+
+        if not (is_interactive or (is_structural and (name or description))):
+            continue
+
+        ref_count += 1
+        _A11Y_REF_MAP[ref_count] = backend_node_id
+
+        if is_interactive:
+            interactive_count += 1
+
+        display_name = name or description or ""
+        attrs = []
+
+        if base_role == "link":
+            href = _get_prop(node, "url")
+            if href:
+                attrs.append(f"href={href}")
+
+        if _get_prop(node, "disabled") == "true":
+            attrs.append("disabled")
+
+        if _get_prop(node, "required") == "true":
+            attrs.append("required")
+
+        if base_role in {"textbox", "combobox"}:
+            val = _get_prop(node, "value")
+            if val:
+                attrs.append(f"value={val!r}")
+            ph = _get_prop(node, "placeholder")
+            if ph:
+                attrs.append(f"placeholder={ph!r}")
+
+        if base_role in {"checkbox", "radio"}:
+            if _get_prop(node, "checked") == "true":
+                attrs.append("checked")
+
+        if _get_prop(node, "expanded") == "true":
+            attrs.append("expanded")
+
+        attr_str = (" " + " ".join(attrs)) if attrs else ""
+        output_lines.append(f"@{ref_count} [{normalized}] \"{display_name}\"{attr_str}")
+
+    _save_a11y_refs(_A11Y_REF_MAP)
+
+    for line in output_lines:
+        print(line)
+    print(f"\n[{interactive_count} interactive, {ref_count} total shown]")
+    print()
+
+    # ── Screenshot ─────────────────────────────────────────────────────────
+    print("=== Screenshot ===")
+    ts = int(time.time())
+    shot_path = f"{SCREENSHOT_DIR}/cdpilot-describe-{ts}.png"
+    shot_res = await cdp_send(ws_url, [(2, "Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})])
+    shot_data = shot_res.get(2, {}).get("data")
+    if shot_data:
+        with open(shot_path, "wb") as f:
+            f.write(base64.b64decode(shot_data))
+        print(f"Saved: {shot_path}")
+    else:
+        print("Could not capture screenshot.", file=sys.stderr)
+    print()
+
+    # ── Text Content ────────────────────────────────────────────────────────
+    print("=== Page Content (first 2000 chars) ===")
+    eval_res = await cdp_send(ws_url, [(3, "Runtime.evaluate", {
+        "expression": "document.body ? document.body.innerText : ''",
+        "returnByValue": True
+    })])
+    page_text = eval_res.get(3, {}).get("result", {}).get("value", "")
+    print(page_text[:2000])
+
+
 async def cmd_a11y_snapshot():
     """Output a compact accessibility snapshot for AI agent navigation.
 
@@ -3186,6 +3345,8 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_close", "description": "Close the active tab",
              "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "browser_describe", "description": "Get full page description with accessibility snapshot, screenshot, and text content. Use when a11y-snapshot alone is insufficient (canvas, WebGL, visual verification).",
+             "inputSchema": {"type": "object", "properties": {}}},
         ]
 
     def _handle_request(self, request):
@@ -3236,6 +3397,7 @@ class MCPServer:
             "browser_fill": lambda a: ["fill", a.get("selector", ""), a.get("value", "")],
             "browser_launch": lambda a: ["launch"],
             "browser_close": lambda a: ["close"],
+            "browser_describe": lambda a: ["describe"],
         }
         if tool_name not in tool_map:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}}
@@ -3380,6 +3542,7 @@ if __name__ == "__main__":
         'intercept': lambda: (require_args(1, 'intercept [block|mock|headers|clear|list] ...'), None)[1] if not args else cmd_intercept(args[0], *args[1:]),
         'a11y': lambda: cmd_a11y(' '.join(args)),
         'a11y-snapshot': cmd_a11y_snapshot,
+        'describe': cmd_describe,
         'click-ref': lambda: (require_args(1, 'click-ref <@N>'), None)[1] if not args else cmd_click_ref(args[0]),
         'hover': lambda: (require_args(1, 'hover <selector>'), None)[1] if not args else cmd_hover(args[0]),
         'dblclick': lambda: (require_args(1, 'dblclick <selector>'), None)[1] if not args else cmd_dblclick(args[0]),
