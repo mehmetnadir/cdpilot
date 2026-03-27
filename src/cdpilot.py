@@ -537,13 +537,19 @@ async def _control_start(ws_url):
     """Enable glow, input blocker, and visual feedback at command start."""
     global _glow_script_id
     try:
+        # Remove previous persistent script if exists (prevent accumulation)
+        cmds = []
+        if _glow_script_id:
+            cmds.append((900, "Page.removeScriptToEvaluateOnNewDocument", {"identifier": _glow_script_id}))
+            _glow_script_id = None
         persistent_source = GLOW_CSS + "\n" + VISUAL_FEEDBACK_JS
-        r = await cdp_send(ws_url, [
+        cmds.extend([
             (901, "Page.addScriptToEvaluateOnNewDocument", {"source": persistent_source}),
             (902, "Runtime.evaluate", {"expression": GLOW_CSS, "returnByValue": True}),
             (903, "Runtime.evaluate", {"expression": VISUAL_FEEDBACK_JS, "returnByValue": True}),
             (904, "Runtime.evaluate", {"expression": INPUT_BLOCKER_ON, "returnByValue": True}),
         ])
+        r = await cdp_send(ws_url, cmds)
         resp_901 = r.get(901, {})
         result = resp_901.get("result", {})
         if isinstance(result, dict) and "identifier" in result:
@@ -552,16 +558,24 @@ async def _control_start(ws_url):
         pass
 
 async def _control_end(ws_url):
-    """Remove input blocker, set glow/vfx auto-timeout (10s)."""
+    """Remove input blocker, set glow/vfx auto-timeout (10s).
+
+    Persistent script stays active so glow survives page navigations.
+    It gets cleaned up by the 10s timeout in GLOW_TIMEOUT_JS.
+    """
     global _glow_script_id
     try:
         cmds = [
             (903, "Runtime.evaluate", {"expression": INPUT_BLOCKER_OFF, "returnByValue": True}),
+            # Re-inject glow+vfx on current page (may be new after navigation)
+            (906, "Runtime.evaluate", {"expression": GLOW_CSS, "returnByValue": True}),
+            (907, "Runtime.evaluate", {"expression": VISUAL_FEEDBACK_JS, "returnByValue": True}),
+            # Then start the 10s auto-cleanup timeout
             (904, "Runtime.evaluate", {"expression": GLOW_TIMEOUT_JS, "returnByValue": True}),
         ]
-        if _glow_script_id:
-            cmds.append((905, "Page.removeScriptToEvaluateOnNewDocument", {"identifier": _glow_script_id}))
-            _glow_script_id = None
+        # Don't remove persistent script here — it auto-cleans via GLOW_TIMEOUT_JS.
+        # Next _control_start will replace it with a fresh one anyway.
+        _glow_script_id = None
         await cdp_send(ws_url, cmds)
     except Exception:
         pass
