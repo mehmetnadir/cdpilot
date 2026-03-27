@@ -42,7 +42,14 @@ CDPILOT_PORT_RANGE_END = 9322
 
 
 def _get_project_id():
-    """Derive a deterministic project ID from the current working directory."""
+    """Derive a deterministic project ID from the current working directory.
+
+    Prefers CDPILOT_PROJECT_ID env (set by bin/cdpilot.js based on caller's cwd)
+    over os.getcwd() which may differ when invoked via npx or absolute path.
+    """
+    env_id = os.environ.get("CDPILOT_PROJECT_ID")
+    if env_id:
+        return env_id
     cwd = os.getcwd()
     dir_name = os.path.basename(cwd)
     safe_name = _re.sub(r'[^a-zA-Z0-9-]', '', dir_name)[:20]
