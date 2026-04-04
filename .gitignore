@@ -8,3 +8,4 @@ __pycache__/
 .env
 .npmrc
 .gitnexus
+.claude/docs/browserless-analysis.md
