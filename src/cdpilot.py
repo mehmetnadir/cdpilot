@@ -1341,16 +1341,62 @@ async def cmd_html():
         print("[Output truncated at 1MB]")
 
 
-async def cmd_shot(output=None):
+async def cmd_shot(output=None, quality=None, element=None, fmt=None):
+    """Take screenshot. Supports --quality, --element, --format for token savings.
+
+    Args:
+        output: File path (auto-detects format from extension)
+        quality: JPEG quality 1-100 (only for jpeg format, saves ~5-7x tokens)
+        element: CSS selector to capture only that element (crop)
+        fmt: Force format: 'png', 'jpeg', or 'webp'
+    """
     if not output:
         output = f"{SCREENSHOT_DIR}/screenshot.png"
     ws, _ = get_page_ws()
-    r = await cdp_send(ws, [(1, "Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})])
-    b64 = r.get(1, {}).get("data", "")
+
+    # Auto-detect format from extension
+    if fmt is None:
+        ext = os.path.splitext(output)[1].lower()
+        fmt = {"jpg": "jpeg", ".jpg": "jpeg", ".jpeg": "jpeg", ".webp": "webp"}.get(ext, "png")
+
+    params = {"format": fmt}
+    if fmt == "jpeg" and quality:
+        params["quality"] = max(1, min(100, int(quality)))
+    elif fmt == "jpeg" and quality is None:
+        params["quality"] = 80  # sensible default
+
+    # Element-level crop: get bounding rect, use clip
+    if element:
+        safe_sel = json.dumps(element)
+        js = f"""
+        (function() {{
+          var el = document.querySelector({safe_sel});
+          if (!el) return null;
+          el.scrollIntoView({{block: 'center'}});
+          var r = el.getBoundingClientRect();
+          return JSON.stringify({{x: r.x, y: r.y, width: r.width, height: r.height}});
+        }})()
+        """
+        cr = await cdp_send(ws, [(2, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+        rect_str = cr.get(2, {}).get("result", {}).get("value")
+        if rect_str:
+            rect = json.loads(rect_str)
+            params["clip"] = {
+                "x": rect["x"], "y": rect["y"],
+                "width": rect["width"], "height": rect["height"],
+                "scale": 1
+            }
+        else:
+            print(f"Element not found: {element}, taking full page", file=sys.stderr)
+
+    r = await cdp_send(ws, [(1, "Page.captureScreenshot", params)])
+    b64 = r.get(1, {}).get("result", {}).get("data", "") or r.get(1, {}).get("data", "")
     if b64:
+        data = base64.b64decode(b64)
         with open(output, "wb") as f:
-            f.write(base64.b64decode(b64))
-        print(f"{output}")
+            f.write(data)
+        size_kb = len(data) / 1024
+        print(f"{output} ({size_kb:.1f}KB)")
     else:
         print("Screenshot failed", file=sys.stderr)
 
@@ -3585,8 +3631,8 @@ class MCPServer:
         return [
             {"name": "browser_navigate", "description": "Navigate the browser to a URL and return the page text content. Use this to open websites, follow links, or load web applications. Waits for page load before returning. Returns first 10000 chars of visible text.",
              "inputSchema": {"type": "object", "properties": {"url": {"type": "string", "description": "Full URL to navigate to (must include https://)"}}, "required": ["url"]}},
-            {"name": "browser_screenshot", "description": "Capture a PNG screenshot of the current browser viewport. Use this for visual verification, debugging layout issues, or when you need to see what the page looks like. Saves to the specified file path.",
-             "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Output file path for the PNG screenshot (e.g. /tmp/screenshot.png)", "default": "screenshot.png"}}}},
+            {"name": "browser_screenshot", "description": "Capture a screenshot of the current browser viewport. Supports element-level cropping to save tokens (capture only a specific element instead of full page). Use JPEG format with quality parameter for smaller files (~5x smaller than PNG). Prefer element cropping + JPEG for token-efficient AI workflows.",
+             "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Output file path (e.g. /tmp/screenshot.png). Extension determines format: .png, .jpg, .webp", "default": "screenshot.png"}, "element": {"type": "string", "description": "CSS selector to capture only that element (crops to bounding box). Saves ~3-7x tokens vs full page."}, "quality": {"type": "number", "description": "JPEG quality 1-100 (only for .jpg files). Lower = smaller file = fewer tokens. Default: 80"}}}},
             {"name": "browser_click", "description": "Click an element on the page identified by CSS selector. Auto-waits up to 5 seconds for the element to appear (MutationObserver). Scrolls the element into view before clicking. Returns the tag name and text of the clicked element.",
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element to click (e.g. '#submit-btn', '.nav a', 'button[type=submit]')"}}, "required": ["selector"]}},
             {"name": "browser_type", "description": "Type text into an input or textarea element. Uses React-compatible value setting (native setter + input/change events). Auto-waits up to 5 seconds for the element. Use browser_fill as an alias.",
@@ -3672,7 +3718,7 @@ class MCPServer:
         import io, subprocess
         tool_map = {
             "browser_navigate": lambda a: ["go", a.get("url", "")],
-            "browser_screenshot": lambda a: ["shot"] + ([self._safe_filename(a["filename"])] if a.get("filename") else []),
+            "browser_screenshot": lambda a: ["shot"] + ([self._safe_filename(a["filename"])] if a.get("filename") else []) + ([f"--element={a['element']}"] if a.get("element") else []) + ([f"--quality={a['quality']}"] if a.get("quality") else []),
             "browser_click": lambda a: ["click", a.get("selector", "")],
             "browser_type": lambda a: ["type", a.get("selector", ""), a.get("text", "")],
             "browser_content": lambda a: ["content"],
@@ -3816,7 +3862,12 @@ if __name__ == "__main__":
         "go": lambda: (require_args(1, "go <url>"), cmd_go(args[0]))[1] if not args else cmd_go(args[0]),
         "content": cmd_content,
         "html": cmd_html,
-        "shot": lambda: cmd_shot(args[0] if args else None),
+        "shot": lambda: cmd_shot(
+            output=next((a for a in args if not a.startswith("--")), None),
+            quality=next((a.split("=")[1] for a in args if a.startswith("--quality=")), None),
+            element=next((a.split("=")[1] for a in args if a.startswith("--element=")), None),
+            fmt=next((a.split("=")[1] for a in args if a.startswith("--format=")), None),
+        ),
         "shot-annotated": lambda: cmd_shot_annotated(args[0] if args else None),
         "batch": cmd_batch,
         "eval": lambda: (require_args(1, "eval <js>"), None)[1] if not args else cmd_eval(" ".join(args)),
