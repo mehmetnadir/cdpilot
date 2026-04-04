@@ -282,22 +282,36 @@ Found a vulnerability? Please email the maintainer directly instead of opening a
 
 ## Roadmap
 
-We're building cdpilot into the lightweight alternative to Playwright MCP for AI agents. Here's what's coming:
+The only browser MCP with built-in test assertions. Here's what we've shipped and what's next:
 
-- [x] 40+ CLI commands (navigate, click, fill, screenshot, PDF, console, network...)
-- [x] MCP server for AI agent integration (Claude Code, etc.)
-- [x] Visual feedback system (green glow, cursor visualization, click ripples, keystroke display)
-- [x] AI control warning toast (appears when user tries to interact during automation)
-- [x] Multi-project browser isolation (each project gets its own port + profile automatically)
+### Shipped
+
+- [x] 60+ CLI commands (navigate, click, fill, screenshot, PDF, console, network...)
+- [x] MCP server for AI agent integration (Claude Code, Cursor, etc.)
+- [x] **10 built-in test assertions** — assert, assert-url, assert-title, assert-count, assert-value, assert-attr, assert-visible/hidden, wait-for, check (batch), screenshot-diff
+- [x] **Accessibility tree snapshot** (`a11y-snapshot`) — structured data with @ref references, 500x fewer tokens than screenshots
+- [x] **Token-efficient screenshots** — element-level crop (13x smaller), JPEG quality control, format selection
+- [x] **Vision fallback** (`describe`) — a11y + screenshot + text in one call
+- [x] **Annotated screenshots** — @N badge overlays on interactive elements
+- [x] **Auto-wait** — MutationObserver-based, 5s automatic element waiting
+- [x] **Batch commands** — pipe JSON arrays via stdin for multi-step automation
+- [x] Visual feedback system (persistent green glow, cursor, ripples, keystroke display)
+- [x] AI control warning toast (red warning when user interacts during automation)
+- [x] Multi-project browser isolation (each project gets its own port + profile)
+- [x] Pre-flight wizard (auto-installs dependencies on first run)
+- [x] Persistent MCP glow (stays on during entire AI session, like Claude's orange glow)
 - [x] DevExtension system (native JS injection without browser store)
-- [ ] **Accessibility tree snapshot** — structured a11y data for AI agents (like Playwright MCP but 4x lighter)
-- [ ] **Annotated screenshots** — element references (@e1, @e2) overlaid on screenshots for precise AI clicking
-- [ ] **Auto-wait** — automatically wait for elements before interaction (reduce flakiness)
-- [ ] **Batch commands** — pipe JSON arrays via stdin for multi-step automation in one call
+
+### Coming Soon
+
 - [ ] **iframe & Shadow DOM** support — interact with elements inside iframes and shadow roots
-- [ ] **Claude Code Skill mode** — run as a `.claude/skills/` skill in addition to MCP
 - [ ] **Session recording & replay** — record browser sessions and replay them deterministically
-- [ ] **Stealth mode** — anti-detection flags for web scraping scenarios
+- [ ] **Stealth mode** *(Pro)* — human-like mouse/typing, anti-fingerprint, CAPTCHA solving
+- [ ] **cdpilot Cloud** — hosted browser sessions API, REST + WebSocket MCP endpoint
+- [ ] **Chrome Extension** — use cdpilot from any browser without CLI
+- [ ] **Performance audit** — Core Web Vitals (LCP, CLS, INP) via CDP Performance domain
+- [ ] **WCAG accessibility audit** — automated a11y compliance reporting
+- [ ] **Claude Code Skill mode** — run as a `.claude/skills/` skill in addition to MCP
 
 Have an idea? [Open an issue](https://github.com/mehmetnadir/cdpilot/issues) or submit a PR!
 
