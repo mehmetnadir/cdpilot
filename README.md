@@ -7,6 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933)](https://nodejs.org)
 [![MCP Compatible](https://img.shields.io/badge/MCP-Compatible-blue)](https://modelcontextprotocol.io)
+[![cdpilot MCP server](https://glama.ai/mcp/servers/mehmetnadir/cdpilot/badge)](https://glama.ai/mcp/servers/mehmetnadir/cdpilot)
 
 <div align="center">
   <img src="cdpilot-demo.gif" alt="cdpilot demo" width="600" />
