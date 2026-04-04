@@ -118,6 +118,80 @@ function runSetup() {
   console.log('  ✓ Setup complete! Run: cdpilot launch\n');
 }
 
+// ── Pre-flight Check (runs on first launch) ──
+
+function checkWebsockets(python) {
+  try {
+    execSync(`${python} -c "import websockets"`, { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function preflight() {
+  const markerFile = path.join(os.homedir(), '.cdpilot', '.preflight-done');
+
+  // Skip if already passed (not first run) and all deps present
+  const python = findPython();
+  const browser = findBrowser();
+  if (fs.existsSync(markerFile) && python && browser && checkWebsockets(python)) {
+    return; // All good, skip silently
+  }
+
+  console.log(`\n  cdpilot v${VERSION} — Pre-flight Check`);
+  console.log('  ' + '─'.repeat(35) + '\n');
+
+  // 1. Python
+  if (python) {
+    const ver = execSync(`${python} --version 2>&1`, { stdio: 'pipe' }).toString().trim();
+    console.log(`  ✓ ${ver}`);
+  } else {
+    console.log('  ✗ Python 3.8+ not found');
+    console.log('    → Install: https://www.python.org/downloads/\n');
+    process.exit(1);
+  }
+
+  // 2. websockets
+  if (checkWebsockets(python)) {
+    console.log('  ✓ websockets');
+  } else {
+    console.log('  ✗ websockets — installing...');
+    try {
+      execSync(`${python} -m pip install websockets --quiet --disable-pip-version-check`, { stdio: 'pipe' });
+      if (checkWebsockets(python)) {
+        console.log('  ✓ websockets (installed)');
+      } else {
+        console.log('  ✗ websockets install failed');
+        console.log('    → Run manually: pip install websockets\n');
+        process.exit(1);
+      }
+    } catch {
+      console.log('  ✗ websockets auto-install failed');
+      console.log('    → Run manually: pip install websockets\n');
+      process.exit(1);
+    }
+  }
+
+  // 3. Browser
+  if (browser) {
+    const name = path.basename(browser).replace(/\.exe$/i, '');
+    console.log(`  ✓ ${name} (${browser})`);
+  } else {
+    console.log('  ✗ No compatible browser found');
+    console.log('    → Install Brave (recommended): https://brave.com/download/');
+    console.log('    → Or Chrome: https://www.google.com/chrome/\n');
+    process.exit(1);
+  }
+
+  // Mark as done
+  const dir = path.dirname(markerFile);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(markerFile, new Date().toISOString());
+
+  console.log('\n  Ready!\n');
+}
+
 // ── Status Command ──
 
 function runStatus() {
@@ -286,6 +360,11 @@ if (cmd === 'status') {
   runStatus();
   // Don't exit immediately — let http callback complete
 } else {
+  // Pre-flight check on first run or 'launch' command
+  if (cmd === 'launch') {
+    preflight();
+  }
+
   // Delegate to Python
   const python = findPython();
   if (!python) {
