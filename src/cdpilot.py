@@ -39,6 +39,7 @@ CDPILOT_HOME = os.path.expanduser("~/.cdpilot")
 REGISTRY_FILE = os.path.join(CDPILOT_HOME, "registry.json")
 CDPILOT_PORT_RANGE_START = 9222
 CDPILOT_PORT_RANGE_END = 9322
+IS_MCP_SESSION = os.environ.get("CDPILOT_MCP_SESSION") == "1"
 
 
 def _get_project_id():
@@ -565,10 +566,11 @@ async def _control_start(ws_url):
         pass
 
 async def _control_end(ws_url):
-    """Remove input blocker, set glow/vfx auto-timeout (10s).
+    """Remove input blocker, keep glow alive.
 
-    Persistent script stays active so glow survives page navigations.
-    It gets cleaned up by the 10s timeout in GLOW_TIMEOUT_JS.
+    In MCP session mode (CDPILOT_MCP_SESSION=1): glow stays permanently,
+    no timeout — mimics Claude's persistent orange glow behavior.
+    In CLI mode: glow fades after 10s idle (GLOW_TIMEOUT_JS).
     """
     global _glow_script_id
     try:
@@ -577,11 +579,12 @@ async def _control_end(ws_url):
             # Re-inject glow+vfx on current page (may be new after navigation)
             (906, "Runtime.evaluate", {"expression": GLOW_CSS, "returnByValue": True}),
             (907, "Runtime.evaluate", {"expression": VISUAL_FEEDBACK_JS, "returnByValue": True}),
-            # Then start the 10s auto-cleanup timeout
-            (904, "Runtime.evaluate", {"expression": GLOW_TIMEOUT_JS, "returnByValue": True}),
         ]
-        # Don't remove persistent script here — it auto-cleans via GLOW_TIMEOUT_JS.
-        # Next _control_start will replace it with a fresh one anyway.
+        if not IS_MCP_SESSION:
+            # CLI mode: start 10s auto-cleanup timeout
+            cmds.append((904, "Runtime.evaluate", {"expression": GLOW_TIMEOUT_JS, "returnByValue": True}))
+        # Don't remove persistent script — it auto-cleans via GLOW_TIMEOUT_JS (CLI)
+        # or stays forever (MCP session).
         _glow_script_id = None
         await cdp_send(ws_url, cmds)
     except Exception:
@@ -2778,6 +2781,120 @@ async def cmd_describe():
     print(page_text[:2000])
 
 
+# ─── Testing Commands ───
+
+async def cmd_assert(selector, expected_text=None, check_visible=True):
+    """Assert element exists, optionally check text content and visibility."""
+    ws_url, _ = get_page_ws()
+    visible_check = ""
+    if check_visible:
+        visible_check = """
+        var rect = el.getBoundingClientRect();
+        var style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.opacity === '0' || (rect.width === 0 && rect.height === 0)) {
+          return 'FAIL: Element found but not visible: ' + sel;
+        }"""
+    text_check = ""
+    if expected_text:
+        safe_text = json.dumps(expected_text)
+        text_check = f"""
+        var actual = el.textContent || el.value || '';
+        if (actual.indexOf({safe_text}) === -1) {{
+          return 'FAIL: Expected text ' + {safe_text} + ' not found in: ' + actual.substring(0, 100);
+        }}"""
+    safe_sel = json.dumps(selector)
+    js = f"""
+    (function() {{
+      var sel = {safe_sel};
+      var el = document.querySelector(sel);
+      if (!el) return 'FAIL: Element not found: ' + sel;
+      {visible_check}
+      {text_check}
+      var tag = el.tagName.toLowerCase();
+      var txt = (el.textContent || '').substring(0, 60).trim();
+      return 'PASS: ' + tag + (txt ? ' "' + txt + '"' : '') + ' (' + sel + ')';
+    }})()
+    """
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
+    print(result)
+
+
+async def cmd_wait_for(selector, timeout_ms=5000):
+    """Wait for element to appear in DOM, up to timeout."""
+    ws_url, _ = get_page_ws()
+    safe_sel = json.dumps(selector)
+    js = f"""
+    (function() {{
+      return new Promise(function(resolve) {{
+        var sel = {safe_sel};
+        var el = document.querySelector(sel);
+        if (el) return resolve('FOUND: ' + el.tagName + ' "' + (el.textContent || '').substring(0, 60).trim() + '"');
+        var obs = new MutationObserver(function() {{
+          var el = document.querySelector(sel);
+          if (el) {{ obs.disconnect(); resolve('FOUND: ' + el.tagName + ' "' + (el.textContent || '').substring(0, 60).trim() + '"'); }}
+        }});
+        obs.observe(document.body, {{childList: true, subtree: true}});
+        setTimeout(function() {{ obs.disconnect(); resolve('TIMEOUT: ' + sel + ' not found after {timeout_ms}ms'); }}, {timeout_ms});
+      }});
+    }})()
+    """
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})], timeout=max(15, timeout_ms // 1000 + 5))
+    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
+    print(result)
+
+
+async def cmd_check(checks_json=None):
+    """Run batch assertions. Input: JSON array of {selector, text?} objects."""
+    ws_url, _ = get_page_ws()
+    if checks_json is None:
+        raw = sys.stdin.read().strip()
+    else:
+        raw = checks_json
+    try:
+        checks = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        print("Error: Invalid JSON. Expected: [{\"selector\": \"...\", \"text\": \"...\"}]")
+        sys.exit(1)
+
+    passed = 0
+    failed = 0
+    results = []
+    for i, check in enumerate(checks, 1):
+        sel = check.get("selector", "")
+        text = check.get("text")
+        safe_sel = json.dumps(sel)
+        text_check = ""
+        if text:
+            safe_text = json.dumps(text)
+            text_check = f"""
+            var actual = el.textContent || el.value || '';
+            if (actual.indexOf({safe_text}) === -1) {{
+              return 'FAIL: Expected ' + {safe_text} + ' in: ' + actual.substring(0, 80);
+            }}"""
+        js = f"""
+        (function() {{
+          var el = document.querySelector({safe_sel});
+          if (!el) return 'FAIL: Not found: ' + {safe_sel};
+          {text_check}
+          return 'PASS: ' + el.tagName + ' (' + {safe_sel} + ')';
+        }})()
+        """
+        r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+        result = r.get(1, {}).get("result", {}).get("value", "ERROR")
+        if result.startswith("PASS"):
+            passed += 1
+        else:
+            failed += 1
+        results.append(f"  {i}. {result}")
+
+    print(f"Test Report: {passed} passed, {failed} failed")
+    print("─" * 40)
+    for line in results:
+        print(line)
+
+
 async def cmd_a11y_snapshot():
     """Output a compact accessibility snapshot for AI agent navigation.
 
@@ -3368,6 +3485,12 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_describe", "description": "Get a comprehensive page description combining three data sources: (1) accessibility tree with @N references for interactive elements, (2) a PNG screenshot saved to disk, and (3) visible text content. Use this when browser_a11y alone is insufficient — for canvas/WebGL content, visual verification, or complex dynamic UIs. This is the vision fallback tool.",
              "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "browser_assert", "description": "Assert that an element matching the CSS selector exists and optionally contains expected text. Returns PASS or FAIL with details. Use this for automated testing — verify page state after navigation or interaction. Checks visibility by default.",
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector to check for existence"}, "text": {"type": "string", "description": "Optional: expected text content (substring match)"}, "visible": {"type": "boolean", "description": "Check element is visible (not hidden/zero-size)", "default": True}}, "required": ["selector"]}},
+            {"name": "browser_wait_for", "description": "Wait for an element matching the CSS selector to appear in the DOM, up to the specified timeout. Uses MutationObserver for efficient waiting. Returns the element's tag and text when found, or TIMEOUT if not found. Use before interactions with dynamically loaded content.",
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector to wait for"}, "timeout": {"type": "number", "description": "Maximum wait time in milliseconds", "default": 5000}}, "required": ["selector"]}},
+            {"name": "browser_check", "description": "Run a batch of assertions on the current page and return a test report. Each check verifies element existence and optional text content. Returns a summary with PASS/FAIL count. Use this for comprehensive page validation after a series of actions.",
+             "inputSchema": {"type": "object", "properties": {"checks": {"type": "array", "description": "Array of checks, each with 'selector' (required) and 'text' (optional)", "items": {"type": "object", "properties": {"selector": {"type": "string"}, "text": {"type": "string"}}, "required": ["selector"]}}}, "required": ["checks"]}},
         ]
 
     def _handle_request(self, request):
@@ -3419,15 +3542,20 @@ class MCPServer:
             "browser_launch": lambda a: ["launch"],
             "browser_close": lambda a: ["close"],
             "browser_describe": lambda a: ["describe"],
+            "browser_assert": lambda a: ["assert", a.get("selector", "")] + ([a["text"]] if a.get("text") else []),
+            "browser_wait_for": lambda a: ["wait-for", a.get("selector", "")] + ([str(a["timeout"])] if a.get("timeout") else []),
+            "browser_check": lambda a: ["check", json.dumps(a.get("checks", []))],
         }
         if tool_name not in tool_map:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}}
 
         cli_args = [a for a in tool_map[tool_name](args) if a]
         try:
+            env = os.environ.copy()
+            env["CDPILOT_MCP_SESSION"] = "1"
             result = subprocess.run(
                 [sys.executable, __file__] + cli_args,
-                capture_output=True, text=True, timeout=30
+                capture_output=True, text=True, timeout=30, env=env
             )
             output = result.stdout.strip()
             errors = result.stderr.strip()
@@ -3564,6 +3692,9 @@ if __name__ == "__main__":
         'a11y': lambda: cmd_a11y(' '.join(args)),
         'a11y-snapshot': cmd_a11y_snapshot,
         'describe': cmd_describe,
+        'assert': lambda: (require_args(1, 'assert <selector> [text]'), None)[1] if not args else cmd_assert(args[0], args[1] if len(args) > 1 else None),
+        'wait-for': lambda: (require_args(1, 'wait-for <selector> [timeout_ms]'), None)[1] if not args else cmd_wait_for(args[0], int(args[1]) if len(args) > 1 else 5000),
+        'check': lambda: cmd_check(args[0] if args else None),
         'click-ref': lambda: (require_args(1, 'click-ref <@N>'), None)[1] if not args else cmd_click_ref(args[0]),
         'hover': lambda: (require_args(1, 'hover <selector>'), None)[1] if not args else cmd_hover(args[0]),
         'dblclick': lambda: (require_args(1, 'dblclick <selector>'), None)[1] if not args else cmd_dblclick(args[0]),
