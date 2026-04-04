@@ -2895,6 +2895,134 @@ async def cmd_check(checks_json=None):
         print(line)
 
 
+async def cmd_assert_url(expected_url):
+    """Assert current page URL contains the expected substring."""
+    ws_url, _ = get_page_ws()
+    safe_expected = json.dumps(expected_url)
+    js = f"""(function() {{
+      var href = window.location.href;
+      var expected = {safe_expected};
+      if (href.indexOf(expected) !== -1) return 'PASS: URL ' + href + ' contains \"' + expected + '\"';
+      return 'FAIL: URL ' + href + ' does not contain \"' + expected + '\"';
+    }})()"""
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
+    print(result)
+
+
+async def cmd_assert_title(expected_title):
+    """Assert page title contains the expected substring."""
+    ws_url, _ = get_page_ws()
+    safe_expected = json.dumps(expected_title)
+    js = f"""(function() {{
+      var title = document.title;
+      var expected = {safe_expected};
+      if (title.indexOf(expected) !== -1) return 'PASS: Title \"' + title + '\" contains \"' + expected + '\"';
+      return 'FAIL: Title \"' + title + '\" does not contain \"' + expected + '\"';
+    }})()"""
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
+    print(result)
+
+
+async def cmd_assert_count(selector, expected_count):
+    """Assert the number of elements matching a CSS selector equals expected_count."""
+    ws_url, _ = get_page_ws()
+    safe_sel = json.dumps(selector)
+    exp = int(expected_count)
+    js = f"""(function() {{
+      var count = document.querySelectorAll({safe_sel}).length;
+      var exp = {exp};
+      if (count === exp) return 'PASS: Found ' + count + ' element(s) matching {safe_sel} (expected ' + exp + ')';
+      return 'FAIL: Expected ' + exp + ' \"{selector}\" but found ' + count;
+    }})()"""
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
+    print(result)
+
+
+async def cmd_assert_value(selector, expected_value):
+    """Assert an input/textarea/select element's value equals expected_value."""
+    ws_url, _ = get_page_ws()
+    safe_sel = json.dumps(selector)
+    safe_expected = json.dumps(expected_value)
+    js = f"""(function() {{
+      var el = document.querySelector({safe_sel});
+      if (!el) return 'FAIL: Element not found: ' + {safe_sel};
+      var val = el.value;
+      var expected = {safe_expected};
+      if (val === expected) return 'PASS: Value matches \"' + expected + '\"';
+      return 'FAIL: Expected value \"' + expected + '\" but got \"' + val + '\"';
+    }})()"""
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
+    print(result)
+
+
+async def cmd_assert_attr(selector, attr, expected):
+    """Assert element attribute value contains expected substring."""
+    ws_url, _ = get_page_ws()
+    safe_sel = json.dumps(selector)
+    safe_attr = json.dumps(attr)
+    safe_expected = json.dumps(expected)
+    js = f"""(function() {{
+      var el = document.querySelector({safe_sel});
+      if (!el) return 'FAIL: Element not found: ' + {safe_sel};
+      var val = el.getAttribute({safe_attr}) || '';
+      var expected = {safe_expected};
+      if (val.indexOf(expected) !== -1) return 'PASS: ' + {safe_sel} + '[' + {safe_attr} + '] = \"' + val + '\"';
+      return 'FAIL: Expected ' + {safe_sel} + '[' + {safe_attr} + '] to contain \"' + expected + '\" but got \"' + val + '\"';
+    }})()"""
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
+    print(result)
+
+
+async def cmd_assert_visible(selector, should_be_visible=True):
+    """Assert element is visible (or hidden). should_be_visible=True checks for visible, False for hidden."""
+    ws_url, _ = get_page_ws()
+    safe_sel = json.dumps(selector)
+    expect_label = "visible" if should_be_visible else "hidden"
+    opposite_label = "hidden" if should_be_visible else "visible"
+    js = f"""(function() {{
+      var el = document.querySelector({safe_sel});
+      if (!el) return 'FAIL: Element not found: ' + {safe_sel};
+      var style = window.getComputedStyle(el);
+      var rect = el.getBoundingClientRect();
+      var isVisible = (
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        style.opacity !== '0' &&
+        (rect.width > 0 || rect.height > 0)
+      );
+      var expectVisible = {str(should_be_visible).lower()};
+      if (isVisible === expectVisible) return 'PASS: ' + {safe_sel} + ' is {expect_label}';
+      return 'FAIL: ' + {safe_sel} + ' expected {expect_label} but is {opposite_label}';
+    }})()"""
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
+    print(result)
+
+
+async def cmd_screenshot_diff(path1, path2):
+    """Compare two screenshot files byte-by-byte. No CDP required."""
+    for path in (path1, path2):
+        if not os.path.exists(path):
+            print(f"ERROR: File not found: {path}")
+            return
+    size1 = os.path.getsize(path1)
+    size2 = os.path.getsize(path2)
+    with open(path1, "rb") as f1, open(path2, "rb") as f2:
+        data1 = f1.read()
+        data2 = f2.read()
+    if data1 == data2:
+        print("MATCH: Files are identical")
+    else:
+        kb1 = size1 / 1024
+        kb2 = size2 / 1024
+        print(f"DIFF: Files differ ({os.path.basename(path1)}: {kb1:.1f}KB, {os.path.basename(path2)}: {kb2:.1f}KB)")
+
+
 async def cmd_a11y_snapshot():
     """Output a compact accessibility snapshot for AI agent navigation.
 
@@ -3491,6 +3619,22 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector to wait for"}, "timeout": {"type": "number", "description": "Maximum wait time in milliseconds", "default": 5000}}, "required": ["selector"]}},
             {"name": "browser_check", "description": "Run a batch of assertions on the current page and return a test report. Each check verifies element existence and optional text content. Returns a summary with PASS/FAIL count. Use this for comprehensive page validation after a series of actions.",
              "inputSchema": {"type": "object", "properties": {"checks": {"type": "array", "description": "Array of checks, each with 'selector' (required) and 'text' (optional)", "items": {"type": "object", "properties": {"selector": {"type": "string"}, "text": {"type": "string"}}, "required": ["selector"]}}}, "required": ["checks"]}},
+            {"name": "browser_assert_url", "description": "Assert the current page URL contains the expected substring. Returns PASS with the full URL or FAIL. Use this after navigation to verify you landed on the correct page.",
+             "inputSchema": {"type": "object", "properties": {"expected_url": {"type": "string", "description": "Expected substring to find in the current URL (e.g. 'example.com', '/dashboard', '?tab=settings')"}}, "required": ["expected_url"]}},
+            {"name": "browser_assert_title", "description": "Assert the current page title contains the expected substring. Returns PASS with full title or FAIL. Useful for verifying page identity without relying on URL.",
+             "inputSchema": {"type": "object", "properties": {"expected_title": {"type": "string", "description": "Expected substring to find in the page title (e.g. 'Dashboard', 'Login')"}}, "required": ["expected_title"]}},
+            {"name": "browser_assert_count", "description": "Assert the number of elements matching a CSS selector equals an expected count. Returns PASS with count or FAIL with actual vs expected. Use this to verify list items, table rows, search results, or repeated components.",
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector to count matching elements"}, "expected_count": {"type": "integer", "description": "Expected number of matching elements"}}, "required": ["selector", "expected_count"]}},
+            {"name": "browser_assert_value", "description": "Assert an input, textarea, or select element's current value equals the expected string. Returns PASS or FAIL with actual value. Use this to verify form field state after filling or after page load.",
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the input/textarea/select element"}, "expected_value": {"type": "string", "description": "Expected exact value of the element"}}, "required": ["selector", "expected_value"]}},
+            {"name": "browser_assert_attr", "description": "Assert an element's HTML attribute contains the expected substring. Returns PASS with actual value or FAIL. Use this to verify href, src, data-*, aria-* and other attributes without reading full page HTML.",
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element"}, "attr": {"type": "string", "description": "Attribute name (e.g. 'href', 'src', 'data-id', 'aria-label')"}, "expected": {"type": "string", "description": "Expected substring in the attribute value"}}, "required": ["selector", "attr", "expected"]}},
+            {"name": "browser_assert_visible", "description": "Assert an element is visible on the page (not hidden by CSS). Checks display, visibility, opacity and bounding rect. Returns PASS or FAIL. Use this to verify modals opened, elements shown after interaction, or content loaded.",
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element to check for visibility"}}, "required": ["selector"]}},
+            {"name": "browser_assert_hidden", "description": "Assert an element exists but is hidden (display:none, visibility:hidden, opacity:0, or zero size). Returns PASS or FAIL. Use this to verify modals closed, tooltips dismissed, or conditional sections hidden.",
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element expected to be hidden"}}, "required": ["selector"]}},
+            {"name": "browser_screenshot_diff", "description": "Compare two screenshot PNG files byte-by-byte. Returns MATCH if files are identical or DIFF with file sizes if different. Use this for visual regression testing — take a baseline screenshot, perform actions, take another screenshot, then compare.",
+             "inputSchema": {"type": "object", "properties": {"path1": {"type": "string", "description": "Absolute path to the first (baseline) screenshot PNG"}, "path2": {"type": "string", "description": "Absolute path to the second (current) screenshot PNG"}}, "required": ["path1", "path2"]}},
         ]
 
     def _handle_request(self, request):
@@ -3545,6 +3689,14 @@ class MCPServer:
             "browser_assert": lambda a: ["assert", a.get("selector", "")] + ([a["text"]] if a.get("text") else []),
             "browser_wait_for": lambda a: ["wait-for", a.get("selector", "")] + ([str(a["timeout"])] if a.get("timeout") else []),
             "browser_check": lambda a: ["check", json.dumps(a.get("checks", []))],
+            "browser_assert_url": lambda a: ["assert-url", a.get("expected_url", "")],
+            "browser_assert_title": lambda a: ["assert-title", a.get("expected_title", "")],
+            "browser_assert_count": lambda a: ["assert-count", a.get("selector", ""), str(a.get("expected_count", 0))],
+            "browser_assert_value": lambda a: ["assert-value", a.get("selector", ""), a.get("expected_value", "")],
+            "browser_assert_attr": lambda a: ["assert-attr", a.get("selector", ""), a.get("attr", ""), a.get("expected", "")],
+            "browser_assert_visible": lambda a: ["assert-visible", a.get("selector", "")],
+            "browser_assert_hidden": lambda a: ["assert-hidden", a.get("selector", "")],
+            "browser_screenshot_diff": lambda a: ["screenshot-diff", a.get("path1", ""), a.get("path2", "")],
         }
         if tool_name not in tool_map:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}}
@@ -3695,6 +3847,14 @@ if __name__ == "__main__":
         'assert': lambda: (require_args(1, 'assert <selector> [text]'), None)[1] if not args else cmd_assert(args[0], args[1] if len(args) > 1 else None),
         'wait-for': lambda: (require_args(1, 'wait-for <selector> [timeout_ms]'), None)[1] if not args else cmd_wait_for(args[0], int(args[1]) if len(args) > 1 else 5000),
         'check': lambda: cmd_check(args[0] if args else None),
+        'assert-url': lambda: (require_args(1, 'assert-url <expected>'), None)[1] if not args else cmd_assert_url(args[0]),
+        'assert-title': lambda: (require_args(1, 'assert-title <expected>'), None)[1] if not args else cmd_assert_title(args[0]),
+        'assert-count': lambda: (require_args(2, 'assert-count <selector> <n>'), None)[1] if len(args) < 2 else cmd_assert_count(args[0], int(args[1])),
+        'assert-value': lambda: (require_args(2, 'assert-value <selector> <value>'), None)[1] if len(args) < 2 else cmd_assert_value(args[0], args[1]),
+        'assert-attr': lambda: (require_args(3, 'assert-attr <selector> <attr> <expected>'), None)[1] if len(args) < 3 else cmd_assert_attr(args[0], args[1], args[2]),
+        'assert-visible': lambda: (require_args(1, 'assert-visible <selector>'), None)[1] if not args else cmd_assert_visible(args[0], True),
+        'assert-hidden': lambda: (require_args(1, 'assert-hidden <selector>'), None)[1] if not args else cmd_assert_visible(args[0], False),
+        'screenshot-diff': lambda: (require_args(2, 'screenshot-diff <path1> <path2>'), None)[1] if len(args) < 2 else cmd_screenshot_diff(args[0], args[1]),
         'click-ref': lambda: (require_args(1, 'click-ref <@N>'), None)[1] if not args else cmd_click_ref(args[0]),
         'hover': lambda: (require_args(1, 'hover <selector>'), None)[1] if not args else cmd_hover(args[0]),
         'dblclick': lambda: (require_args(1, 'dblclick <selector>'), None)[1] if not args else cmd_dblclick(args[0]),
@@ -3713,7 +3873,7 @@ if __name__ == "__main__":
     # Commands that do not require the visual indicator / input blocker
     NO_CONTROL_CMDS = {'glow', 'stop', 'tabs', 'close', 'close-tab', 'new-tab',
                        'dialog', 'download', 'throttle', 'permission', 'intercept',
-                       'batch'}
+                       'batch', 'screenshot-diff'}
     # Clean up idle sessions before running any command
     _cleanup_idle_sessions()
 
