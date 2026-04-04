@@ -1,0 +1,65 @@
+name: PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install websockets
+        run: pip install websockets
+
+      - name: Syntax check
+        run: python3 -m py_compile src/cdpilot.py
+
+      - name: Run tests
+        run: node test/test.js
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check file size (zero-dep policy)
+        run: |
+          FOUND=$(grep -r 'require(' src/ 2>/dev/null | grep -v 'node:' | grep -v 'test/' || true)
+          if [ -n "$FOUND" ]; then
+            echo "⚠️ External require() found in src/ — cdpilot is zero-dependency"
+            echo "$FOUND"
+            exit 1
+          fi
+
+      - name: Check Python imports
+        run: |
+          python3 -c "
+          import ast, sys
+          ALLOWED = {'websockets'}
+          STDLIB = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') else set()
+          with open('src/cdpilot.py') as f:
+              tree = ast.parse(f.read())
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  for alias in node.names:
+                      mod = alias.name.split('.')[0]
+                      if mod not in ALLOWED and mod not in STDLIB and not mod.startswith('_'):
+                          print(f'❌ Non-stdlib import: {mod}')
+                          sys.exit(1)
+              elif isinstance(node, ast.ImportFrom) and node.module:
+                  mod = node.module.split('.')[0]
+                  if mod not in ALLOWED and mod not in STDLIB and not mod.startswith('_'):
+                      print(f'❌ Non-stdlib import: {mod}')
+                      sys.exit(1)
+          print('✅ All imports are stdlib or allowed (websockets)')
+          "
