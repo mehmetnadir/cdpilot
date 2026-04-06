@@ -2,6 +2,28 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [0.3.0] - 2026-04-07
+
+### Added
+- **Smart commands** — interact by visible text, no CSS selectors or LLM needed
+  - `smart-click <text>` — fuzzy match across textContent, aria-label, title, placeholder
+  - `smart-fill <label> <value>` — find input by label/placeholder, React-compatible
+  - `smart-select <label> <option>` — select dropdown by label text
+- **Data extraction** (`extract`) — structured DOM data in text, JSON, or list format
+- **Page observation** (`observe`) — list all interactive elements with available actions (CLICK, FILL, NAVIGATE, TOGGLE, SELECT, SUBMIT, UPLOAD)
+- **Script runner** (`run <script.cdp>`) — execute `.cdp` script files with pass/fail reporting
+- **10 test assertions** — unique among all browser MCP servers
+  - `assert`, `assert-url`, `assert-title`, `assert-count`, `assert-value`, `assert-attr`, `assert-visible`, `assert-hidden`, `wait-for`, `check` (batch), `screenshot-diff`
+- **Token-efficient screenshots** — element-level crop (13x smaller), JPEG quality control, format selection
+- **Pre-flight wizard** — auto-checks Python, websockets, browser on first launch; auto-installs missing deps
+- **Persistent MCP glow** — `CDPILOT_MCP_SESSION=1` keeps glow active during entire AI session
+- **MCP tool descriptions** enriched for Glama TDQS scoring (6 quality dimensions)
+- **Glama.ai integration** — `glama.json` metadata, claimed on Glama registry
+- **GitHub Actions** — PR auto-review (syntax + tests + zero-dep lint) + welcome bot for first-time contributors
+
+### Fixed
+- Python 3.8-3.11 compatibility — removed backslash in f-strings (reported by @senthazalravi)
+
 ## [0.2.0] - 2026-04-05
 
 ### Added
