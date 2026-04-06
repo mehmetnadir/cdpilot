@@ -831,12 +831,12 @@ async def cdp_send(ws_url, commands, timeout=15):
                     continue
         return results
     except ConnectionRefusedError:
-        print(f'Browser is not running. Run \'cdpilot launch\' first.', file=sys.stderr)
+        print("Browser is not running. Run 'cdpilot launch' first.", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         err = str(e)
         if "websocket" in err.lower() or "connect" in err.lower() or "ws://" in err.lower():
-            print(f'Browser is not running or CDP port {CDP_PORT} is unreachable. Run \'cdpilot launch\' first.', file=sys.stderr)
+            print(f"Browser is not running or CDP port {CDP_PORT} is unreachable. Run 'cdpilot launch' first.", file=sys.stderr)
             sys.exit(1)
         raise
 
@@ -2091,7 +2091,8 @@ def cmd_ext_remove(ext_id):
 async def cmd_new_tab(url='about:blank'):
     """Open a new tab."""
     import urllib.parse
-    data = cdp_get(f'/json/new?{urllib.parse.quote(url, safe=":/?#[]@!$&\'()*+,;=")}')
+    safe_chars = ":/?#[]@!$&'()*+,;="
+    data = cdp_get(f'/json/new?{urllib.parse.quote(url, safe=safe_chars)}')
     if data:
         print(f'New tab opened: {data.get("url", url)}')
         print(f'  ID: {data.get("id", "?")}')
