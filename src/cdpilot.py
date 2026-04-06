@@ -2984,6 +2984,293 @@ async def cmd_observe():
     print(result)
 
 
+# ─── Smart Commands (LLM-free intelligence) ───
+
+async def cmd_smart_click(text):
+    """Click element by visible text — fuzzy matching, no CSS selector needed.
+
+    Like Stagehand's act("Click login") but without LLM.
+    Searches: button text, link text, aria-label, placeholder, title, value.
+
+    Usage:
+        cdpilot smart-click "Login"
+        cdpilot smart-click "Submit Order"
+        cdpilot smart-click "Learn more"
+    """
+    ws_url, _ = get_page_ws()
+    safe_text = json.dumps(text.lower())
+    js = f"""
+    (function() {{
+      var search = {safe_text};
+      var candidates = [];
+
+      // Score: exact > startsWith > includes > partial
+      function score(str) {{
+        if (!str) return 0;
+        var s = str.toLowerCase().trim();
+        if (s === search) return 100;
+        if (s.startsWith(search)) return 80;
+        if (s.includes(search)) return 60;
+        // Partial word match
+        var words = search.split(/\\s+/);
+        var matched = words.filter(function(w) {{ return s.includes(w); }}).length;
+        if (matched > 0) return 20 + (matched / words.length) * 30;
+        return 0;
+      }}
+
+      var els = document.querySelectorAll(
+        'a, button, input[type=submit], input[type=button], ' +
+        '[role=button], [role=link], [role=tab], [role=menuitem], ' +
+        'summary, label, [onclick], [tabindex]'
+      );
+
+      Array.from(els).forEach(function(el) {{
+        var rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return;
+        var style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return;
+
+        var texts = [
+          el.textContent || '',
+          el.getAttribute('aria-label') || '',
+          el.getAttribute('title') || '',
+          el.getAttribute('placeholder') || '',
+          el.value || '',
+          el.getAttribute('alt') || ''
+        ];
+
+        var bestScore = 0;
+        var bestMatch = '';
+        texts.forEach(function(t) {{
+          var s = score(t);
+          if (s > bestScore) {{ bestScore = s; bestMatch = t.trim().substring(0, 60); }}
+        }});
+
+        if (bestScore > 0) {{
+          candidates.push({{
+            el: el,
+            score: bestScore,
+            match: bestMatch,
+            tag: el.tagName.toLowerCase(),
+            cx: rect.x + rect.width / 2,
+            cy: rect.y + rect.height / 2
+          }});
+        }}
+      }});
+
+      if (candidates.length === 0) return JSON.stringify({{found: false}});
+
+      candidates.sort(function(a, b) {{ return b.score - a.score; }});
+      var best = candidates[0];
+      best.el.scrollIntoView({{block: 'center'}});
+      var rect = best.el.getBoundingClientRect();
+      best.el.click();
+      return JSON.stringify({{
+        found: true,
+        tag: best.tag,
+        text: best.match,
+        score: best.score,
+        x: rect.x + rect.width / 2,
+        y: rect.y + rect.height / 2,
+        alternatives: candidates.slice(1, 4).map(function(c) {{
+          return c.tag + ' "' + c.match + '" (score:' + c.score + ')';
+        }})
+      }});
+    }})()
+    """
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    raw = r.get(1, {}).get("result", {}).get("value", "")
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        print(f"Error parsing result", file=sys.stderr)
+        return
+
+    if not data.get("found"):
+        print(f'No element found matching: "{text}"', file=sys.stderr)
+        sys.exit(1)
+
+    await _vfx_ripple(ws_url, data["x"], data["y"])
+    print(f'Clicked: {data["tag"].upper()} "{data["text"]}" (score:{data["score"]})')
+    if data.get("alternatives"):
+        print(f'  Also found: {", ".join(data["alternatives"])}')
+
+
+async def cmd_smart_fill(text, value):
+    """Fill input by label/placeholder text — no CSS selector needed.
+
+    Finds input by: associated label, placeholder, aria-label, name, id match.
+
+    Usage:
+        cdpilot smart-fill "Email" "test@example.com"
+        cdpilot smart-fill "Password" "secret123"
+        cdpilot smart-fill "Search" "cdpilot"
+    """
+    ws_url, _ = get_page_ws()
+    safe_text = json.dumps(text.lower())
+    safe_value = json.dumps(value)
+    js = f"""
+    (function() {{
+      var search = {safe_text};
+      var value = {safe_value};
+      var candidates = [];
+
+      function score(str) {{
+        if (!str) return 0;
+        var s = str.toLowerCase().trim();
+        if (s === search) return 100;
+        if (s.startsWith(search)) return 80;
+        if (s.includes(search)) return 60;
+        return 0;
+      }}
+
+      var inputs = document.querySelectorAll('input, textarea, select, [contenteditable=true]');
+      Array.from(inputs).forEach(function(el) {{
+        var rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return;
+
+        var scores = [];
+        // Check placeholder
+        scores.push(score(el.getAttribute('placeholder') || ''));
+        // Check aria-label
+        scores.push(score(el.getAttribute('aria-label') || ''));
+        // Check name/id
+        scores.push(score(el.name || ''));
+        scores.push(score(el.id || ''));
+        // Check associated label
+        if (el.id) {{
+          var label = document.querySelector('label[for="' + el.id + '"]');
+          if (label) scores.push(score(label.textContent || ''));
+        }}
+        // Check parent label
+        var parentLabel = el.closest('label');
+        if (parentLabel) scores.push(score(parentLabel.textContent || ''));
+        // Check preceding text node/label
+        var prev = el.previousElementSibling;
+        if (prev) scores.push(score(prev.textContent || ''));
+
+        var bestScore = Math.max.apply(null, scores);
+        if (bestScore > 0) {{
+          candidates.push({{el: el, score: bestScore, tag: el.tagName.toLowerCase(), type: el.type || ''}});
+        }}
+      }});
+
+      if (candidates.length === 0) return JSON.stringify({{found: false}});
+
+      candidates.sort(function(a, b) {{ return b.score - a.score; }});
+      var best = candidates[0];
+
+      // React-compatible value setting
+      var nativeSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, 'value'
+      ) || Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype, 'value'
+      );
+      if (nativeSetter && nativeSetter.set) {{
+        nativeSetter.set.call(best.el, value);
+      }} else {{
+        best.el.value = value;
+      }}
+      best.el.dispatchEvent(new Event('input', {{bubbles: true}}));
+      best.el.dispatchEvent(new Event('change', {{bubbles: true}}));
+
+      return JSON.stringify({{
+        found: true,
+        tag: best.tag,
+        type: best.type,
+        score: best.score,
+        placeholder: best.el.getAttribute('placeholder') || '',
+        name: best.el.name || best.el.id || ''
+      }});
+    }})()
+    """
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    raw = r.get(1, {}).get("result", {}).get("value", "")
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        print(f"Error parsing result", file=sys.stderr)
+        return
+
+    if not data.get("found"):
+        print(f'No input found matching: "{text}"', file=sys.stderr)
+        sys.exit(1)
+
+    ident = data.get("placeholder") or data.get("name") or data["tag"]
+    print(f'Filled: {data["tag"].upper()}[{data["type"]}] "{ident}" = {value} (score:{data["score"]})')
+
+
+async def cmd_smart_select(text, option_text):
+    """Select dropdown option by label text — no CSS selector needed.
+
+    Usage:
+        cdpilot smart-select "Country" "Turkey"
+        cdpilot smart-select "Size" "Large"
+    """
+    ws_url, _ = get_page_ws()
+    safe_text = json.dumps(text.lower())
+    safe_option = json.dumps(option_text.lower())
+    js = f"""
+    (function() {{
+      var search = {safe_text};
+      var optSearch = {safe_option};
+      var selects = document.querySelectorAll('select');
+      var best = null;
+      var bestScore = 0;
+
+      Array.from(selects).forEach(function(sel) {{
+        var texts = [
+          sel.getAttribute('aria-label') || '',
+          sel.name || '', sel.id || ''
+        ];
+        if (sel.id) {{
+          var label = document.querySelector('label[for="' + sel.id + '"]');
+          if (label) texts.push(label.textContent || '');
+        }}
+        var parent = sel.closest('label');
+        if (parent) texts.push(parent.textContent || '');
+
+        texts.forEach(function(t) {{
+          var s = t.toLowerCase().trim();
+          var sc = s === search ? 100 : s.includes(search) ? 60 : 0;
+          if (sc > bestScore) {{ bestScore = sc; best = sel; }}
+        }});
+      }});
+
+      if (!best) return JSON.stringify({{found: false}});
+
+      // Find matching option
+      var options = Array.from(best.options);
+      var match = options.find(function(o) {{
+        return o.text.toLowerCase().trim() === optSearch;
+      }}) || options.find(function(o) {{
+        return o.text.toLowerCase().includes(optSearch);
+      }});
+
+      if (!match) return JSON.stringify({{found: true, optionFound: false, available: options.map(function(o) {{ return o.text; }}).slice(0, 10)}});
+
+      best.value = match.value;
+      best.dispatchEvent(new Event('change', {{bubbles: true}}));
+      return JSON.stringify({{found: true, optionFound: true, selected: match.text, value: match.value}});
+    }})()
+    """
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    raw = r.get(1, {}).get("result", {}).get("value", "")
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        print("Error parsing result", file=sys.stderr)
+        return
+
+    if not data.get("found"):
+        print(f'No select found matching: "{text}"', file=sys.stderr)
+        sys.exit(1)
+    if not data.get("optionFound"):
+        print(f'Option "{option_text}" not found. Available: {", ".join(data.get("available", []))}', file=sys.stderr)
+        sys.exit(1)
+    print(f'Selected: "{data["selected"]}" (value={data["value"]})')
+
+
 async def cmd_run_script(script_path):
     """Run a .cdp script file — sequential commands, one per line.
 
@@ -3878,6 +4165,12 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector to match elements (e.g. 'table tr', '.product', 'a')"}, "format": {"type": "string", "enum": ["text", "json", "list"], "description": "Output format: 'text' (one per line), 'json' (full structure with attrs), 'list' (numbered)", "default": "text"}}, "required": ["selector"]}},
             {"name": "browser_observe", "description": "List all interactive elements on the current page with their available actions (CLICK, FILL, NAVIGATE, TOGGLE, SELECT, SUBMIT, UPLOAD). Like Stagehand observe() but deterministic — no LLM needed. Shows what you CAN DO on the page. Use this to understand page structure before acting.",
              "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "browser_smart_click", "description": "Click an element by its visible text — no CSS selector needed. Uses fuzzy matching across text content, aria-label, title, placeholder, and value. Returns match score and alternatives. Like Stagehand act('Click login') but without LLM cost. Use when you know WHAT to click but not the exact selector.",
+             "inputSchema": {"type": "object", "properties": {"text": {"type": "string", "description": "Visible text of the element to click (e.g. 'Login', 'Submit Order', 'Learn more')"}}, "required": ["text"]}},
+            {"name": "browser_smart_fill", "description": "Fill an input by its label or placeholder text — no CSS selector needed. Finds input by associated label, placeholder, aria-label, name, or id. React-compatible value setting. Use when you know WHAT field to fill but not the exact selector.",
+             "inputSchema": {"type": "object", "properties": {"label": {"type": "string", "description": "Label or placeholder text of the input (e.g. 'Email', 'Password', 'Search')"}, "value": {"type": "string", "description": "Value to fill in the input"}}, "required": ["label", "value"]}},
+            {"name": "browser_smart_select", "description": "Select a dropdown option by label and option text — no CSS selector needed. Finds the select element by label/name, then selects the matching option. Use for dropdown interactions without knowing selectors.",
+             "inputSchema": {"type": "object", "properties": {"label": {"type": "string", "description": "Label text of the select dropdown"}, "option": {"type": "string", "description": "Text of the option to select"}}, "required": ["label", "option"]}},
             {"name": "browser_describe", "description": "Get a comprehensive page description combining three data sources: (1) accessibility tree with @N references for interactive elements, (2) a PNG screenshot saved to disk, and (3) visible text content. Use this when browser_a11y alone is insufficient — for canvas/WebGL content, visual verification, or complex dynamic UIs. This is the vision fallback tool.",
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_assert", "description": "Assert that an element matching the CSS selector exists and optionally contains expected text. Returns PASS or FAIL with details. Use this for automated testing — verify page state after navigation or interaction. Checks visibility by default.",
@@ -3954,6 +4247,9 @@ class MCPServer:
             "browser_close": lambda a: ["close"],
             "browser_extract": lambda a: ["extract", a.get("selector", "")] + ([f"--{a['format']}"] if a.get("format") and a["format"] != "text" else []),
             "browser_observe": lambda a: ["observe"],
+            "browser_smart_click": lambda a: ["smart-click", a.get("text", "")],
+            "browser_smart_fill": lambda a: ["smart-fill", a.get("label", ""), a.get("value", "")],
+            "browser_smart_select": lambda a: ["smart-select", a.get("label", ""), a.get("option", "")],
             "browser_describe": lambda a: ["describe"],
             "browser_assert": lambda a: ["assert", a.get("selector", "")] + ([a["text"]] if a.get("text") else []),
             "browser_wait_for": lambda a: ["wait-for", a.get("selector", "")] + ([str(a["timeout"])] if a.get("timeout") else []),
@@ -4121,6 +4417,9 @@ if __name__ == "__main__":
         'extract': lambda: (require_args(1, 'extract <selector> [--json|--list|--attrs=href,title]'), None)[1] if not args else cmd_extract(args[0], next((a.lstrip('-') for a in args[1:] if a.startswith('--')), "text")),
         'observe': cmd_observe,
         'run': lambda: (require_args(1, 'run <script.cdp>'), None)[1] if not args else cmd_run_script(args[0]),
+        'smart-click': lambda: (require_args(1, 'smart-click <text>'), None)[1] if not args else cmd_smart_click(" ".join(args)),
+        'smart-fill': lambda: (require_args(2, 'smart-fill <label> <value>'), None)[1] if len(args) < 2 else cmd_smart_fill(args[0], " ".join(args[1:])),
+        'smart-select': lambda: (require_args(2, 'smart-select <label> <option>'), None)[1] if len(args) < 2 else cmd_smart_select(args[0], " ".join(args[1:])),
         'assert': lambda: (require_args(1, 'assert <selector> [text]'), None)[1] if not args else cmd_assert(args[0], args[1] if len(args) > 1 else None),
         'wait-for': lambda: (require_args(1, 'wait-for <selector> [timeout_ms]'), None)[1] if not args else cmd_wait_for(args[0], int(args[1]) if len(args) > 1 else 5000),
         'check': lambda: cmd_check(args[0] if args else None),
