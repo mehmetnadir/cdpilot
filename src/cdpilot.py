@@ -2828,6 +2828,222 @@ async def cmd_describe():
     print(page_text[:2000])
 
 
+# ─── Data Extraction & Observation Commands ───
+
+async def cmd_extract(selector, output_format="text"):
+    """Extract structured data from elements matching selector.
+
+    Returns text content, attributes, or full JSON structure.
+    No LLM required — pure DOM extraction.
+
+    Usage:
+        cdpilot extract "table tr"              → text rows
+        cdpilot extract ".product" --json        → full JSON (tag, text, attrs, children)
+        cdpilot extract "a" --attrs=href,title   → specific attributes
+        cdpilot extract "ul li" --list           → clean list output
+    """
+    ws_url, _ = get_page_ws()
+    safe_sel = json.dumps(selector)
+
+    if output_format == "json":
+        js = f"""
+        (function() {{
+          var els = document.querySelectorAll({safe_sel});
+          if (!els.length) return JSON.stringify([]);
+          return JSON.stringify(Array.from(els).slice(0, 100).map(function(el) {{
+            var attrs = {{}};
+            for (var i = 0; i < el.attributes.length; i++) {{
+              attrs[el.attributes[i].name] = el.attributes[i].value;
+            }}
+            return {{
+              tag: el.tagName.toLowerCase(),
+              text: (el.textContent || '').trim().substring(0, 500),
+              attrs: attrs,
+              value: el.value || null,
+              href: el.href || null,
+              src: el.src || null
+            }};
+          }}));
+        }})()
+        """
+    elif output_format.startswith("attrs="):
+        attr_names = output_format.split("=", 1)[1].split(",")
+        attrs_js = ",".join(f'"{a}": el.getAttribute("{a}")' for a in attr_names)
+        js = f"""
+        (function() {{
+          var els = document.querySelectorAll({safe_sel});
+          if (!els.length) return JSON.stringify([]);
+          return JSON.stringify(Array.from(els).slice(0, 100).map(function(el) {{
+            return {{ {attrs_js} }};
+          }}));
+        }})()
+        """
+    elif output_format == "list":
+        js = f"""
+        (function() {{
+          var els = document.querySelectorAll({safe_sel});
+          if (!els.length) return '';
+          return Array.from(els).slice(0, 200).map(function(el, i) {{
+            return (i + 1) + '. ' + (el.textContent || '').trim().substring(0, 200);
+          }}).join('\\n');
+        }})()
+        """
+    else:
+        # Default: text content, one per line
+        js = f"""
+        (function() {{
+          var els = document.querySelectorAll({safe_sel});
+          if (!els.length) return '';
+          return Array.from(els).slice(0, 200).map(function(el) {{
+            return (el.textContent || '').trim().substring(0, 300);
+          }}).filter(function(t) {{ return t; }}).join('\\n');
+        }})()
+        """
+
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    result = r.get(1, {}).get("result", {}).get("value", "")
+    if not result:
+        print(f"No elements found: {selector}", file=sys.stderr)
+        return
+    if output_format in ("json",) or output_format.startswith("attrs="):
+        # Pretty print JSON
+        try:
+            parsed = json.loads(result)
+            print(json.dumps(parsed, indent=2, ensure_ascii=False))
+        except (json.JSONDecodeError, TypeError):
+            print(result)
+    else:
+        print(result)
+
+
+async def cmd_observe():
+    """List all interactive elements on the page with actions.
+
+    Like Stagehand's observe() but deterministic — no LLM needed.
+    Shows what you CAN DO on the current page.
+    """
+    ws_url, _ = get_page_ws()
+    js = """
+    (function() {
+      var results = [];
+      var els = document.querySelectorAll(
+        'a, button, input, textarea, select, [role=button], [role=link], ' +
+        '[role=tab], [role=menuitem], [role=checkbox], [role=radio], ' +
+        '[onclick], [tabindex]:not([tabindex="-1"])'
+      );
+      var seen = new Set();
+      Array.from(els).forEach(function(el, i) {
+        if (i >= 50) return;
+        var rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return;
+        var style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return;
+
+        var tag = el.tagName.toLowerCase();
+        var type = el.type || '';
+        var role = el.getAttribute('role') || '';
+        var text = (el.textContent || el.value || el.placeholder || '').trim().substring(0, 60);
+        var href = el.href || '';
+        var name = el.name || el.id || '';
+
+        // Determine action
+        var action = 'click';
+        if (tag === 'input' || tag === 'textarea') {
+          if (type === 'checkbox' || type === 'radio') action = 'toggle';
+          else if (type === 'submit') action = 'submit';
+          else if (type === 'file') action = 'upload';
+          else action = 'fill';
+        } else if (tag === 'select') {
+          action = 'select';
+        } else if (tag === 'a') {
+          action = 'navigate';
+        }
+
+        // Build selector
+        var sel = '';
+        if (el.id) sel = '#' + el.id;
+        else if (name) sel = tag + '[name=' + JSON.stringify(name) + ']';
+        else if (type) sel = tag + '[type=' + type + ']';
+        else sel = tag;
+
+        var key = action + ':' + sel + ':' + text;
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        var line = action.toUpperCase() + '  ' + sel;
+        if (text) line += '  "' + text + '"';
+        if (href && action === 'navigate') line += '  → ' + href.substring(0, 80);
+        results.push(line);
+      });
+      return results.join('\\n') || 'No interactive elements found';
+    })()
+    """
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    result = r.get(1, {}).get("result", {}).get("value", "No interactive elements found")
+    print(f"=== What you can do on this page ===\n")
+    print(result)
+
+
+async def cmd_run_script(script_path):
+    """Run a .cdp script file — sequential commands, one per line.
+
+    Script format (plain text):
+        go https://example.com
+        wait-for h1
+        assert h1 "Example Domain"
+        click a
+        shot /tmp/result.png
+
+    Lines starting with # are comments. Empty lines are skipped.
+    """
+    if not os.path.exists(script_path):
+        print(f"Script not found: {script_path}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(script_path) as f:
+        lines = f.readlines()
+
+    import shlex
+    passed = 0
+    failed = 0
+    for line_num, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            parts = line.split()
+        cmd_name = parts[0]
+        cmd_args = parts[1:]
+
+        print(f"[{line_num}] {line}")
+        try:
+            result = subprocess.run(
+                [sys.executable, __file__] + parts,
+                capture_output=True, text=True, timeout=30,
+                env={**os.environ, "CDPILOT_MCP_SESSION": "1"}
+            )
+            output = result.stdout.strip()
+            if output:
+                for out_line in output.split("\n"):
+                    print(f"     {out_line}")
+            if result.returncode != 0:
+                err = result.stderr.strip()
+                if err:
+                    print(f"     ERROR: {err}")
+                failed += 1
+            else:
+                passed += 1
+        except subprocess.TimeoutExpired:
+            print(f"     TIMEOUT")
+            failed += 1
+
+    print(f"\n{'─' * 40}")
+    print(f"Script: {script_path}")
+    print(f"Result: {passed} passed, {failed} failed, {passed + failed} total")
+
+
 # ─── Testing Commands ───
 
 async def cmd_assert(selector, expected_text=None, check_visible=True):
@@ -3658,6 +3874,10 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_close", "description": "Close the currently active browser tab. Use this to clean up after automation tasks or to close unwanted popups/tabs that were opened during navigation.",
              "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "browser_extract", "description": "Extract structured data from elements matching a CSS selector. No LLM needed — pure DOM extraction. Returns text (default), JSON (with tag, text, attrs, href, src), specific attributes, or clean list. Use for scraping tables, lists, links, form values. Limit: 100 elements for JSON, 200 for text.",
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector to match elements (e.g. 'table tr', '.product', 'a')"}, "format": {"type": "string", "enum": ["text", "json", "list"], "description": "Output format: 'text' (one per line), 'json' (full structure with attrs), 'list' (numbered)", "default": "text"}}, "required": ["selector"]}},
+            {"name": "browser_observe", "description": "List all interactive elements on the current page with their available actions (CLICK, FILL, NAVIGATE, TOGGLE, SELECT, SUBMIT, UPLOAD). Like Stagehand observe() but deterministic — no LLM needed. Shows what you CAN DO on the page. Use this to understand page structure before acting.",
+             "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_describe", "description": "Get a comprehensive page description combining three data sources: (1) accessibility tree with @N references for interactive elements, (2) a PNG screenshot saved to disk, and (3) visible text content. Use this when browser_a11y alone is insufficient — for canvas/WebGL content, visual verification, or complex dynamic UIs. This is the vision fallback tool.",
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_assert", "description": "Assert that an element matching the CSS selector exists and optionally contains expected text. Returns PASS or FAIL with details. Use this for automated testing — verify page state after navigation or interaction. Checks visibility by default.",
@@ -3732,6 +3952,8 @@ class MCPServer:
             "browser_fill": lambda a: ["fill", a.get("selector", ""), a.get("value", "")],
             "browser_launch": lambda a: ["launch"],
             "browser_close": lambda a: ["close"],
+            "browser_extract": lambda a: ["extract", a.get("selector", "")] + ([f"--{a['format']}"] if a.get("format") and a["format"] != "text" else []),
+            "browser_observe": lambda a: ["observe"],
             "browser_describe": lambda a: ["describe"],
             "browser_assert": lambda a: ["assert", a.get("selector", "")] + ([a["text"]] if a.get("text") else []),
             "browser_wait_for": lambda a: ["wait-for", a.get("selector", "")] + ([str(a["timeout"])] if a.get("timeout") else []),
@@ -3896,6 +4118,9 @@ if __name__ == "__main__":
         'a11y': lambda: cmd_a11y(' '.join(args)),
         'a11y-snapshot': cmd_a11y_snapshot,
         'describe': cmd_describe,
+        'extract': lambda: (require_args(1, 'extract <selector> [--json|--list|--attrs=href,title]'), None)[1] if not args else cmd_extract(args[0], next((a.lstrip('-') for a in args[1:] if a.startswith('--')), "text")),
+        'observe': cmd_observe,
+        'run': lambda: (require_args(1, 'run <script.cdp>'), None)[1] if not args else cmd_run_script(args[0]),
         'assert': lambda: (require_args(1, 'assert <selector> [text]'), None)[1] if not args else cmd_assert(args[0], args[1] if len(args) > 1 else None),
         'wait-for': lambda: (require_args(1, 'wait-for <selector> [timeout_ms]'), None)[1] if not args else cmd_wait_for(args[0], int(args[1]) if len(args) > 1 else 5000),
         'check': lambda: cmd_check(args[0] if args else None),
@@ -3925,7 +4150,7 @@ if __name__ == "__main__":
     # Commands that do not require the visual indicator / input blocker
     NO_CONTROL_CMDS = {'glow', 'stop', 'tabs', 'close', 'close-tab', 'new-tab',
                        'dialog', 'download', 'throttle', 'permission', 'intercept',
-                       'batch', 'screenshot-diff'}
+                       'batch', 'screenshot-diff', 'run'}
     # Clean up idle sessions before running any command
     _cleanup_idle_sessions()
 
