@@ -301,6 +301,10 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] Pre-flight wizard (auto-installs dependencies on first run)
 - [x] Persistent MCP glow (stays on during entire AI session, like Claude's orange glow)
 - [x] DevExtension system (native JS injection without browser store)
+- [x] **Smart commands** — `smart-click`, `smart-fill`, `smart-select` — interact by visible text, no CSS selectors needed, no LLM required
+- [x] **Data extraction** (`extract`) — structured DOM data in text, JSON, or list format
+- [x] **Page observation** (`observe`) — list all interactive elements with available actions
+- [x] **Script runner** (`run`) — execute `.cdp` script files with pass/fail reporting
 
 ### Coming Soon
 
