@@ -1,3 +1,7 @@
+> **Conductor:** Bu projeye global orkestrasyon kuralları otomatik uygulanır.
+> Routing · Agent seçimi · Review pipeline → `~/.claude/CLAUDE.md` üzerinden yüklenir.
+> Bu dosya yalnızca projeye özgü bağlamı içerir — global kuralları tekrar yazmayın.
+
 # cdpilot
 
 > Zero-dependency browser automation CLI. Tek komut, tam kontrol.
@@ -100,10 +104,11 @@ Brave/Chrome/Chromium (CDP modu, port 9222)
 | ✅ | Auto-Wait | 5s MutationObserver bekleme |
 | ✅ | Batch Commands | JSON pipe desteği |
 | ✅ | Site | cdpilot.ndr.ist canlı (landing + 61 komut docs) |
-| ✅ | GitHub & npm | v0.1.2 yayınlandı, 6 awesome repo PR'ı |
-| 🔄 | Stealth Mode | Premium tier - insan benzeri davranış (roadmap) |
+| ✅ | GitHub & npm | v0.3.0 yayınlandı, 6 awesome repo PR'ı |
+| ✅ | Stealth Layer | Zero-dep fingerprint patches (webdriver smart no-op, plugins PluginArray-typed, WebGL spoof, Worker wrap) — opt-in via `cdpilot stealth on` |
+| ✅ | CAPTCHA Detection | 8 sağlayıcı (Turnstile, hCaptcha, reCAPTCHA, DataDome, PerimeterX, Arkose, GeeTest, CF-interstitial). `captcha-check` + `captcha-wait` komutları |
 | 🔄 | cdpilot Cloud | Hosted browser sessions API (roadmap) |
-| ⏳ | npm 0.2.0 | Yeni özelliklerle versiyon yükseltme |
+| ⏳ | npm 0.4.0 | Stealth + CAPTCHA layer publish |
 
 ## Dikkat Edilecekler (Gotchas)
 
@@ -117,6 +122,9 @@ Brave/Chrome/Chromium (CDP modu, port 9222)
 - **Glow kalıcılığı:** `_control_end` glow+vfx'i yeni sayfaya re-inject eder, persistent script 10s sonra JS timeout ile temizlenir
 - **Multi-project:** `CDPILOT_PROJECT_ID` env var'ı Node→Python aktarılır, `_get_project_id()` bunu öncelikli okur
 - **cdpilot-site:** Ayrı dizin `/Users/nadir/01dev/cdpilot-site/`, Server 21'de port 3400
+- **Stealth session-bound:** `Page.addScriptToEvaluateOnNewDocument` cdp_send connection kapanınca silinir → `STEALTH_JS` `_control_start`'ta DEĞİL `navigate_collect`'te aynı WS'de register edilir
+- **Stealth smart no-op:** `navigator.webdriver` patch'i sadece value=true ise devreye girer; benign Chrome'da hiç dokunmaz (defineProperty'nin kendisi de bir tell olduğundan)
+- **CDP detection:** `incolumitas.overflowTest` ve `fpscanner.WEBDRIVER` JS patch ile aşılamaz, CDP'nin kendisini tespit ediyorlar — kabul edilen sınır
 
 ## İlgili Dosyalar
 
@@ -128,7 +136,7 @@ Brave/Chrome/Chromium (CDP modu, port 9222)
 | `cdpilot-video.mp4` | Tam demo videosu (1080x1080, 30fps) |
 
 ---
-Son Güncelleme: 2026-03-28
+Son Güncelleme: 2026-04-20
 
 <!-- gitnexus:start -->
 ## GitNexus — Code Intelligence
