@@ -112,6 +112,140 @@ test('python script has shebang', () => {
   }
 });
 
+// ── Stealth & CAPTCHA layer ──
+
+const PY_PATH = path.join(__dirname, '..', 'src', 'cdpilot.py');
+const PY_CONTENT = fs.existsSync(PY_PATH) ? fs.readFileSync(PY_PATH, 'utf-8') : '';
+
+function extractRawTripleString(src, varName) {
+  // Extract the content between  VARNAME = r"""  ...  """
+  const re = new RegExp(varName + '\\s*=\\s*r"""([\\s\\S]*?)"""', 'm');
+  const m = src.match(re);
+  return m ? m[1] : null;
+}
+
+test('STEALTH_JS constant is defined', () => {
+  assert(PY_CONTENT.includes('STEALTH_JS = r"""'), 'Should define STEALTH_JS');
+});
+
+test('STEALTH_JS is syntactically valid JavaScript', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  assert(js, 'STEALTH_JS body should be extractable');
+  const vm = require('vm');
+  // new Script validates syntax without executing
+  assert.doesNotThrow(() => new vm.Script(js), 'STEALTH_JS should parse as valid JS');
+});
+
+test('STEALTH_JS is idempotent (guards with __cdpilot_stealth flag)', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  assert(js.includes('__cdpilot_stealth'), 'Should guard against double-injection');
+  assert(js.includes('if (window.__cdpilot_stealth) return'), 'Should early-return on repeat');
+});
+
+test('STEALTH_JS patches the documented fingerprint surfaces', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  assert(js.includes("'webdriver'") || js.includes('"webdriver"'), 'Should patch navigator.webdriver');
+  assert(js.includes('chrome.runtime') || js.includes("chrome.runtime"), 'Should patch chrome.runtime');
+  assert(js.includes("'plugins'") || js.includes('"plugins"'), 'Should patch navigator.plugins');
+  assert(js.includes('37445'), 'Should spoof WebGL UNMASKED_VENDOR (37445)');
+  assert(js.includes('37446'), 'Should spoof WebGL UNMASKED_RENDERER (37446)');
+  assert(js.includes('permissions.query') || js.includes('permissions'), 'Should patch permissions.query');
+});
+
+test('STEALTH_JS does NOT weaken web security primitives', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  // Fail-fast on common anti-patterns that would be a security regression.
+  assert(!js.includes('eval('), 'Must not use eval()');
+  assert(!js.includes('document.domain'), 'Must not relax same-origin via document.domain');
+  assert(!js.includes('Content-Security-Policy'), 'Must not touch CSP');
+  assert(!/fetch\(|XMLHttpRequest/.test(js), 'Must not make network calls');
+});
+
+test('CAPTCHA_DETECT_JS constant is defined', () => {
+  assert(PY_CONTENT.includes('CAPTCHA_DETECT_JS = r"""'), 'Should define CAPTCHA_DETECT_JS');
+});
+
+test('CAPTCHA_DETECT_JS is syntactically valid JavaScript', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'CAPTCHA_DETECT_JS');
+  assert(js, 'CAPTCHA_DETECT_JS body should be extractable');
+  const vm = require('vm');
+  assert.doesNotThrow(() => new vm.Script(js), 'CAPTCHA_DETECT_JS should parse as valid JS');
+});
+
+test('CAPTCHA_DETECT_JS covers major providers', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'CAPTCHA_DETECT_JS');
+  assert(js.includes('challenges.cloudflare.com'), 'Should detect Turnstile');
+  assert(js.includes('hcaptcha.com'), 'Should detect hCaptcha');
+  assert(js.includes('recaptcha'), 'Should detect reCAPTCHA');
+  assert(js.includes('datadome'), 'Should detect DataDome');
+  assert(js.includes('arkoselabs.com') || js.includes('funcaptcha'), 'Should detect Arkose');
+});
+
+test('CAPTCHA_DETECT_JS is read-only (no DOM mutation or network)', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'CAPTCHA_DETECT_JS');
+  assert(!/\.innerHTML\s*=/.test(js), 'Must not write innerHTML');
+  assert(!/\.appendChild\(/.test(js), 'Must not append DOM nodes');
+  assert(!/fetch\(|XMLHttpRequest|navigator\.sendBeacon/.test(js), 'Must not make network calls');
+  assert(!/localStorage|sessionStorage|document\.cookie/.test(js), 'Must not read storage/cookies');
+});
+
+test('get_stealth_config default is OFF (opt-in)', () => {
+  // Look at the function body for the default return path.
+  const m = PY_CONTENT.match(/def get_stealth_config\(\):[\s\S]*?\n    return (False|True)\n/);
+  assert(m, 'get_stealth_config should have a clear default return');
+  assert.strictEqual(m[1], 'False', 'Default must be False (opt-in) for backward compat');
+});
+
+test('cmd_stealth is registered in sync dispatch', () => {
+  assert(/'stealth':\s*lambda:\s*cmd_stealth/.test(PY_CONTENT),
+    "Should register 'stealth' in sync_cmds dispatch");
+});
+
+test('captcha-check and captcha-wait are registered in async dispatch', () => {
+  assert(/'captcha-check':\s*cmd_captcha_check/.test(PY_CONTENT),
+    "Should register 'captcha-check' in async_map");
+  assert(/'captcha-wait':\s*lambda:\s*cmd_captcha_wait/.test(PY_CONTENT),
+    "Should register 'captcha-wait' in async_map");
+});
+
+test('captcha commands are in NO_CONTROL_CMDS (no glow interference)', () => {
+  const m = PY_CONTENT.match(/NO_CONTROL_CMDS\s*=\s*\{([\s\S]*?)\}/);
+  assert(m, 'NO_CONTROL_CMDS should exist');
+  assert(m[1].includes("'captcha-check'"), 'captcha-check should bypass control wrapper');
+  assert(m[1].includes("'captcha-wait'"), 'captcha-wait should bypass control wrapper');
+});
+
+test('navigate_collect gates stealth injection behind get_stealth_config', () => {
+  // STEALTH_JS must be registered on the SAME WS as Page.navigate so the
+  // session-bound script survives until loadEventFired. Therefore the gate
+  // lives in navigate_collect, not _control_start.
+  const m = PY_CONTENT.match(/async def navigate_collect[\s\S]*?stealth_active = get_stealth_config\(\)[\s\S]*?if stealth_active:[\s\S]*?addScriptToEvaluateOnNewDocument[\s\S]*?STEALTH_JS/);
+  assert(m, 'navigate_collect should read get_stealth_config() and conditionally register STEALTH_JS via addScriptToEvaluateOnNewDocument');
+});
+
+test('navigate_collect registers stealth BEFORE Page.navigate', () => {
+  // Order matters: stealth must be registered before the navigate command,
+  // otherwise the page may execute its detection script before our patch.
+  const body = PY_CONTENT.match(/async def navigate_collect[\s\S]*?return content, events/)[0];
+  const stealthIdx = body.search(/Page\.addScriptToEvaluateOnNewDocument/);
+  const navigateIdx = body.search(/"Page\.navigate"/);
+  assert(stealthIdx > 0, 'addScriptToEvaluateOnNewDocument should appear in navigate_collect');
+  assert(navigateIdx > 0, 'Page.navigate should appear in navigate_collect');
+  assert(stealthIdx < navigateIdx, 'Stealth script must be registered before Page.navigate');
+});
+
+test('cmd_go runs CAPTCHA detection after navigate (non-blocking)', () => {
+  const m = PY_CONTENT.match(/async def cmd_go[\s\S]*?_detect_captcha[\s\S]*?CAPTCHA tespit edildi/);
+  assert(m, 'cmd_go should probe CAPTCHA after navigate_collect and warn on stderr');
+});
+
+test('help output includes STEALTH & CAPTCHA section', () => {
+  const out = run('--help');
+  assert(out.includes('STEALTH'), 'Help should advertise stealth');
+  assert(out.includes('captcha-check'), 'Help should advertise captcha-check');
+  assert(out.includes('captcha-wait'), 'Help should advertise captcha-wait');
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);

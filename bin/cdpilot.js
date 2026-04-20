@@ -324,6 +324,11 @@ function showHelp() {
     new-tab [url]      Open new tab
     close-tab [id]     Close tab
 
+  STEALTH & CAPTCHA
+    stealth [on|off]   Toggle anti-fingerprint patches (opt-in)
+    captcha-check      Detect CAPTCHA on active page (JSON output)
+    captcha-wait [s]   Pause until user solves CAPTCHA (default 300s)
+
   PROJECTS
     projects           List all project browser instances
     project-stop <id>  Stop a specific project's browser

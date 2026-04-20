@@ -221,8 +221,184 @@ window.__cdpilot_waitFor = function(selector, timeout) {
   });
 };
 """
+# ─── Stealth & CAPTCHA Detection ──────────────────────────────────────────────
+# Zero-dependency anti-fingerprinting layer. Patches common automation tells
+# (navigator.webdriver, missing chrome.runtime, plugin list, WebGL vendor).
+# Runs via Page.addScriptToEvaluateOnNewDocument BEFORE any page script.
+# Notes:
+#   - Does NOT weaken web security (CSP, CORS, SOP intact).
+#   - Idempotent: guarded by window.__cdpilot_stealth flag.
+#   - Fails silently per-patch; one failure cannot break the page.
+#   - Opt-in via `cdpilot stealth on`. Default OFF for backward compatibility.
+STEALTH_JS = r"""
+(function() {
+  'use strict';
+  if (window.__cdpilot_stealth) return;
+  try { Object.defineProperty(window, '__cdpilot_stealth', {value: true, writable: false, configurable: false}); } catch(e) {}
+
+  // 1) navigator.webdriver → undefined (most common headless tell)
+  try {
+    Object.defineProperty(Navigator.prototype, 'webdriver', {
+      get: function() { return undefined; },
+      configurable: true
+    });
+  } catch (e) {}
+
+  // 2) window.chrome — real Chrome exposes chrome.runtime even without extensions
+  try {
+    if (!window.chrome) {
+      window.chrome = {};
+    }
+    if (!window.chrome.runtime) {
+      window.chrome.runtime = {
+        OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {},
+        PlatformNackArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}
+      };
+    }
+    if (typeof window.chrome.app === 'undefined') {
+      window.chrome.app = { isInstalled: false, InstallState: {}, RunningState: {} };
+    }
+  } catch (e) {}
+
+  // 3) Permissions.query — reconcile with Notification.permission (classic tell)
+  try {
+    if (navigator.permissions && navigator.permissions.query) {
+      var origQuery = navigator.permissions.query.bind(navigator.permissions);
+      navigator.permissions.query = function(p) {
+        if (p && p.name === 'notifications') {
+          return Promise.resolve({ state: Notification.permission, onchange: null });
+        }
+        return origQuery(p);
+      };
+    }
+  } catch (e) {}
+
+  // 4) navigator.plugins — empty array is a headless tell. Provide standard PDF set.
+  try {
+    var pdfMime = { type: 'application/pdf', suffixes: 'pdf', description: '' };
+    var makePlugin = function(name, filename) {
+      var p = { name: name, filename: filename, description: 'Portable Document Format', length: 1 };
+      p[0] = pdfMime;
+      p.item = function(i) { return i === 0 ? pdfMime : null; };
+      p.namedItem = function(n) { return n === pdfMime.type ? pdfMime : null; };
+      return p;
+    };
+    var plugins = [
+      makePlugin('PDF Viewer', 'internal-pdf-viewer'),
+      makePlugin('Chrome PDF Viewer', 'internal-pdf-viewer'),
+      makePlugin('Chromium PDF Viewer', 'internal-pdf-viewer'),
+      makePlugin('Microsoft Edge PDF Viewer', 'internal-pdf-viewer'),
+      makePlugin('WebKit built-in PDF', 'internal-pdf-viewer'),
+    ];
+    plugins.item = function(i) { return plugins[i] || null; };
+    plugins.namedItem = function(n) {
+      for (var i = 0; i < plugins.length; i++) if (plugins[i].name === n) return plugins[i];
+      return null;
+    };
+    plugins.refresh = function() {};
+    Object.defineProperty(Navigator.prototype, 'plugins', {
+      get: function() { return plugins; },
+      configurable: true
+    });
+  } catch (e) {}
+
+  // 5) WebGL vendor/renderer — UNMASKED_* params reveal "SwiftShader" in headless.
+  // Override returns generic Intel values. Read-only spoof; does not affect rendering.
+  try {
+    var spoofParam = function(orig, parameter) {
+      if (parameter === 37445) return 'Intel Inc.';                       // UNMASKED_VENDOR_WEBGL
+      if (parameter === 37446) return 'Intel Iris OpenGL Engine';         // UNMASKED_RENDERER_WEBGL
+      return orig.call(this, parameter);
+    };
+    if (window.WebGLRenderingContext) {
+      var gp1 = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function(p) { return spoofParam.call(this, gp1, p); };
+    }
+    if (window.WebGL2RenderingContext) {
+      var gp2 = WebGL2RenderingContext.prototype.getParameter;
+      WebGL2RenderingContext.prototype.getParameter = function(p) { return spoofParam.call(this, gp2, p); };
+    }
+  } catch (e) {}
+
+  // 6) navigator.hardwareConcurrency — 0 is a tell. Clamp to a sane default if missing.
+  try {
+    if (!navigator.hardwareConcurrency || navigator.hardwareConcurrency < 2) {
+      Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', {
+        get: function() { return 8; },
+        configurable: true
+      });
+    }
+  } catch (e) {}
+})();
+"""
+
+# ─── CAPTCHA Detection ────────────────────────────────────────────────────────
+# Read-only DOM probe. Detects common CAPTCHA/challenge providers post-navigation.
+# Returns JSON string: {"detected": bool, "types": [...], "details": [...]}
+# Pure detection — no DOM mutation, no network, no user data leak.
+CAPTCHA_DETECT_JS = r"""
+(function() {
+  try {
+    var result = { detected: false, types: [], details: [] };
+    var add = function(type, provider, extra) {
+      result.detected = true;
+      if (result.types.indexOf(type) < 0) result.types.push(type);
+      var d = { type: type, provider: provider };
+      if (extra) for (var k in extra) d[k] = extra[k];
+      result.details.push(d);
+    };
+
+    // Cloudflare Turnstile
+    var ts = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]');
+    if (ts.length > 0) add('turnstile', 'Cloudflare', { count: ts.length });
+
+    // Cloudflare interstitial / managed challenge
+    var cfChallenge = document.querySelector('#challenge-form, #challenge-stage, #cf-challenge-running, #cf-please-wait');
+    var titleLower = (document.title || '').toLowerCase();
+    if (cfChallenge || titleLower.indexOf('just a moment') >= 0 || titleLower.indexOf('attention required') >= 0) {
+      add('cloudflare-challenge', 'Cloudflare');
+    }
+
+    // hCaptcha
+    var hc = document.querySelectorAll('iframe[src*="hcaptcha.com"]');
+    var hcDiv = document.querySelector('.h-captcha, [data-hcaptcha-sitekey]');
+    if (hc.length > 0 || hcDiv) add('hcaptcha', 'hCaptcha');
+
+    // reCAPTCHA (v2 visible, v2 invisible, v3, enterprise)
+    var rc = document.querySelectorAll('iframe[src*="recaptcha/api2"], iframe[src*="recaptcha/enterprise"]');
+    var rcDiv = document.querySelector('.g-recaptcha');
+    if (rc.length > 0 || (rcDiv && !hcDiv)) add('recaptcha', 'Google');
+
+    // DataDome
+    if (document.querySelector('#datadome-captcha, iframe[src*="captcha-delivery.com"]')) {
+      add('datadome', 'DataDome');
+    }
+
+    // PerimeterX / HUMAN
+    if (document.querySelector('#px-captcha, [class*="px-captcha"]')) {
+      add('perimeterx', 'HUMAN');
+    }
+
+    // Arkose Labs (FunCaptcha)
+    if (document.querySelector('iframe[src*="arkoselabs.com"], iframe[src*="funcaptcha.com"], #FunCaptcha')) {
+      add('arkose', 'Arkose Labs');
+    }
+
+    // GeeTest
+    if (document.querySelector('.geetest_holder, .geetest_panel, [id^="geetest_"]')) {
+      add('geetest', 'GeeTest');
+    }
+
+    return JSON.stringify(result);
+  } catch (e) {
+    return JSON.stringify({ detected: false, error: String(e) });
+  }
+})()
+"""
+
 PROXY_CONFIG_FILE = os.path.join(PROFILE_DIR, 'proxy.json')
 HEADLESS_CONFIG_FILE = os.path.join(PROFILE_DIR, 'headless.json')
+STEALTH_CONFIG_FILE = os.path.join(PROFILE_DIR, 'stealth.json')
 DOWNLOAD_CONFIG_FILE = os.path.join(PROFILE_DIR, 'download-config.json')
 SESSION_FILE = os.path.join(PROFILE_DIR, 'sessions.json')
 
@@ -542,11 +718,21 @@ window.__cdpilot_glow_timeout = setTimeout(function() {
 _glow_script_id = None  # addScriptToEvaluateOnNewDocument identifier
 
 async def _control_start(ws_url):
-    """Enable glow, input blocker, and visual feedback at command start."""
+    """Enable glow, input blocker, visual feedback, and (if enabled) stealth.
+
+    Stealth JS is registered via addScriptToEvaluateOnNewDocument so it runs
+    BEFORE any page script on the next navigation. It cannot un-fingerprint
+    the currently-loaded document — that's by design.
+    """
     global _glow_script_id
     try:
-        # Remove previous persistent script if exists (prevent accumulation)
-        cmds = []
+        # NOTE: addScriptToEvaluateOnNewDocument registered here is session-bound
+        # to the WS connection cdp_send opens — it dies when this call returns.
+        # That's fine for GLOW (also injected via Runtime.evaluate below) but
+        # NOT for stealth, which must run BEFORE page scripts. Stealth is
+        # therefore registered inside navigate_collect on the same WS as
+        # Page.navigate, so it survives long enough to apply.
+        cmds = [(898, "Page.enable", {})]
         if _glow_script_id:
             cmds.append((900, "Page.removeScriptToEvaluateOnNewDocument", {"identifier": _glow_script_id}))
             _glow_script_id = None
@@ -852,6 +1038,18 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
         for domain in ["Page", "Network", "Runtime", "Log"]:
             await ws.send(json.dumps({"id": sid, "method": f"{domain}.enable", "params": {}}))
             sid += 1
+
+        # Register stealth script BEFORE navigate, on this same WS session.
+        # addScriptToEvaluateOnNewDocument is session-bound: it persists only
+        # as long as this connection lives — which is exactly the window we
+        # need (until Page.loadEventFired below). Stealth must run before
+        # any page script inspects navigator; addScript guarantees that.
+        stealth_active = get_stealth_config()
+        if stealth_active:
+            await ws.send(json.dumps({
+                "id": 50, "method": "Page.addScriptToEvaluateOnNewDocument",
+                "params": {"source": STEALTH_JS}
+            }))
 
         # Navigate
         await ws.send(json.dumps({"id": 100, "method": "Page.navigate", "params": {"url": url}}))
@@ -1187,6 +1385,25 @@ def get_headless_config():
             pass
     return False
 
+
+def get_stealth_config():
+    """Return whether stealth fingerprint patches are enabled.
+
+    Default: False (opt-in) — preserves existing behavior, lets users enable
+    only when needed. Some sites detect inconsistent fingerprints and
+    block stealth-mode harder than they would block plain Chrome.
+    """
+    env = os.environ.get('CDPILOT_STEALTH', '')
+    if env:
+        return env.lower() in ('1', 'true', 'yes', 'on')
+    if os.path.exists(STEALTH_CONFIG_FILE):
+        try:
+            with open(STEALTH_CONFIG_FILE) as f:
+                return bool(json.load(f).get('stealth', False))
+        except (OSError, ValueError):
+            pass
+    return False
+
 # ─── Commands ───
 
 def cmd_launch():
@@ -1315,6 +1532,15 @@ async def cmd_go(url):
     ws, page = get_page_ws()
     content, _ = await navigate_collect(ws, url)
     print(content)
+    # Post-navigation CAPTCHA probe. Non-blocking: stderr warning only.
+    # Users can run `cdpilot captcha-wait` to pause for manual solve.
+    try:
+        info = await _detect_captcha(ws)
+        if info.get("detected"):
+            types = ",".join(info.get("types", [])) or "unknown"
+            sys.stderr.write(f"⚠️  CAPTCHA tespit edildi ({types}). Çözüm için: cdpilot captcha-wait\n")
+    except Exception:
+        pass
 
 
 async def cmd_content():
@@ -2295,6 +2521,135 @@ def cmd_headless(state=None):
         json.dump({'headless': enabled}, f)
     print(f'Headless mode: {"on" if enabled else "off"}')
     print('Restart browser (stop → launch).')
+
+
+def cmd_stealth(state=None):
+    """Toggle stealth fingerprint patches.
+
+    Usage:
+      cdpilot stealth            # show status
+      cdpilot stealth on|off     # toggle
+      cdpilot stealth status     # show status (alias)
+
+    Patches navigator.webdriver, chrome.runtime, plugins, WebGL vendor and
+    permissions API to defeat the most common automation tells. Effect
+    applies on the NEXT navigation (current pages keep their fingerprint).
+    Zero new dependencies. Disabled by default.
+    """
+    if state is None or state.lower() == 'status':
+        current = get_stealth_config()
+        print(f'Stealth: {"on" if current else "off"}')
+        if current:
+            print('  Patches: navigator.webdriver, chrome.runtime, plugins, WebGL vendor, permissions, hardwareConcurrency')
+        return
+
+    s = state.lower()
+    if s not in ('on', 'off', '1', '0', 'true', 'false', 'yes', 'no'):
+        print(f"Invalid state: {state}. Use 'on', 'off', or 'status'.", file=sys.stderr)
+        sys.exit(1)
+    enabled = s in ('on', '1', 'true', 'yes')
+    os.makedirs(os.path.dirname(STEALTH_CONFIG_FILE), exist_ok=True)
+    with open(STEALTH_CONFIG_FILE, 'w') as f:
+        json.dump({'stealth': enabled}, f)
+    print(f'Stealth: {"on" if enabled else "off"}')
+    print('Effect applies on next navigation (`cdpilot go <url>`).')
+
+
+async def _detect_captcha(ws_url):
+    """Run CAPTCHA_DETECT_JS in the active page, return parsed dict.
+
+    Returns: {"detected": bool, "types": [...], "details": [...], "error"?: str}
+    Never raises — failures return {"detected": False, "error": "..."}.
+    """
+    try:
+        r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {
+            "expression": CAPTCHA_DETECT_JS,
+            "returnByValue": True,
+        })], timeout=5)
+        raw = r.get(1, {}).get("result", {}).get("value")
+        if not raw:
+            return {"detected": False}
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return {"detected": False, "error": "parse_failed"}
+    except Exception as e:
+        return {"detected": False, "error": str(e)[:120]}
+
+
+async def cmd_captcha_check():
+    """One-shot CAPTCHA detection on the active page. Prints JSON.
+
+    Exit codes: 0 = no CAPTCHA, 3 = CAPTCHA detected, 1 = error.
+    Useful in scripts: `cdpilot captcha-check && do-stuff`.
+    """
+    ws, _ = get_page_ws()
+    info = await _detect_captcha(ws)
+    print(json.dumps(info, ensure_ascii=False))
+    if info.get("error") and not info.get("detected"):
+        sys.exit(1)
+    sys.exit(3 if info.get("detected") else 0)
+
+
+async def cmd_captcha_wait(timeout_arg=None):
+    """Detect CAPTCHA and wait for the user to solve it.
+
+    Behavior:
+      - Interactive (stdin is a TTY): print warning, block on Enter.
+      - Non-interactive (pipe / MCP): poll every 2s until the CAPTCHA
+        disappears or timeout expires; emit one JSON line per poll on
+        state change so callers can stream progress.
+
+    Args:
+      timeout_arg: int seconds (default 300, max 1800). Passed as string from CLI.
+
+    Exit codes: 0 = solved (or none detected), 2 = timeout, 1 = error.
+    """
+    try:
+        timeout = int(timeout_arg) if timeout_arg else 300
+    except (ValueError, TypeError):
+        print(f"Invalid timeout: {timeout_arg}", file=sys.stderr)
+        sys.exit(1)
+    timeout = max(5, min(timeout, 1800))
+
+    ws, _ = get_page_ws()
+    info = await _detect_captcha(ws)
+    if not info.get("detected"):
+        print(json.dumps({"detected": False, "status": "none"}, ensure_ascii=False))
+        return
+
+    types = ",".join(info.get("types", [])) or "unknown"
+    interactive = sys.stdin.isatty() and not IS_MCP_SESSION
+
+    if interactive:
+        sys.stderr.write(f"\n⚠️  CAPTCHA tespit edildi: {types}\n")
+        sys.stderr.write("    Tarayıcıda çözün, ardından Enter'a basın (Ctrl+C iptal)...\n")
+        sys.stderr.flush()
+        try:
+            input()
+        except (EOFError, KeyboardInterrupt):
+            print(json.dumps({"detected": True, "status": "cancelled", "types": info.get("types", [])}, ensure_ascii=False))
+            sys.exit(1)
+        # Verify it's gone
+        post = await _detect_captcha(ws)
+        if post.get("detected"):
+            print(json.dumps({"detected": True, "status": "still_present", "types": post.get("types", [])}, ensure_ascii=False))
+            sys.exit(2)
+        print(json.dumps({"detected": False, "status": "solved"}, ensure_ascii=False))
+        return
+
+    # Non-interactive: poll until solved or timeout
+    print(json.dumps({"detected": True, "status": "waiting", "types": info.get("types", []), "timeout": timeout}, ensure_ascii=False), flush=True)
+    deadline = time.time() + timeout
+    poll_interval = 2.0
+    while time.time() < deadline:
+        await asyncio.sleep(poll_interval)
+        post = await _detect_captcha(ws)
+        if not post.get("detected"):
+            print(json.dumps({"detected": False, "status": "solved", "elapsed": round(timeout - (deadline - time.time()), 1)}, ensure_ascii=False), flush=True)
+            return
+    print(json.dumps({"detected": True, "status": "timeout", "types": info.get("types", []), "waited": timeout}, ensure_ascii=False), flush=True)
+    sys.exit(2)
 
 
 def _stop_browser_on_port(port):
@@ -4334,6 +4689,7 @@ if __name__ == "__main__":
         'version': cmd_version,
         'proxy': lambda: cmd_proxy(args[0] if args else None),
         'headless': lambda: cmd_headless(args[0] if args else None),
+        'stealth': lambda: cmd_stealth(args[0] if args else None),
         'session': cmd_session,
         'sessions': cmd_sessions,
         'session-close': lambda: cmd_session_close(args[0] if args else None),
@@ -4444,12 +4800,15 @@ if __name__ == "__main__":
         'throttle': lambda: (require_args(1, 'throttle [slow3g|fast3g|offline|off|custom <down> <up> <lat>]'), None)[1] if not args else cmd_throttle(args[0], *args[1:]),
         'geo': lambda: (require_args(1, 'geo [<lat> <lng>|istanbul|london|newyork|off]'), None)[1] if not args else cmd_geo(args[0], args[1] if len(args) > 1 else None, args[2] if len(args) > 2 else None),
         'permission': lambda: (require_args(1, 'permission [grant|deny|reset] [<permission>]'), None)[1] if not args else cmd_permission(args[0], args[1] if len(args) > 1 else None),
+        'captcha-check': cmd_captcha_check,
+        'captcha-wait': lambda: cmd_captcha_wait(args[0] if args else None),
     }
 
     # Commands that do not require the visual indicator / input blocker
     NO_CONTROL_CMDS = {'glow', 'stop', 'tabs', 'close', 'close-tab', 'new-tab',
                        'dialog', 'download', 'throttle', 'permission', 'intercept',
-                       'batch', 'screenshot-diff', 'run'}
+                       'batch', 'screenshot-diff', 'run',
+                       'captcha-check', 'captcha-wait'}
     # Clean up idle sessions before running any command
     _cleanup_idle_sessions()
 
