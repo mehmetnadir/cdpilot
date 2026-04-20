@@ -236,12 +236,20 @@ STEALTH_JS = r"""
   if (window.__cdpilot_stealth) return;
   try { Object.defineProperty(window, '__cdpilot_stealth', {value: true, writable: false, configurable: false}); } catch(e) {}
 
-  // 1) navigator.webdriver → undefined (most common headless tell)
+  // 1) navigator.webdriver — only patch if it's actually `true`.
+  // Vanilla Chrome (no --enable-automation) already returns `false` and the
+  // property exists on Navigator.prototype. Replacing the getter when it's
+  // already safe creates a worse fingerprint (returning `undefined` instead
+  // of `false` is itself a tell). Only mask when CDP/automation flagged it.
   try {
-    Object.defineProperty(Navigator.prototype, 'webdriver', {
-      get: function() { return undefined; },
-      configurable: true
-    });
+    var wdValue;
+    try { wdValue = navigator.webdriver; } catch (_) {}
+    if (wdValue === true) {
+      Object.defineProperty(Navigator.prototype, 'webdriver', {
+        get: function() { return false; },
+        configurable: true
+      });
+    }
   } catch (e) {}
 
   // 2) window.chrome — real Chrome exposes chrome.runtime even without extensions
@@ -274,25 +282,54 @@ STEALTH_JS = r"""
   } catch (e) {}
 
   // 4) navigator.plugins — empty array is a headless tell. Provide standard PDF set.
+  // Critical: must be a real PluginArray instance, not vanilla Array, or
+  // detection scripts catch it via `navigator.plugins instanceof PluginArray`.
   try {
-    var pdfMime = { type: 'application/pdf', suffixes: 'pdf', description: '' };
+    var PluginArrayProto = (window.PluginArray && window.PluginArray.prototype) || null;
+    var PluginProto = (window.Plugin && window.Plugin.prototype) || null;
+    var MimeTypeProto = (window.MimeType && window.MimeType.prototype) || null;
+
+    var makeMime = function(type, suffixes, plugin) {
+      var m = Object.create(MimeTypeProto || Object.prototype);
+      Object.defineProperties(m, {
+        type:        { value: type,        enumerable: true },
+        suffixes:    { value: suffixes,    enumerable: true },
+        description: { value: '',          enumerable: true },
+        enabledPlugin: { value: plugin,    enumerable: true }
+      });
+      return m;
+    };
     var makePlugin = function(name, filename) {
-      var p = { name: name, filename: filename, description: 'Portable Document Format', length: 1 };
-      p[0] = pdfMime;
-      p.item = function(i) { return i === 0 ? pdfMime : null; };
-      p.namedItem = function(n) { return n === pdfMime.type ? pdfMime : null; };
+      var p = Object.create(PluginProto || Object.prototype);
+      var mime = makeMime('application/pdf', 'pdf', p);
+      Object.defineProperties(p, {
+        name:        { value: name,        enumerable: true },
+        filename:    { value: filename,    enumerable: true },
+        description: { value: 'Portable Document Format', enumerable: true },
+        length:      { value: 1,           enumerable: true },
+        '0':         { value: mime,        enumerable: true }
+      });
+      p.item = function(i) { return i === 0 ? mime : null; };
+      p.namedItem = function(n) { return n === mime.type ? mime : null; };
       return p;
     };
-    var plugins = [
-      makePlugin('PDF Viewer', 'internal-pdf-viewer'),
-      makePlugin('Chrome PDF Viewer', 'internal-pdf-viewer'),
-      makePlugin('Chromium PDF Viewer', 'internal-pdf-viewer'),
-      makePlugin('Microsoft Edge PDF Viewer', 'internal-pdf-viewer'),
-      makePlugin('WebKit built-in PDF', 'internal-pdf-viewer'),
+    var pluginNames = [
+      ['PDF Viewer', 'internal-pdf-viewer'],
+      ['Chrome PDF Viewer', 'internal-pdf-viewer'],
+      ['Chromium PDF Viewer', 'internal-pdf-viewer'],
+      ['Microsoft Edge PDF Viewer', 'internal-pdf-viewer'],
+      ['WebKit built-in PDF', 'internal-pdf-viewer'],
     ];
+    var plugins = Object.create(PluginArrayProto || Array.prototype);
+    for (var i = 0; i < pluginNames.length; i++) {
+      var p = makePlugin(pluginNames[i][0], pluginNames[i][1]);
+      Object.defineProperty(plugins, i, { value: p, enumerable: true });
+      Object.defineProperty(plugins, p.name, { value: p });
+    }
+    Object.defineProperty(plugins, 'length', { value: pluginNames.length });
     plugins.item = function(i) { return plugins[i] || null; };
     plugins.namedItem = function(n) {
-      for (var i = 0; i < plugins.length; i++) if (plugins[i].name === n) return plugins[i];
+      for (var k = 0; k < plugins.length; k++) if (plugins[k].name === n) return plugins[k];
       return null;
     };
     plugins.refresh = function() {};
@@ -300,6 +337,35 @@ STEALTH_JS = r"""
       get: function() { return plugins; },
       configurable: true
     });
+  } catch (e) {}
+
+  // 4b) Worker stealth — workers have their own global scope, so navigator.webdriver
+  // patches above do NOT propagate. Fingerprint scripts that probe via Worker
+  // (e.g. fpscanner.WEBDRIVER) catch this inconsistency. Fix: wrap the Worker
+  // constructor to prepend a navigator.webdriver patch via blob URL. Limitations:
+  // module workers and same-origin script URLs are best-effort (importScripts
+  // doesn't support module workers; cross-origin URLs may bypass via direct fetch).
+  try {
+    var OrigWorker = window.Worker;
+    if (OrigWorker && !window.__cdpilot_worker_patched) {
+      var workerPatch = "(function(){try{Object.defineProperty(self.navigator||{},'webdriver',{get:function(){return undefined;},configurable:true});}catch(e){}})();";
+      var WrappedWorker = function(scriptURL, options) {
+        try {
+          var isModule = options && options.type === 'module';
+          if (typeof scriptURL === 'string' && !isModule) {
+            // Wrap script in a blob that applies the patch then importScripts the original.
+            var wrapped = workerPatch + "importScripts(" + JSON.stringify(String(scriptURL)) + ");";
+            var blob = new Blob([wrapped], { type: 'application/javascript' });
+            scriptURL = URL.createObjectURL(blob);
+          }
+        } catch (e) {}
+        return new OrigWorker(scriptURL, options);
+      };
+      WrappedWorker.prototype = OrigWorker.prototype;
+      Object.setPrototypeOf(WrappedWorker, OrigWorker);
+      window.Worker = WrappedWorker;
+      Object.defineProperty(window, '__cdpilot_worker_patched', { value: true });
+    }
   } catch (e) {}
 
   // 5) WebGL vendor/renderer — UNMASKED_* params reveal "SwiftShader" in headless.

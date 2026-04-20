@@ -152,6 +152,29 @@ test('STEALTH_JS patches the documented fingerprint surfaces', () => {
   assert(js.includes('permissions.query') || js.includes('permissions'), 'Should patch permissions.query');
 });
 
+test('STEALTH_JS only patches webdriver when value is actually true (smart no-op)', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  assert(/wdValue\s*===\s*true/.test(js),
+    'webdriver patch must be conditional on actual value being true — patching a benign Chrome creates a worse fingerprint');
+});
+
+test('STEALTH_JS plugins inherit from PluginArray.prototype (instanceof check)', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  assert(js.includes('PluginArray.prototype') || js.includes('PluginArrayProto'),
+    'plugins must inherit from PluginArray.prototype, not vanilla Array');
+  assert(js.includes('Plugin.prototype') || js.includes('PluginProto'),
+    'individual plugins must inherit from Plugin.prototype');
+});
+
+test('STEALTH_JS patches Worker constructor for worker-context webdriver', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  assert(/window\.Worker/.test(js), 'Should wrap window.Worker');
+  assert(/createObjectURL/.test(js), 'Should use blob URL to inject patch');
+  assert(/__cdpilot_worker_patched/.test(js), 'Should guard against double-patching Worker');
+  assert(/options\s*&&\s*options\.type\s*===\s*'module'/.test(js),
+    'Must skip module workers (importScripts incompatible)');
+});
+
 test('STEALTH_JS does NOT weaken web security primitives', () => {
   const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
   // Fail-fast on common anti-patterns that would be a security regression.
