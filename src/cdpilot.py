@@ -14,7 +14,7 @@ Environment:
   CDPILOT_PROFILE      Isolated browser profile directory
 """
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 import asyncio
 import json
@@ -1227,42 +1227,108 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
 
 # ─── Helper Functions ───
 
-def _find_browser():
-    """İşletim sistemine göre tarayıcı ikili dosyasını otomatik olarak bulur."""
-    for b in ["brave-browser", "google-chrome", "chromium-browser", "chromium"]:
-        found = shutil.which(b)
-        if found:
-            return found
+# ─── Browser preference & detection ───────────────────────────────────────────
+# Map of canonical browser names to platform-specific binary candidates.
+# Order matters within each list: first existing path wins.
+BROWSER_BINARIES = {
+    'brave':    {'Darwin':  ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"],
+                 'Linux':   ["/usr/bin/brave-browser", "/usr/bin/brave"],
+                 'Windows': [os.path.expandvars(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe")]},
+    'chrome':   {'Darwin':  ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+                 'Linux':   ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"],
+                 'Windows': [os.path.expandvars(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+                             os.path.expandvars(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe")]},
+    'vivaldi':  {'Darwin':  ["/Applications/Vivaldi.app/Contents/MacOS/Vivaldi"],
+                 'Linux':   ["/usr/bin/vivaldi", "/usr/bin/vivaldi-stable"],
+                 'Windows': [os.path.expandvars(r"C:\Program Files\Vivaldi\Application\vivaldi.exe")]},
+    'edge':     {'Darwin':  ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"],
+                 'Linux':   ["/usr/bin/microsoft-edge"],
+                 'Windows': [os.path.expandvars(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")]},
+    'chromium': {'Darwin':  ["/Applications/Chromium.app/Contents/MacOS/Chromium"],
+                 'Linux':   ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium"],
+                 'Windows': [os.path.expandvars(r"C:\Program Files\Chromium\Application\chromium.exe")]},
+}
 
-    system = platform.system()
-    if system == "Darwin":
-        paths = [
-            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ]
-    elif system == "Linux":
-        paths = [
-            "/usr/bin/brave-browser",
-            "/usr/bin/google-chrome",
-            "/usr/bin/chromium-browser",
-            "/usr/bin/chromium",
-            "/snap/bin/chromium",
-        ]
-    elif system == "Windows":
-        paths = [
-            os.path.expandvars(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
-            os.path.expandvars(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-            os.path.expandvars(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-            os.path.expandvars(r"C:\Program Files\Chromium\Application\chromium.exe"),
-        ]
-    else:
+BROWSER_CONFIG_FILE = os.path.join(CDPILOT_HOME, 'browser.json')
+
+
+def _macos_major():
+    """Return macOS major version (e.g. 26) or None on other platforms."""
+    if platform.system() != 'Darwin':
+        return None
+    try:
+        return int(platform.mac_ver()[0].split('.')[0])
+    except (ValueError, IndexError):
         return None
 
-    for path in paths:
+
+def _resolve_browser_name(name):
+    """Resolve a browser name to its binary path. Returns None if not installed."""
+    name = (name or '').lower().strip()
+    if name not in BROWSER_BINARIES:
+        return None
+    candidates = BROWSER_BINARIES[name].get(platform.system(), [])
+    for path in candidates:
         if os.path.exists(path):
             return path
     return None
+
+
+def get_browser_preference():
+    """Read user's persisted browser preference. Returns name or 'auto'."""
+    if os.path.exists(BROWSER_CONFIG_FILE):
+        try:
+            with open(BROWSER_CONFIG_FILE) as f:
+                return (json.load(f).get('browser') or 'auto').lower()
+        except (OSError, ValueError):
+            pass
+    return 'auto'
+
+
+def _auto_browser_priority():
+    """Default detection order. macOS 26 (Tahoe) demotes Brave because the
+    current Brave 1.89 build crashes deterministically at ~7min uptime
+    (SIGTRAP in ThreadPoolForegroundWorker, observed across 9+ dumps).
+    Vivaldi takes priority because it's Chromium-based AND honors
+    --load-extension (Chrome silently drops unpacked extensions in 147+).
+    """
+    if _macos_major() and _macos_major() >= 26:
+        return ['vivaldi', 'brave', 'chrome', 'chromium', 'edge']
+    return ['brave', 'chrome', 'vivaldi', 'chromium', 'edge']
+
+
+def _find_browser():
+    """Locate the browser binary. Priority:
+    1. CHROME_BIN env var (full path, backward-compatible)
+    2. ~/.cdpilot/browser.json preference (set via `cdpilot browser <name>`)
+    3. Auto-detection per _auto_browser_priority()
+    """
+    # 1) PATH lookup for common command names (Linux/Brew installs)
+    for b in ["brave-browser", "vivaldi", "google-chrome", "chromium-browser", "chromium"]:
+        found = shutil.which(b)
+        if found:
+            # Only use PATH match as fallback — preference still wins below.
+            path_match = found
+            break
+    else:
+        path_match = None
+
+    # 2) User preference from config (overrides auto)
+    pref = get_browser_preference()
+    if pref and pref != 'auto':
+        resolved = _resolve_browser_name(pref)
+        if resolved:
+            return resolved
+        # Configured browser not installed — fall through to auto with a warning.
+        sys.stderr.write(f"⚠️  Configured browser '{pref}' not found, falling back to auto-detect.\n")
+
+    # 3) Auto-detection in priority order
+    for name in _auto_browser_priority():
+        resolved = _resolve_browser_name(name)
+        if resolved:
+            return resolved
+
+    return path_match  # Last resort
 
 
 def _is_port_in_use(port):
@@ -1512,10 +1578,28 @@ def cmd_launch():
     #   2) `--disable-features=...` added — catches Brave-specific background
     #      tasks that individual `--disable-brave-*` flags don't fully kill
     #      (Rewards ad scanner, Sync heartbeat, News fetcher).
+    # Per-browser profile isolation. Brave-written profiles include keys that
+    # confuse Vivaldi/Chrome (search_engines.json missing, prefs schema diffs),
+    # so each browser gets its own subdir. Brave keeps the original path for
+    # backward compatibility — existing users don't lose state on upgrade.
+    browser_basename = os.path.basename(CHROME_BIN).lower()
+    if 'brave' in browser_basename:
+        profile_dir = PROFILE_DIR
+    elif 'vivaldi' in browser_basename:
+        profile_dir = PROFILE_DIR + '-vivaldi'
+    elif 'edge' in browser_basename or 'msedge' in browser_basename:
+        profile_dir = PROFILE_DIR + '-edge'
+    elif 'chromium' in browser_basename:
+        profile_dir = PROFILE_DIR + '-chromium'
+    else:
+        # Default: chrome and unknown chromium-based browsers
+        profile_dir = PROFILE_DIR + '-chrome'
+    os.makedirs(profile_dir, exist_ok=True)
+
     chrome_args = [
         CHROME_BIN,
         f'--remote-debugging-port={CDP_PORT}',
-        f'--user-data-dir={PROFILE_DIR}',
+        f'--user-data-dir={profile_dir}',
         '--remote-allow-origins=*',
         '--disable-fre', '--no-default-browser-check', '--no-first-run',
         # ─── Brave-specific features (harmless on other Chromium builds) ───
@@ -2625,6 +2709,53 @@ def cmd_headless(state=None):
         json.dump({'headless': enabled}, f)
     print(f'Headless mode: {"on" if enabled else "off"}')
     print('Restart browser (stop → launch).')
+
+
+def cmd_browser(name=None):
+    """Show or set the preferred browser (chrome|brave|chromium|edge|vivaldi|auto).
+
+    The choice is persisted in ~/.cdpilot/browser.json and applies to all
+    projects. `auto` (default) picks per-platform priority — on macOS 26
+    Vivaldi is preferred over Brave due to a known Brave 1.89/macOS 26
+    crash. `CHROME_BIN` env var still overrides if set.
+
+    Usage:
+      cdpilot browser                # show current + which is detected
+      cdpilot browser vivaldi        # force Vivaldi
+      cdpilot browser auto           # restore platform default
+    """
+    if name is None or name.lower() == 'status':
+        pref = get_browser_preference()
+        resolved = _resolve_browser_name(pref) if pref != 'auto' else None
+        auto_resolved = _find_browser()
+        installed = [n for n in BROWSER_BINARIES if _resolve_browser_name(n)]
+        print(f"Preference:  {pref}")
+        if pref != 'auto':
+            print(f"  resolved:  {resolved or '(not found — falling back to auto)'}")
+        print(f"Auto-pick:   {auto_resolved or '(none)'}")
+        print(f"Installed:   {', '.join(installed) or '(none detected)'}")
+        if _macos_major() and _macos_major() >= 26:
+            print(f"Note: macOS {_macos_major()} demotes Brave in auto-pick (Brave 1.89 crashes ~7min).")
+        return
+
+    name = name.lower().strip()
+    if name not in BROWSER_BINARIES and name != 'auto':
+        valid = ', '.join(['auto'] + list(BROWSER_BINARIES.keys()))
+        print(f"Invalid browser: {name}. Valid: {valid}", file=sys.stderr)
+        sys.exit(1)
+
+    if name != 'auto' and not _resolve_browser_name(name):
+        print(f"⚠️  Browser '{name}' not installed on this system.", file=sys.stderr)
+        candidates = BROWSER_BINARIES[name].get(platform.system(), [])
+        if candidates:
+            print(f"   Looked at: {candidates[0]}", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(os.path.dirname(BROWSER_CONFIG_FILE), exist_ok=True)
+    with open(BROWSER_CONFIG_FILE, 'w') as f:
+        json.dump({'browser': name}, f)
+    print(f"Browser preference: {name}")
+    print('Restart the browser (`cdpilot stop` then any command) for the change to take effect.')
 
 
 def cmd_health():
@@ -4842,6 +4973,7 @@ if __name__ == "__main__":
         'proxy': lambda: cmd_proxy(args[0] if args else None),
         'headless': lambda: cmd_headless(args[0] if args else None),
         'stealth': lambda: cmd_stealth(args[0] if args else None),
+        'browser': lambda: cmd_browser(args[0] if args else None),
         'health': cmd_health,
         'session': cmd_session,
         'sessions': cmd_sessions,

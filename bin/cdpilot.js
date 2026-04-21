@@ -329,6 +329,10 @@ function showHelp() {
     captcha-check      Detect CAPTCHA on active page (JSON output)
     captcha-wait [s]   Pause until user solves CAPTCHA (default 300s)
 
+  RELIABILITY
+    browser [name]     Show or set preferred browser (chrome|brave|chromium|edge|vivaldi|auto)
+    health             JSON status: alive, port, tabs, browser, today's crashes
+
   PROJECTS
     projects           List all project browser instances
     project-stop <id>  Stop a specific project's browser
