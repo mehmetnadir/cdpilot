@@ -14,7 +14,7 @@ Environment:
   CDPILOT_PROFILE      Isolated browser profile directory
 """
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 import asyncio
 import json
@@ -1503,6 +1503,15 @@ def cmd_launch():
     proj_label = f' [{PROJECT_ID}]' if PROJECT_ID else ''
     print(f'Launching browser (isolated session, port {CDP_PORT}){proj_label}...')
 
+    # ─── Stability fixes (2026-04-21) ───
+    # Brave on Apple Silicon crashed with SIGTRAP/EXC_BREAKPOINT deterministically
+    # at ~7 min uptime on ThreadPoolForegroundWorker. Two changes:
+    #   1) `--disable-gpu-compositing` removed — conflicts with Metal accel on
+    #      M-series. Browser falls back to GPU-accel rendering which is the
+    #      Chromium default and matches what websites expect.
+    #   2) `--disable-features=...` added — catches Brave-specific background
+    #      tasks that individual `--disable-brave-*` flags don't fully kill
+    #      (Rewards ad scanner, Sync heartbeat, News fetcher).
     chrome_args = [
         CHROME_BIN,
         f'--remote-debugging-port={CDP_PORT}',
@@ -1521,6 +1530,14 @@ def cmd_launch():
         '--disable-tor',
         '--disable-ipfs',
         '--disable-brave-extension',
+        # Feature-level disables — catch background workers the
+        # single-purpose flags above miss. Comma-joined string = one arg.
+        '--disable-features=' + ','.join([
+            'BraveRewards', 'BraveAds', 'BraveSync', 'BraveNewsToday',
+            'BraveVPN', 'BraveWalletBubble', 'SpeedReader', 'Tor',
+            'IPFSCompanion', 'Translate', 'OptimizationGuideModelDownloading',
+            'InterestFeedContentSuggestions', 'CalculateNativeWinOcclusion',
+        ]),
         # ─── Chromium performance flags ───
         '--disable-background-networking',
         '--disable-background-timer-throttling',
@@ -1542,7 +1559,9 @@ def cmd_launch():
         '--safebrowsing-disable-auto-update',
         '--password-store=basic',
         # ─── GPU / rendering ───
-        '--disable-gpu-compositing',
+        # --disable-gpu-compositing REMOVED: caused EXC_BREAKPOINT on Apple
+        # Silicon Brave 147+ after ~7min. Let the browser use its default
+        # (Metal-accelerated) compositor.
         '--disable-smooth-scrolling',
         '--new-window', 'about:blank',
     ]
@@ -2225,52 +2244,71 @@ def cmd_session_close(session_id=None):
 
 
 def cmd_extensions():
-    """List installed extensions."""
+    """List installed extensions (packed via Chrome Web Store + dev mode unpacked).
+
+    Two sources are checked independently — neither absence should hide the other.
+    Previously an early-return on missing Default/Extensions/ silently swallowed
+    dev-mode entries written by `ext-install`.
+    """
+    # 1) Packed (CRX) extensions live under Default/Extensions and are described
+    #    in Default/Preferences. Only present after the user installs from the
+    #    Chrome Web Store; ext-install does NOT write here.
     ext_dir = os.path.join(PROFILE_DIR, "Default", "Extensions")
-    if not os.path.isdir(ext_dir):
-        print("No extensions installed.")
-        return
-
-    prefs_path = os.path.join(PROFILE_DIR, "Default", "Preferences")
+    packed_ids = []
     ext_names = {}
-    if os.path.exists(prefs_path):
-        try:
-            with open(prefs_path) as f:
-                prefs = json.load(f)
-            settings = prefs.get("extensions", {}).get("settings", {})
-            for ext_id, info in settings.items():
-                manifest = info.get("manifest", {})
-                ext_names[ext_id] = {
-                    "name": manifest.get("name", ext_id),
-                    "version": manifest.get("version", "?"),
-                    "enabled": info.get("state", 1) == 1,
-                    "path": info.get("path", ""),
-                }
-        except Exception:
-            pass
+    if os.path.isdir(ext_dir):
+        prefs_path = os.path.join(PROFILE_DIR, "Default", "Preferences")
+        if os.path.exists(prefs_path):
+            try:
+                with open(prefs_path) as f:
+                    prefs = json.load(f)
+                settings = prefs.get("extensions", {}).get("settings", {})
+                for ext_id, info in settings.items():
+                    manifest = info.get("manifest", {})
+                    ext_names[ext_id] = {
+                        "name": manifest.get("name", ext_id),
+                        "version": manifest.get("version", "?"),
+                        "enabled": info.get("state", 1) == 1,
+                    }
+            except Exception:
+                pass
+        packed_ids = [d for d in os.listdir(ext_dir) if not d.startswith(".")]
 
-    ext_ids = [d for d in os.listdir(ext_dir) if not d.startswith(".")]
-    if not ext_ids:
+    # 2) Dev-mode (unpacked) extensions registered by `ext-install` —
+    #    loaded into the browser via --load-extension on each launch.
+    dev_exts = get_dev_extensions()
+
+    if not packed_ids and not dev_exts:
         print("No extensions installed.")
         return
 
-    for ext_id in sorted(ext_ids):
-        info = ext_names.get(ext_id, {})
-        name = info.get("name", ext_id)
-        version = info.get("version", "?")
-        enabled = info.get("enabled", True)
-        status = "✅" if enabled else "⏸️"
-        print(f"  {status} {name} (v{version})")
-        print(f"     ID: {ext_id}")
+    if packed_ids:
+        for ext_id in sorted(packed_ids):
+            info = ext_names.get(ext_id, {})
+            name = info.get("name", ext_id)
+            version = info.get("version", "?")
+            enabled = info.get("enabled", True)
+            status = "✅" if enabled else "⏸️"
+            print(f"  {status} {name} (v{version})")
+            print(f"     ID: {ext_id}")
+        print(f"\n{len(packed_ids)} packed extension{'s' if len(packed_ids) != 1 else ''}")
 
-    print(f"\n{len(ext_ids)} extensions")
-
-    dev_exts = get_dev_extensions()
     if dev_exts:
-        print(f'\nDev Mode Extensions ({len(dev_exts)}):')
+        if packed_ids:
+            print()
+        print(f"Dev Mode Extensions ({len(dev_exts)}):")
         for i, path in enumerate(dev_exts):
             exists = '✅' if os.path.isdir(path) else '❌ (directory not found)'
-            print(f'  {exists} [{i}] {path}')
+            # Try to read manifest for friendlier output
+            label = os.path.basename(path.rstrip('/'))
+            try:
+                with open(os.path.join(path, 'manifest.json')) as f:
+                    mf = json.load(f)
+                label = f"{mf.get('name', label)} (v{mf.get('version', '?')})"
+            except Exception:
+                pass
+            print(f"  {exists} [{i}] {label}")
+            print(f"        {path}")
 
 
 def cmd_ext_install(source):
@@ -2587,6 +2625,54 @@ def cmd_headless(state=None):
         json.dump({'headless': enabled}, f)
     print(f'Headless mode: {"on" if enabled else "off"}')
     print('Restart browser (stop → launch).')
+
+
+def cmd_health():
+    """Print JSON health summary of the cdpilot browser session.
+
+    Output keys:
+      alive          — bool, CDP /json/version reachable
+      port           — int, current CDP port
+      project_id     — str|null, project identifier (multi-instance)
+      tabs           — int, count of page targets (when alive)
+      browser        — str|null, version string from /json/version
+      crashes_today  — int, Brave crash dump count from macOS today
+      stealth        — bool, current stealth config
+      uptime_warning — str|null, hint when browser is alive but very old
+
+    Exit codes: 0 = alive, 2 = down. Designed for shell watchdog loops:
+      `until cdpilot health >/dev/null; do cdpilot launch; sleep 2; done`
+    """
+    import datetime as _dt
+    import glob as _glob
+
+    info = {
+        'alive': False,
+        'port': CDP_PORT,
+        'project_id': PROJECT_ID,
+        'tabs': 0,
+        'browser': None,
+        'crashes_today': 0,
+        'stealth': get_stealth_config(),
+        'uptime_warning': None,
+    }
+    ver = cdp_get('/json/version')
+    if ver:
+        info['alive'] = True
+        info['browser'] = ver.get('Browser') or ver.get('browser') or ''
+        targets = cdp_get('/json') or []
+        info['tabs'] = sum(1 for t in targets if t.get('type') == 'page')
+
+    # Today's crash count from macOS DiagnosticReports (Brave only).
+    if platform.system() == 'Darwin':
+        today = _dt.date.today().strftime('%Y-%m-%d')
+        pattern = os.path.expanduser(f'~/Library/Logs/DiagnosticReports/Brave Browser-{today}-*.ips')
+        info['crashes_today'] = len(_glob.glob(pattern))
+        if info['crashes_today'] >= 3:
+            info['uptime_warning'] = f"{info['crashes_today']} Brave crashes today — consider `cdpilot stop` then relaunch"
+
+    print(json.dumps(info, ensure_ascii=False))
+    sys.exit(0 if info['alive'] else 2)
 
 
 def cmd_stealth(state=None):
@@ -4756,6 +4842,7 @@ if __name__ == "__main__":
         'proxy': lambda: cmd_proxy(args[0] if args else None),
         'headless': lambda: cmd_headless(args[0] if args else None),
         'stealth': lambda: cmd_stealth(args[0] if args else None),
+        'health': cmd_health,
         'session': cmd_session,
         'sessions': cmd_sessions,
         'session-close': lambda: cmd_session_close(args[0] if args else None),
