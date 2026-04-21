@@ -37,22 +37,34 @@ AI agents and developers need browser control that **just works**:
 - **AI control warning** — Red toast notification appears when you hover during active automation
 - **Privacy-first** — Everything runs locally. No data leaves your machine
 
-### Why Brave?
+### Browser Selection (Workload-Aware Auto-Pick)
 
-cdpilot uses [Brave Browser](https://brave.com) as its engine. Here's why:
+cdpilot picks the right browser for what you're doing. `auto` (default) is a
+two-axis policy — extension workload × platform stability:
 
-| Feature | Brave | Chrome | Why it matters |
-|---------|-------|--------|---------------|
-| **Built-in ad blocker** | Shields (native) | Extension needed | Pages load faster, less noise in DOM |
-| **Tracker blocking** | Default on | Manual config | Cleaner network logs for debugging |
-| **Fingerprint protection** | Native | None | Better privacy for automated sessions |
-| **Chromium-based** | Full CDP support | Full CDP support | Same DevTools Protocol, same power |
-| **Open source** | Yes (MPL 2.0) | Chromium yes, Chrome no | Transparent, auditable |
-| **Resource usage** | Lower memory | Higher memory | Better for running alongside your work |
+| Your workload | Auto-pick order |
+|---|---|
+| Has extensions registered (`ext-install`) | vivaldi → brave → edge → chromium → chrome |
+| No extensions (pure automation) | chrome → vivaldi → edge → chromium → brave |
 
-**TL;DR:** Brave = Chrome's power + built-in privacy + less bloat. Perfect for automation.
+Override anytime:
 
-> cdpilot also works with Chrome and Chromium as fallback. Brave is recommended, not required.
+```bash
+cdpilot browser            # show current pick + reason
+cdpilot browser vivaldi    # pin to Vivaldi
+cdpilot browser auto       # restore smart default
+```
+
+**Why the split?**
+- **Chrome 147+ silently drops `--load-extension`** for unpacked extensions
+  (no error, no warning). Verified — `chrome://extensions` shows 0 items.
+- **Vivaldi, Brave, Edge, Chromium** honor `--load-extension` (tested).
+- On **macOS 26 (Tahoe)** Brave 1.89 crashes deterministically at ~7min
+  uptime (SIGTRAP in ThreadPoolForegroundWorker). cdpilot detects the OS
+  and demotes Brave automatically until a fixed Brave release ships.
+
+Each browser gets its own isolated profile (`~/.cdpilot/.../profile-vivaldi`
+etc.) so switching never causes prefs corruption.
 
 ## Installation
 
@@ -186,6 +198,47 @@ cdpilot frame list            # List iframes
 cdpilot dialog auto-accept    # Auto-accept dialogs
 cdpilot permission grant geo  # Grant geolocation
 ```
+
+### Stealth & CAPTCHA
+
+Zero-dependency anti-fingerprint layer — patches `navigator.webdriver`,
+`chrome.runtime`, plugins (proper `PluginArray` inheritance), WebGL
+vendor/renderer, permissions, hardware concurrency, and the `Worker`
+constructor. Injected via `Page.addScriptToEvaluateOnNewDocument` before
+any page script runs. Disabled by default; opt-in.
+
+```bash
+cdpilot stealth on            # enable fingerprint patches (opt-in)
+cdpilot stealth off           # disable (default)
+cdpilot stealth status        # show which patches are applied
+
+cdpilot captcha-check         # JSON detection of Turnstile/hCaptcha/reCAPTCHA/
+                              # DataDome/PerimeterX/Arkose/GeeTest. Exit 0/3
+cdpilot captcha-wait [sec]    # block until user solves (interactive)
+                              # or poll with JSON stream (non-interactive)
+```
+
+Verified against public bot-detection panels:
+- **bot.sannysoft.com:** 24/24 PASS (WebDriver, Chrome obj, Plugins as PluginArray, WebGL, PHANTOM_*, HEADCHR_*, SELENIUM_DRIVER)
+- **bot.incolumitas.com** intoli: 6/6 OK — new-tests: 6/7 OK (one FAIL = pure CDP presence, cannot be JS-patched)
+- **nowsecure.nl** (Cloudflare full challenge): passed
+- **arh.antoinevastel.com/areyouheadless:** "You are not Chrome headless"
+
+### Reliability
+
+```bash
+cdpilot browser [name|auto]   # workload-aware browser selection
+cdpilot health                # JSON: alive, port, tabs, browser, today's crashes
+```
+
+`cdpilot health` is designed for shell watchdogs:
+
+```bash
+until cdpilot health >/dev/null; do cdpilot launch; sleep 2; done
+```
+
+Surfaces today's Brave crash count from `~/Library/Logs/DiagnosticReports/`
+on macOS — spot degradation before your automation silently stalls.
 
 ## Use with AI Agents
 
