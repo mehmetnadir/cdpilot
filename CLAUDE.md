@@ -103,12 +103,14 @@ Brave/Chrome/Chromium (CDP modu, port 9222)
 | ✅ | Annotated Shot | Screenshot üzerinde @N badge'leri |
 | ✅ | Auto-Wait | 5s MutationObserver bekleme |
 | ✅ | Batch Commands | JSON pipe desteği |
-| ✅ | Site | cdpilot.ndr.ist canlı (landing + 61 komut docs) |
-| ✅ | GitHub & npm | v0.3.0 yayınlandı, 6 awesome repo PR'ı |
+| ✅ | Site | cdpilot.ndr.ist canlı (landing + 63 komut docs, browser+health dahil) |
+| ✅ | GitHub & npm | **v0.4.3 yayınlandı**, 6 awesome repo PR'ı |
 | ✅ | Stealth Layer | Zero-dep fingerprint patches (webdriver smart no-op, plugins PluginArray-typed, WebGL spoof, Worker wrap) — opt-in via `cdpilot stealth on` |
 | ✅ | CAPTCHA Detection | 8 sağlayıcı (Turnstile, hCaptcha, reCAPTCHA, DataDome, PerimeterX, Arkose, GeeTest, CF-interstitial). `captcha-check` + `captcha-wait` komutları |
+| ✅ | Browser Selection | `cdpilot browser [name|auto]` — workload-aware (ext var→Vivaldi/Brave, ext yok→Chrome) + macOS 26 Brave demote + per-browser profile izolasyonu |
+| ✅ | Health Probe | `cdpilot health` JSON output — alive, port, tabs, browser, today's crashes. Watchdog loop için exit 0/2 |
 | 🔄 | cdpilot Cloud | Hosted browser sessions API (roadmap) |
-| ⏳ | npm 0.4.0 | Stealth + CAPTCHA layer publish |
+| ⏳ | v0.5.0 | Auto-recovery wrapper (cdp_send fail'de retry + relaunch) |
 
 ## Dikkat Edilecekler (Gotchas)
 
@@ -136,7 +138,7 @@ Brave/Chrome/Chromium (CDP modu, port 9222)
 | `cdpilot-video.mp4` | Tam demo videosu (1080x1080, 30fps) |
 
 ---
-Son Güncelleme: 2026-04-20
+Son Güncelleme: 2026-04-21
 
 <!-- gitnexus:start -->
 ## GitNexus — Code Intelligence
