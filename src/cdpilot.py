@@ -14,7 +14,7 @@ Environment:
   CDPILOT_PROFILE      Isolated browser profile directory
 """
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 import asyncio
 import json
@@ -1286,15 +1286,41 @@ def get_browser_preference():
 
 
 def _auto_browser_priority():
-    """Default detection order. macOS 26 (Tahoe) demotes Brave because the
-    current Brave 1.89 build crashes deterministically at ~7min uptime
-    (SIGTRAP in ThreadPoolForegroundWorker, observed across 9+ dumps).
-    Vivaldi takes priority because it's Chromium-based AND honors
-    --load-extension (Chrome silently drops unpacked extensions in 147+).
+    """Workload-aware browser priority.
+
+    Two axes:
+      1. Extension workload — `cdpilot ext-install` populates dev-extensions.json.
+         If non-empty, the user is doing extension work, so prioritise browsers
+         that honor --load-extension for unpacked extensions:
+           Vivaldi ✅, Brave ✅, Edge ✅, Chrome ❌ (silently drops, 147+),
+           Chromium ✅ (but rarely installed).
+         If the registry is empty, prefer Chrome — most stable, fastest startup,
+         no idiosyncratic background workers.
+      2. Platform stability — macOS 26 (Tahoe) demotes Brave because the
+         current Brave 1.89 build crashes deterministically at ~7min uptime
+         (SIGTRAP in ThreadPoolForegroundWorker, observed across 9+ dumps).
+
+    Returns (priority_list, reason_string) — reason explains *why* this order
+    was picked, surfaced by `cdpilot browser status`.
     """
-    if _macos_major() and _macos_major() >= 26:
-        return ['vivaldi', 'brave', 'chrome', 'chromium', 'edge']
-    return ['brave', 'chrome', 'vivaldi', 'chromium', 'edge']
+    has_extensions = bool(get_dev_extensions())
+    on_tahoe = _macos_major() and _macos_major() >= 26
+
+    if has_extensions:
+        if on_tahoe:
+            order = ['vivaldi', 'brave', 'edge', 'chromium', 'chrome']
+            reason = f"extension mode (registry has dev extensions) + macOS {_macos_major()} (Brave demoted)"
+        else:
+            order = ['brave', 'vivaldi', 'edge', 'chromium', 'chrome']
+            reason = "extension mode (registry has dev extensions)"
+    else:
+        if on_tahoe:
+            order = ['chrome', 'vivaldi', 'edge', 'chromium', 'brave']
+            reason = f"stability mode (no dev extensions) + macOS {_macos_major()} (Brave demoted)"
+        else:
+            order = ['chrome', 'brave', 'vivaldi', 'edge', 'chromium']
+            reason = "stability mode (no dev extensions)"
+    return order, reason
 
 
 def _find_browser():
@@ -1323,7 +1349,8 @@ def _find_browser():
         sys.stderr.write(f"⚠️  Configured browser '{pref}' not found, falling back to auto-detect.\n")
 
     # 3) Auto-detection in priority order
-    for name in _auto_browser_priority():
+    order, _reason = _auto_browser_priority()
+    for name in order:
         resolved = _resolve_browser_name(name)
         if resolved:
             return resolved
@@ -2428,6 +2455,18 @@ def cmd_ext_install(source):
 
         print(f'✅ Dev extension registered: {name} (v{version})')
         print(f'   Path: {abs_source}')
+
+        # Warn if the active browser silently drops --load-extension.
+        # Chrome 147+ does this without any console message, easily wasting
+        # hours of "why isn't my extension loading?" debugging.
+        active = os.environ.get('CHROME_BIN') or _find_browser() or ''
+        active_lower = os.path.basename(active).lower()
+        if 'google chrome' in active_lower or active_lower == 'chrome' or 'google-chrome' in active_lower:
+            sys.stderr.write(
+                "⚠️  Active browser is Chrome — Chrome 147+ silently ignores --load-extension\n"
+                "   for unpacked extensions. Switch with: cdpilot browser vivaldi\n"
+            )
+
         print('   Restarting browser...')
         cmd_stop()
         import time as _time
@@ -2729,13 +2768,16 @@ def cmd_browser(name=None):
         resolved = _resolve_browser_name(pref) if pref != 'auto' else None
         auto_resolved = _find_browser()
         installed = [n for n in BROWSER_BINARIES if _resolve_browser_name(n)]
+        order, reason = _auto_browser_priority()
+        ext_count = len(get_dev_extensions())
         print(f"Preference:  {pref}")
         if pref != 'auto':
             print(f"  resolved:  {resolved or '(not found — falling back to auto)'}")
         print(f"Auto-pick:   {auto_resolved or '(none)'}")
+        print(f"  reason:    {reason}")
+        print(f"  order:     {' > '.join(order)}")
         print(f"Installed:   {', '.join(installed) or '(none detected)'}")
-        if _macos_major() and _macos_major() >= 26:
-            print(f"Note: macOS {_macos_major()} demotes Brave in auto-pick (Brave 1.89 crashes ~7min).")
+        print(f"Dev exts:    {ext_count} registered (run `cdpilot extensions` to list)")
         return
 
     name = name.lower().strip()

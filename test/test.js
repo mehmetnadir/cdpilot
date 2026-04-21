@@ -40,12 +40,12 @@ console.log('\n  cdpilot tests\n');
 
 test('--version prints version', () => {
   const out = run('--version');
-  assert(out.includes('0.4.2'), 'Should print version');
+  assert(out.includes('0.4.3'), 'Should print version');
 });
 
 test('-v prints version', () => {
   const out = run('-v');
-  assert(out.includes('0.4.2'), 'Should print version');
+  assert(out.includes('0.4.3'), 'Should print version');
 });
 
 test('help shows usage', () => {
