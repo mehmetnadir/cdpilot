@@ -1,12 +1,13 @@
-# Hacker News - Show HN Post
+# Hacker News — Show HN Post (revised 2026-04-22)
 
 ## Title Options (pick one)
 
-1. **Show HN: cdpilot -- 50KB zero-dependency browser automation CLI (replaces Playwright for AI agents)**
-2. **Show HN: cdpilot -- Browser automation with zero dependencies, 40+ CLI commands, built-in MCP server**
-3. **Show HN: I built a 50KB alternative to Playwright for AI agent browser control**
+1. **Show HN: cdpilot – zero-dependency browser automation CLI (1/4000th of Playwright)**
+2. **Show HN: cdpilot – 60KB browser automation for AI agents, with built-in MCP server**
+3. **Show HN: cdpilot – I debugged a Brave-macOS-26 crash in prod; the fix became a browser picker**
 
-> Recommendation: Option 1 -- it's specific, has the key differentiators, and mentions the target use case.
+> Recommendation: **Option 1** — pure comparison numbers beat feature lists on HN.
+> Option 3 is tempting but too narrative for a title; move the story to the comment.
 
 ---
 
@@ -16,35 +17,129 @@ https://github.com/mehmetnadir/cdpilot
 
 ---
 
+## Submission timing
+
+HN traffic peaks Tuesday–Thursday, 08:00–10:00 PDT (18:00–20:00 TR time).
+First 2 hours are make-or-break — respond to every comment. Stay available
+for ~4 hours after posting.
+
+---
+
 ## First Comment (post immediately after submission)
 
-Hey HN! I built cdpilot because I was frustrated with the state of browser automation for AI agents.
+Hey HN — author here.
 
-**The problem:** Every time I needed an AI agent (Claude, GPT) to interact with a browser, I had to install Playwright (200MB+) or Puppeteer (400MB+), download separate browser binaries, and write boilerplate code. For what? To take a screenshot or click a button.
+**The itch:** Every AI agent demo that touches a browser pulls in
+Playwright (~200MB) or Puppeteer (~400MB) plus a bundled Chromium.
+For what — a screenshot and three clicks? I wanted a version that
+talks to my already-installed Brave over CDP and does nothing else.
 
-**The solution:** cdpilot is a CLI that talks directly to your existing browser via Chrome DevTools Protocol. The entire tool is ~50KB -- a single Python file with a thin Node.js wrapper for npx distribution.
+cdpilot is a CLI that does exactly that. The distribution is a single
+Python file (`src/cdpilot.py`) plus a thin Node wrapper
+(`bin/cdpilot.js`) for `npx` support. Total unpacked size: 233KB.
+Zero npm deps, zero pip deps — stdlib only. You can audit the whole
+thing in an afternoon.
 
 ```
-npx cdpilot launch
-npx cdpilot go https://example.com
-npx cdpilot shot
+npx cdpilot launch          # start an isolated Brave/Chrome/Vivaldi
+npx cdpilot go <url>         # navigate
+npx cdpilot a11y-snapshot    # structured accessibility tree — LLM-ready
+npx cdpilot smart-click "Sign in"   # find by visible text, no selector
+npx cdpilot mcp              # expose everything as an MCP server
 ```
 
-**Key decisions:**
+**Three decisions I'll defend:**
 
-- **Zero dependencies** -- no npm packages, no Python packages. Just stdlib. This eliminates supply chain risk entirely.
-- **CLI-first** -- every command is a standalone operation. Composable with pipes, scripts, and AI tool-use.
-- **Uses your existing browser** -- no downloading Chromium. cdpilot finds Brave/Chrome/Chromium on your system and connects via CDP.
-- **Built-in MCP server** -- AI agents (Claude Code, etc.) can control the browser out of the box.
-- **Single file architecture** -- the entire core is one ~2500-line Python file. Easy to audit, easy to understand.
+1. **CLI-first, not a library.** Every command is a standalone process
+   that writes to stdout. Composable with pipes, shell scripts, `jq`,
+   and — crucially — AI tool-use loops. An LLM calling `cdpilot click`
+   doesn't care what language the tool is written in.
 
-**What it's NOT:** It's not a test framework. It doesn't replace Playwright's test runner or assertion library. It replaces the browser automation layer with something 4000x lighter.
+2. **Uses your existing browser.** No bundled Chromium download. cdpilot
+   picks whichever Chromium-family browser you have (Brave, Chrome,
+   Vivaldi, Edge, Chromium) and connects over `--remote-debugging-port`.
+   The profile lives under `~/.cdpilot/` so it doesn't touch your real
+   browsing session.
 
-The visual feedback system (green glow overlay, cursor visualization, click ripples) was born from debugging AI automation -- you need to see what the agent is doing.
+3. **Workload-aware browser pick.** Shipped this week after Brave 1.89
+   started crashing on macOS 26 (Tahoe) at exactly ~7min uptime —
+   SIGTRAP in ThreadPoolForegroundWorker, deterministic across 9+
+   dumps. While digging into that I noticed Chrome 147 silently drops
+   `--load-extension` for unpacked extensions (no error, no warning).
+   So `cdpilot browser auto` now reads the dev-extension registry:
+   if you're doing extension work it prefers Vivaldi/Brave/Edge (they
+   honor the flag); if you're not, it prefers Chrome (most stable).
+   Both tradeoffs are surfaced in `cdpilot browser status` with a
+   reason string — I hate tools that make silent choices.
 
-Tech stack: Node.js entry point + Python core, pure HTTP/WebSocket CDP communication, asyncio for WebSocket handling.
+**What's in it that surprised people in testing:**
 
-Happy to answer any questions about the architecture or design decisions!
+- `cdpilot describe` — one command combines a11y tree + OCR + screenshot
+  for LLM vision fallback. A screenshot-describe round-trip goes from
+  ~250k tokens (Computer Use style) to ~500 tokens.
+- `cdpilot stealth on` — zero-dep fingerprint patches (opt-in). Passes
+  bot.sannysoft 24/24, Cloudflare full challenge at nowsecure.nl, and
+  incolumitas intoli 6/6. It does NOT beat `incolumitas overflowTest`
+  because that probe detects CDP presence itself — no JS patch can hide
+  the protocol.
+- `cdpilot health` — JSON status with today's crash count from macOS
+  DiagnosticReports. Designed for `until cdpilot health; do launch;
+  done` watchdog loops.
+
+**What it's NOT:** not a test framework. No runner, no assertion DSL
+(though there are 10 assertion commands for CI pipelines). It replaces
+the automation layer only.
+
+Would love feedback on the `browser auto` policy in particular — the
+two-axis (extension workload × platform stability) ended up being one
+of those decisions that feels obvious in hindsight but wasn't on my
+roadmap. Are there other workload signals I should be reading?
 
 GitHub: https://github.com/mehmetnadir/cdpilot
 npm: https://www.npmjs.com/package/cdpilot
+
+---
+
+## Rebuttal drafts (prepped for expected comments)
+
+**"Why not just use Playwright?"**
+> Fair — if you're writing a test suite, Playwright is the right tool.
+> cdpilot replaces the automation layer below the test runner. If
+> you're an AI agent that needs to take a screenshot of a user's
+> browser, shipping 200MB + a bundled Chromium just to call
+> `page.screenshot()` is wrong-sized for the job.
+
+**"Zero dependencies is a feature until you need something"**
+> Agreed — if I ever need something stdlib can't provide, the zero-dep
+> promise breaks. So far (3600 LOC Python) the discipline has been
+> useful: it forced me to think about what's actually essential vs.
+> what's library habit. The WebSocket client is 80 lines of asyncio.
+> The CDP protocol handler is 30. That's the whole "dependency."
+
+**"Chrome already has remote-debugging"**
+> Yes — cdpilot is a thin ergonomic layer over that. The value is
+> `npx cdpilot go <url>` works on a fresh machine in 2 seconds vs.
+> writing the WebSocket handshake + CDP message pump yourself.
+
+**"This is just curl for browsers"**
+> Basically, yeah. That's a compliment.
+
+---
+
+## URL
+
+https://github.com/mehmetnadir/cdpilot
+
+---
+
+## Notes for the post-launch first hour
+
+- **Don't editorialize the title.** No "My ..." or "I made ..." — HN
+  downweights those.
+- **No emojis in title.** Dang (moderator) kills them.
+- **Respond fast, stay civil.** Even hostile comments — dry acknowledgment
+  > defensive rebuttal.
+- **If someone says "there's already X"** — thank them, check X,
+  acknowledge differences without trashing X.
+- **First 30 minutes matter most.** One upvote in the first 10 min
+  = 10 in hour 3.
