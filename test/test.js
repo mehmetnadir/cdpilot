@@ -214,7 +214,8 @@ test('CAPTCHA_DETECT_JS is read-only (no DOM mutation or network)', () => {
 
 test('get_stealth_config default is OFF (opt-in)', () => {
   // Look at the function body for the default return path.
-  const m = PY_CONTENT.match(/def get_stealth_config\(\):[\s\S]*?\n    return (False|True)\n/);
+  // \r?\n tolerates Windows CRLF checkouts (defense-in-depth alongside .gitattributes).
+  const m = PY_CONTENT.match(/def get_stealth_config\(\):[\s\S]*?\r?\n    return (False|True)\r?\n/);
   assert(m, 'get_stealth_config should have a clear default return');
   assert.strictEqual(m[1], 'False', 'Default must be False (opt-in) for backward compat');
 });
