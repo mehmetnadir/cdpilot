@@ -5006,6 +5006,15 @@ if __name__ == "__main__":
     cmd = sys.argv[1]
     args = sys.argv[2:]
 
+    # POSIX-style flag aliases — accepted at the Python entry point too,
+    # not just at the Node wrapper. Lets `python src/cdpilot.py --version`
+    # work in CI and for users who skip the Node wrapper entirely.
+    if cmd in ('--version', '-v'):
+        cmd = 'version'
+    elif cmd in ('--help', '-h'):
+        print(__doc__)
+        sys.exit(0)
+
     sync_cmds = {
         'launch': cmd_launch,
         'tabs': cmd_tabs,
