@@ -1,0 +1,21 @@
+# Force LF line endings for source files across all platforms.
+# Windows checkouts default to CRLF (core.autocrlf=true), which breaks
+# regex-based source inspection in test.js and any tool that expects \n.
+* text=auto eol=lf
+
+# Explicit LF for source/script files
+*.py text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Binary files — never touch
+*.png binary
+*.jpg binary
+*.gif binary
+*.mp4 binary
+*.crx binary
