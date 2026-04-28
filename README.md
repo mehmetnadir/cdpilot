@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/mehmetnadir-cdpilot-badge.png)](https://mseep.ai/app/mehmetnadir-cdpilot)
+
 # cdpilot
 
 > Zero-dependency browser automation from your terminal. One command, full control.
