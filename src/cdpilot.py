@@ -1563,6 +1563,34 @@ def get_stealth_config():
             pass
     return False
 
+def _sanitize_profile_state(profile_dir):
+    """Patch Default/Preferences to suppress launch dialogs.
+
+    Sets exit_type=Normal so Chrome doesn't show the crash-restore bubble after
+    we kill the process, and disables the password-save infobar. Idempotent —
+    safe to run every launch. Profile is isolated under ~/.cdpilot/, user's
+    personal browser state is never touched.
+    """
+    prefs_path = os.path.join(profile_dir, 'Default', 'Preferences')
+    try:
+        if os.path.exists(prefs_path):
+            with open(prefs_path) as f:
+                prefs = json.load(f)
+        else:
+            os.makedirs(os.path.dirname(prefs_path), exist_ok=True)
+            prefs = {}
+        prof = prefs.setdefault('profile', {})
+        prof['exit_type'] = 'Normal'
+        prof['exited_cleanly'] = True
+        prof['password_manager_enabled'] = False
+        prefs['credentials_enable_service'] = False
+        prefs['credentials_enable_autosignin'] = False
+        with open(prefs_path, 'w') as f:
+            json.dump(prefs, f)
+    except (OSError, ValueError):
+        pass
+
+
 # ─── Commands ───
 
 def cmd_launch():
@@ -1622,6 +1650,7 @@ def cmd_launch():
         # Default: chrome and unknown chromium-based browsers
         profile_dir = PROFILE_DIR + '-chrome'
     os.makedirs(profile_dir, exist_ok=True)
+    _sanitize_profile_state(profile_dir)
 
     chrome_args = [
         CHROME_BIN,
@@ -1648,6 +1677,7 @@ def cmd_launch():
             'BraveVPN', 'BraveWalletBubble', 'SpeedReader', 'Tor',
             'IPFSCompanion', 'Translate', 'OptimizationGuideModelDownloading',
             'InterestFeedContentSuggestions', 'CalculateNativeWinOcclusion',
+            'PasswordManagerOnboarding', 'AutofillServerCommunication',
         ]),
         # ─── Chromium performance flags ───
         '--disable-background-networking',
@@ -1669,6 +1699,8 @@ def cmd_launch():
         '--no-pings',
         '--safebrowsing-disable-auto-update',
         '--password-store=basic',
+        '--use-mock-keychain',
+        '--disable-session-crashed-bubble',
         # ─── GPU / rendering ───
         # --disable-gpu-compositing REMOVED: caused EXC_BREAKPOINT on Apple
         # Silicon Brave 147+ after ~7min. Let the browser use its default
