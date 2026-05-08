@@ -1583,8 +1583,13 @@ def _sanitize_profile_state(profile_dir):
         prof['exit_type'] = 'Normal'
         prof['exited_cleanly'] = True
         prof['password_manager_enabled'] = False
+        prof['password_manager_leak_detection'] = False
         prefs['credentials_enable_service'] = False
         prefs['credentials_enable_autosignin'] = False
+        autofill = prefs.setdefault('autofill', {})
+        autofill['enabled'] = False
+        autofill['profile_enabled'] = False
+        autofill['credit_card_enabled'] = False
         with open(prefs_path, 'w') as f:
             json.dump(prefs, f)
     except (OSError, ValueError):
