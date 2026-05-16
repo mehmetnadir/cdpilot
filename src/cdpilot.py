@@ -465,6 +465,7 @@ CAPTCHA_DETECT_JS = r"""
 PROXY_CONFIG_FILE = os.path.join(PROFILE_DIR, 'proxy.json')
 HEADLESS_CONFIG_FILE = os.path.join(PROFILE_DIR, 'headless.json')
 STEALTH_CONFIG_FILE = os.path.join(PROFILE_DIR, 'stealth.json')
+BLOCK_CONFIG_FILE = os.path.join(PROFILE_DIR, 'block.json')
 DOWNLOAD_CONFIG_FILE = os.path.join(PROFILE_DIR, 'download-config.json')
 SESSION_FILE = os.path.join(PROFILE_DIR, 'sessions.json')
 
@@ -869,13 +870,38 @@ async def _vfx_move_cursor(ws_url, x, y):
 
 # ─── Connection Helpers ───
 
-def cdp_get(path):
-    """GET request to a CDP HTTP endpoint."""
+# Per-process micro-cache for hot CDP HTTP endpoints (`/json`, `/json/version`).
+# A typical CLI invocation calls `cdp_get("/json")` 3-7 times (session lookup,
+# tab discovery, target validation). Each call is a ~10-30ms blocking HTTP
+# roundtrip via urllib. Caching for a short window collapses those into one
+# fetch without changing semantics — CDP tab list rarely changes mid-command.
+# TTL is intentionally tiny: long enough to dedupe within a single command's
+# call graph, short enough that stale state is never a concern across commands.
+_CDP_GET_CACHE = {}  # path -> (timestamp, value)
+_CDP_GET_TTL_S = 0.5
+_CDP_GET_CACHEABLE = ("/json", "/json/version")
+
+
+def cdp_get(path, no_cache=False):
+    """GET request to a CDP HTTP endpoint, with TTL cache for hot paths."""
+    if not no_cache and path in _CDP_GET_CACHEABLE:
+        hit = _CDP_GET_CACHE.get(path)
+        if hit and (time.time() - hit[0]) < _CDP_GET_TTL_S:
+            return hit[1]
     try:
         with urllib.request.urlopen(f"{CDP_BASE}{path}", timeout=3) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
+            data = json.loads(resp.read())
+    except Exception:
         return None
+    if path in _CDP_GET_CACHEABLE:
+        _CDP_GET_CACHE[path] = (time.time(), data)
+    return data
+
+
+def cdp_cache_invalidate():
+    """Drop the cdp_get cache. Call after operations that mutate the tab set
+    (create/close/switch tab) so the next read sees fresh state."""
+    _CDP_GET_CACHE.clear()
 
 
 def get_tabs():
@@ -966,6 +992,7 @@ def _create_session_window():
         resp = urllib.request.urlopen(req, timeout=5)
         data = json.loads(resp.read())
         target_id = data.get("id")
+        cdp_cache_invalidate()
     except Exception:
         target_id = None
 
@@ -1115,6 +1142,18 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
             await ws.send(json.dumps({
                 "id": 50, "method": "Page.addScriptToEvaluateOnNewDocument",
                 "params": {"source": STEALTH_JS}
+            }))
+
+        # Apply request blocking BEFORE navigate, on this same WS session.
+        # Network.setBlockedURLs is session-bound (just like the stealth
+        # script): the patterns are honored until this connection closes.
+        # Setting it before Page.navigate ensures the very first requests
+        # for this page already get blocked.
+        block_cfg = get_block_config()
+        if block_cfg['enabled'] and block_cfg['patterns']:
+            await ws.send(json.dumps({
+                "id": 60, "method": "Network.setBlockedURLs",
+                "params": {"urls": block_cfg['patterns']}
             }))
 
         # Navigate
@@ -1963,6 +2002,57 @@ async def cmd_eval(js_code):
             print(json.dumps(val, indent=2, ensure_ascii=False))
 
 
+async def cmd_eval_batch(exprs_json):
+    """Evaluate N JS expressions in a SINGLE Runtime.evaluate call.
+
+    Input: JSON array of strings. Each string is one JS expression.
+    Output: JSON array of results (one per expression). Per-expression errors
+    are reported as {"error": "..."} without aborting the batch.
+
+    Why this exists:
+      Every CDP `Runtime.evaluate` is a WebSocket roundtrip (~10-40ms over
+      localhost, more over network). For workflows that need many small
+      observations (e.g. read 12 DOM values to fill a report), N sequential
+      `eval` commands cost N × roundtrip. This packs them into one IIFE that
+      runs all N expressions and returns the result array — one roundtrip
+      total. Typical speedup: 5-30x for batches of 5+ expressions.
+    """
+    try:
+        exprs = json.loads(exprs_json) if isinstance(exprs_json, str) else exprs_json
+        if not isinstance(exprs, list) or not all(isinstance(e, str) for e in exprs):
+            print(json.dumps({"error": "Input must be a JSON array of strings"}), file=sys.stderr)
+            sys.exit(1)
+    except (json.JSONDecodeError, TypeError) as exc:
+        print(json.dumps({"error": f"JSON parse error: {exc}"}), file=sys.stderr)
+        sys.exit(1)
+
+    ws, _ = get_page_ws()
+    # Wrap each expression in its own try/catch so one failure doesn't sink
+    # the batch. The user's expression is dropped directly into a parenthesized
+    # position, so any value-producing JS works as-is (`1+1`, `document.title`,
+    # `await fetch(...).then(r=>r.json())`). Statement-style code that needs
+    # `let`/`const` must be wrapped manually: `(function(){let x=1; return x})()`.
+    wrapped = []
+    for e in exprs:
+        wrapped.append(
+            "(async function(){try{return {ok:true, value: (" + e + ")};}"
+            "catch(err){return {ok:false, error:String(err && err.message || err)};}})()"
+        )
+    js = "Promise.all([" + ",".join(wrapped) + "])"
+    r = await cdp_send(ws, [(1, "Runtime.evaluate", {
+        "expression": js,
+        "returnByValue": True,
+        "awaitPromise": True,
+    })], timeout=30)
+    result = r.get(1, {})
+    if "exceptionDetails" in result:
+        exc = result["exceptionDetails"]
+        print(json.dumps({"error": f"batch failed: {exc.get('text', '')}"}), file=sys.stderr)
+        sys.exit(1)
+    val = result.get("result", {}).get("value", [])
+    print(json.dumps(val, indent=2, ensure_ascii=False))
+
+
 async def cmd_click(selector):
     ws, _ = get_page_ws()
     safe_sel = json.dumps(selector)
@@ -2583,6 +2673,7 @@ async def cmd_new_tab(url='about:blank'):
     import urllib.parse
     safe_chars = ":/?#[]@!$&'()*+,;="
     data = cdp_get(f'/json/new?{urllib.parse.quote(url, safe=safe_chars)}')
+    cdp_cache_invalidate()
     if data:
         print(f'New tab opened: {data.get("url", url)}')
         print(f'  ID: {data.get("id", "?")}')
@@ -2619,6 +2710,7 @@ async def cmd_close_tab(index_or_id=None):
     if index_or_id is None:
         ws, page = get_page_ws()
         r = await cdp_send(ws, [(1, 'Page.close', {})])
+        cdp_cache_invalidate()
         print('Active tab closed')
         return
 
@@ -2644,6 +2736,7 @@ async def cmd_close_tab(index_or_id=None):
                 await asyncio.wait_for(ws.recv(), timeout=3)
             except:
                 pass
+        cdp_cache_invalidate()
         print(f'Tab closed: {target.get("title", "")[:60]}')
     else:
         print(f'Tab not found: {index_or_id}', file=sys.stderr)
@@ -2883,6 +2976,132 @@ def cmd_health():
 
     print(json.dumps(info, ensure_ascii=False))
     sys.exit(0 if info['alive'] else 2)
+
+
+# ─── Resource Block (perf opt-in) ───
+#
+# Why this exists:
+#   Many automation workloads don't need images, fonts, or analytics pings.
+#   Blocking them via CDP Network.setBlockedURLs cuts page load time
+#   dramatically (often 3-10x) — bytes transferred drop, decoder pressure
+#   drops, third-party connections drop.
+#
+# Stealth caveat:
+#   Blocking changes the fingerprint surface — a real browser fetches images
+#   and fonts. Cloudflare-class bot detectors notice missing requests. Keep
+#   block-resources OFF when fighting bot challenges; turn it ON for known
+#   internal/safe sites where speed matters more than blending in.
+#
+# Preset patterns are wildcards understood by Chromium's Network.setBlockedURLs.
+BLOCK_PRESETS = {
+    'images': ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.webp', '*.svg', '*.ico', '*.bmp'],
+    'fonts':  ['*.woff', '*.woff2', '*.ttf', '*.otf', '*.eot'],
+    'media':  ['*.mp4', '*.webm', '*.mp3', '*.wav', '*.ogg', '*.m4a', '*.m4v'],
+    'ads': [
+        '*googletagmanager.com*', '*google-analytics.com*', '*doubleclick.net*',
+        '*facebook.com/tr*', '*facebook.net*', '*hotjar.com*', '*segment.io*',
+        '*mixpanel.com*', '*amplitude.com*', '*googlesyndication.com*',
+        '*adservice.google.*', '*ads.yahoo.com*', '*scorecardresearch.com*',
+    ],
+}
+
+
+def get_block_config():
+    """Return {'enabled': bool, 'patterns': [str, ...]} for the block system."""
+    if not os.path.exists(BLOCK_CONFIG_FILE):
+        return {'enabled': False, 'patterns': []}
+    try:
+        with open(BLOCK_CONFIG_FILE) as f:
+            data = json.load(f)
+        return {
+            'enabled': bool(data.get('enabled', False)),
+            'patterns': list(data.get('patterns', [])),
+        }
+    except (OSError, ValueError):
+        return {'enabled': False, 'patterns': []}
+
+
+def _save_block_config(enabled, patterns):
+    os.makedirs(os.path.dirname(BLOCK_CONFIG_FILE), exist_ok=True)
+    with open(BLOCK_CONFIG_FILE, 'w') as f:
+        json.dump({'enabled': enabled, 'patterns': patterns}, f)
+
+
+def cmd_block(*args):
+    """Manage CDP request blocking (Network.setBlockedURLs).
+
+    Usage:
+      cdpilot block                                   # status
+      cdpilot block on                                # enable with current patterns (default preset if none set)
+      cdpilot block off                               # disable
+      cdpilot block preset images,fonts,ads,media     # set patterns from named presets
+      cdpilot block patterns '*.png' '*.woff2'        # set custom patterns directly
+      cdpilot block clear                             # drop all patterns
+
+    Effect applies on the next `cdpilot go <url>` (or any command that triggers
+    navigate_collect). Existing pages keep their network policy. Opt-in only —
+    breaks fingerprint plausibility, do NOT combine with stealth-mode targets.
+    """
+    cfg = get_block_config()
+
+    if not args:
+        print(f'Block: {"on" if cfg["enabled"] else "off"}')
+        if cfg['patterns']:
+            print(f'  Patterns ({len(cfg["patterns"])}):')
+            for p in cfg['patterns'][:10]:
+                print(f'    {p}')
+            if len(cfg['patterns']) > 10:
+                print(f'    ... and {len(cfg["patterns"]) - 10} more')
+        else:
+            print('  Patterns: (none)')
+        return
+
+    sub = args[0].lower()
+    if sub in ('status',):
+        cmd_block()
+        return
+    if sub in ('on', '1', 'true', 'yes'):
+        patterns = cfg['patterns'] or (
+            BLOCK_PRESETS['images'] + BLOCK_PRESETS['fonts'] + BLOCK_PRESETS['ads']
+        )
+        _save_block_config(True, patterns)
+        print(f'Block: on ({len(patterns)} patterns)')
+        print('Effect applies on next navigation.')
+        return
+    if sub in ('off', '0', 'false', 'no'):
+        _save_block_config(False, cfg['patterns'])
+        print('Block: off')
+        return
+    if sub == 'clear':
+        _save_block_config(False, [])
+        print('Block: cleared')
+        return
+    if sub == 'preset':
+        if len(args) < 2:
+            print('Usage: cdpilot block preset <names>  (e.g. images,fonts,ads,media)', file=sys.stderr)
+            sys.exit(1)
+        names = [n.strip().lower() for n in args[1].split(',') if n.strip()]
+        unknown = [n for n in names if n not in BLOCK_PRESETS]
+        if unknown:
+            print(f'Unknown preset(s): {", ".join(unknown)}. Available: {", ".join(BLOCK_PRESETS)}', file=sys.stderr)
+            sys.exit(1)
+        patterns = []
+        for n in names:
+            patterns.extend(BLOCK_PRESETS[n])
+        _save_block_config(True, patterns)
+        print(f'Block: on — preset {",".join(names)} → {len(patterns)} patterns')
+        return
+    if sub == 'patterns':
+        if len(args) < 2:
+            print('Usage: cdpilot block patterns <pattern1> [pattern2 ...]', file=sys.stderr)
+            sys.exit(1)
+        patterns = list(args[1:])
+        _save_block_config(True, patterns)
+        print(f'Block: on — {len(patterns)} custom pattern(s)')
+        return
+
+    print(f'Unknown subcommand: {sub}. Use on|off|status|preset|patterns|clear.', file=sys.stderr)
+    sys.exit(1)
 
 
 def cmd_stealth(state=None):
@@ -4126,22 +4345,28 @@ async def cmd_wait_for_text(text, timeout_ms=5000):
       return new Promise(function(resolve) {{
         var needle = {safe_text};
         function check() {{
-          var bodyText = document.body && document.body.innerText || '';
-          if (bodyText.indexOf(needle) !== -1) {{
-            var idx = bodyText.indexOf(needle);
-            var ctx = bodyText.substring(Math.max(0, idx - 30), Math.min(bodyText.length, idx + needle.length + 30));
-            return 'FOUND: "' + ctx.replace(/\\s+/g, ' ').trim() + '"';
-          }}
-          return null;
+          var bodyText = (document.body && document.body.innerText) || '';
+          var idx = bodyText.indexOf(needle);
+          if (idx === -1) return null;
+          var ctx = bodyText.substring(Math.max(0, idx - 30), Math.min(bodyText.length, idx + needle.length + 30));
+          return 'FOUND: "' + ctx.replace(/\\s+/g, ' ').trim() + '"';
         }}
         var hit = check();
         if (hit) return resolve(hit);
-        var obs = new MutationObserver(function() {{
-          var r = check();
-          if (r) {{ obs.disconnect(); resolve(r); }}
-        }});
+        var pending = false, done = false;
+        function schedule() {{
+          if (pending || done) return;
+          pending = true;
+          requestAnimationFrame(function() {{
+            pending = false;
+            if (done) return;
+            var r = check();
+            if (r) {{ done = true; obs.disconnect(); resolve(r); }}
+          }});
+        }}
+        var obs = new MutationObserver(schedule);
         obs.observe(document.body, {{childList: true, subtree: true, characterData: true}});
-        setTimeout(function() {{ obs.disconnect(); resolve('TIMEOUT: text "' + needle.substring(0, 40) + '" not found after {timeout_ms}ms'); }}, {timeout_ms});
+        setTimeout(function() {{ if (done) return; done = true; obs.disconnect(); resolve('TIMEOUT: text "' + needle.substring(0, 40) + '" not found after {timeout_ms}ms'); }}, {timeout_ms});
       }});
     }})()
     """
@@ -4902,6 +5127,8 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_eval", "description": "Execute arbitrary JavaScript code in the browser page context and return the result. Use for custom DOM queries, data extraction, or page manipulation that other tools don't cover. Expression is evaluated via Runtime.evaluate.",
              "inputSchema": {"type": "object", "properties": {"expression": {"type": "string", "description": "JavaScript expression to evaluate (e.g. 'document.title', 'document.querySelectorAll(\"a\").length')"}}, "required": ["expression"]}},
+            {"name": "browser_eval_batch", "description": "Evaluate N JavaScript expressions in a SINGLE round-trip. Returns an array of {ok, value} or {ok:false, error} objects, one per expression — a failure in one does not abort the batch. Use this when you need many small observations (read 10 DOM values, query multiple selectors, build a report) — collapses N×roundtrip into 1×roundtrip, typically 5-30x faster than calling browser_eval repeatedly.",
+             "inputSchema": {"type": "object", "properties": {"expressions": {"type": "array", "items": {"type": "string"}, "description": "Array of JavaScript expression strings. Each runs in its own try/catch."}}, "required": ["expressions"]}},
             {"name": "browser_tabs", "description": "List all open browser tabs with their IDs, URLs, and titles. Use this to see what pages are open and get tab IDs for switching between them with other navigation commands.",
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_console", "description": "Navigate to a URL and capture all browser console output (log, warn, error, info) and uncaught exceptions. Use for debugging JavaScript errors, monitoring API calls logged to console, or verifying application behavior.",
@@ -4995,6 +5222,7 @@ class MCPServer:
             "browser_content": lambda a: ["content"],
             "browser_html": lambda a: ["html"],
             "browser_eval": lambda a: ["eval", a.get("expression", "")],
+            "browser_eval_batch": lambda a: ["eval-batch", json.dumps(a.get("expressions", []))],
             "browser_tabs": lambda a: ["tabs"],
             "browser_console": lambda a: ["console"] + ([a["url"]] if a.get("url") else []),
             "browser_network": lambda a: ["network"] + ([a["url"]] if a.get("url") else []),
@@ -5102,6 +5330,7 @@ if __name__ == "__main__":
         'proxy': lambda: cmd_proxy(args[0] if args else None),
         'headless': lambda: cmd_headless(args[0] if args else None),
         'stealth': lambda: cmd_stealth(args[0] if args else None),
+        'block': lambda: cmd_block(*args),
         'browser': lambda: cmd_browser(args[0] if args else None),
         'health': cmd_health,
         'session': cmd_session,
@@ -5160,6 +5389,7 @@ if __name__ == "__main__":
         "shot-annotated": lambda: cmd_shot_annotated(args[0] if args else None),
         "batch": cmd_batch,
         "eval": lambda: (require_args(1, "eval <js>"), None)[1] if not args else cmd_eval(" ".join(args)),
+        "eval-batch": lambda: (require_args(1, "eval-batch <json_array_of_expressions>"), None)[1] if not args else cmd_eval_batch(args[0]),
         "click": lambda: (require_args(1, "click <selector>"), None)[1] if not args else cmd_click(args[0]),
         "fill": lambda: (require_args(2, "fill <selector> <value>"), None)[1] if len(args) < 2 else cmd_fill(args[0], " ".join(args[1:])),
         "submit": lambda: cmd_submit(args[0] if args else "form"),

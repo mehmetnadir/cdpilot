@@ -119,7 +119,30 @@ cdpilot network [url]         # Monitor network requests
 cdpilot debug [url]           # Full diagnostic (console+network+perf+shot)
 cdpilot perf                  # Performance metrics
 cdpilot eval <js>             # Execute JavaScript
+cdpilot eval-batch <json>     # Run N JS expressions in 1 roundtrip (5-30x faster)
 ```
+
+```bash
+# Example: read 4 DOM values in a single CDP roundtrip instead of 4
+cdpilot eval-batch '["document.title","location.href","document.links.length","document.images.length"]'
+# → [{"ok":true,"value":"..."}, {"ok":true,"value":"..."}, ...]
+```
+
+### Performance
+
+```bash
+cdpilot block                                # Show status
+cdpilot block on                             # Enable (default preset: images+fonts+ads)
+cdpilot block off                            # Disable
+cdpilot block preset images,fonts,ads,media  # Set patterns from named presets
+cdpilot block patterns '*.png' '*.woff2'     # Custom URL patterns
+cdpilot block clear                          # Drop all patterns
+```
+
+> **Stealth caveat:** `block` changes the fingerprint surface — real browsers fetch
+> images, fonts, and analytics. Cloudflare-class bot detectors notice missing
+> requests. Keep `block` **off** for stealth/anti-bot targets; turn it **on** for
+> known-safe internal sites where speed matters more than blending in.
 
 ### Tab Management
 
@@ -348,6 +371,8 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] **Annotated screenshots** — @N badge overlays on interactive elements
 - [x] **Auto-wait** — MutationObserver-based, 5s automatic element waiting
 - [x] **`wait-for-text`** — adaptive text-based waiting (subtree + characterData) for streaming AI responses, async toasts, and selector-less synchronization
+- [x] **`eval-batch`** — run N JS expressions in 1 CDP roundtrip (5-30x speedup vs sequential `eval`)
+- [x] **`block`** — request blocking via `Network.setBlockedURLs` with built-in presets (images/fonts/ads/media), 3-10x faster page loads on opt-in
 - [x] **Batch commands** — pipe JSON arrays via stdin for multi-step automation
 - [x] Visual feedback system (persistent green glow, cursor, ripples, keystroke display)
 - [x] AI control warning toast (red warning when user interacts during automation)

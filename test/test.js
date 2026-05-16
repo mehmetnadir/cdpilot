@@ -294,6 +294,86 @@ test('browser_wait_for_text MCP tool exposed in tools/list and tool_map', () => 
     "browser_wait_for_text should map to wait-for-text CLI command");
 });
 
+// ── Perf: cdp_get cache, eval-batch, block-resources ──
+
+test('cdp_get has TTL cache for /json and /json/version', () => {
+  assert(/_CDP_GET_CACHE\b/.test(PY_CONTENT),
+    "Should declare _CDP_GET_CACHE structure");
+  assert(/_CDP_GET_CACHEABLE\s*=\s*\(\s*"\/json"\s*,\s*"\/json\/version"\s*\)/.test(PY_CONTENT),
+    "Should declare which paths are cacheable");
+  // Honor an explicit bypass so callers that need fresh state can opt out.
+  assert(/def cdp_get\(path,\s*no_cache=False\)/.test(PY_CONTENT),
+    "cdp_get should accept no_cache bypass parameter");
+});
+
+test('cdp_cache_invalidate is called after tab-mutating ops', () => {
+  // /json reflects tab set + URLs; mutations must drop the cache so the next
+  // read isn't stale. We invalidate on new-tab, close-tab, and session window
+  // creation — the three places we know the tab set changed.
+  assert(/def cdp_cache_invalidate\(\)/.test(PY_CONTENT),
+    "Should define cdp_cache_invalidate()");
+  const newTab = PY_CONTENT.match(/async def cmd_new_tab[\s\S]*?cdp_cache_invalidate\(\)/);
+  assert(newTab, "cmd_new_tab should invalidate cache after creating a tab");
+  const closeTab = PY_CONTENT.match(/async def cmd_close_tab[\s\S]*?cdp_cache_invalidate\(\)/);
+  assert(closeTab, "cmd_close_tab should invalidate cache after closing a tab");
+});
+
+test('eval-batch command is defined and runs all expressions in one Promise.all', () => {
+  assert(/async def cmd_eval_batch\(exprs_json\):/.test(PY_CONTENT),
+    "Should define async def cmd_eval_batch(exprs_json)");
+  // The whole point: one Runtime.evaluate, N expressions inside. Promise.all
+  // is the cheap way to keep return order stable + parallel-friendly.
+  const m = PY_CONTENT.match(/async def cmd_eval_batch[\s\S]*?Promise\.all\(\[/);
+  assert(m, "cmd_eval_batch should wrap all expressions in Promise.all([...])");
+  // Each expression must be wrapped in its own try/catch so one failure
+  // doesn't sink the entire batch.
+  const m2 = PY_CONTENT.match(/async def cmd_eval_batch[\s\S]*?try\{[\s\S]*?catch\(err\)/);
+  assert(m2, "cmd_eval_batch should wrap each expression in try/catch");
+});
+
+test('eval-batch is registered in dispatch', () => {
+  assert(/"eval-batch":\s*lambda:[\s\S]*?cmd_eval_batch\(args\[0\]\)/.test(PY_CONTENT),
+    "Should register 'eval-batch' in dispatch");
+});
+
+test('browser_eval_batch MCP tool exposed in tools/list and tool_map', () => {
+  assert(PY_CONTENT.includes('"browser_eval_batch"'),
+    "browser_eval_batch should appear as MCP tool name");
+  assert(/"browser_eval_batch":\s*lambda\s+a:\s*\["eval-batch"/.test(PY_CONTENT),
+    "browser_eval_batch should map to eval-batch CLI command");
+});
+
+test('block-resources: config + presets + cmd_block defined', () => {
+  assert(/BLOCK_CONFIG_FILE\s*=/.test(PY_CONTENT),
+    "Should declare BLOCK_CONFIG_FILE path");
+  assert(/BLOCK_PRESETS\s*=\s*\{[\s\S]*?'images'[\s\S]*?'fonts'[\s\S]*?'ads'/.test(PY_CONTENT),
+    "BLOCK_PRESETS should expose images/fonts/ads preset groups");
+  assert(/def get_block_config\(\)/.test(PY_CONTENT),
+    "Should define get_block_config()");
+  assert(/def cmd_block\(\*args\):/.test(PY_CONTENT),
+    "Should define cmd_block accepting variadic args");
+});
+
+test('navigate_collect applies Network.setBlockedURLs when block is enabled', () => {
+  // Block must be wired into the SAME WS that runs Page.navigate, otherwise
+  // the patterns don't apply to the very first request. We also need it
+  // gated behind get_block_config() so disabled-by-default is honored.
+  const m = PY_CONTENT.match(/async def navigate_collect[\s\S]*?get_block_config\(\)[\s\S]*?Network\.setBlockedURLs/);
+  assert(m, "navigate_collect should send Network.setBlockedURLs when get_block_config().enabled");
+});
+
+test('block command is registered in dispatch', () => {
+  assert(/'block':\s*lambda:\s*cmd_block\(\*args\)/.test(PY_CONTENT),
+    "Should register 'block' in dispatch with variadic args");
+});
+
+test('help output advertises eval-batch and block', () => {
+  const out = run('--help');
+  assert(out.includes('eval-batch'), "Help should advertise eval-batch");
+  assert(out.includes('block'), "Help should advertise block");
+  assert(out.includes('PERFORMANCE'), "Help should have a PERFORMANCE section");
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
