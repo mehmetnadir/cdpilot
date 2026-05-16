@@ -318,6 +318,12 @@ function showHelp() {
     network [url]      Monitor network requests
     debug [url]        Full diagnostic
     eval <js>          Execute JavaScript
+    eval-batch <json>  Run N JS expressions in 1 roundtrip (perf)
+
+  PERFORMANCE
+    block [on|off|preset|patterns|clear]
+                       Block requests via Network.setBlockedURLs (perf opt-in,
+                       breaks fingerprint plausibility — not for stealth targets)
 
   TABS
     tabs               List open tabs
