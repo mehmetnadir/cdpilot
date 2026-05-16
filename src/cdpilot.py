@@ -467,6 +467,7 @@ PROXY_CONFIG_FILE = os.path.join(PROFILE_DIR, 'proxy.json')
 HEADLESS_CONFIG_FILE = os.path.join(PROFILE_DIR, 'headless.json')
 STEALTH_CONFIG_FILE = os.path.join(PROFILE_DIR, 'stealth.json')
 BLOCK_CONFIG_FILE = os.path.join(PROFILE_DIR, 'block.json')
+FAST_CONFIG_FILE = os.path.join(PROFILE_DIR, 'fast.json')
 DOWNLOAD_CONFIG_FILE = os.path.join(PROFILE_DIR, 'download-config.json')
 SESSION_FILE = os.path.join(PROFILE_DIR, 'sessions.json')
 
@@ -793,6 +794,12 @@ async def _control_start(ws_url):
     the currently-loaded document — that's by design.
     """
     global _glow_script_id
+    # Visual feedback default OFF since 0.4.4. _control_start is the per-command
+    # entry point — gating here turns off glow/cursor/ripples globally without
+    # touching every command's code path. Backward compat preserved by
+    # get_visual_config() honoring CDPILOT_MCP_SESSION=1 and CDPILOT_SHOW=1.
+    if not get_visual_config():
+        return
     try:
         # NOTE: addScriptToEvaluateOnNewDocument registered here is session-bound
         # to the WS connection cdp_send opens — it dies when this call returns.
@@ -827,6 +834,11 @@ async def _control_end(ws_url):
     In CLI mode: glow fades after 10s idle (GLOW_TIMEOUT_JS).
     """
     global _glow_script_id
+    # Symmetric with _control_start: if visual feedback is off, skip the
+    # re-inject + timeout dance entirely. Caller checked this already, but
+    # belt-and-braces in case some other path invokes _control_end directly.
+    if not get_visual_config():
+        return
     try:
         cmds = [
             (903, "Runtime.evaluate", {"expression": INPUT_BLOCKER_OFF, "returnByValue": True}),
@@ -1414,14 +1426,21 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
 
                 if method == "Page.loadEventFired":
                     loaded = True
-                    await asyncio.sleep(1.5)
+                    # Was 1.5s blind sleep. Most pages settle within 300ms
+                    # of the load event. Pages with late JS still get up to
+                    # the outer 20s deadline via the next iteration's recv —
+                    # we just don't pay 1.2s of dead waiting on every nav.
+                    await asyncio.sleep(0.3)
                     break
             except asyncio.TimeoutError:
                 if loaded:
                     break
 
-        # Inject visual indicator (glow overlay + visual feedback)
-        if glow:
+        # Inject visual indicator (glow overlay + visual feedback).
+        # Default OFF since 0.4.4 — the glow/cursor animations made cdpilot
+        # feel sluggish in real automation. Re-enable with `cdpilot show on`
+        # or via CDPILOT_MCP_SESSION=1 / CDPILOT_SHOW=1.
+        if glow and get_visual_config():
             await ws.send(json.dumps({
                 "id": 200, "method": "Runtime.evaluate",
                 "params": {"expression": GLOW_CSS, "returnByValue": True}
@@ -2276,11 +2295,12 @@ async def cmd_eval_batch(exprs_json):
 async def cmd_click(selector):
     ws, _ = get_page_ws()
     safe_sel = json.dumps(selector)
+    wait_ms = get_auto_wait_ms()
     js = WAIT_AND_QUERY_JS + f"""
 (function() {{
-    return window.__cdpilot_waitFor({safe_sel}, 5000).then(function(el) {{
+    return window.__cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
         if (!el) return 'Timeout waiting for: ' + {safe_sel};
-        el.scrollIntoView({{behavior:'smooth', block:'center'}});
+        el.scrollIntoView({{behavior:'instant', block:'center'}});
         if (window.__cdpilot_vfx) {{
             var r = el.getBoundingClientRect();
             var cx = Math.round(r.left + r.width/2), cy = Math.round(r.top + r.height/2);
@@ -2300,9 +2320,10 @@ async def cmd_fill(selector, value):
     ws, _ = get_page_ws()
     safe_sel = json.dumps(selector)
     safe_value = json.dumps(value)
+    wait_ms = get_auto_wait_ms()
     js = WAIT_AND_QUERY_JS + f"""
 (function() {{
-    return window.__cdpilot_waitFor({safe_sel}, 5000).then(function(el) {{
+    return window.__cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
         if (!el) return 'Timeout waiting for: ' + {safe_sel};
         el.focus();
         if (window.__cdpilot_vfx) {{
@@ -3354,6 +3375,156 @@ def cmd_stealth(state=None):
         json.dump({'stealth': enabled}, f)
     print(f'Stealth: {"on" if enabled else "off"}')
     print('Effect applies on next navigation (`cdpilot go <url>`).')
+
+
+# ─── Visual feedback config (default OFF) ───
+#
+# Why default OFF (BEHAVIOR CHANGE from 0.4.x):
+#   The visual feedback layer (green glow border, fake cursor, click ripples,
+#   keystroke display) was an early "is the AI working?" trust signal. In
+#   real automation use it makes cdpilot feel slow and amateurish — animated
+#   cursor moves take frames, the glow flashes between pages, every action
+#   triggers a ripple. Defaulting OFF gives a quiet, professional experience.
+#   Use `cdpilot show on` (or set `CDPILOT_MCP_SESSION=1`) to bring it back.
+#
+# Backwards-compat: CDPILOT_MCP_SESSION=1 still forces visual ON (used by
+# the MCP server's persistent-glow flow). Existing scripts that rely on the
+# visual layer can opt in via `cdpilot show on` once.
+
+VISUAL_CONFIG_FILE = os.path.join(PROFILE_DIR, 'visual.json')
+
+
+def _atomic_write_json(path, data):
+    """Write JSON to `path` atomically — write to a temp file then os.replace.
+
+    Without this, a concurrent reader (every command opens get_visual_config
+    or get_fast_config) could observe a truncated file mid-write and fall
+    through to the default. For the visual toggle this means glow flickering
+    off for a single command. os.replace is POSIX-atomic on the same fs.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def get_visual_config():
+    """Return True if the visual feedback layer should be injected on navigate."""
+    # MCP persistent-glow flow takes precedence — it's how AI sessions signal
+    # "I'm using this browser" to the human watching, and that promise was
+    # made in 0.4.x docs. Don't break it silently.
+    if os.environ.get('CDPILOT_MCP_SESSION') == '1':
+        return True
+    if os.environ.get('CDPILOT_SHOW') in ('1', 'true', 'yes', 'on'):
+        return True
+    if os.path.exists(VISUAL_CONFIG_FILE):
+        try:
+            with open(VISUAL_CONFIG_FILE) as f:
+                return bool(json.load(f).get('enabled', False))
+        except (OSError, ValueError):
+            pass
+    return False
+
+
+def cmd_show(state=None):
+    """Toggle the visual feedback layer (glow + cursor + ripples + keystrokes).
+
+    Usage:
+      cdpilot show              # status
+      cdpilot show on|off       # toggle
+      cdpilot show status       # status (alias)
+
+    Default since 0.4.4: OFF. The MCP server's `CDPILOT_MCP_SESSION=1` flow
+    still forces ON regardless of this setting — that's the persistent-glow
+    promise to humans watching an AI session. The `cdpilot glow on/off`
+    command is an explicit per-action override and is NOT gated by this
+    config — call it directly to flash glow on demand without persisting.
+    """
+    if state is None or state.lower() == 'status':
+        current = get_visual_config()
+        print(f'Visual feedback: {"on" if current else "off"}')
+        if os.environ.get('CDPILOT_MCP_SESSION') == '1':
+            print('  (forced ON by CDPILOT_MCP_SESSION=1)')
+        return
+    s = state.lower()
+    if s not in ('on', 'off', '1', '0', 'true', 'false', 'yes', 'no'):
+        print(f"Invalid state: {state}. Use 'on', 'off', or 'status'.", file=sys.stderr)
+        sys.exit(1)
+    enabled = s in ('on', '1', 'true', 'yes')
+    _atomic_write_json(VISUAL_CONFIG_FILE, {'enabled': enabled})
+    print(f'Visual feedback: {"on" if enabled else "off"}')
+    print('Effect applies on next navigation.')
+
+
+# ─── Fast mode (auto-wait shrink, post-load shrink, opt-in bundle) ───
+#
+# A single switch that flips multiple timing knobs to "professional speed":
+# - auto-wait timeout default 5000ms → 2000ms (configurable via CDPILOT_WAIT_MS)
+# Visual feedback toggling has its own command (`show`) because it's a UX
+# concern, not a timing one. `fast` is purely about how long we wait.
+
+FAST_DEFAULT_WAIT_MS = 2000
+NORMAL_DEFAULT_WAIT_MS = 5000
+
+
+def get_fast_config():
+    """Return True if fast mode is enabled."""
+    if os.environ.get('CDPILOT_FAST') in ('1', 'true', 'yes', 'on'):
+        return True
+    if os.path.exists(FAST_CONFIG_FILE):
+        try:
+            with open(FAST_CONFIG_FILE) as f:
+                return bool(json.load(f).get('enabled', False))
+        except (OSError, ValueError):
+            pass
+    return False
+
+
+def get_auto_wait_ms():
+    """Return the effective auto-wait timeout in milliseconds.
+
+    Resolution order: explicit CDPILOT_WAIT_MS env (user override) → fast
+    mode default (2000) → normal default (5000). The env variable wins
+    even over fast mode so power users can dial it independently.
+
+    The env value is clamped to [100, 120_000]:
+      - 0 would make __cdpilot_waitFor return null instantly, breaking every
+        click on pages where the element renders even one paint frame late.
+      - 100ms is a sane floor — single render tick + small buffer.
+      - 120s (2 min) is a sane ceiling — beyond that the outer command timeout
+        kicks in anyway; asyncio also handles very large floats poorly.
+    """
+    env = os.environ.get('CDPILOT_WAIT_MS')
+    if env and env.isdigit():
+        return max(100, min(int(env), 120_000))
+    return FAST_DEFAULT_WAIT_MS if get_fast_config() else NORMAL_DEFAULT_WAIT_MS
+
+
+def cmd_fast(state=None):
+    """Toggle fast mode — shorter auto-wait, less idle padding.
+
+    Usage:
+      cdpilot fast              # status (shows effective auto-wait ms)
+      cdpilot fast on|off       # toggle
+      cdpilot fast status       # status (alias)
+
+    Override the timeout independently via env CDPILOT_WAIT_MS=<ms>.
+    """
+    if state is None or state.lower() == 'status':
+        current = get_fast_config()
+        effective = get_auto_wait_ms()
+        print(f'Fast mode: {"on" if current else "off"}')
+        print(f'  Effective auto-wait: {effective}ms')
+        return
+    s = state.lower()
+    if s not in ('on', 'off', '1', '0', 'true', 'false', 'yes', 'no'):
+        print(f"Invalid state: {state}. Use 'on', 'off', or 'status'.", file=sys.stderr)
+        sys.exit(1)
+    enabled = s in ('on', '1', 'true', 'yes')
+    _atomic_write_json(FAST_CONFIG_FILE, {'enabled': enabled})
+    print(f'Fast mode: {"on" if enabled else "off"}')
+    print(f'  Effective auto-wait: {get_auto_wait_ms()}ms')
 
 
 async def _detect_captcha(ws_url):
@@ -5081,7 +5252,7 @@ async def cmd_keys(combo):
 async def cmd_scroll_to(selector):
     """Scroll the specified element into view."""
     ws_url, _ = get_page_ws()
-    js = f"(function(){{ var el=document.querySelector({json.dumps(selector)}); if(!el) return false; el.scrollIntoView({{behavior:'smooth',block:'center'}}); return true; }})()"
+    js = f"(function(){{ var el=document.querySelector({json.dumps(selector)}); if(!el) return false; el.scrollIntoView({{behavior:'instant',block:'center'}}); return true; }})()"
     res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
     ok = res.get(1, {}).get("result", {}).get("value", False)
     if ok:
@@ -5551,6 +5722,8 @@ if __name__ == "__main__":
         'headless': lambda: cmd_headless(args[0] if args else None),
         'stealth': lambda: cmd_stealth(args[0] if args else None),
         'block': lambda: cmd_block(*args),
+        'show': lambda: cmd_show(args[0] if args else None),
+        'fast': lambda: cmd_fast(args[0] if args else None),
         'browser': lambda: cmd_browser(args[0] if args else None),
         'health': cmd_health,
         'session': cmd_session,

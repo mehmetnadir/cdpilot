@@ -324,6 +324,9 @@ function showHelp() {
     block [on|off|preset|patterns|clear]
                        Block requests via Network.setBlockedURLs (perf opt-in,
                        breaks fingerprint plausibility — not for stealth targets)
+    fast [on|off]      Fast mode — auto-wait 5s→2s (env CDPILOT_WAIT_MS overrides)
+    show [on|off]      Visual feedback (glow + cursor + ripples).
+                       Default OFF since 0.4.4 — opt-in for "see automation" mode.
 
   TABS
     tabs               List open tabs

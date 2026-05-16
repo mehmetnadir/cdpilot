@@ -432,6 +432,90 @@ test('WS pool: per-URL lock prevents command interleaving', () => {
     "Pooled path must acquire _ws_lock(ws_url) before touching the connection");
 });
 
+// ── Efficient mode: scroll, post-load, visual, fast ──
+
+test('scrollIntoView uses instant (not smooth) everywhere', () => {
+  // Smooth scroll animates ~300-500ms before the click can fire. In automation
+  // it never adds value and adds time. The previous behavior was a regression
+  // we inherited from earlier "make it feel alive" code.
+  assert(!/behavior:\s*'smooth'/.test(PY_CONTENT),
+    "No JS in cdpilot.py should use scrollIntoView with behavior:'smooth'");
+  // And we DO want instant on at least one of the action sites:
+  assert(/behavior:\s*'instant'/.test(PY_CONTENT),
+    "At least one action should use scrollIntoView({behavior:'instant'}) — verifies the replacement actually landed");
+});
+
+test('navigate_collect post-load sleep cut from 1.5s to 0.3s', () => {
+  // The 1.5s blind wait after Page.loadEventFired was the single biggest
+  // contributor to the "amateur typing" feel. 0.3s is enough buffer for late
+  // JS without blocking on every navigation.
+  const m = PY_CONTENT.match(/async def navigate_collect[\s\S]*?Page\.loadEventFired[\s\S]*?asyncio\.sleep\(0\.3\)/);
+  assert(m, "navigate_collect should sleep 0.3s after loadEventFired (was 1.5s)");
+  // Negative assert: the old 1.5s must NOT come back here.
+  const neg = PY_CONTENT.match(/async def navigate_collect[\s\S]*?asyncio\.sleep\(1\.5\)/);
+  assert(!neg, "navigate_collect must not regress to the 1.5s sleep");
+});
+
+test('visual feedback config: default OFF', () => {
+  // The whole "professional feel" change. Default OFF means new users don't
+  // see the glow/cursor unless they opt in via `cdpilot show on` or env.
+  assert(/def get_visual_config\(\)/.test(PY_CONTENT),
+    "Should define get_visual_config()");
+  // Default-false branch is explicit at the bottom of get_visual_config.
+  const m = PY_CONTENT.match(/def get_visual_config[\s\S]*?return False\s*$/m);
+  assert(m, "get_visual_config() must end with `return False` — default OFF");
+  // Backward compat: CDPILOT_MCP_SESSION=1 still forces ON (MCP persistent glow).
+  assert(/CDPILOT_MCP_SESSION[\s\S]{0,200}?return True/.test(PY_CONTENT),
+    "CDPILOT_MCP_SESSION=1 must short-circuit to True (backward compat)");
+});
+
+test('_control_start and _control_end gate on visual config', () => {
+  // _control_start/_control_end re-inject glow on every command boundary —
+  // they bypass navigate_collect's gate. Both must respect the visual config
+  // or `cdpilot show off` silently fails to remove the glow.
+  const start = PY_CONTENT.match(/async def _control_start[\s\S]{0,800}?if not get_visual_config\(\):\s*\n\s*return/);
+  assert(start, "_control_start must early-return when get_visual_config() is False");
+  const end = PY_CONTENT.match(/async def _control_end[\s\S]{0,800}?if not get_visual_config\(\):\s*\n\s*return/);
+  assert(end, "_control_end must early-return when get_visual_config() is False");
+});
+
+test('fast mode config: get_auto_wait_ms honors env override and clamps', () => {
+  // get_auto_wait_ms is the single source of truth for auto-wait timing.
+  // CDPILOT_WAIT_MS must win over fast mode so power users can dial it
+  // independently of the bundle switch. The returned value must be clamped
+  // to a sane range so an env of "0" (instant timeout, breaks every click)
+  // or "9999999999" (>10 days, breaks asyncio) can't propagate.
+  assert(/def get_auto_wait_ms\(\)/.test(PY_CONTENT),
+    "Should define get_auto_wait_ms()");
+  const envCheck = PY_CONTENT.match(/def get_auto_wait_ms[\s\S]*?CDPILOT_WAIT_MS[\s\S]*?int\(env\)/);
+  assert(envCheck, "get_auto_wait_ms must check CDPILOT_WAIT_MS env first and use int(env)");
+  const clamp = PY_CONTENT.match(/def get_auto_wait_ms[\s\S]*?max\(\s*\d+\s*,\s*min\(int\(env\)\s*,\s*\d/);
+  assert(clamp, "get_auto_wait_ms must clamp env value via max(floor, min(int(env), ceiling))");
+});
+
+test('cmd_click and cmd_fill use get_auto_wait_ms (no hardcoded 5000)', () => {
+  // Originally cmd_click hardcoded `5000` as the wait timeout. Switching to
+  // get_auto_wait_ms() means `cdpilot fast on` actually shortens the wait
+  // (instead of just toggling a flag with no effect).
+  const click = PY_CONTENT.match(/async def cmd_click[\s\S]*?wait_ms\s*=\s*get_auto_wait_ms\(\)[\s\S]*?__cdpilot_waitFor\([^)]*,\s*\{wait_ms\}/);
+  assert(click, "cmd_click must compute wait_ms = get_auto_wait_ms() and use it in the JS template");
+  const fill = PY_CONTENT.match(/async def cmd_fill[\s\S]*?wait_ms\s*=\s*get_auto_wait_ms\(\)[\s\S]*?__cdpilot_waitFor\([^)]*,\s*\{wait_ms\}/);
+  assert(fill, "cmd_fill must compute wait_ms = get_auto_wait_ms() and use it in the JS template");
+});
+
+test('show and fast registered in dispatch', () => {
+  assert(/'show':\s*lambda:\s*cmd_show\(/.test(PY_CONTENT),
+    "Should register 'show' in dispatch");
+  assert(/'fast':\s*lambda:\s*cmd_fast\(/.test(PY_CONTENT),
+    "Should register 'fast' in dispatch");
+});
+
+test('help output advertises show and fast', () => {
+  const out = run('--help');
+  assert(out.includes('show'), "Help should advertise show");
+  assert(out.includes('fast'), "Help should advertise fast");
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
