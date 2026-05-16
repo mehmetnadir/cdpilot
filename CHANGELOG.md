@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`cdpilot dismiss [N|aggressive]`** — heuristic auto-click for "Stay signed out / No thanks / Continue without account" buttons. Designed for unauthenticated queries against LLM chat sites (ChatGPT, Perplexity, Claude.ai, Gemini) that gate access behind a sign-up modal but offer an escape hatch. Built-in pattern library covers English + Turkish dismissive phrases with weighted scoring (exact-match bonus). **Safety guards** are load-bearing: an explicit negative-pattern list ("delete account", "sign out", "subscribe", Turkish equivalents) disqualifies dangerous lookalikes — one negative hit on any of the element's text/aria/title/value attributes and it's out, regardless of how many positive patterns also match. Visibility gate (0-size, display:none, visibility:hidden, opacity<0.1) and a minimum score threshold of 40 prevent weak-match misfires. Pass an integer N (1-10) or `aggressive` (up to 5) to handle chained modals — common on cookie-banner-then-signup pages. MCP: `browser_dismiss`.
+
 ### Breaking
 - **Visual feedback default flipped to OFF.** The glow border, fake cursor, click ripples and keystroke display were originally a trust signal that made an automation session legible to a human watching the screen. In day-to-day automation use the animations made cdpilot feel slow and amateurish — animated cursor moves take frames, the glow re-flashes between pages, every action triggers a ripple. Default OFF gives a quiet, professional experience. Bring it back any of these ways: `cdpilot show on` (persists), `CDPILOT_SHOW=1` (one-shot), or `CDPILOT_MCP_SESSION=1` (the existing MCP persistent-glow flow, still honored exactly as before). The MCP server itself sets `CDPILOT_MCP_SESSION=1` so AI sessions retain the visible glow automatically — no migration needed for that flow.
 
