@@ -374,6 +374,64 @@ test('help output advertises eval-batch and block', () => {
   assert(out.includes('PERFORMANCE'), "Help should have a PERFORMANCE section");
 });
 
+// ── WebSocket connection pool ──
+
+test('cdp_send signature is unchanged (callers depend on it)', () => {
+  // Every existing caller passes (ws_url, commands) with optional timeout=15.
+  // If this signature changes the entire codebase needs touching — fail loud.
+  assert(/async def cdp_send\(ws_url,\s*commands,\s*timeout=15\):/.test(PY_CONTENT),
+    "cdp_send must keep exact signature: async def cdp_send(ws_url, commands, timeout=15)");
+});
+
+test('WS pool: structures and atexit cleanup are declared', () => {
+  assert(/^_WS_POOL\s*=\s*\{\}/m.test(PY_CONTENT),
+    "Should declare _WS_POOL dict at module scope");
+  assert(/^_WS_LOCKS\s*=\s*\{\}/m.test(PY_CONTENT),
+    "Should declare _WS_LOCKS dict at module scope");
+  assert(/_WS_POOL_ENABLED\s*=\s*os\.environ\.get\("CDPILOT_WS_POOL",\s*"1"\)\s*!=\s*"0"/.test(PY_CONTENT),
+    "Pool must be env-gated via CDPILOT_WS_POOL (default ON)");
+  assert(/atexit\.register\(_ws_pool_close_all\)/.test(PY_CONTENT),
+    "Pool must register an atexit cleanup so exiting processes close connections");
+});
+
+test('WS pool: helpers exist with correct contracts', () => {
+  assert(/def _ws_lock\(ws_url\):/.test(PY_CONTENT),
+    "Should define _ws_lock(ws_url) factory");
+  assert(/def _ws_is_open\(ws\):/.test(PY_CONTENT),
+    "Should define _ws_is_open(ws) liveness check");
+  assert(/async def _ws_drain\(ws,\s*max_drain=64\):/.test(PY_CONTENT),
+    "Should define async _ws_drain(ws, max_drain=64)");
+  // Drain must use a near-zero timeout, otherwise it slows every reused call.
+  // Match _ws_drain body through to the first wait_for — docstring may exceed
+  // the previous 400-char window, allow up to 1500.
+  assert(/async def _ws_drain[\s\S]{0,1500}?asyncio\.wait_for\(ws\.recv\(\),\s*timeout=0\.001\)/.test(PY_CONTENT),
+    "_ws_drain must use ~1ms timeout, never block on empty buffer");
+});
+
+test('WS pool: non-pooled path stays identical when CDPILOT_WS_POOL=0', () => {
+  // Regression guard: turning the pool off must restore exact prior behavior
+  // for users who hit edge cases. The opt-out branch must use the original
+  // `async with websockets.connect(...)` open-use-close pattern.
+  const m = PY_CONTENT.match(/if not _WS_POOL_ENABLED:[\s\S]*?async with websockets\.connect/);
+  assert(m, "Non-pooled path must use `async with websockets.connect(...)` (the original pattern)");
+});
+
+test('WS pool: stale-conn retry only fires on reused conn with zero results', () => {
+  // Invariant: retrying after partial progress would re-fire non-idempotent
+  // commands (mouse events, form submits). Retry must be gated on both
+  // `not results` AND `reused`.
+  const m = PY_CONTENT.match(/async def cdp_send[\s\S]*?if not results and reused:/);
+  assert(m, "Retry guard must be `if not results and reused:` — never retry after partial success");
+});
+
+test('WS pool: per-URL lock prevents command interleaving', () => {
+  // Two cdp_send calls to the same target tab must serialise so their command
+  // frames don't interleave on the wire (CDP responses are id-routed, but the
+  // browser still expects frames to belong to coherent transactions).
+  assert(/async with _ws_lock\(ws_url\):/.test(PY_CONTENT),
+    "Pooled path must acquire _ws_lock(ws_url) before touching the connection");
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);

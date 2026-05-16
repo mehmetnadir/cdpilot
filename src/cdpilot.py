@@ -17,6 +17,7 @@ Environment:
 __version__ = "0.4.4"
 
 import asyncio
+import atexit
 import json
 import sys
 import base64
@@ -1088,12 +1089,169 @@ def activate_tab(page_id):
 
 # ─── CDP WebSocket Operations ───
 
+# ─── WebSocket Connection Pool ───
+#
+# Goal: amortise the ~30-50 ms TCP+WebSocket handshake across repeated
+# cdp_send calls within a single process (MCP server, batch mode).
+# Tekil CLI invocations are unaffected — the process exits after one call
+# so the pool never holds more than one entry anyway.
+# Opt-out: CDPILOT_WS_POOL=0 reverts to the original open-use-close path.
+# navigate_collect, cmd_new_tab, cmd_close_tab keep their own short-lived
+# connections because they enable CDP domains that would pollute pooled WS
+# with unrelated events.
+
+_WS_POOL = {}          # ws_url -> open websockets.WebSocketClientProtocol
+_WS_LOCKS = {}         # ws_url -> asyncio.Lock  (per-URL serialisation)
+_WS_POOL_ENABLED = os.environ.get("CDPILOT_WS_POOL", "1") != "0"
+
+
+def _ws_lock(ws_url):
+    """Return the per-URL asyncio.Lock bound to the CURRENT running loop.
+
+    On Python 3.9 and earlier, asyncio.Lock() snapshots the running loop at
+    construction time and raises if reused on a different loop later. If a
+    process invokes asyncio.run() twice (rare, but possible — e.g. a CLI
+    command that schedules a follow-up async call after the main one), the
+    cached Lock from the first run is bound to a closed loop. We guard by
+    stamping each entry with the current loop and evicting on mismatch.
+    Evicting the lock also drops any pooled WS for that URL — that WS is
+    bound to the dead loop too and calling anything async on it would raise.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    entry = _WS_LOCKS.get(ws_url)
+    if entry is None or entry[0] is not loop:
+        # Stale or absent. Evict pooled WS too — same loop, same fate.
+        if entry is not None:
+            _WS_POOL.pop(ws_url, None)
+        _WS_LOCKS[ws_url] = (loop, asyncio.Lock())
+    return _WS_LOCKS[ws_url][1]
+
+
+def _ws_is_open(ws):
+    """Return True if `ws` looks usable, False if it is closed/half-closed.
+
+    Prefers the typed State enum introduced in websockets 10+; falls back to
+    the boolean `.closed` attribute on older versions so we don't hard-dep
+    on a specific websockets release.
+    """
+    try:
+        from websockets.protocol import State
+        return ws.state is State.OPEN
+    except (ImportError, AttributeError):
+        return not getattr(ws, "closed", True)
+
+
+async def _ws_drain(ws, max_drain=64):
+    """Consume leftover event frames on a reused connection.
+
+    CDP servers push unsolicited events (Page.loadEventFired, DOM mutations
+    etc.) between our calls. Leaving them in the recv buffer would cause
+    the next cdp_send's id-dispatch loop to waste iterations on stale data
+    and could trigger false TimeoutErrors when the buffer fills.
+    We read up to max_drain frames with a near-zero timeout; any timeout or
+    error just means the buffer is empty — that's the happy path.
+    """
+    for _ in range(max_drain):
+        try:
+            await asyncio.wait_for(ws.recv(), timeout=0.001)
+        except Exception:
+            break
+
+
+def _ws_pool_close_all():
+    """atexit handler: synchronously close pooled WebSocket transports.
+
+    Earlier this used asyncio.new_event_loop() + run_until_complete(ws.close()),
+    but `await ws.close()` raises if invoked from a different loop than the one
+    that owns the protocol — and at process-exit time the original loop is
+    already dead. The exception was swallowed, so the "graceful close" was
+    effectively a no-op and FDs leaked until kernel reaped them.
+
+    Going loop-agnostic: close the underlying asyncio.Transport synchronously.
+    The TCP FIN goes out cleanly without needing a running event loop.
+    """
+    for ws in list(_WS_POOL.values()):
+        transport = getattr(ws, 'transport', None)
+        if transport is not None:
+            try:
+                if not transport.is_closing():
+                    transport.close()
+            except Exception:
+                pass
+    _WS_POOL.clear()
+    _WS_LOCKS.clear()
+
+
+atexit.register(_ws_pool_close_all)
+
+
 async def cdp_send(ws_url, commands, timeout=15):
     """Send multiple CDP commands and collect results."""
     import websockets
-    results = {}
-    try:
-        async with websockets.connect(ws_url, max_size=100 * 1024 * 1024) as ws:
+
+    # ── Non-pooled path (CDPILOT_WS_POOL=0) — identical to original ──
+    if not _WS_POOL_ENABLED:
+        results = {}
+        try:
+            async with websockets.connect(ws_url, max_size=100 * 1024 * 1024) as ws:
+                for cmd_id, method, params in commands:
+                    await ws.send(json.dumps({"id": cmd_id, "method": method, "params": params or {}}))
+                pending = {c[0] for c in commands}
+                start = time.time()
+                while pending and (time.time() - start) < timeout:
+                    try:
+                        resp = await asyncio.wait_for(ws.recv(), timeout=2)
+                        data = json.loads(resp)
+                        if "id" in data and data["id"] in pending:
+                            pending.discard(data["id"])
+                            results[data["id"]] = data.get("result", data.get("error", {}))
+                    except asyncio.TimeoutError:
+                        continue
+            return results
+        except ConnectionRefusedError:
+            print("Browser is not running. Run 'cdpilot launch' first.", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            err = str(e)
+            if "websocket" in err.lower() or "connect" in err.lower() or "ws://" in err.lower():
+                print(f"Browser is not running or CDP port {CDP_PORT} is unreachable. Run 'cdpilot launch' first.", file=sys.stderr)
+                sys.exit(1)
+            raise
+
+    # ── Pooled path ──
+    async with _ws_lock(ws_url):
+        results = {}
+        reused = False  # track whether we fetched from pool or opened fresh
+
+        # Fetch or create the connection for this URL.
+        # Note: we never drain on the happy path. A pooled connection is only
+        # put back after `pending` was fully consumed (recv loop exited cleanly,
+        # see post-loop check below), so by construction there are no stale
+        # response frames waiting. Skipping the drain saves ~1ms per call —
+        # this matters because cdp_send is called dozens of times per command.
+        ws = _WS_POOL.get(ws_url)
+        if ws is not None and _ws_is_open(ws):
+            reused = True
+        else:
+            # Pool miss or dead entry — open a fresh connection
+            if ws_url in _WS_POOL:
+                _WS_POOL.pop(ws_url)
+            try:
+                ws = await websockets.connect(ws_url, max_size=100 * 1024 * 1024)
+            except ConnectionRefusedError:
+                print("Browser is not running. Run 'cdpilot launch' first.", file=sys.stderr)
+                sys.exit(1)
+            except Exception as e:
+                err = str(e)
+                if "websocket" in err.lower() or "connect" in err.lower() or "ws://" in err.lower():
+                    print(f"Browser is not running or CDP port {CDP_PORT} is unreachable. Run 'cdpilot launch' first.", file=sys.stderr)
+                    sys.exit(1)
+                raise
+
+        try:
             for cmd_id, method, params in commands:
                 await ws.send(json.dumps({"id": cmd_id, "method": method, "params": params or {}}))
 
@@ -1108,16 +1266,78 @@ async def cdp_send(ws_url, commands, timeout=15):
                         results[data["id"]] = data.get("result", data.get("error", {}))
                 except asyncio.TimeoutError:
                     continue
-        return results
-    except ConnectionRefusedError:
-        print("Browser is not running. Run 'cdpilot launch' first.", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        err = str(e)
-        if "websocket" in err.lower() or "connect" in err.lower() or "ws://" in err.lower():
-            print(f"Browser is not running or CDP port {CDP_PORT} is unreachable. Run 'cdpilot launch' first.", file=sys.stderr)
-            sys.exit(1)
-        raise
+
+            # Only re-pool if we drained `pending` to zero. If we timed out
+            # with responses still in flight, late frames could arrive on this
+            # connection and confuse the NEXT cdp_send call (which restarts
+            # IDs from 1 and would mismatch IDs from the previous call).
+            # Drop in that case — safer to pay a fresh handshake next time.
+            if pending:
+                _WS_POOL.pop(ws_url, None)
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            else:
+                _WS_POOL[ws_url] = ws
+            return results
+
+        except Exception:
+            # Drop the dead/errored connection from the pool
+            _WS_POOL.pop(ws_url, None)
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+            # Retry ONCE with a fresh connection, but only when no responses
+            # have arrived yet — replaying after partial progress would
+            # re-fire non-idempotent commands (mouse events, form submits).
+            if not results and reused:
+                try:
+                    ws2 = await websockets.connect(ws_url, max_size=100 * 1024 * 1024)
+                except ConnectionRefusedError:
+                    print("Browser is not running. Run 'cdpilot launch' first.", file=sys.stderr)
+                    sys.exit(1)
+                except Exception as e2:
+                    err = str(e2)
+                    if "websocket" in err.lower() or "connect" in err.lower() or "ws://" in err.lower():
+                        print(f"Browser is not running or CDP port {CDP_PORT} is unreachable. Run 'cdpilot launch' first.", file=sys.stderr)
+                        sys.exit(1)
+                    raise
+                results2 = {}
+                try:
+                    for cmd_id, method, params in commands:
+                        await ws2.send(json.dumps({"id": cmd_id, "method": method, "params": params or {}}))
+                    pending2 = {c[0] for c in commands}
+                    start2 = time.time()
+                    while pending2 and (time.time() - start2) < timeout:
+                        try:
+                            resp2 = await asyncio.wait_for(ws2.recv(), timeout=2)
+                            data2 = json.loads(resp2)
+                            if "id" in data2 and data2["id"] in pending2:
+                                pending2.discard(data2["id"])
+                                results2[data2["id"]] = data2.get("result", data2.get("error", {}))
+                        except asyncio.TimeoutError:
+                            continue
+                    # Same invariant as the main path: only re-pool on full drain.
+                    if pending2:
+                        try:
+                            await ws2.close()
+                        except Exception:
+                            pass
+                    else:
+                        _WS_POOL[ws_url] = ws2
+                    return results2
+                except Exception:
+                    _WS_POOL.pop(ws_url, None)
+                    try:
+                        await ws2.close()
+                    except Exception:
+                        pass
+                    raise
+
+            raise
 
 
 async def navigate_collect(ws_url, url, network=False, console=False, glow=True):
