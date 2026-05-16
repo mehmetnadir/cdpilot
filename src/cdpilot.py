@@ -1106,14 +1106,28 @@ _WS_POOL_ENABLED = os.environ.get("CDPILOT_WS_POOL", "1") != "0"
 
 
 def _ws_lock(ws_url):
-    """Return (creating if absent) the per-URL asyncio.Lock.
+    """Return the per-URL asyncio.Lock bound to the CURRENT running loop.
 
-    Locks must be created in an event-loop context; first cdp_send call
-    per URL always runs inside asyncio.run(), so this is safe.
+    On Python 3.9 and earlier, asyncio.Lock() snapshots the running loop at
+    construction time and raises if reused on a different loop later. If a
+    process invokes asyncio.run() twice (rare, but possible — e.g. a CLI
+    command that schedules a follow-up async call after the main one), the
+    cached Lock from the first run is bound to a closed loop. We guard by
+    stamping each entry with the current loop and evicting on mismatch.
+    Evicting the lock also drops any pooled WS for that URL — that WS is
+    bound to the dead loop too and calling anything async on it would raise.
     """
-    if ws_url not in _WS_LOCKS:
-        _WS_LOCKS[ws_url] = asyncio.Lock()
-    return _WS_LOCKS[ws_url]
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    entry = _WS_LOCKS.get(ws_url)
+    if entry is None or entry[0] is not loop:
+        # Stale or absent. Evict pooled WS too — same loop, same fate.
+        if entry is not None:
+            _WS_POOL.pop(ws_url, None)
+        _WS_LOCKS[ws_url] = (loop, asyncio.Lock())
+    return _WS_LOCKS[ws_url][1]
 
 
 def _ws_is_open(ws):
@@ -1148,27 +1162,27 @@ async def _ws_drain(ws, max_drain=64):
 
 
 def _ws_pool_close_all():
-    """atexit handler: close all pooled connections best-effort.
+    """atexit handler: synchronously close pooled WebSocket transports.
 
-    At process exit the original event loop may already be torn down, so
-    we spin up a fresh one just for cleanup. Errors are swallowed — the
-    process is leaving anyway and we must never raise from atexit.
+    Earlier this used asyncio.new_event_loop() + run_until_complete(ws.close()),
+    but `await ws.close()` raises if invoked from a different loop than the one
+    that owns the protocol — and at process-exit time the original loop is
+    already dead. The exception was swallowed, so the "graceful close" was
+    effectively a no-op and FDs leaked until kernel reaped them.
+
+    Going loop-agnostic: close the underlying asyncio.Transport synchronously.
+    The TCP FIN goes out cleanly without needing a running event loop.
     """
-    if not _WS_POOL:
-        return
-    async def _close_all():
-        for ws in list(_WS_POOL.values()):
+    for ws in list(_WS_POOL.values()):
+        transport = getattr(ws, 'transport', None)
+        if transport is not None:
             try:
-                await ws.close()
+                if not transport.is_closing():
+                    transport.close()
             except Exception:
                 pass
-        _WS_POOL.clear()
-    try:
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(_close_all())
-        loop.close()
-    except Exception:
-        pass
+    _WS_POOL.clear()
+    _WS_LOCKS.clear()
 
 
 atexit.register(_ws_pool_close_all)
@@ -1268,7 +1282,7 @@ async def cdp_send(ws_url, commands, timeout=15):
                 _WS_POOL[ws_url] = ws
             return results
 
-        except Exception as exc:
+        except Exception:
             # Drop the dead/errored connection from the pool
             _WS_POOL.pop(ws_url, None)
             try:
