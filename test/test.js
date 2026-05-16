@@ -516,6 +516,75 @@ test('help output advertises show and fast', () => {
   assert(out.includes('fast'), "Help should advertise fast");
 });
 
+// ── Auto-dismiss: pattern lib + safety guards ──
+
+test('dismiss pattern lib: positives cover LLM chat escape hatches', () => {
+  // Direct anonymous-use intent — these are the killer use cases.
+  // Score asymmetry matters: "stay signed out" must beat generic "later".
+  assert(PY_CONTENT.includes('"stay signed out", 100'),
+    "DISMISS_POSITIVE should include 'stay signed out' at weight 100");
+  assert(PY_CONTENT.includes('"continue without signing in", 100'),
+    "DISMISS_POSITIVE should include 'continue without signing in' at weight 100");
+  assert(PY_CONTENT.includes('"continue as guest", 95'),
+    "DISMISS_POSITIVE should include 'continue as guest'");
+  // Turkish coverage — cdpilot's primary audience.
+  assert(PY_CONTENT.includes('"şimdi değil", 80'),
+    "DISMISS_POSITIVE should include Turkish 'şimdi değil'");
+  assert(PY_CONTENT.includes('"üye olmadan", 95'),
+    "DISMISS_POSITIVE should include Turkish 'üye olmadan'");
+});
+
+test('dismiss pattern lib: negatives prevent destructive misfires', () => {
+  // Anti-patterns are load-bearing — they're what makes auto-dismiss safe to
+  // ship as a default-on style helper. If these regress, users lose accounts.
+  assert(/DISMISS_NEGATIVE\s*=/.test(PY_CONTENT),
+    "DISMISS_NEGATIVE list must be declared");
+  assert(PY_CONTENT.includes('"delete account"'),
+    "DISMISS_NEGATIVE must disqualify 'delete account'");
+  assert(PY_CONTENT.includes('"sign out"'),
+    "DISMISS_NEGATIVE must disqualify 'sign out'");
+  assert(PY_CONTENT.includes('"subscribe"'),
+    "DISMISS_NEGATIVE must disqualify 'subscribe'");
+  // Turkish account-destruction patterns
+  assert(PY_CONTENT.includes('"hesabı sil"') || PY_CONTENT.includes('"hesabımı sil"'),
+    "DISMISS_NEGATIVE must disqualify Turkish account-deletion phrasing");
+});
+
+test('cmd_dismiss: one negative hit disqualifies regardless of positives', () => {
+  // Critical invariant: an element matching ANY anti-pattern is out, period.
+  // Without this an element labelled "no thanks, delete account" would still
+  // get a positive score from "no thanks" and be clicked.
+  // Note: the JS lives inside a Python f-string so `{{` in source → `{` after format.
+  const m = PY_CONTENT.match(/checkText[\s\S]{0,800}?NEG\[i\][\s\S]{0,200}?return\s*\{+\s*pos:\s*0,\s*neg:\s*true/);
+  assert(m, "checkText must early-return {pos:0, neg:true} as soon as any NEG pattern hits");
+});
+
+test('cmd_dismiss: visibility gate + min score threshold', () => {
+  // No clicks on invisible elements (0×0 box, display:none, opacity:0). And
+  // weak partial matches must NOT cross the dismiss threshold — that's the
+  // line between "found the escape hatch" and "guessing".
+  assert(/rect\.width === 0 && rect\.height === 0/.test(PY_CONTENT),
+    "Dismiss must skip 0-size elements");
+  assert(/style\.display === 'none' \|\| style\.visibility === 'hidden'/.test(PY_CONTENT),
+    "Dismiss must skip display:none / visibility:hidden");
+  assert(/MIN_SCORE\s*=\s*40/.test(PY_CONTENT),
+    "Dismiss must enforce MIN_SCORE = 40 to avoid weak-match misfires");
+});
+
+test('dismiss registered in dispatch + MCP', () => {
+  assert(/'dismiss':\s*lambda:\s*cmd_dismiss\(/.test(PY_CONTENT),
+    "Should register 'dismiss' in dispatch");
+  assert(PY_CONTENT.includes('"browser_dismiss"'),
+    "Should expose browser_dismiss MCP tool");
+  assert(/"browser_dismiss":\s*lambda\s+a:\s*\["dismiss"\]/.test(PY_CONTENT),
+    "MCP tool_map must route browser_dismiss to the dismiss CLI command");
+});
+
+test('help advertises dismiss command', () => {
+  const out = run('--help');
+  assert(out.includes('dismiss'), "Help should advertise dismiss");
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
