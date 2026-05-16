@@ -144,6 +144,25 @@ cdpilot block clear                          # Drop all patterns
 > requests. Keep `block` **off** for stealth/anti-bot targets; turn it **on** for
 > known-safe internal sites where speed matters more than blending in.
 
+```bash
+cdpilot fast                       # Show status (effective auto-wait ms)
+cdpilot fast on                    # Auto-wait 5s → 2s, less idle padding
+cdpilot fast off                   # Back to defaults
+CDPILOT_WAIT_MS=1000 cdpilot click # Per-command override (env wins over fast mode)
+```
+
+```bash
+cdpilot show                       # Show status (visual feedback on/off)
+cdpilot show on                    # Re-enable glow border + cursor + ripples + keystrokes
+cdpilot show off                   # Default since 0.4.4 — quiet, professional output
+```
+
+> **Visual feedback default changed in 0.4.4** — the old animations (green glow,
+> moving cursor, click ripples) used to make every action look like an amateur
+> driving the screen. They're now opt-in via `cdpilot show on`. The MCP server's
+> persistent-glow flow (`CDPILOT_MCP_SESSION=1`) is unaffected — AI agents that
+> rely on visible feedback during a session still see it automatically.
+
 ### Tab Management
 
 ```bash
