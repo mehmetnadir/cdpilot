@@ -328,6 +328,13 @@ function showHelp() {
     show [on|off]      Visual feedback (glow + cursor + ripples).
                        Default OFF since 0.4.4 — opt-in for "see automation" mode.
 
+  SMART NAVIGATION
+    dismiss [N|aggressive]
+                       Click best "Stay signed out / No thanks / Skip" button.
+                       English + Turkish patterns; never clicks destructive
+                       lookalikes (Delete account, Sign out, Subscribe).
+                       Pass N (1-10) or "aggressive" for chained modals.
+
   TABS
     tabs               List open tabs
     new-tab [url]      Open new tab

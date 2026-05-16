@@ -4423,6 +4423,203 @@ async def cmd_smart_click(text):
         print(f'  Also found: {", ".join(data["alternatives"])}')
 
 
+# ─── Auto-dismiss: heuristic click for "leave me alone" modal buttons ───
+#
+# Many sites (especially LLM chat UIs — ChatGPT, Perplexity, Claude.ai, Gemini)
+# gate access behind a sign-up modal but offer an escape hatch like "Stay
+# signed out" or "Continue without". For unauthenticated query workflows
+# (citation tracking, scraping public AI answers, etc.) we need to find and
+# click that escape hatch reliably without firing on dangerous lookalikes.
+#
+# Two lists, evaluated against every visible clickable's text/aria/title:
+#   POSITIVE → contribute a positive score (higher = more dismissive)
+#   NEGATIVE → contribute a negative penalty (any hit = element is disqualified)
+#
+# Conservative on purpose: anti-patterns block obvious traps ("Delete account",
+# "Sign out"), and the minimum score threshold (40) means weak partial matches
+# don't trigger a click.
+
+DISMISS_POSITIVE = [
+    # English — direct anonymous-use intent
+    ("stay signed out", 100), ("keep me signed out", 100),
+    ("continue without signing in", 100), ("continue without an account", 100),
+    ("use without an account", 95), ("continue as guest", 95),
+    ("stay logged out", 95), ("no, thanks", 90),
+    # English — generic dismiss
+    ("no thanks", 85), ("not now", 80), ("maybe later", 75),
+    ("skip for now", 75), ("skip", 65), ("dismiss", 70),
+    ("later", 55), ("close", 50),
+    # Cookie / GDPR — these unblock the page without consenting away rights
+    ("reject all", 60), ("only necessary", 60), ("only essential", 60),
+    ("decline", 55),
+    # Turkish
+    ("şimdi değil", 80), ("şimdilik geç", 80), ("üye olmadan", 95),
+    ("hesapsız devam et", 95), ("girişsiz", 90), ("kapat", 50),
+    ("atla", 65), ("vazgeç", 55), ("yok teşekkürler", 85),
+    ("reddet", 55), ("tümünü reddet", 60),
+]
+
+DISMISS_NEGATIVE = [
+    # Account destruction — never auto-click these
+    "delete account", "remove account", "deactivate account",
+    "hesabı sil", "hesabımı sil", "hesabı kapat",
+    # Session destruction — opposite of what we want
+    "sign out", "log out", "logout", "çıkış yap", "oturumu kapat",
+    # Destructive confirmations
+    "yes, delete", "confirm delete", "permanently delete",
+    "evet, sil", "kalıcı olarak sil",
+    # Subscription / payment
+    "subscribe", "upgrade", "buy now", "satın al", "abone ol",
+]
+
+
+def _dismiss_js_template():
+    """Build the JS expression for cmd_dismiss. Inlines pattern lists as JSON.
+
+    Pulled out into a helper so tests can grep for the patterns without
+    paying for a 200-line literal string in every function definition.
+    """
+    return f"""
+    (function() {{
+      var POS = {json.dumps(DISMISS_POSITIVE)};
+      var NEG = {json.dumps(DISMISS_NEGATIVE)};
+      var MIN_SCORE = 40;
+
+      function checkText(t) {{
+        if (!t) return {{ pos: 0, neg: false, hit: '' }};
+        var s = (t + '').toLowerCase().trim();
+        // Disqualifier first — one negative hit and the element is out,
+        // regardless of how many positive patterns also match.
+        for (var i = 0; i < NEG.length; i++) {{
+          if (s.indexOf(NEG[i]) !== -1) return {{ pos: 0, neg: true, hit: NEG[i] }};
+        }}
+        var bestPos = 0, bestHit = '';
+        for (var j = 0; j < POS.length; j++) {{
+          var pat = POS[j][0], weight = POS[j][1];
+          if (s.indexOf(pat) !== -1) {{
+            // Exact match bonus; otherwise scaled by how much of the
+            // element's text matches the pattern (longer match = more
+            // confident).
+            var score = (s === pat) ? weight + 10 : weight;
+            if (score > bestPos) {{ bestPos = score; bestHit = pat; }}
+          }}
+        }}
+        return {{ pos: bestPos, neg: false, hit: bestHit }};
+      }}
+
+      var els = document.querySelectorAll(
+        'a, button, input[type=submit], input[type=button], ' +
+        '[role=button], [role=link], [role=menuitem], [role=option], ' +
+        'summary, [onclick], [tabindex]'
+      );
+
+      var best = null;
+      Array.from(els).forEach(function(el) {{
+        // Must be visible — invisible/0-size elements are not real buttons
+        var rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return;
+        var style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return;
+        if (parseFloat(style.opacity) < 0.1) return;
+
+        var texts = [
+          el.textContent || '',
+          el.getAttribute('aria-label') || '',
+          el.getAttribute('title') || '',
+          el.value || '',
+          el.getAttribute('alt') || ''
+        ];
+
+        var disq = false, bestPos = 0, bestHit = '';
+        for (var k = 0; k < texts.length; k++) {{
+          var r = checkText(texts[k]);
+          if (r.neg) {{ disq = true; break; }}
+          if (r.pos > bestPos) {{ bestPos = r.pos; bestHit = r.hit; }}
+        }}
+        if (disq) return;
+        if (bestPos < MIN_SCORE) return;
+
+        if (best === null || bestPos > best.score) {{
+          best = {{
+            score: bestPos,
+            hit: bestHit,
+            text: (texts[0] || texts[1] || '').trim().substring(0, 80),
+            tag: el.tagName.toLowerCase(),
+            x: rect.x + rect.width / 2,
+            y: rect.y + rect.height / 2,
+            el: el
+          }};
+        }}
+      }});
+
+      if (best === null) return JSON.stringify({{ found: false }});
+
+      best.el.scrollIntoView({{behavior:'instant', block:'center'}});
+      best.el.click();
+      return JSON.stringify({{
+        found: true,
+        tag: best.tag,
+        text: best.text,
+        pattern: best.hit,
+        score: best.score
+      }});
+    }})()
+    """
+
+
+async def cmd_dismiss(repeat=None):
+    """Find and click the strongest "dismiss / continue without account" button.
+
+    Designed for LLM chat sites that gate queries behind a sign-up modal but
+    offer an escape hatch ("Stay signed out", "No thanks", etc.). Built-in
+    pattern library covers English + Turkish dismissive phrases and explicitly
+    excludes destructive lookalikes ("Delete account", "Sign out", "Subscribe").
+
+    Usage:
+      cdpilot dismiss              # one shot — click best dismiss button if any
+      cdpilot dismiss 3            # repeat up to 3 times (chained modals)
+      cdpilot dismiss aggressive   # repeat until no candidates found (max 5)
+
+    Exit code: 0 if something was clicked or nothing to dismiss, 1 on error.
+    """
+    # Parse repeat: int N, "aggressive" (=5), or default 1
+    if repeat is None:
+        max_iter = 1
+    elif isinstance(repeat, str) and repeat.lower() == 'aggressive':
+        max_iter = 5
+    else:
+        try:
+            max_iter = max(1, min(int(repeat), 10))
+        except (TypeError, ValueError):
+            print(f"Invalid repeat: {repeat}. Use a number 1-10 or 'aggressive'.", file=sys.stderr)
+            sys.exit(1)
+
+    ws_url, _ = get_page_ws()
+    js = _dismiss_js_template()
+    total_clicked = 0
+    for i in range(max_iter):
+        r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+        raw = r.get(1, {}).get("result", {}).get("value", "")
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            print("Error parsing dismiss result", file=sys.stderr)
+            sys.exit(1)
+        if not data.get("found"):
+            if total_clicked == 0:
+                print("No dismiss candidates on page.")
+            break
+        total_clicked += 1
+        print(f'Dismissed: {data["tag"].upper()} "{data["text"]}" '
+              f'(pattern: "{data["pattern"]}", score: {data["score"]})')
+        # Give the modal a moment to close before next scan
+        if i + 1 < max_iter:
+            await asyncio.sleep(0.4)
+
+    if total_clicked:
+        print(f'Total dismissed: {total_clicked}')
+
+
 async def cmd_smart_fill(text, value):
     """Fill input by label/placeholder text — no CSS selector needed.
 
@@ -5540,6 +5737,8 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_smart_click", "description": "Click an element by its visible text — no CSS selector needed. Uses fuzzy matching across text content, aria-label, title, placeholder, and value. Returns match score and alternatives. Like Stagehand act('Click login') but without LLM cost. Use when you know WHAT to click but not the exact selector.",
              "inputSchema": {"type": "object", "properties": {"text": {"type": "string", "description": "Visible text of the element to click (e.g. 'Login', 'Submit Order', 'Learn more')"}}, "required": ["text"]}},
+            {"name": "browser_dismiss", "description": "Find and click the strongest 'dismiss / continue without account' button on the page. Built-in pattern library covers English + Turkish dismissive phrases ('Stay signed out', 'No thanks', 'Skip', 'Continue without', etc.) and explicitly excludes destructive lookalikes (Delete account, Sign out, Subscribe). Designed for LLM chat sites that gate queries behind a sign-up modal. Pass 'aggressive' or an integer N (max 10) to handle chained modals.",
+             "inputSchema": {"type": "object", "properties": {"repeat": {"type": "string", "description": "Optional. Number of dismiss attempts (1-10) or 'aggressive' (up to 5 chained). Default: 1.", "default": "1"}}}},
             {"name": "browser_smart_fill", "description": "Fill an input by its label or placeholder text — no CSS selector needed. Finds input by associated label, placeholder, aria-label, name, or id. React-compatible value setting. Use when you know WHAT field to fill but not the exact selector.",
              "inputSchema": {"type": "object", "properties": {"label": {"type": "string", "description": "Label or placeholder text of the input (e.g. 'Email', 'Password', 'Search')"}, "value": {"type": "string", "description": "Value to fill in the input"}}, "required": ["label", "value"]}},
             {"name": "browser_smart_select", "description": "Select a dropdown option by label and option text — no CSS selector needed. Finds the select element by label/name, then selects the matching option. Use for dropdown interactions without knowing selectors.",
@@ -5624,6 +5823,7 @@ class MCPServer:
             "browser_extract": lambda a: ["extract", a.get("selector", "")] + ([f"--{a['format']}"] if a.get("format") and a["format"] != "text" else []),
             "browser_observe": lambda a: ["observe"],
             "browser_smart_click": lambda a: ["smart-click", a.get("text", "")],
+            "browser_dismiss": lambda a: ["dismiss"] + ([str(a["repeat"])] if a.get("repeat") else []),
             "browser_smart_fill": lambda a: ["smart-fill", a.get("label", ""), a.get("value", "")],
             "browser_smart_select": lambda a: ["smart-select", a.get("label", ""), a.get("option", "")],
             "browser_describe": lambda a: ["describe"],
@@ -5811,6 +6011,7 @@ if __name__ == "__main__":
         'observe': cmd_observe,
         'run': lambda: (require_args(1, 'run <script.cdp>'), None)[1] if not args else cmd_run_script(args[0]),
         'smart-click': lambda: (require_args(1, 'smart-click <text>'), None)[1] if not args else cmd_smart_click(" ".join(args)),
+        'dismiss': lambda: cmd_dismiss(args[0] if args else None),
         'smart-fill': lambda: (require_args(2, 'smart-fill <label> <value>'), None)[1] if len(args) < 2 else cmd_smart_fill(args[0], " ".join(args[1:])),
         'smart-select': lambda: (require_args(2, 'smart-select <label> <option>'), None)[1] if len(args) < 2 else cmd_smart_select(args[0], " ".join(args[1:])),
         'assert': lambda: (require_args(1, 'assert <selector> [text]'), None)[1] if not args else cmd_assert(args[0], args[1] if len(args) > 1 else None),
