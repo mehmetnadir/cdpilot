@@ -479,14 +479,18 @@ test('_control_start and _control_end gate on visual config', () => {
   assert(end, "_control_end must early-return when get_visual_config() is False");
 });
 
-test('fast mode config: get_auto_wait_ms honors env override', () => {
+test('fast mode config: get_auto_wait_ms honors env override and clamps', () => {
   // get_auto_wait_ms is the single source of truth for auto-wait timing.
   // CDPILOT_WAIT_MS must win over fast mode so power users can dial it
-  // independently of the bundle switch.
+  // independently of the bundle switch. The returned value must be clamped
+  // to a sane range so an env of "0" (instant timeout, breaks every click)
+  // or "9999999999" (>10 days, breaks asyncio) can't propagate.
   assert(/def get_auto_wait_ms\(\)/.test(PY_CONTENT),
     "Should define get_auto_wait_ms()");
-  const m = PY_CONTENT.match(/def get_auto_wait_ms[\s\S]*?CDPILOT_WAIT_MS[\s\S]*?return\s+int\(env\)/);
-  assert(m, "get_auto_wait_ms must check CDPILOT_WAIT_MS env first and return int(env)");
+  const envCheck = PY_CONTENT.match(/def get_auto_wait_ms[\s\S]*?CDPILOT_WAIT_MS[\s\S]*?int\(env\)/);
+  assert(envCheck, "get_auto_wait_ms must check CDPILOT_WAIT_MS env first and use int(env)");
+  const clamp = PY_CONTENT.match(/def get_auto_wait_ms[\s\S]*?max\(\s*\d+\s*,\s*min\(int\(env\)\s*,\s*\d/);
+  assert(clamp, "get_auto_wait_ms must clamp env value via max(floor, min(int(env), ceiling))");
 });
 
 test('cmd_click and cmd_fill use get_auto_wait_ms (no hardcoded 5000)', () => {

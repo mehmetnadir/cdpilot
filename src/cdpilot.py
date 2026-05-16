@@ -3394,6 +3394,21 @@ def cmd_stealth(state=None):
 VISUAL_CONFIG_FILE = os.path.join(PROFILE_DIR, 'visual.json')
 
 
+def _atomic_write_json(path, data):
+    """Write JSON to `path` atomically — write to a temp file then os.replace.
+
+    Without this, a concurrent reader (every command opens get_visual_config
+    or get_fast_config) could observe a truncated file mid-write and fall
+    through to the default. For the visual toggle this means glow flickering
+    off for a single command. os.replace is POSIX-atomic on the same fs.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
 def get_visual_config():
     """Return True if the visual feedback layer should be injected on navigate."""
     # MCP persistent-glow flow takes precedence — it's how AI sessions signal
@@ -3422,7 +3437,9 @@ def cmd_show(state=None):
 
     Default since 0.4.4: OFF. The MCP server's `CDPILOT_MCP_SESSION=1` flow
     still forces ON regardless of this setting — that's the persistent-glow
-    promise to humans watching an AI session.
+    promise to humans watching an AI session. The `cdpilot glow on/off`
+    command is an explicit per-action override and is NOT gated by this
+    config — call it directly to flash glow on demand without persisting.
     """
     if state is None or state.lower() == 'status':
         current = get_visual_config()
@@ -3435,9 +3452,7 @@ def cmd_show(state=None):
         print(f"Invalid state: {state}. Use 'on', 'off', or 'status'.", file=sys.stderr)
         sys.exit(1)
     enabled = s in ('on', '1', 'true', 'yes')
-    os.makedirs(os.path.dirname(VISUAL_CONFIG_FILE), exist_ok=True)
-    with open(VISUAL_CONFIG_FILE, 'w') as f:
-        json.dump({'enabled': enabled}, f)
+    _atomic_write_json(VISUAL_CONFIG_FILE, {'enabled': enabled})
     print(f'Visual feedback: {"on" if enabled else "off"}')
     print('Effect applies on next navigation.')
 
@@ -3472,10 +3487,17 @@ def get_auto_wait_ms():
     Resolution order: explicit CDPILOT_WAIT_MS env (user override) → fast
     mode default (2000) → normal default (5000). The env variable wins
     even over fast mode so power users can dial it independently.
+
+    The env value is clamped to [100, 120_000]:
+      - 0 would make __cdpilot_waitFor return null instantly, breaking every
+        click on pages where the element renders even one paint frame late.
+      - 100ms is a sane floor — single render tick + small buffer.
+      - 120s (2 min) is a sane ceiling — beyond that the outer command timeout
+        kicks in anyway; asyncio also handles very large floats poorly.
     """
     env = os.environ.get('CDPILOT_WAIT_MS')
     if env and env.isdigit():
-        return int(env)
+        return max(100, min(int(env), 120_000))
     return FAST_DEFAULT_WAIT_MS if get_fast_config() else NORMAL_DEFAULT_WAIT_MS
 
 
@@ -3500,9 +3522,7 @@ def cmd_fast(state=None):
         print(f"Invalid state: {state}. Use 'on', 'off', or 'status'.", file=sys.stderr)
         sys.exit(1)
     enabled = s in ('on', '1', 'true', 'yes')
-    os.makedirs(os.path.dirname(FAST_CONFIG_FILE), exist_ok=True)
-    with open(FAST_CONFIG_FILE, 'w') as f:
-        json.dump({'enabled': enabled}, f)
+    _atomic_write_json(FAST_CONFIG_FILE, {'enabled': enabled})
     print(f'Fast mode: {"on" if enabled else "off"}')
     print(f'  Effective auto-wait: {get_auto_wait_ms()}ms')
 

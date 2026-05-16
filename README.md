@@ -86,6 +86,25 @@ npx cdpilot launch    # Start browser with CDP enabled
 npx cdpilot status    # Check connection
 ```
 
+### Upgrading from 0.4.3 → 0.4.4 — read this first
+
+**Visual feedback default flipped to OFF.** The green glow border, animated
+fake cursor, click ripples, and keystroke display made cdpilot feel like an
+amateur typing on every page. They are now opt-in:
+
+```bash
+cdpilot show on     # restore the old visual feedback layer
+cdpilot show off    # default since 0.4.4
+```
+
+The MCP server's persistent-glow flow (`CDPILOT_MCP_SESSION=1`) is **unchanged**
+— AI agents that rely on visible feedback during a session still see it
+automatically. Only direct-CLI users see the difference.
+
+Other 0.4.4 changes are pure performance and require no migration:
+post-load sleep cut 1500ms → 300ms, `scrollIntoView('smooth')` →
+`'instant'` everywhere, new `cdpilot fast` toggle for shorter auto-waits.
+
 ## Commands
 
 ### Navigation & Content
