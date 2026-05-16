@@ -270,6 +270,30 @@ test('help output includes STEALTH & CAPTCHA section', () => {
   assert(out.includes('captcha-wait'), 'Help should advertise captcha-wait');
 });
 
+test('wait-for-text command is defined as async function', () => {
+  assert(/async def cmd_wait_for_text\(text,\s*timeout_ms=5000\):/.test(PY_CONTENT),
+    "Should define async def cmd_wait_for_text(text, timeout_ms=5000)");
+});
+
+test('wait-for-text uses MutationObserver with characterData=true', () => {
+  // characterData mutations are essential for streaming text (AI responses,
+  // typewriter effects) — without it the observer misses text node updates.
+  const m = PY_CONTENT.match(/async def cmd_wait_for_text[\s\S]*?characterData:\s*true/);
+  assert(m, "cmd_wait_for_text should observe characterData mutations");
+});
+
+test('wait-for-text is registered in async dispatch', () => {
+  assert(/'wait-for-text':\s*lambda:\s*\(require_args\(1,\s*'wait-for-text\s+<text>/.test(PY_CONTENT),
+    "Should register 'wait-for-text' in async_map");
+});
+
+test('browser_wait_for_text MCP tool exposed in tools/list and tool_map', () => {
+  assert(PY_CONTENT.includes('"browser_wait_for_text"'),
+    "browser_wait_for_text should appear as MCP tool name");
+  assert(/"browser_wait_for_text":\s*lambda\s+a:\s*\["wait-for-text"/.test(PY_CONTENT),
+    "browser_wait_for_text should map to wait-for-text CLI command");
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);

@@ -347,6 +347,7 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] **Vision fallback** (`describe`) — a11y + screenshot + text in one call
 - [x] **Annotated screenshots** — @N badge overlays on interactive elements
 - [x] **Auto-wait** — MutationObserver-based, 5s automatic element waiting
+- [x] **`wait-for-text`** — adaptive text-based waiting (subtree + characterData) for streaming AI responses, async toasts, and selector-less synchronization
 - [x] **Batch commands** — pipe JSON arrays via stdin for multi-step automation
 - [x] Visual feedback system (persistent green glow, cursor, ripples, keystroke display)
 - [x] AI control warning toast (red warning when user interacts during automation)

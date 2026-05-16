@@ -4112,6 +4112,44 @@ async def cmd_wait_for(selector, timeout_ms=5000):
     print(result)
 
 
+async def cmd_wait_for_text(text, timeout_ms=5000):
+    """Wait for text content to appear anywhere in document.body, up to timeout.
+
+    Useful when you don't know the selector but know the text will appear (e.g.
+    streaming AI responses, dynamic banners, late-loaded copy). Uses
+    MutationObserver — returns as soon as the text is rendered, no fixed sleep.
+    """
+    ws_url, _ = get_page_ws()
+    safe_text = json.dumps(text)
+    js = f"""
+    (function() {{
+      return new Promise(function(resolve) {{
+        var needle = {safe_text};
+        function check() {{
+          var bodyText = document.body && document.body.innerText || '';
+          if (bodyText.indexOf(needle) !== -1) {{
+            var idx = bodyText.indexOf(needle);
+            var ctx = bodyText.substring(Math.max(0, idx - 30), Math.min(bodyText.length, idx + needle.length + 30));
+            return 'FOUND: "' + ctx.replace(/\\s+/g, ' ').trim() + '"';
+          }}
+          return null;
+        }}
+        var hit = check();
+        if (hit) return resolve(hit);
+        var obs = new MutationObserver(function() {{
+          var r = check();
+          if (r) {{ obs.disconnect(); resolve(r); }}
+        }});
+        obs.observe(document.body, {{childList: true, subtree: true, characterData: true}});
+        setTimeout(function() {{ obs.disconnect(); resolve('TIMEOUT: text "' + needle.substring(0, 40) + '" not found after {timeout_ms}ms'); }}, {timeout_ms});
+      }});
+    }})()
+    """
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})], timeout=max(15, timeout_ms // 1000 + 5))
+    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
+    print(result)
+
+
 async def cmd_check(checks_json=None):
     """Run batch assertions. Input: JSON array of {selector, text?} objects."""
     ws_url, _ = get_page_ws()
@@ -4894,6 +4932,8 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector to check for existence"}, "text": {"type": "string", "description": "Optional: expected text content (substring match)"}, "visible": {"type": "boolean", "description": "Check element is visible (not hidden/zero-size)", "default": True}}, "required": ["selector"]}},
             {"name": "browser_wait_for", "description": "Wait for an element matching the CSS selector to appear in the DOM, up to the specified timeout. Uses MutationObserver for efficient waiting. Returns the element's tag and text when found, or TIMEOUT if not found. Use before interactions with dynamically loaded content.",
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector to wait for"}, "timeout": {"type": "number", "description": "Maximum wait time in milliseconds", "default": 5000}}, "required": ["selector"]}},
+            {"name": "browser_wait_for_text", "description": "Wait for a specific text string to appear anywhere in document.body, up to the specified timeout. Uses MutationObserver (subtree + characterData) for efficient adaptive waiting — returns the moment the text renders, no fixed sleeps. Ideal for streaming AI responses, async toasts, late-loaded banners, and citation tracking where you know the text but not the selector. Returns surrounding context on hit.",
+             "inputSchema": {"type": "object", "properties": {"text": {"type": "string", "description": "Text fragment to wait for (substring match on document.body.innerText)"}, "timeout": {"type": "number", "description": "Maximum wait time in milliseconds", "default": 5000}}, "required": ["text"]}},
             {"name": "browser_check", "description": "Run a batch of assertions on the current page and return a test report. Each check verifies element existence and optional text content. Returns a summary with PASS/FAIL count. Use this for comprehensive page validation after a series of actions.",
              "inputSchema": {"type": "object", "properties": {"checks": {"type": "array", "description": "Array of checks, each with 'selector' (required) and 'text' (optional)", "items": {"type": "object", "properties": {"selector": {"type": "string"}, "text": {"type": "string"}}, "required": ["selector"]}}}, "required": ["checks"]}},
             {"name": "browser_assert_url", "description": "Assert the current page URL contains the expected substring. Returns PASS with the full URL or FAIL. Use this after navigation to verify you landed on the correct page.",
@@ -4970,6 +5010,7 @@ class MCPServer:
             "browser_describe": lambda a: ["describe"],
             "browser_assert": lambda a: ["assert", a.get("selector", "")] + ([a["text"]] if a.get("text") else []),
             "browser_wait_for": lambda a: ["wait-for", a.get("selector", "")] + ([str(a["timeout"])] if a.get("timeout") else []),
+            "browser_wait_for_text": lambda a: ["wait-for-text", a.get("text", "")] + ([str(a["timeout"])] if a.get("timeout") else []),
             "browser_check": lambda a: ["check", json.dumps(a.get("checks", []))],
             "browser_assert_url": lambda a: ["assert-url", a.get("expected_url", "")],
             "browser_assert_title": lambda a: ["assert-title", a.get("expected_title", "")],
@@ -5151,6 +5192,7 @@ if __name__ == "__main__":
         'smart-select': lambda: (require_args(2, 'smart-select <label> <option>'), None)[1] if len(args) < 2 else cmd_smart_select(args[0], " ".join(args[1:])),
         'assert': lambda: (require_args(1, 'assert <selector> [text]'), None)[1] if not args else cmd_assert(args[0], args[1] if len(args) > 1 else None),
         'wait-for': lambda: (require_args(1, 'wait-for <selector> [timeout_ms]'), None)[1] if not args else cmd_wait_for(args[0], int(args[1]) if len(args) > 1 else 5000),
+        'wait-for-text': lambda: (require_args(1, 'wait-for-text <text> [timeout_ms]'), None)[1] if not args else cmd_wait_for_text(args[0], int(args[1]) if len(args) > 1 else 5000),
         'check': lambda: cmd_check(args[0] if args else None),
         'assert-url': lambda: (require_args(1, 'assert-url <expected>'), None)[1] if not args else cmd_assert_url(args[0]),
         'assert-title': lambda: (require_args(1, 'assert-title <expected>'), None)[1] if not args else cmd_assert_title(args[0]),
