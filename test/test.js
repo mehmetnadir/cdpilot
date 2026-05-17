@@ -585,6 +585,93 @@ test('help advertises dismiss command', () => {
   assert(out.includes('dismiss'), "Help should advertise dismiss");
 });
 
+// ── Adaptive escalation (CAPTCHA → stealth memory) ──
+
+test('adaptive config + hostname memory defined', () => {
+  assert(/ADAPTIVE_CONFIG_FILE\s*=/.test(PY_CONTENT),
+    "ADAPTIVE_CONFIG_FILE path must be declared alongside the other config files");
+  assert(/def get_adaptive_config\(\)/.test(PY_CONTENT),
+    "Should define get_adaptive_config()");
+  assert(/stealth_hosts/.test(PY_CONTENT),
+    "Adaptive must persist a stealth_hosts list");
+});
+
+test('cmd_go: adaptive auto-enables stealth for known host before navigate', () => {
+  // Invariant: when adaptive is ON and the URL's host is in the learned list,
+  // cmd_go must set CDPILOT_STEALTH=1 BEFORE navigate_collect runs (otherwise
+  // the stealth script wouldn't be registered in time).
+  const m = PY_CONTENT.match(/async def cmd_go[\s\S]*?_adaptive_host_requires_stealth\(url\)[\s\S]{0,500}?CDPILOT_STEALTH[\s\S]{0,200}?navigate_collect/);
+  assert(m, "cmd_go must check _adaptive_host_requires_stealth and set CDPILOT_STEALTH=1 BEFORE navigate_collect");
+});
+
+test('cmd_go: CAPTCHA detection → remember host + retry once with stealth', () => {
+  // The escalation loop: after navigate, if CAPTCHA is detected AND adaptive
+  // mode is enabled, the host is added to the persistent list. If stealth
+  // was OFF during this navigation, retry exactly once with stealth enabled.
+  const m = PY_CONTENT.match(/info\.get\("detected"\)[\s\S]*?_adaptive_remember_host\(host\)[\s\S]*?navigate_collect\(ws,\s*url\)/);
+  assert(m, "cmd_go must call _adaptive_remember_host(host) and re-navigate when CAPTCHA is detected with adaptive on");
+});
+
+test('adaptive never auto-demotes — once added, hostname stays until manual forget', () => {
+  // Conservative design: a single false-negative CAPTCHA detection shouldn't
+  // drop a host out of the list. Removal is manual via `adaptive forget`
+  // or `adaptive clear`. The forget helper must be defined.
+  assert(/def cmd_adaptive_forget\(hostname\):/.test(PY_CONTENT),
+    "Should define cmd_adaptive_forget(hostname)");
+  // No automatic removal path in cmd_go or _detect_captcha.
+  const autoRemove = PY_CONTENT.match(/cfg\['stealth_hosts'\]\.remove/g) || [];
+  assert(autoRemove.length === 1,
+    "Only cmd_adaptive_forget should call stealth_hosts.remove — auto-demote is forbidden");
+});
+
+test('adaptive registered in dispatch with forget subcommand routing', () => {
+  // The dispatch handles two shapes: `adaptive forget <host>` routes to
+  // cmd_adaptive_forget(host); everything else routes to cmd_adaptive.
+  assert(/'adaptive':[\s\S]{0,200}?cmd_adaptive_forget\(args\[1\]\)/.test(PY_CONTENT),
+    "Dispatch must route 'adaptive forget <host>' to cmd_adaptive_forget(args[1])");
+  assert(/'adaptive':[\s\S]{0,200}?cmd_adaptive\(args\[0\]/.test(PY_CONTENT),
+    "Dispatch must route 'adaptive' / 'adaptive on/off' to cmd_adaptive");
+});
+
+test('help advertises adaptive command', () => {
+  const out = run('--help');
+  assert(out.includes('adaptive'), "Help should advertise adaptive");
+});
+
+// ── Cookies save/load (clearance pool foundation) ──
+
+test('cmd_cookies accepts variadic args for save/load', () => {
+  // The old signature was cmd_cookies(domain=None) — just listing. With
+  // save/load subcommands the function must accept *args.
+  assert(/async def cmd_cookies\(\*args\):/.test(PY_CONTENT),
+    "cmd_cookies should accept *args to handle save/load subcommands");
+});
+
+test('cmd_cookies save: writes JSON array via Network.getCookies', () => {
+  // The 'save' subcommand must fetch via Network.getCookies (NOT a hand-rolled
+  // scan), apply optional domain filter, and write as a JSON array.
+  const m = PY_CONTENT.match(/sub == 'save'[\s\S]{0,1200}?Network\.getCookies[\s\S]{0,800}?json\.dump\(cookies/);
+  assert(m, "cookies save must use Network.getCookies and json.dump the result");
+});
+
+test('cmd_cookies load: round-trips via Network.setCookies and verifies count', () => {
+  const m = PY_CONTENT.match(/sub == 'load'[\s\S]{0,1500}?Network\.setCookies[\s\S]{0,500}?Network\.getCookies/);
+  assert(m, "cookies load must call Network.setCookies and verify via Network.getCookies");
+});
+
+test('cookies dispatch passes variadic args', () => {
+  // Old dispatch was `cmd_cookies(args[0] if args else None)` — would only
+  // forward one positional. Save/load need ≥2 args.
+  assert(/"cookies":\s*lambda:\s*cmd_cookies\(\*args\)/.test(PY_CONTENT),
+    "Dispatch must call cmd_cookies(*args) to forward subcommand + path");
+});
+
+test('help advertises cookies save/load', () => {
+  const out = run('--help');
+  assert(out.includes('cookies save'), "Help should advertise 'cookies save'");
+  assert(out.includes('cookies load'), "Help should advertise 'cookies load'");
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);

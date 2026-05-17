@@ -468,6 +468,7 @@ HEADLESS_CONFIG_FILE = os.path.join(PROFILE_DIR, 'headless.json')
 STEALTH_CONFIG_FILE = os.path.join(PROFILE_DIR, 'stealth.json')
 BLOCK_CONFIG_FILE = os.path.join(PROFILE_DIR, 'block.json')
 FAST_CONFIG_FILE = os.path.join(PROFILE_DIR, 'fast.json')
+ADAPTIVE_CONFIG_FILE = os.path.join(PROFILE_DIR, 'adaptive.json')
 DOWNLOAD_CONFIG_FILE = os.path.join(PROFILE_DIR, 'download-config.json')
 SESSION_FILE = os.path.join(PROFILE_DIR, 'sessions.json')
 
@@ -2041,8 +2042,21 @@ async def cmd_go(url):
         cmd_launch()
 
     ws, page = get_page_ws()
+
+    # Adaptive mode: if this hostname is in the learned stealth-required list,
+    # temporarily enable stealth for the navigation that's about to happen.
+    # We do this by setting the env var (which get_stealth_config honors first)
+    # instead of writing to stealth.json — keeps the user's permanent setting
+    # untouched and only changes behavior for this one cmd_go call.
+    adaptive_stealth = False
+    if _adaptive_host_requires_stealth(url) and not get_stealth_config():
+        os.environ['CDPILOT_STEALTH'] = '1'
+        adaptive_stealth = True
+        sys.stderr.write(f"🛡️  Adaptive: enabling stealth for known-hostile host\n")
+
     content, _ = await navigate_collect(ws, url)
     print(content)
+
     # Post-navigation CAPTCHA probe. Non-blocking: stderr warning only.
     # Users can run `cdpilot captcha-wait` to pause for manual solve.
     try:
@@ -2050,6 +2064,31 @@ async def cmd_go(url):
         if info.get("detected"):
             types = ",".join(info.get("types", [])) or "unknown"
             sys.stderr.write(f"⚠️  CAPTCHA tespit edildi ({types}). Çözüm için: cdpilot captcha-wait\n")
+
+            # Adaptive escalation: remember this host so the next visit starts
+            # in stealth, and if stealth was off this round, try once more
+            # right now with stealth on. Re-nav is gated to once-per-call to
+            # avoid an infinite loop if stealth doesn't actually fix it.
+            cfg = get_adaptive_config()
+            if cfg['enabled']:
+                try:
+                    from urllib.parse import urlparse
+                    host = (urlparse(url).hostname or '').lower()
+                except Exception:
+                    host = ''
+                if host:
+                    _adaptive_remember_host(host)
+                    sys.stderr.write(f"🛡️  Adaptive: remembered {host} as stealth-required\n")
+                if not adaptive_stealth and not get_stealth_config():
+                    sys.stderr.write("🛡️  Adaptive: retrying once with stealth on...\n")
+                    os.environ['CDPILOT_STEALTH'] = '1'
+                    await navigate_collect(ws, url)
+                    # Re-probe after stealth re-nav
+                    info2 = await _detect_captcha(ws)
+                    if info2.get("detected"):
+                        sys.stderr.write("⚠️  Adaptive: CAPTCHA still present after stealth retry. Manual solve needed.\n")
+                    else:
+                        sys.stderr.write("✅ Adaptive: CAPTCHA cleared with stealth.\n")
     except Exception:
         pass
 
@@ -2458,7 +2497,79 @@ async def cmd_console(url=None):
     print(f"\n=== Content (first 3000 chars) ===\n{content[:3000]}")
 
 
-async def cmd_cookies(domain=None):
+async def cmd_cookies(*args):
+    """List, export, or import cookies.
+
+    Usage:
+      cdpilot cookies                          # list all cookies (or for current page)
+      cdpilot cookies <domain>                 # list cookies for a specific domain
+      cdpilot cookies save <file> [<domain>]   # export to JSON (all or scoped)
+      cdpilot cookies load <file>              # import cookies from JSON
+
+    Why save/load: once you've beaten a Cloudflare/DataDome challenge in one
+    cdpilot process, the `cf_clearance` (or equivalent) cookie sits in this
+    browser instance's jar. Exporting it lets you skip the wall in a separate
+    process or after a `cdpilot stop` cycle. Same applies to logged-in
+    sessions — capture once, replay across runs.
+    """
+    sub = args[0].lower() if args else None
+
+    if sub == 'save':
+        if len(args) < 2:
+            print('Usage: cdpilot cookies save <file> [<domain>]', file=sys.stderr)
+            sys.exit(1)
+        out_path = os.path.expanduser(args[1])
+        domain_filter = args[2] if len(args) >= 3 else None
+        ws, _ = get_page_ws()
+        # Get all cookies (no urls filter → all). Domain filter is applied
+        # client-side so we can match subdomains via endswith.
+        r = await cdp_send(ws, [(1, "Network.getCookies", {})])
+        cookies = r.get(1, {}).get("cookies", [])
+        if domain_filter:
+            d = domain_filter.lstrip('.')
+            cookies = [c for c in cookies
+                       if c.get('domain', '').lstrip('.').endswith(d)]
+        with open(out_path, 'w') as f:
+            json.dump(cookies, f, indent=2)
+        print(f'Saved {len(cookies)} cookies → {out_path}')
+        return
+
+    if sub == 'load':
+        if len(args) < 2:
+            print('Usage: cdpilot cookies load <file>', file=sys.stderr)
+            sys.exit(1)
+        in_path = os.path.expanduser(args[1])
+        if not os.path.exists(in_path):
+            print(f'File not found: {in_path}', file=sys.stderr)
+            sys.exit(1)
+        try:
+            with open(in_path) as f:
+                cookies = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f'Cannot parse cookie file: {e}', file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(cookies, list):
+            print('Cookie file must contain a JSON array of cookie objects', file=sys.stderr)
+            sys.exit(1)
+        ws, _ = get_page_ws()
+        # Network.setCookies takes the same shape Network.getCookies returns.
+        # CDP will skip cookies it considers invalid; we log the count it
+        # actually accepted by re-reading.
+        await cdp_send(ws, [(1, "Network.setCookies", {"cookies": cookies})])
+        # Verify count
+        r = await cdp_send(ws, [(2, "Network.getCookies", {})])
+        loaded = r.get(2, {}).get("cookies", [])
+        # Map by (name, domain, path) for set inclusion check
+        want = {(c.get('name'), c.get('domain'), c.get('path', '/')) for c in cookies}
+        have = {(c.get('name'), c.get('domain'), c.get('path', '/')) for c in loaded}
+        accepted = len(want & have)
+        print(f'Loaded {accepted}/{len(cookies)} cookies from {in_path}')
+        if accepted < len(cookies):
+            print(f'  ({len(cookies) - accepted} rejected by CDP — usually because of expiry or domain mismatch)')
+        return
+
+    # List mode
+    domain = args[0] if args else None
     ws, _ = get_page_ws()
     params = {}
     if domain:
@@ -3525,6 +3636,128 @@ def cmd_fast(state=None):
     _atomic_write_json(FAST_CONFIG_FILE, {'enabled': enabled})
     print(f'Fast mode: {"on" if enabled else "off"}')
     print(f'  Effective auto-wait: {get_auto_wait_ms()}ms')
+
+
+# ─── Adaptive mode: "run fast, climb walls when seen" ───
+#
+# Default cdpilot mode is "fast lane" — no stealth, agile defaults. Some sites
+# (Cloudflare Turnstile, hCaptcha, DataDome, PerimeterX) detect this and serve
+# a challenge. Without adaptive mode the user has to manually `cdpilot stealth
+# on` then re-navigate. Adaptive does it automatically:
+#
+#   1. cmd_go navigates as usual
+#   2. _detect_captcha runs (it already runs today, just for warnings)
+#   3. If CAPTCHA detected AND adaptive is ON:
+#      - Persist this hostname so future visits start in stealth
+#      - If stealth is currently OFF: flip it ON and re-navigate once
+#      - Print what we did so the user sees the decision
+#
+# State persists in adaptive.json as {enabled, stealth_hosts: [hostname,...]}.
+# We only AUTO-promote hostnames, never auto-demote — if you turn stealth on
+# for example.com once, it stays on for example.com forever (until you
+# manually clear the list). Conservative: prevents flapping when CAPTCHA
+# detection has a false negative.
+
+
+def get_adaptive_config():
+    """Return {'enabled': bool, 'stealth_hosts': [hostname,...]}."""
+    if not os.path.exists(ADAPTIVE_CONFIG_FILE):
+        return {'enabled': False, 'stealth_hosts': []}
+    try:
+        with open(ADAPTIVE_CONFIG_FILE) as f:
+            data = json.load(f)
+        return {
+            'enabled': bool(data.get('enabled', False)),
+            'stealth_hosts': list(data.get('stealth_hosts', [])),
+        }
+    except (OSError, ValueError):
+        return {'enabled': False, 'stealth_hosts': []}
+
+
+def _adaptive_remember_host(hostname):
+    """Add hostname to the stealth_hosts list. Idempotent."""
+    cfg = get_adaptive_config()
+    if hostname in cfg['stealth_hosts']:
+        return
+    cfg['stealth_hosts'].append(hostname)
+    _atomic_write_json(ADAPTIVE_CONFIG_FILE, cfg)
+
+
+def _adaptive_host_requires_stealth(url):
+    """True if the URL's hostname is in the adaptive stealth list."""
+    cfg = get_adaptive_config()
+    if not cfg['enabled']:
+        return False
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or '').lower()
+    except Exception:
+        return False
+    return host in cfg['stealth_hosts']
+
+
+def cmd_adaptive(state=None):
+    """Toggle adaptive mode — auto-escalate to stealth when a CAPTCHA is seen.
+
+    Usage:
+      cdpilot adaptive               # status — shows enabled + stealth host list
+      cdpilot adaptive on|off        # toggle
+      cdpilot adaptive clear         # drop the stealth host memory
+      cdpilot adaptive forget <host> # remove one hostname from the list
+
+    Default: OFF. When ON, cdpilot will:
+      - Auto-enable stealth for known-hostile hostnames before navigating.
+      - After every navigation, detect CAPTCHA and remember the hostname for
+        future visits.
+      - If a CAPTCHA appears AND stealth is currently off, flip stealth on and
+        re-navigate once automatically.
+
+    Never auto-demotes — once a hostname is in the list, it stays unless you
+    run `cdpilot adaptive forget <host>` or `cdpilot adaptive clear`. This
+    prevents flapping from a single false-negative CAPTCHA detection.
+    """
+    cfg = get_adaptive_config()
+
+    if state is None or state.lower() == 'status':
+        print(f'Adaptive: {"on" if cfg["enabled"] else "off"}')
+        if cfg['stealth_hosts']:
+            print(f'  Stealth hosts ({len(cfg["stealth_hosts"])}):')
+            for h in cfg['stealth_hosts'][:10]:
+                print(f'    {h}')
+            if len(cfg['stealth_hosts']) > 10:
+                print(f'    ... and {len(cfg["stealth_hosts"]) - 10} more')
+        else:
+            print('  Stealth hosts: (none)')
+        return
+
+    s = state.lower()
+    if s in ('clear',):
+        _atomic_write_json(ADAPTIVE_CONFIG_FILE, {'enabled': cfg['enabled'], 'stealth_hosts': []})
+        print('Adaptive: stealth host list cleared')
+        return
+    if s in ('forget',):
+        # Stub — actual hostname comes via sys.argv parsing in the dispatch
+        print("Usage: cdpilot adaptive forget <hostname>", file=sys.stderr)
+        sys.exit(1)
+    if s not in ('on', 'off', '1', '0', 'true', 'false', 'yes', 'no'):
+        print(f"Invalid state: {state}. Use 'on', 'off', 'clear', 'forget', or 'status'.", file=sys.stderr)
+        sys.exit(1)
+    enabled = s in ('on', '1', 'true', 'yes')
+    _atomic_write_json(ADAPTIVE_CONFIG_FILE, {'enabled': enabled, 'stealth_hosts': cfg['stealth_hosts']})
+    print(f'Adaptive: {"on" if enabled else "off"}')
+    if enabled and not cfg['stealth_hosts']:
+        print('  (no stealth hosts learned yet — visit a CAPTCHA-protected site to start the memory)')
+
+
+def cmd_adaptive_forget(hostname):
+    """Remove one hostname from the adaptive stealth list."""
+    cfg = get_adaptive_config()
+    if hostname not in cfg['stealth_hosts']:
+        print(f'Adaptive: "{hostname}" was not in the stealth list')
+        return
+    cfg['stealth_hosts'].remove(hostname)
+    _atomic_write_json(ADAPTIVE_CONFIG_FILE, cfg)
+    print(f'Adaptive: forgot "{hostname}"')
 
 
 async def _detect_captcha(ws_url):
@@ -5924,6 +6157,7 @@ if __name__ == "__main__":
         'block': lambda: cmd_block(*args),
         'show': lambda: cmd_show(args[0] if args else None),
         'fast': lambda: cmd_fast(args[0] if args else None),
+        'adaptive': (lambda: cmd_adaptive_forget(args[1])) if (len(args) >= 2 and args[0].lower() == 'forget') else (lambda: cmd_adaptive(args[0] if args else None)),
         'browser': lambda: cmd_browser(args[0] if args else None),
         'health': cmd_health,
         'session': cmd_session,
@@ -5991,7 +6225,7 @@ if __name__ == "__main__":
         "tabs": cmd_tabs,
         "network": lambda: cmd_network(args[0] if args else None),
         "console": lambda: cmd_console(args[0] if args else None),
-        "cookies": lambda: cmd_cookies(args[0] if args else None),
+        "cookies": lambda: cmd_cookies(*args),
         "storage": cmd_storage,
         "perf": cmd_perf,
         "emulate": lambda: (require_args(1, "emulate <device>"), None)[1] if not args else cmd_emulate(args[0]),

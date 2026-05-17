@@ -344,6 +344,13 @@ function showHelp() {
     stealth [on|off]   Toggle anti-fingerprint patches (opt-in)
     captcha-check      Detect CAPTCHA on active page (JSON output)
     captcha-wait [s]   Pause until user solves CAPTCHA (default 300s)
+    adaptive [on|off]  Auto-escalate to stealth on hosts that show CAPTCHA.
+                       Remembers per-host. Use 'adaptive forget <host>' to reset.
+    cookies save <file> [<dom>]
+                       Export cookies (all or scoped). Replay clearance cookies
+                       across cdpilot runs to skip Cloudflare walls.
+    cookies load <file>
+                       Import previously-saved cookies into the current jar.
 
   RELIABILITY
     browser [name]     Show or set preferred browser (chrome|brave|chromium|edge|vivaldi|auto)
