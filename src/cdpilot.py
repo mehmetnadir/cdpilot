@@ -14,7 +14,7 @@ Environment:
   CDPILOT_PROFILE      Isolated browser profile directory
 """
 
-__version__ = "0.4.4"
+__version__ = "0.5.0"
 
 import asyncio
 import atexit

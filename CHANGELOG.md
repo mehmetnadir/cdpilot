@@ -2,7 +2,11 @@
 
 All notable changes to cdpilot will be documented in this file.
 
-## [Unreleased]
+## [0.5.0] - 2026-05-17
+
+> "Run fast in the open lane, climb walls when you see them, then keep running."
+> A release organised around three themes: **quiet professional output**,
+> **wall-aware navigation**, and **true parallelism**.
 
 ### Added
 - **`cdpilot dismiss [N|aggressive]`** — heuristic auto-click for "Stay signed out / No thanks / Continue without account" buttons. Designed for unauthenticated queries against LLM chat sites (ChatGPT, Perplexity, Claude.ai, Gemini) that gate access behind a sign-up modal but offer an escape hatch. Built-in pattern library covers English + Turkish dismissive phrases with weighted scoring (exact-match bonus). **Safety guards** are load-bearing: an explicit negative-pattern list ("delete account", "sign out", "subscribe", Turkish equivalents) disqualifies dangerous lookalikes — one negative hit on any of the element's text/aria/title/value attributes and it's out, regardless of how many positive patterns also match. Visibility gate (0-size, display:none, visibility:hidden, opacity<0.1) and a minimum score threshold of 40 prevent weak-match misfires. Pass an integer N (1-10) or `aggressive` (up to 5) to handle chained modals — common on cookie-banner-then-signup pages. MCP: `browser_dismiss`.
