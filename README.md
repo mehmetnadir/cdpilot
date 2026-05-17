@@ -86,24 +86,38 @@ npx cdpilot launch    # Start browser with CDP enabled
 npx cdpilot status    # Check connection
 ```
 
-### Upgrading from 0.4.3 → 0.4.4 — read this first
+### Upgrading from 0.4.x → 0.5.0 — read this first
 
-**Visual feedback default flipped to OFF.** The green glow border, animated
-fake cursor, click ripples, and keystroke display made cdpilot feel like an
-amateur typing on every page. They are now opt-in:
+**One breaking change**, the rest is additive.
+
+**Breaking — Visual feedback default flipped to OFF.** The green glow border,
+animated fake cursor, click ripples, and keystroke display made cdpilot feel
+like an amateur typing on every page. They are now opt-in:
 
 ```bash
 cdpilot show on     # restore the old visual feedback layer
-cdpilot show off    # default since 0.4.4
+cdpilot show off    # default since 0.5.0
 ```
 
 The MCP server's persistent-glow flow (`CDPILOT_MCP_SESSION=1`) is **unchanged**
 — AI agents that rely on visible feedback during a session still see it
 automatically. Only direct-CLI users see the difference.
 
-Other 0.4.4 changes are pure performance and require no migration:
-post-load sleep cut 1500ms → 300ms, `scrollIntoView('smooth')` →
-`'instant'` everywhere, new `cdpilot fast` toggle for shorter auto-waits.
+**New in 0.5.0** (no migration needed):
+
+- `cdpilot dismiss` — heuristic auto-click for "Stay signed out / No thanks"
+  buttons on LLM chat sign-up walls.
+- `cdpilot adaptive on` — auto-escalate to stealth on CAPTCHA-protected
+  hosts, with persistent per-host memory.
+- `cdpilot cookies save/load` — export/import cookies as JSON to replay
+  CF/DataDome clearance across runs.
+- `cdpilot context create/list/close` + `CDPILOT_TARGET` — isolated browser
+  contexts for true parallel automation inside a single browser.
+- `cdpilot fast` / `cdpilot show` — bundled timing + visual toggles.
+- Pure performance: post-load sleep 1500ms → 300ms, `scrollIntoView` instant,
+  WebSocket connection pool, `/json` TTL cache.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list with rationale.
 
 ## Commands
 
@@ -250,7 +264,10 @@ cdpilot session-close [id]    # Close session
 ### Advanced
 
 ```bash
-cdpilot cookies [domain]      # List cookies
+cdpilot cookies [domain]      # List cookies (filter by domain)
+cdpilot cookies save <file> [<domain>]
+                              # Export cookies as JSON (optional domain filter)
+cdpilot cookies load <file>   # Import cookies (replay CF clearance across runs)
 cdpilot storage               # localStorage contents
 cdpilot upload <sel> <file>   # Upload file to input
 cdpilot multi-eval <js>       # Execute JS in all tabs
@@ -259,6 +276,36 @@ cdpilot frame list            # List iframes
 cdpilot dialog auto-accept    # Auto-accept dialogs
 cdpilot permission grant geo  # Grant geolocation
 ```
+
+### Parallel Contexts
+
+```bash
+cdpilot context create [url]  # Make fresh browser context + tab (prints JSON)
+cdpilot context list          # Tree of contexts and their tabs
+cdpilot context close <ctx>   # Destroy a context (refuses 'default')
+```
+
+Address a specific context's tab in subsequent commands via the env pin:
+
+```bash
+ID=$(cdpilot context create https://example.com | jq -r .target_id)
+CDPILOT_TARGET=$ID cdpilot eval 'document.title'
+```
+
+> True isolation — each context has its own cookie/storage jar. Designed for
+> running N AI chat queries in parallel without history pollution, or A/B
+> testing logged-in vs logged-out flows without spinning up multiple browsers.
+
+### Smart Navigation (LLM-aware)
+
+```bash
+cdpilot dismiss               # Click best "Stay signed out / No thanks" button
+cdpilot dismiss aggressive    # Handle chained modals (cookie banner → signup)
+```
+
+> Built-in English + Turkish pattern library. Explicitly excludes destructive
+> lookalikes (Delete account, Sign out, Subscribe) — safe to chain into a
+> query workflow.
 
 ### Stealth & CAPTCHA
 
@@ -277,7 +324,19 @@ cdpilot captcha-check         # JSON detection of Turnstile/hCaptcha/reCAPTCHA/
                               # DataDome/PerimeterX/Arkose/GeeTest. Exit 0/3
 cdpilot captcha-wait [sec]    # block until user solves (interactive)
                               # or poll with JSON stream (non-interactive)
+
+cdpilot adaptive [on|off|status]
+                              # Auto-escalate to stealth on hosts that show
+                              # CAPTCHA. Persistent per-host memory.
+cdpilot adaptive forget <host>
+                              # Remove a hostname from the stealth list
+cdpilot adaptive clear        # Drop the stealth host memory entirely
 ```
+
+> **Adaptive mode** is the "run fast, climb walls when seen" automation: cdpilot
+> runs in the open lane by default, detects CAPTCHA after each navigation, and
+> when it sees one — adds the host to a persistent list, retries once with
+> stealth on. Never auto-demotes. Conservative by design.
 
 Verified against public bot-detection panels:
 - **bot.sannysoft.com:** 24/24 PASS (WebDriver, Chrome obj, Plugins as PluginArray, WebGL, PHANTOM_*, HEADCHR_*, SELENIUM_DRIVER)
@@ -411,6 +470,12 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] **`wait-for-text`** — adaptive text-based waiting (subtree + characterData) for streaming AI responses, async toasts, and selector-less synchronization
 - [x] **`eval-batch`** — run N JS expressions in 1 CDP roundtrip (5-30x speedup vs sequential `eval`)
 - [x] **`block`** — request blocking via `Network.setBlockedURLs` with built-in presets (images/fonts/ads/media), 3-10x faster page loads on opt-in
+- [x] **`dismiss`** — heuristic auto-click for LLM chat sign-up walls (EN+TR pattern library, destructive-action guards)
+- [x] **`adaptive`** — auto-escalate to stealth on CAPTCHA-protected hosts, persistent per-host memory ("run fast, climb walls")
+- [x] **`cookies save/load`** — export/import cookies as JSON (replay CF/DataDome clearance across runs)
+- [x] **`context` pool + `CDPILOT_TARGET`** — isolated browser contexts for true parallel automation in a single browser (Playwright's parallel-tabs model)
+- [x] **`fast` / `show`** — bundled timing + visual toggles. Default quiet/fast in 0.5.0
+- [x] **WebSocket pool + `/json` TTL cache** — zero-regression connection reuse for MCP/batch workloads
 - [x] **Batch commands** — pipe JSON arrays via stdin for multi-step automation
 - [x] Visual feedback system (persistent green glow, cursor, ripples, keystroke display)
 - [x] AI control warning toast (red warning when user interacts during automation)

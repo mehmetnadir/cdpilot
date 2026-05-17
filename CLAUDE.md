@@ -104,13 +104,22 @@ Brave/Chrome/Chromium (CDP modu, port 9222)
 | ✅ | Auto-Wait | 5s MutationObserver bekleme |
 | ✅ | Batch Commands | JSON pipe desteği |
 | ✅ | Site | cdpilot.ndr.ist canlı (landing + 63 komut docs, browser+health dahil) |
-| ✅ | GitHub & npm | **v0.4.3 yayınlandı**, 6 awesome repo PR'ı |
+| ✅ | GitHub & npm | **v0.5.0 hazırlandı** (lokal); npm publish onay bekliyor |
 | ✅ | Stealth Layer | Zero-dep fingerprint patches (webdriver smart no-op, plugins PluginArray-typed, WebGL spoof, Worker wrap) — opt-in via `cdpilot stealth on` |
 | ✅ | CAPTCHA Detection | 8 sağlayıcı (Turnstile, hCaptcha, reCAPTCHA, DataDome, PerimeterX, Arkose, GeeTest, CF-interstitial). `captcha-check` + `captcha-wait` komutları |
+| ✅ | Adaptive Escalation (v0.5.0) | `cdpilot adaptive on` — CAPTCHA detect → per-host stealth memory + auto re-nav. "Run fast, climb walls when seen" |
+| ✅ | Auto-Dismiss (v0.5.0) | `cdpilot dismiss` — EN+TR pattern lib, destructive-action guards, LLM sign-up wall escape |
+| ✅ | Cookies save/load (v0.5.0) | CF/DataDome clearance replay across runs |
+| ✅ | Context Pool (v0.5.0) | `Target.createBrowserContext` × N + `CDPILOT_TARGET` env pin → true parallel automation |
+| ✅ | Efficient Mode (v0.5.0) | Visual feedback default OFF (`cdpilot show on` opt-in), `cdpilot fast`, scroll instant, post-load 1.5s → 0.3s |
+| ✅ | WS Pool (v0.5.0) | Per-target connection reuse, atexit cleanup, zero tekil-CLI regression |
+| ✅ | `wait-for-text` (v0.5.0) | rAF-throttled MutationObserver — streaming AI response wait |
+| ✅ | `eval-batch` (v0.5.0) | N JS expressions in 1 CDP roundtrip |
+| ✅ | `block` (v0.5.0) | `Network.setBlockedURLs` + image/font/ad presets |
 | ✅ | Browser Selection | `cdpilot browser [name|auto]` — workload-aware (ext var→Vivaldi/Brave, ext yok→Chrome) + macOS 26 Brave demote + per-browser profile izolasyonu |
 | ✅ | Health Probe | `cdpilot health` JSON output — alive, port, tabs, browser, today's crashes. Watchdog loop için exit 0/2 |
 | 🔄 | cdpilot Cloud | Hosted browser sessions API (roadmap) |
-| ⏳ | v0.5.0 | Auto-recovery wrapper (cdp_send fail'de retry + relaunch) |
+| ⏳ | v0.5.0 release | npm publish + site update + sosyal medya duyurusu (onay bekliyor) |
 
 ## Dikkat Edilecekler (Gotchas)
 
@@ -138,7 +147,7 @@ Brave/Chrome/Chromium (CDP modu, port 9222)
 | `cdpilot-video.mp4` | Tam demo videosu (1080x1080, 30fps) |
 
 ---
-Son Güncelleme: 2026-04-21
+Son Güncelleme: 2026-05-17
 
 <!-- gitnexus:start -->
 ## GitNexus — Code Intelligence
