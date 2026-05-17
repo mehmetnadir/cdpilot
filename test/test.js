@@ -672,6 +672,63 @@ test('help advertises cookies save/load', () => {
   assert(out.includes('cookies load'), "Help should advertise 'cookies load'");
 });
 
+// ── Browser context pool ──
+
+test('cmd_context_create uses CDP Target.createBrowserContext + createTarget', () => {
+  // True isolation: a fresh BrowserContext gives you a clean cookie/storage
+  // jar. Without createBrowserContext first, createTarget would land in the
+  // default context (shared cookies) — that's a soft tab, not a real
+  // isolated session.
+  const m = PY_CONTENT.match(/async def cmd_context_create[\s\S]*?Target\.createBrowserContext[\s\S]*?Target\.createTarget/);
+  assert(m, "cmd_context_create must call Target.createBrowserContext THEN Target.createTarget(browserContextId=...)");
+});
+
+test('cmd_context_create rolls back on createTarget failure', () => {
+  // If createBrowserContext succeeded but createTarget failed, we'd leak an
+  // empty context. The rollback path must call disposeBrowserContext BEFORE
+  // sys.exit so we don't leave the orphan dangling.
+  const m = PY_CONTENT.match(/async def cmd_context_create[\s\S]*?if not tgt_id:[\s\S]{0,600}?Target\.disposeBrowserContext[\s\S]{0,400}?sys\.exit\(1\)/);
+  assert(m, "cmd_context_create must dispose the orphan context BEFORE sys.exit(1) when createTarget fails");
+});
+
+test('CDPILOT_TARGET env pin bypasses session lookup', () => {
+  // For parallel workflows, each CLI invocation must be able to address a
+  // specific tab without polluting CWD-keyed session state. The env pin must
+  // be checked BEFORE _get_session_window_target_id.
+  const m = PY_CONTENT.match(/def get_page_ws[\s\S]{0,1200}?CDPILOT_TARGET[\s\S]{0,500}?return\s+p\[.webSocketDebuggerUrl.\],\s*p/);
+  assert(m, "get_page_ws must check CDPILOT_TARGET env first and short-circuit on match");
+});
+
+test('CDPILOT_TARGET pin fails loud when tab is gone', () => {
+  // Silent fallback to a different tab on a missing pin would be a heisenbug
+  // for parallel callers — they'd think they hit context A but actually
+  // ran on context B.
+  const m = PY_CONTENT.match(/CDPILOT_TARGET[\s\S]{0,500}?no such tab[\s\S]{0,200}?sys\.exit\(1\)/);
+  assert(m, "Missing pinned target must print an error and sys.exit(1), not silently fall through");
+});
+
+test('cmd_context_close refuses to destroy the default context', () => {
+  // disposeBrowserContext on the default context's "id" (which is empty/None
+  // depending on how it's passed) would either no-op or break things. Refuse
+  // to even try.
+  const m = PY_CONTENT.match(/async def cmd_context_close[\s\S]{0,500}?context_id == 'default'[\s\S]{0,200}?sys\.exit\(1\)/);
+  assert(m, "cmd_context_close must refuse 'default' context_id");
+});
+
+test('context registered in dispatch as variadic dispatcher', () => {
+  // The dispatch entry must forward *args because the subcommand structure
+  // is `context create|list|close [extra]` — single-arg lambda would lose
+  // the URL / context_id parameter.
+  assert(/'context':\s*lambda:\s*cmd_context\(\*args\)/.test(PY_CONTENT),
+    "Dispatch must call cmd_context(*args) to forward subcommand + extra args");
+});
+
+test('help advertises context commands', () => {
+  const out = run('--help');
+  assert(out.includes('context'), "Help should advertise context");
+  assert(out.includes('CDPILOT_TARGET'), "Help should explain how to target a context's tab");
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);

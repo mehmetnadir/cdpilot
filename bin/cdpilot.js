@@ -340,6 +340,12 @@ function showHelp() {
     new-tab [url]      Open new tab
     close-tab [id]     Close tab
 
+  PARALLEL CONTEXTS (isolated cookies/storage inside one browser)
+    context create [url]     Make a fresh browser context + tab; prints JSON
+    context list             List all browser contexts and their tabs
+    context close <ctx-id>   Destroy a browser context (closes all its tabs)
+    (Address a context's tab in subsequent commands via CDPILOT_TARGET=<tgt-id>)
+
   STEALTH & CAPTCHA
     stealth [on|off]   Toggle anti-fingerprint patches (opt-in)
     captcha-check      Detect CAPTCHA on active page (JSON output)
