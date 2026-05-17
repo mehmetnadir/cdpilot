@@ -1039,11 +1039,34 @@ def _ensure_session_window():
 def get_page_ws(prefer_url=None):
     """Find the WebSocket URL for the appropriate page target.
 
-    If a session window exists, only looks at tabs in that window.
-    Otherwise creates a new session window.
+    Resolution order:
+      1. CDPILOT_TARGET env — explicit target_id pin. Used by the browser
+         context pool to address a specific tab inside a specific browser
+         context from a parallel CLI invocation. Bypasses session lookup
+         entirely.
+      2. Session window target_id (CWD-keyed).
+      3. Create a new session window.
+
+    Why the env override matters: a parallel workflow like
+        ID=$(cdpilot context create) ; CDPILOT_TARGET=$ID cdpilot go URL
+    needs to address the just-created tab without polluting the CWD-keyed
+    session state (which would be a race condition between concurrent calls).
     """
     tabs = get_tabs()
     pages = [t for t in tabs if t.get("type") == "page"]
+
+    # Explicit target pin via env — used by context pool callers.
+    pin = os.environ.get('CDPILOT_TARGET')
+    if pin:
+        for p in pages:
+            if p.get("id") == pin:
+                return p["webSocketDebuggerUrl"], p
+        # Pin was specified but the tab is gone — fail loudly rather than
+        # silently switching to a different tab (would be a heisenbug for
+        # parallel workflows).
+        print(f"CDPILOT_TARGET={pin} but no such tab. Did the context get destroyed?",
+              file=sys.stderr)
+        sys.exit(1)
 
     # Get target ID for the current session window
     session_target_id = _get_session_window_target_id()
@@ -3019,6 +3042,156 @@ def cmd_ext_remove(ext_id):
     shutil.rmtree(ext_dir)
     print(f"🗑️ Extension removed: {name}")
     print("   Note: Restart the browser (stop → launch).")
+
+# ─── Browser context pool (Target.createBrowserContext × N) ───
+#
+# Browser contexts are isolated cookie/storage namespaces inside the SAME
+# browser process. Playwright's parallel-tabs model — true concurrency for
+# automation workloads that would otherwise serialize on one shared cookie
+# jar. Use cases:
+#   - Run a citation tracker across 50 Perplexity queries in parallel
+#     without each query stomping on the previous one's chat history.
+#   - Test a flow against logged-in + logged-out + guest variants in
+#     parallel without spinning up 3 browsers.
+#   - Beat a Cloudflare wall in one context, keep the clearance there;
+#     start a fresh anonymous context for the next sensitive operation.
+#
+# How parallelism works at the cdpilot CLI layer:
+#   ID=$(cdpilot context create https://example.com)
+#   ID2=$(cdpilot context create https://google.com)
+#   CDPILOT_TARGET=$ID cdpilot eval 'document.title' &
+#   CDPILOT_TARGET=$ID2 cdpilot eval 'document.title' &
+#   wait
+# Each invocation is a separate Python process with its own WS pool, talking
+# to the SAME browser but a DIFFERENT tab inside a DIFFERENT context. They
+# don't share cookies, storage, or auth state — but they DO share renderer
+# CPU/memory (single browser process limit still applies).
+
+
+async def cmd_context_create(url='about:blank'):
+    """Create a fresh browser context + tab inside it. Print JSON to stdout.
+
+    Output: {"context_id": "...", "target_id": "...", "url": "..."}
+    The target_id is what CDPILOT_TARGET expects.
+    """
+    if not cdp_get('/json/version'):
+        cmd_launch()
+    # Resolve a base WS to talk to the browser itself (not a tab).
+    ver = cdp_get('/json/version')
+    browser_ws = ver.get('webSocketDebuggerUrl') if ver else None
+    if not browser_ws:
+        print('Cannot reach browser-level WS', file=sys.stderr)
+        sys.exit(1)
+    r = await cdp_send(browser_ws, [
+        (1, "Target.createBrowserContext", {}),
+    ])
+    ctx_id = r.get(1, {}).get("browserContextId")
+    if not ctx_id:
+        print(f'createBrowserContext failed: {r.get(1)}', file=sys.stderr)
+        sys.exit(1)
+    r2 = await cdp_send(browser_ws, [
+        (2, "Target.createTarget", {"url": url, "browserContextId": ctx_id}),
+    ])
+    tgt_id = r2.get(2, {}).get("targetId")
+    if not tgt_id:
+        # Roll back the empty context — orphaned contexts leak memory.
+        await cdp_send(browser_ws, [
+            (3, "Target.disposeBrowserContext", {"browserContextId": ctx_id})
+        ])
+        print(f'createTarget failed: {r2.get(2)}', file=sys.stderr)
+        sys.exit(1)
+    cdp_cache_invalidate()
+    print(json.dumps({
+        "context_id": ctx_id,
+        "target_id": tgt_id,
+        "url": url,
+    }))
+
+
+async def cmd_context_list():
+    """List all browser contexts and their tabs as JSON."""
+    ver = cdp_get('/json/version')
+    browser_ws = ver.get('webSocketDebuggerUrl') if ver else None
+    if not browser_ws:
+        print('Cannot reach browser-level WS', file=sys.stderr)
+        sys.exit(1)
+    r = await cdp_send(browser_ws, [
+        (1, "Target.getBrowserContexts", {}),
+        (2, "Target.getTargets", {}),
+    ])
+    ctx_ids = r.get(1, {}).get("browserContextIds", [])
+    targets = r.get(2, {}).get("targetInfos", [])
+    # Group page targets by their browserContextId. Targets without a
+    # browserContextId are in the default context.
+    grouped = {}
+    for t in targets:
+        if t.get("type") != "page":
+            continue
+        cid = t.get("browserContextId", "default")
+        grouped.setdefault(cid, []).append({
+            "target_id": t.get("targetId"),
+            "url": t.get("url", "")[:120],
+            "title": (t.get("title") or '')[:80],
+        })
+    # Make sure every reported context shows up even if it has no tabs.
+    for cid in ctx_ids:
+        grouped.setdefault(cid, [])
+    grouped.setdefault("default", grouped.get("default", []))
+    print(json.dumps({
+        "default_context": grouped.get("default", []),
+        "browser_contexts": [
+            {"context_id": cid, "tabs": grouped[cid]}
+            for cid in ctx_ids
+        ],
+    }, indent=2))
+
+
+async def cmd_context_close(context_id):
+    """Destroy a browser context. All tabs inside it close automatically.
+
+    Refuses to destroy the default context (which has no context_id anyway).
+    """
+    if not context_id or context_id == 'default':
+        print('Cannot destroy the default context.', file=sys.stderr)
+        sys.exit(1)
+    ver = cdp_get('/json/version')
+    browser_ws = ver.get('webSocketDebuggerUrl') if ver else None
+    if not browser_ws:
+        print('Cannot reach browser-level WS', file=sys.stderr)
+        sys.exit(1)
+    r = await cdp_send(browser_ws, [
+        (1, "Target.disposeBrowserContext", {"browserContextId": context_id}),
+    ])
+    cdp_cache_invalidate()
+    err = r.get(1, {}).get("error") if isinstance(r.get(1), dict) else None
+    if err:
+        print(f'disposeBrowserContext failed: {err}', file=sys.stderr)
+        sys.exit(1)
+    print(f'Closed context: {context_id}')
+
+
+def cmd_context(*args):
+    """Dispatcher for the context subcommand family.
+
+    Usage:
+      cdpilot context create [url]
+      cdpilot context list
+      cdpilot context close <context_id>
+    """
+    sub = args[0].lower() if args else None
+    if sub == 'create':
+        asyncio.run(cmd_context_create(args[1] if len(args) > 1 else 'about:blank'))
+    elif sub == 'list':
+        asyncio.run(cmd_context_list())
+    elif sub == 'close':
+        if len(args) < 2:
+            print('Usage: cdpilot context close <context_id>', file=sys.stderr)
+            sys.exit(1)
+        asyncio.run(cmd_context_close(args[1]))
+    else:
+        print('Usage: cdpilot context [create|list|close]', file=sys.stderr)
+        sys.exit(1)
+
 
 async def cmd_new_tab(url='about:blank'):
     """Open a new tab."""
@@ -6155,6 +6328,7 @@ if __name__ == "__main__":
         'headless': lambda: cmd_headless(args[0] if args else None),
         'stealth': lambda: cmd_stealth(args[0] if args else None),
         'block': lambda: cmd_block(*args),
+        'context': lambda: cmd_context(*args),
         'show': lambda: cmd_show(args[0] if args else None),
         'fast': lambda: cmd_fast(args[0] if args else None),
         'adaptive': (lambda: cmd_adaptive_forget(args[1])) if (len(args) >= 2 and args[0].lower() == 'forget') else (lambda: cmd_adaptive(args[0] if args else None)),
