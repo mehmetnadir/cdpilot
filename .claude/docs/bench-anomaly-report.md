@@ -55,10 +55,50 @@ Hypothesis: **Adaptive escalation + Context Pool interact badly — sessions/coo
 - Category breakdown: Cloudflare 12/22, reCaptcha 2/6, PerimeterX 2/18, DataDome 5/13, GeeTest 1/4, Akamai 4/6, Kasada 1/1, Custom Antibot 2/5, hCaptcha 0/3, Shape 0/1, Temu Slider 0/1.
 - Wrong-site landing count reduced from 11 (v0.5.0 full) to ~2 (estimated, consistent with baseline).
 
-## v0.5.2 results (entropy auto-hook) — PENDING
+## v0.5.2 results (entropy auto-hook) — 2026-05-19
 
-- Bench rerun in progress.
-- Expected: PerimeterX 2/18 → 6+/18, DataDome 5/13 → 7+/13.
+- **28/80 (35.0%)** — slight regression vs v0.5.1 (36.25%)
 - Entropy auto-activation scoped to: PerimeterX, DataDome, hCaptcha, reCaptcha, Arkose, GeeTest.
-- Entropy explicitly excluded for: Cloudflare, Akamai (JS challenge-based; behavioral entropy provides no bypass benefit).
-- Update this file with actuals once rerun completes.
+- PerimeterX: 2/18 — expected improvement did not materialize.
+- DataDome: 5/13 → 3/13 (regression; entropy added latency without bypass benefit on DataDome's JS challenge model).
+- Cloudflare: 10/22 (slight drop, likely variance).
+- Net: entropy on DataDome was a negative trade.
+
+## v0.5.3 results (entropy scope tightening) — 2026-05-20
+
+- **30/80 (37.5%)** — back to baseline parity
+- Datadome, Custom Antibot removed from entropy auto-enable. Kasada, Shape added as explicit False (TLS-based detectors).
+- DataDome 3→5, Cloudflare 10→12, hCaptcha 0→2 (entropy off helped DataDome; hCaptcha improvement from scope change).
+- PerimeterX 5→2 (lost gain from v0.5.1; variance or entropy interaction — under investigation).
+- Custom Antibot 2→5 (full recovery once entropy removed).
+- Net: zero improvement vs baseline; adaptive layer has plateaued.
+
+### Per-category v0.5.3 final
+
+| Category | Success / Total | Rate |
+|---|---|---|
+| Custom Antibot | 5 / 5 | 100% |
+| Temu Slider | 1 / 1 | 100% |
+| hCaptcha | 2 / 3 | 67% |
+| Cloudflare | 12 / 22 | 55% |
+| DataDome | 5 / 13 | 38% |
+| reCaptcha | 2 / 6 | 33% |
+| Akamai | 1 / 6 | 17% |
+| PerimeterX | 2 / 18 | 11% |
+| GeeTest | 0 / 4 | 0% |
+| Shape | 0 / 1 | 0% |
+| Kasada | 0 / 1 | 0% |
+| **Total** | **30 / 80** | **37.5%** |
+
+## Conclusion (v0.5.x iteration)
+
+Adaptive layer requires more invasive changes (TLS fingerprint, captcha solver integration) to provide net positive value on Stealth Bench V1's mix. The current entropy-only mechanism has plateaued at baseline parity.
+
+Stealth-only (v0.5.0: 32/80 = 40%) remains the best single variant. Adaptive is appropriate only for PerimeterX-heavy or captcha-heavy specific workflows where the operator has profiled their target sites.
+
+## Future work (v0.6.x roadmap)
+
+1. Captcha solver integration (2captcha/anti-captcha plugin)
+2. TLS fingerprint match (JA3/JA4) — CDP detection vector
+3. Per-host cookie persistence with CF clearance replay (beyond current session scope)
+4. Residential proxy integration (optional, Anchor parity)
