@@ -2,6 +2,40 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [0.5.2] - 2026-05-19
+
+### Added
+- Adaptive layer now auto-enables behavioral entropy per-host when CAPTCHA categories sensitive to mouse/keyboard patterns are detected (PerimeterX, DataDome, hCaptcha, reCaptcha, Arkose, GeeTest).
+
+### Changed
+- Per-command `--entropy=on` flag still works as override. Global `cdpilot entropy on` unchanged.
+- Akamai and Cloudflare are explicitly excluded from entropy auto-activation (JS challenge-based; mouse entropy provides no bypass benefit there).
+
+### Bench impact
+- Stealth Bench V1 (80 tasks): pending v0.5.2 rerun.
+- PerimeterX: 2/18 (v0.5.1) → expected 6+/18 (v0.5.2).
+- DataDome: 5/13 → expected 7+/13.
+
+### Internal
+- `_adaptive_state[host].entropy_required` flag added.
+- `_entropy_enabled(project_id, host=None)` honors host-gated override.
+
+## [0.5.1] - 2026-05-19
+
+### Fixed
+- **Adaptive regression**: per-task wrong-site landings (11/80 in v0.5.0 full) due to context reuse + cookie replay timing. Now idempotent (skip re-nav if already on origin) + host-assert after every navigate.
+- `posixpath.join() argument must be str... None` TypeError on `cdpilot type/click` when `CDP_PORT` + `CDPILOT_PROFILE` env both set.
+- Twitter wrapper `_tw_type` rewritten to use `document.execCommand('insertText')` for Draft.js compatibility (was broken on contenteditable).
+
+### Added
+- `CDPILOT_ADAPTIVE_FRESH_CONTEXT=1` opt-in env: per-task `Target.createBrowserContext`. Default OFF (incompatible with browser-use's target_id model).
+- `NavigationDrift` exception (raise mode via `CDPILOT_ADAPTIVE_STRICT=1`).
+
+### Bench
+- v0.5.0 full: 26/80 (32.5%) — regression from baseline (37.5%).
+- v0.5.1 full: 29/80 (36.25%) — regression closed.
+- Category breakdown (v0.5.1): Cloudflare 12/22, reCaptcha 2/6, PerimeterX 2/18, DataDome 5/13, GeeTest 1/4, Akamai 4/6, Kasada 1/1, Custom Antibot 2/5. hCaptcha 0/3, Shape 0/1, Temu Slider 0/1.
+
 ## [0.5.0] - 2026-05-17
 
 > "Run fast in the open lane, climb walls when you see them, then keep running."
