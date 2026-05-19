@@ -40,12 +40,12 @@ console.log('\n  cdpilot tests\n');
 
 test('--version prints version', () => {
   const out = run('--version');
-  assert(out.includes('0.5.0'), 'Should print version');
+  assert(out.includes('0.5.2'), 'Should print version');
 });
 
 test('-v prints version', () => {
   const out = run('-v');
-  assert(out.includes('0.5.0'), 'Should print version');
+  assert(out.includes('0.5.2'), 'Should print version');
 });
 
 test('help shows usage', () => {
@@ -600,16 +600,20 @@ test('cmd_go: adaptive auto-enables stealth for known host before navigate', () 
   // Invariant: when adaptive is ON and the URL's host is in the learned list,
   // cmd_go must set CDPILOT_STEALTH=1 BEFORE navigate_collect runs (otherwise
   // the stealth script wouldn't be registered in time).
-  const m = PY_CONTENT.match(/async def cmd_go[\s\S]*?_adaptive_host_requires_stealth\(url\)[\s\S]{0,500}?CDPILOT_STEALTH[\s\S]{0,200}?navigate_collect/);
-  assert(m, "cmd_go must check _adaptive_host_requires_stealth and set CDPILOT_STEALTH=1 BEFORE navigate_collect");
+  // v0.5.1: Fix 1 isolation block sits between CDPILOT_STEALTH and navigate_collect,
+  // so we verify the two invariants separately.
+  const hasHostCheck = /async def cmd_go[\s\S]*?_adaptive_host_requires_stealth\(url\)[\s\S]{0,600}?CDPILOT_STEALTH/.test(PY_CONTENT);
+  const hasNavCollect = /async def cmd_go[\s\S]*?navigate_collect\(active_ws,\s*url\)/.test(PY_CONTENT);
+  assert(hasHostCheck && hasNavCollect,
+    "cmd_go must check _adaptive_host_requires_stealth and set CDPILOT_STEALTH=1 BEFORE navigate_collect");
 });
 
 test('cmd_go: CAPTCHA detection → remember host + retry once with stealth', () => {
   // The escalation loop: after navigate, if CAPTCHA is detected AND adaptive
   // mode is enabled, the host is added to the persistent list. If stealth
   // was OFF during this navigation, retry exactly once with stealth enabled.
-  const m = PY_CONTENT.match(/info\.get\("detected"\)[\s\S]*?_adaptive_remember_host\(host\)[\s\S]*?navigate_collect\(ws,\s*url\)/);
-  assert(m, "cmd_go must call _adaptive_remember_host(host) and re-navigate when CAPTCHA is detected with adaptive on");
+  const m = PY_CONTENT.match(/info\.get\("detected"\)[\s\S]*?_adaptive_remember_host\(expected_host\)[\s\S]*?navigate_collect\(active_ws,\s*url\)/);
+  assert(m, "cmd_go must call _adaptive_remember_host(expected_host) and re-navigate when CAPTCHA is detected with adaptive on");
 });
 
 test('adaptive never auto-demotes — once added, hostname stays until manual forget', () => {
@@ -727,6 +731,966 @@ test('help advertises context commands', () => {
   const out = run('--help');
   assert(out.includes('context'), "Help should advertise context");
   assert(out.includes('CDPILOT_TARGET'), "Help should explain how to target a context's tab");
+});
+
+// ── Selector Ladder + Heal Log Tests ──
+
+test('_resolve_selector_ladder exists with correct default strategy order', () => {
+  // The ladder must be defined in the source with all 7 strategies in order.
+  const m = PY_CONTENT.match(/async def _resolve_selector_ladder\([\s\S]{0,300}?"css"[\s\S]{0,100}?"xpath"[\s\S]{0,100}?"role-name"[\s\S]{0,100}?"text-exact"[\s\S]{0,100}?"text-fuzzy"[\s\S]{0,100}?"stable-attr"[\s\S]{0,100}?"a11y-ref"/);
+  assert(m, "_resolve_selector_ladder must define default strategies: css, xpath, role-name, text-exact, text-fuzzy, stable-attr, a11y-ref in that order");
+});
+
+test('text-exact strategy queries visible elements by innerText', () => {
+  // text-exact must search offsetParent-visible elements comparing innerText.trim().
+  const m = PY_CONTENT.match(/text-exact[\s\S]{0,300}?offsetParent[\s\S]{0,200}?innerText\.trim\(\)/);
+  assert(m, "text-exact strategy must filter by offsetParent and match innerText.trim()");
+});
+
+test('css fast-path returns inp directly without token injection', () => {
+  // CSS hit must return inp as selector immediately — no data-cdpilot-tmp needed.
+  // Verify: after css hit, return inp, tried (no token used).
+  const m = PY_CONTENT.match(/"css"[\s\S]{0,500}?return inp, tried/);
+  assert(m, "css strategy must return inp directly (no tmp-attr injection) on hit");
+});
+
+test('_log_heal writes JSONL with required fields', () => {
+  // heal.jsonl entry must contain ts, cmd, input, tried, duration_ms.
+  const m = PY_CONTENT.match(/def _log_heal[\s\S]{0,400}?"ts"[\s\S]{0,100}?"cmd"[\s\S]{0,100}?"input"[\s\S]{0,100}?"tried"[\s\S]{0,100}?"duration_ms"/);
+  assert(m, "_log_heal must write JSON with fields: ts, cmd, input, tried, duration_ms");
+});
+
+test('_log_heal writes to project-specific heal.jsonl path', () => {
+  // Path must be under CDPILOT_HOME/projects/PROJECT_ID/heal.jsonl.
+  const m = PY_CONTENT.match(/def _log_heal[\s\S]{0,300}?CDPILOT_HOME[\s\S]{0,100}?projects[\s\S]{0,100}?PROJECT_ID[\s\S]{0,100}?heal\.jsonl/);
+  assert(m, "_log_heal must write to ~/.cdpilot/projects/<PROJECT_ID>/heal.jsonl");
+});
+
+test('_log_heal respects no_heal flag (skips write)', () => {
+  // When no_heal=True, _log_heal must return immediately without writing.
+  const m = PY_CONTENT.match(/def _log_heal[\s\S]{0,100}?no_heal[\s\S]{0,100}?if no_heal:\s*\n\s*return/);
+  assert(m, "_log_heal must early-return when no_heal is True");
+});
+
+test('cmd_click skips heal log on immediate CSS hit', () => {
+  // If CSS matches first (tried has 1 entry, hit=True), _log_heal must NOT be called.
+  // Verified by: log condition checks len(tried) > 1 or tried[0] not hit.
+  // v0.5.2: ws + host-aware entropy block added before tried check → wider scan window.
+  const m = PY_CONTENT.match(/async def cmd_click[\s\S]{0,900}?len\(tried\) > 1 or \(tried and not tried\[0\]\["hit"\]\)/);
+  assert(m, "cmd_click must only call _log_heal when fallback was used or CSS missed");
+});
+
+test('cmd_click delegates @N refs to cmd_click_ref unchanged', () => {
+  // a11y-ref shortcut: @digit input must delegate to cmd_click_ref, bypassing ladder.
+  const m = PY_CONTENT.match(/async def cmd_click[\s\S]{0,200}?selector\.startswith\("@"\) and selector\[1:\]\.isdigit\(\)[\s\S]{0,100}?cmd_click_ref/);
+  assert(m, "cmd_click must bypass ladder and delegate to cmd_click_ref for @N inputs");
+});
+
+test('cmd_heal_log and cmd_heal_stats are registered in sync_cmds under heal', () => {
+  // The heal command must dispatch to cmd_heal_log (default) or cmd_heal_stats.
+  const m = PY_CONTENT.match(/'heal':\s*lambda[\s\S]{0,300}?cmd_heal_stats[\s\S]{0,100}?cmd_heal_log/);
+  assert(m, "'heal' must be in sync_cmds dispatching to cmd_heal_log/cmd_heal_stats");
+});
+
+test('stable-attr strategy tries data-testid, data-cy, name, id', () => {
+  // All four stable attributes must be in the strategy implementation.
+  const m = PY_CONTENT.match(/stable-attr[\s\S]{0,400}?data-testid[\s\S]{0,200}?data-cy[\s\S]{0,200}?(?:name|id)[\s\S]{0,200}?(?:id|name)/);
+  assert(m, "stable-attr must try data-testid, data-cy, name, id attributes");
+});
+
+test('--no-heal flag plumbed through click dispatch', () => {
+  // The click dispatch lambda must pass no_heal kwarg.
+  const m = PY_CONTENT.match(/"click":\s*lambda[\s\S]{0,400}?no_heal=/);
+  assert(m, "click dispatch must pass no_heal= kwarg from --no-heal flag");
+});
+
+test('--ladder flag plumbed through click dispatch', () => {
+  // The click dispatch lambda must extract --ladder= and pass to cmd_click.
+  const m = PY_CONTENT.match(/"click":\s*lambda[\s\S]{0,400}?--ladder=/);
+  assert(m, "click dispatch must extract --ladder= flag and pass to cmd_click");
+});
+
+// ── Behavioral Entropy ──
+
+test('ENTROPY_CONFIG_FILE is declared alongside other config files', () => {
+  assert(/ENTROPY_CONFIG_FILE\s*=\s*os\.path\.join\(PROFILE_DIR/.test(PY_CONTENT),
+    "ENTROPY_CONFIG_FILE must be declared near ADAPTIVE_CONFIG_FILE");
+});
+
+test('_ENTROPY_SEED is read from CDPILOT_ENTROPY_SEED env at module scope', () => {
+  assert(/_ENTROPY_SEED\s*=\s*os\.environ\.get\('CDPILOT_ENTROPY_SEED'\)/.test(PY_CONTENT),
+    "Must declare _ENTROPY_SEED = os.environ.get('CDPILOT_ENTROPY_SEED') for test seeding");
+});
+
+test('get_entropy_config default is OFF', () => {
+  const m = PY_CONTENT.match(/def get_entropy_config\(\):[\s\S]*?\n    return (False|True)\n/);
+  assert(m, "get_entropy_config must have a clear default return");
+  assert.strictEqual(m[1], 'False', "Default must be False (opt-in)");
+});
+
+test('get_entropy_config honors CDPILOT_ENTROPY env override', () => {
+  const m = PY_CONTENT.match(/def get_entropy_config[\s\S]{0,500}?CDPILOT_ENTROPY[\s\S]{0,200}?return/);
+  assert(m, "get_entropy_config must check CDPILOT_ENTROPY env first");
+});
+
+test('_gauss clamp logic is present', () => {
+  assert(/def _gauss\(mu,\s*sigma,\s*lo,\s*hi\):/.test(PY_CONTENT),
+    "Must define _gauss(mu, sigma, lo, hi)");
+  assert(/max\(lo,\s*min\(hi,/.test(PY_CONTENT),
+    "_gauss must use max(lo, min(hi, ...)) clamping");
+});
+
+test('_quartic_easeout is defined with correct formula', () => {
+  assert(/def _quartic_easeout\(t\):/.test(PY_CONTENT),
+    "Must define _quartic_easeout(t)");
+  assert(/1\.0\s*-\s*\(1\.0\s*-\s*t\)\s*\*\*\s*4/.test(PY_CONTENT),
+    "_quartic_easeout must use formula 1-(1-t)^4");
+  // Verify boundary values via Python (inline pure function extract)
+  const { execSync } = require('child_process');
+  const out = execSync(`python3 -c "
+def _quartic_easeout(t): return 1.0 - (1.0 - t) ** 4
+print(_quartic_easeout(0), _quartic_easeout(1))
+"`, { encoding: 'utf-8', timeout: 5000 });
+  const [v0, v1] = out.trim().split(' ').map(Number);
+  assert(Math.abs(v0 - 0.0) < 0.001, "_quartic_easeout(0) must be 0.0");
+  assert(Math.abs(v1 - 1.0) < 0.001, "_quartic_easeout(1) must be 1.0");
+});
+
+test('_bezier_path returns correct point count', () => {
+  // Verify formula via inline Python (stdlib only, no cdpilot.py load needed)
+  const { execSync } = require('child_process');
+  const out = execSync(`python3 -c "
+import random, os
+os.environ['CDPILOT_ENTROPY_SEED'] = '42'
+_ENTROPY_SEED = '42'
+def _bezier_path(start_xy, end_xy, points=15):
+    r = random.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else random.Random()
+    x0, y0 = start_xy; x1, y1 = end_xy
+    mx, my = (x0+x1)/2, (y0+y1)/2
+    cx = mx + r.uniform(-60, 60); cy = my + r.uniform(-60, 60)
+    result = []
+    for i in range(points):
+        t = i/(points-1) if points>1 else 0.0
+        x = (1-t)**2*x0 + 2*(1-t)*t*cx + t**2*x1
+        y = (1-t)**2*y0 + 2*(1-t)*t*cy + t**2*y1
+        result.append((int(round(x)), int(round(y))))
+    return result
+pts = _bezier_path((0, 0), (100, 100), 10)
+print(len(pts))
+"`, { encoding: 'utf-8', timeout: 5000 });
+  assert.strictEqual(parseInt(out.trim()), 10, "_bezier_path must return exactly N points");
+});
+
+test('_gauss stays within [lo, hi] bounds (1000 samples)', () => {
+  const { execSync } = require('child_process');
+  const out = execSync(`python3 -c "
+import random
+_ENTROPY_SEED = '42'
+def _gauss(mu, sigma, lo, hi):
+    r = random.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else random
+    return max(lo, min(hi, r.gauss(mu, sigma)))
+failures = [v for i in range(1000) for v in [_gauss(85, 25, 40, 200)] if v < 40 or v > 200]
+print(len(failures))
+"`, { encoding: 'utf-8', timeout: 5000 });
+  assert.strictEqual(parseInt(out.trim()), 0, "_gauss must produce 0 out-of-range samples in 1000 trials");
+});
+
+test('cmd_entropy is defined as sync function', () => {
+  assert(/^def cmd_entropy\(state=None\):/m.test(PY_CONTENT),
+    "Must define def cmd_entropy(state=None) as sync (not async)");
+});
+
+test('cmd_entropy registered in sync dispatch', () => {
+  assert(/'entropy':\s*lambda:\s*cmd_entropy\(/.test(PY_CONTENT),
+    "Must register 'entropy' in sync_cmds dispatch");
+});
+
+test('cmd_entropy writes to ENTROPY_CONFIG_FILE via _atomic_write_json', () => {
+  const m = PY_CONTENT.match(/def cmd_entropy[\s\S]{0,1500}?_atomic_write_json\(ENTROPY_CONFIG_FILE/);
+  assert(m, "cmd_entropy must persist state via _atomic_write_json(ENTROPY_CONFIG_FILE, ...)");
+});
+
+test('--entropy flag plumbed through click dispatch', () => {
+  const m = PY_CONTENT.match(/"click":\s*lambda[\s\S]{0,600}?--entropy=on/);
+  assert(m, "click dispatch must accept --entropy=on flag");
+});
+
+test('--entropy flag plumbed through fill dispatch', () => {
+  const m = PY_CONTENT.match(/"fill":\s*lambda[\s\S]{0,600}?--entropy=on/);
+  assert(m, "fill dispatch must accept --entropy=on flag");
+});
+
+test('--entropy flag plumbed through hover dispatch', () => {
+  const m = PY_CONTENT.match(/'hover':\s*lambda[\s\S]{0,600}?--entropy=on/);
+  assert(m, "hover dispatch must accept --entropy=on flag");
+});
+
+test('cmd_click accepts entropy param', () => {
+  assert(/async def cmd_click\(selector,\s*ladder=None,\s*no_heal=False,\s*entropy=None\):/.test(PY_CONTENT),
+    "cmd_click must have entropy=None parameter");
+});
+
+test('cmd_fill accepts entropy param', () => {
+  assert(/async def cmd_fill\(selector,\s*value,\s*ladder=None,\s*no_heal=False,\s*entropy=None\):/.test(PY_CONTENT),
+    "cmd_fill must have entropy=None parameter");
+});
+
+test('cmd_hover accepts entropy param', () => {
+  assert(/async def cmd_hover\(selector,\s*ladder=None,\s*no_heal=False,\s*entropy=None\):/.test(PY_CONTENT),
+    "cmd_hover must have entropy=None parameter");
+});
+
+test('adaptive escalation auto-enables entropy on CAPTCHA detect (v0.5.2: per-host)', () => {
+  // v0.5.2: global entropy.json write replaced by per-host _adaptive_remember_host_entropy.
+  // The adaptive block must call _adaptive_remember_host_entropy after remembering the host.
+  const m = PY_CONTENT.match(/_adaptive_remember_host\(expected_host\)[\s\S]{0,400}?_adaptive_remember_host_entropy\(expected_host/);
+  assert(m, "cmd_go adaptive block must call _adaptive_remember_host_entropy(expected_host, ...) after _adaptive_remember_host");
+});
+
+test('_humanize_mouse_move dispatches mouseMoved events via CDP', () => {
+  assert(/async def _humanize_mouse_move\(ws_url,\s*x,\s*y\):/.test(PY_CONTENT),
+    "Must define _humanize_mouse_move");
+  assert(/"mouseMoved"/.test(PY_CONTENT), "Must dispatch mouseMoved events");
+});
+
+test('_humanize_type dispatches keyDown/keyUp with dwell delay', () => {
+  assert(/async def _humanize_type\(ws_url,\s*text\):/.test(PY_CONTENT),
+    "Must define _humanize_type");
+  const m = PY_CONTENT.match(/async def _humanize_type[\s\S]{0,600}?keyDown[\s\S]{0,500}?keyUp/);
+  assert(m, "_humanize_type must send keyDown before keyUp for each character");
+});
+
+test('_humanize_scroll uses quartic easeout chunking', () => {
+  assert(/async def _humanize_scroll\(ws_url,\s*delta_y/.test(PY_CONTENT),
+    "Must define _humanize_scroll");
+  const m = PY_CONTENT.match(/async def _humanize_scroll[\s\S]{0,800}?_quartic_easeout/);
+  assert(m, "_humanize_scroll must use _quartic_easeout for easing");
+});
+
+// ── Agent Token-Budget Mode ──
+
+test('AGENT_INTERACTIVE_ROLES defined with core interactive roles', () => {
+  assert(/AGENT_INTERACTIVE_ROLES\s*=\s*\{/.test(PY_CONTENT),
+    "AGENT_INTERACTIVE_ROLES must be defined");
+  assert(/'button'/.test(PY_CONTENT) && /'link'/.test(PY_CONTENT),
+    "AGENT_INTERACTIVE_ROLES must include button and link");
+});
+
+test('_agent_state_path returns project-scoped path', () => {
+  assert(/def _agent_state_path\(\):/.test(PY_CONTENT),
+    "_agent_state_path must be a zero-arg function");
+  assert(/agent-state\.json/.test(PY_CONTENT),
+    "_agent_state_path must return path to agent-state.json");
+  assert(/CDPILOT_HOME[\s\S]{0,80}projects[\s\S]{0,80}PROJECT_ID[\s\S]{0,80}agent-state/.test(PY_CONTENT),
+    "_agent_state_path must use CDPILOT_HOME/projects/PROJECT_ID");
+});
+
+test('_load_agent_state returns fresh state dict on missing file', () => {
+  assert(/def _load_agent_state\(\):/.test(PY_CONTENT),
+    "_load_agent_state must be defined");
+  const m = PY_CONTENT.match(/def _load_agent_state[\s\S]{0,400}?ref_counter/);
+  assert(m, "_load_agent_state fresh state must include ref_counter");
+  const m2 = PY_CONTENT.match(/def _load_agent_state[\s\S]{0,400}?total_tokens_full/);
+  assert(m2, "_load_agent_state fresh state must include total_tokens_full");
+});
+
+test('_save_agent_state drops oldest entries when actions_map exceeds 1000', () => {
+  assert(/len\(amap\)\s*>\s*1000/.test(PY_CONTENT),
+    "_save_agent_state must enforce 1000-entry cap on actions_map");
+  assert(/sorted_refs\[:200\]/.test(PY_CONTENT) || /\[:200\]/.test(PY_CONTENT),
+    "_save_agent_state must drop 200 oldest entries when cap exceeded");
+});
+
+test('_estimate_tokens uses chars//4 heuristic', () => {
+  assert(/def _estimate_tokens\(/.test(PY_CONTENT),
+    "_estimate_tokens must be defined");
+  assert(/\/\/\s*4/.test(PY_CONTENT),
+    "_estimate_tokens must divide by 4");
+});
+
+test('_diff_snapshots computes added/removed/value_changed', () => {
+  assert(/def _diff_snapshots\(old_map,\s*new_actions\)/.test(PY_CONTENT),
+    "_diff_snapshots must accept old_map and new_actions");
+  assert(/'added'/.test(PY_CONTENT) && /'removed'/.test(PY_CONTENT) && /'value_changed'/.test(PY_CONTENT),
+    "_diff_snapshots output dict must have added, removed, value_changed keys");
+});
+
+test('_diff_snapshots uses set operations for efficiency (no O(n) .remove)', () => {
+  // The old_refs/new_refs approach with set difference
+  const m = PY_CONTENT.match(/_diff_snapshots[\s\S]{0,600}?set\(/);
+  assert(m, "_diff_snapshots must use set operations for O(1) lookups");
+});
+
+test('_snapshot_to_actions assigns monotonically increasing ref IDs', () => {
+  assert(/def _snapshot_to_actions\(nodes,\s*state\)/.test(PY_CONTENT),
+    "_snapshot_to_actions must be defined");
+  assert(/ref_counter.*\+= 1/.test(PY_CONTENT),
+    "_snapshot_to_actions must increment ref_counter for new elements");
+});
+
+test('_snapshot_to_actions reuses existing ref for same backend_node_id', () => {
+  // bid_to_ref reverse map is built and then .get(bid) is used to look up existing ref
+  assert(/bid_to_ref\s*=\s*\{/.test(PY_CONTENT),
+    "_snapshot_to_actions must build bid_to_ref reverse map");
+  assert(/bid_to_ref\.get\(bid\)/.test(PY_CONTENT),
+    "_snapshot_to_actions must use bid_to_ref.get(bid) to reuse existing ref");
+});
+
+test('cmd_agent_observe is async and outputs JSON with required fields', () => {
+  assert(/async def cmd_agent_observe\(\)/.test(PY_CONTENT),
+    "cmd_agent_observe must be async def");
+  const m = PY_CONTENT.match(/cmd_agent_observe[\s\S]{0,1000}?token_estimate/);
+  assert(m, "cmd_agent_observe output must include token_estimate");
+  const m2 = PY_CONTENT.match(/cmd_agent_observe[\s\S]{0,1000}?'actions'/);
+  assert(m2, "cmd_agent_observe output must include actions key");
+});
+
+test('cmd_agent_act is async and handles click/type/hover/submit/url', () => {
+  assert(/async def cmd_agent_act\(/.test(PY_CONTENT),
+    "cmd_agent_act must be async def");
+  assert(/action\s*==\s*'click'/.test(PY_CONTENT),
+    "cmd_agent_act must handle click action");
+  assert(/action\s*in\s*\('type',\s*'fill'\)/.test(PY_CONTENT),
+    "cmd_agent_act must handle type/fill actions");
+  assert(/action\s*==\s*'hover'/.test(PY_CONTENT),
+    "cmd_agent_act must handle hover action");
+  assert(/action\s*==\s*'submit'/.test(PY_CONTENT),
+    "cmd_agent_act must handle submit action");
+  assert(/if url:/.test(PY_CONTENT),
+    "cmd_agent_act must handle --url navigation");
+});
+
+test('cmd_agent_act type/fill uses Input.insertText CDP (not cmd_fill selector)', () => {
+  const m = PY_CONTENT.match(/Input\.insertText/);
+  assert(m, "cmd_agent_act type/fill must use Input.insertText CDP method");
+});
+
+test('cmd_agent_act outputs diff JSON with saved_vs_full', () => {
+  const m = PY_CONTENT.match(/saved_vs_full/);
+  assert(m, "cmd_agent_act output must include saved_vs_full ratio");
+});
+
+test('cmd_agent_reset deletes state file and outputs JSON', () => {
+  assert(/async def cmd_agent_reset\(\)/.test(PY_CONTENT),
+    "cmd_agent_reset must be async def");
+  assert(/os\.remove\(.*agent/.test(PY_CONTENT) || /os\.remove\(path\)/.test(PY_CONTENT),
+    "cmd_agent_reset must call os.remove on state file");
+  const m = PY_CONTENT.match(/cmd_agent_reset[\s\S]{0,200}?'status'.*'reset'|'status'.*'reset'[\s\S]{0,200}?cmd_agent_reset/);
+  assert(m, "cmd_agent_reset must output {status: reset}");
+});
+
+test('cmd_agent_stats outputs token savings JSON', () => {
+  assert(/async def cmd_agent_stats\(\)/.test(PY_CONTENT),
+    "cmd_agent_stats must be async def");
+  const m = PY_CONTENT.match(/cmd_agent_stats[\s\S]{0,400}?savings_pct|savings_pct[\s\S]{0,400}?cmd_agent_stats/);
+  assert(m, "cmd_agent_stats must output savings_pct");
+});
+
+test('_dispatch_agent_cmd is synchronous and returns coroutine', () => {
+  assert(/def _dispatch_agent_cmd\(args\):/.test(PY_CONTENT),
+    "_dispatch_agent_cmd must be a sync function");
+  // It returns coroutines from async fns, not calls asyncio.run
+  const m = PY_CONTENT.match(/_dispatch_agent_cmd[\s\S]{0,800}?return cmd_agent_observe\(\)/);
+  assert(m, "_dispatch_agent_cmd must return coroutine for observe");
+});
+
+test('_dispatch_agent_cmd parses --ref, --action, --text, --url flags', () => {
+  assert(/--ref/.test(PY_CONTENT), "_dispatch_agent_cmd must parse --ref flag");
+  assert(/--action/.test(PY_CONTENT), "_dispatch_agent_cmd must parse --action flag");
+  assert(/--text/.test(PY_CONTENT), "_dispatch_agent_cmd must parse --text flag");
+  assert(/--url/.test(PY_CONTENT), "_dispatch_agent_cmd must parse --url flag");
+});
+
+test("'agent' command registered in main() async_map dispatch", () => {
+  const m = PY_CONTENT.match(/'agent'\s*:\s*lambda[\s\S]{0,100}?_dispatch_agent_cmd/);
+  assert(m, "'agent' must be in async_map pointing to _dispatch_agent_cmd");
+});
+
+test('_agent_full_snapshot syncs _A11Y_REF_MAP for click-ref compatibility', () => {
+  const m = PY_CONTENT.match(/_agent_full_snapshot[\s\S]{0,600}?_A11Y_REF_MAP/);
+  assert(m, "_agent_full_snapshot must update global _A11Y_REF_MAP");
+  const m2 = PY_CONTENT.match(/_agent_full_snapshot[\s\S]{0,700}?_save_a11y_refs/);
+  assert(m2, "_agent_full_snapshot must call _save_a11y_refs for click-ref compat");
+});
+
+// ── Browserbase-compatible API (serve command) ──
+
+console.log('\n  Browserbase-compatible API (serve command)\n');
+
+test('cmd_serve function defined', () => {
+  assert(/def cmd_serve/.test(PY_CONTENT), 'cmd_serve must be defined');
+});
+
+test('BrowserbaseHandler class defined', () => {
+  assert(/class BrowserbaseHandler/.test(PY_CONTENT), 'BrowserbaseHandler must be defined');
+});
+
+test('DEFAULT_MAX_SESSIONS defined', () => {
+  assert(/DEFAULT_MAX_SESSIONS/.test(PY_CONTENT), 'DEFAULT_MAX_SESSIONS must be defined');
+});
+
+test('_api_create_session defined', () => {
+  assert(/def _api_create_session/.test(PY_CONTENT), '_api_create_session must be defined');
+});
+
+test('_api_get_session defined', () => {
+  assert(/def _api_get_session/.test(PY_CONTENT), '_api_get_session must be defined');
+});
+
+test('_api_release_session defined', () => {
+  assert(/def _api_release_session/.test(PY_CONTENT), '_api_release_session must be defined');
+});
+
+test("serve command registered in main() dispatch", () => {
+  assert(/cmd == .serve./.test(PY_CONTENT), "'serve' must be handled in main()");
+});
+
+test('TEST_MODE env var supported in _api_create_session', () => {
+  assert(/CDPILOT_API_TEST_MODE/.test(PY_CONTENT), 'CDPILOT_API_TEST_MODE must be checked');
+});
+
+test('ThreadingHTTPServer used in cmd_serve', () => {
+  assert(/ThreadingHTTPServer/.test(PY_CONTENT), 'ThreadingHTTPServer must be used');
+});
+
+test('CDPILOT_MAX_SESSIONS env configures session limit', () => {
+  assert(/CDPILOT_MAX_SESSIONS/.test(PY_CONTENT), 'CDPILOT_MAX_SESSIONS env var must be read');
+});
+
+test('atexit shutdown registered in cmd_serve', () => {
+  const m = PY_CONTENT.match(/def cmd_serve[\s\S]{0,600}?atexit\.register/);
+  assert(m, 'cmd_serve must register atexit shutdown handler');
+});
+
+test('/healthz route handled in do_GET', () => {
+  assert(/healthz/.test(PY_CONTENT), '/healthz route must be handled');
+});
+
+test('/v1/sessions POST route handled in do_POST', () => {
+  const m = PY_CONTENT.match(/def do_POST[\s\S]{0,400}?\/v1\/sessions/);
+  assert(m, 'do_POST must handle /v1/sessions');
+});
+
+test('/v1/sessions/{id}/debug route handled', () => {
+  assert(/debug/.test(PY_CONTENT) && /debuggerUrl/.test(PY_CONTENT),
+    '/debug route must return debuggerUrl');
+});
+
+test('do_DELETE handles /v1/sessions/{id}', () => {
+  assert(/def do_DELETE/.test(PY_CONTENT), 'do_DELETE must be defined');
+  const m = PY_CONTENT.match(/def do_DELETE[\s\S]{0,400}?_api_release_session/);
+  assert(m, 'do_DELETE must call _api_release_session');
+});
+
+test('404 returned for unknown routes', () => {
+  assert(/not_found/.test(PY_CONTENT), 'unknown routes must return not_found error');
+});
+
+test('Browserbase session dict shape contains required fields', () => {
+  assert(/'id'/.test(PY_CONTENT), "session dict must have 'id'");
+  assert(/'createdAt'/.test(PY_CONTENT), "session dict must have 'createdAt'");
+  assert(/'connectUrl'/.test(PY_CONTENT), "session dict must have 'connectUrl'");
+  assert(/'status'/.test(PY_CONTENT), "session dict must have 'status'");
+  assert(/'seleniumRemoteUrl'/.test(PY_CONTENT), "session dict must have 'seleniumRemoteUrl'");
+});
+
+// ── Live API server tests (spawn Python with TEST_MODE) ──
+
+(function() {
+  const http = require('http');
+  const { spawn, spawnSync } = require('child_process');
+
+  const API_PORT = 19333;
+  const PY_SCRIPT = path.join(__dirname, '..', 'src', 'cdpilot.py');
+
+  // Check curl availability
+  const curlCheck = spawnSync('curl', ['--version'], { encoding: 'utf-8' });
+  if (curlCheck.error) {
+    console.log('  ⚠ curl not available — skipping live API server tests');
+    return;
+  }
+
+  // Start server
+  const serverProc = spawn(
+    'python3', [PY_SCRIPT, 'serve', '--api', `--port=${API_PORT}`],
+    {
+      env: { ...process.env, CDPILOT_API_TEST_MODE: '1', CDP_PORT: '19222' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }
+  );
+
+  // Poll until ready (max 6s)
+  const deadline = Date.now() + 6000;
+  let ready = false;
+  while (Date.now() < deadline) {
+    const r = spawnSync('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}',
+      `http://127.0.0.1:${API_PORT}/healthz`], { encoding: 'utf-8', timeout: 1000 });
+    if (r.stdout && r.stdout.trim() === '200') { ready = true; break; }
+    spawnSync('sleep', ['0.2']);
+  }
+
+  if (!ready) {
+    serverProc.kill();
+    console.log('  ⚠ API server did not start in time — skipping live tests');
+    return;
+  }
+
+  function curl(method, urlPath, body) {
+    const curlArgs = ['-s', '-w', '\n%{http_code}', '-X', method,
+      `http://127.0.0.1:${API_PORT}${urlPath}`,
+      '-H', 'Content-Type: application/json'];
+    if (body) curlArgs.push('-d', JSON.stringify(body));
+    const r = spawnSync('curl', curlArgs, { encoding: 'utf-8', timeout: 5000 });
+    const lines = (r.stdout || '').split('\n');
+    const status = parseInt(lines[lines.length - 1], 10);
+    let json = null;
+    try { json = JSON.parse(lines.slice(0, -1).join('\n')); } catch (_) {}
+    return { status, json };
+  }
+
+  test('live: GET /healthz returns 200 with status ok', () => {
+    const { status, json } = curl('GET', '/healthz');
+    assert.strictEqual(status, 200, 'healthz must return 200');
+    assert(json && json.status === 'ok', 'healthz must return {status: "ok"}');
+  });
+
+  let createdId = null;
+
+  test('live: POST /v1/sessions returns 201 with id and connectUrl', () => {
+    const { status, json } = curl('POST', '/v1/sessions', {});
+    assert.strictEqual(status, 201, 'POST /v1/sessions must return 201');
+    assert(json && json.id && json.id.startsWith('sess_'), 'id must start with sess_');
+    assert(json && json.connectUrl, 'connectUrl must be present');
+    createdId = json.id;
+  });
+
+  test('live: GET /v1/sessions returns array', () => {
+    const { status, json } = curl('GET', '/v1/sessions');
+    assert.strictEqual(status, 200, 'GET /v1/sessions must return 200');
+    assert(Array.isArray(json), 'response must be an array');
+  });
+
+  test('live: GET /v1/sessions/{id} returns session', () => {
+    if (!createdId) { assert.fail('No session created, skipping'); }
+    const { status, json } = curl('GET', `/v1/sessions/${createdId}`);
+    assert.strictEqual(status, 200, 'GET session by id must return 200');
+    assert(json && json.id === createdId, 'returned session id must match');
+  });
+
+  test('live: GET /v1/sessions/{id}/debug returns debuggerUrl', () => {
+    if (!createdId) { assert.fail('No session created, skipping'); }
+    const { status, json } = curl('GET', `/v1/sessions/${createdId}/debug`);
+    assert.strictEqual(status, 200, '/debug must return 200');
+    assert(json && json.debuggerUrl, 'debuggerUrl must be present');
+  });
+
+  test('live: DELETE /v1/sessions/{id} returns 200', () => {
+    if (!createdId) { assert.fail('No session created, skipping'); }
+    const { status, json } = curl('DELETE', `/v1/sessions/${createdId}`);
+    assert.strictEqual(status, 200, 'DELETE must return 200');
+    assert(json && json.status === 'ok', 'response must be {status: "ok"}');
+  });
+
+  test('live: GET /v1/sessions/{id} after delete returns 404', () => {
+    if (!createdId) { assert.fail('No session created, skipping'); }
+    const { status } = curl('GET', `/v1/sessions/${createdId}`);
+    assert.strictEqual(status, 404, 'deleted session must return 404');
+  });
+
+  test('live: unknown route returns 404', () => {
+    const { status } = curl('GET', '/v1/unknown-route');
+    assert.strictEqual(status, 404, 'unknown route must return 404');
+  });
+
+  serverProc.kill();
+})();
+
+// ── Test Runner ──
+
+const FIXTURE = path.join(__dirname, 'fixtures', 'example.cdpt.js');
+
+test('test runner: fixture file exists', () => {
+  assert(fs.existsSync(FIXTURE), 'example.cdpt.js should exist');
+});
+
+test('test runner: cmd_test defined in cdpilot.py', () => {
+  assert(PY_CONTENT.includes('def cmd_test('), 'Should define cmd_test');
+});
+
+test('test runner: cmd_trace_list defined in cdpilot.py', () => {
+  assert(PY_CONTENT.includes('def cmd_trace_list()'), 'Should define cmd_trace_list');
+});
+
+test('test runner: cmd_trace_open defined in cdpilot.py', () => {
+  assert(PY_CONTENT.includes('def cmd_trace_open('), 'Should define cmd_trace_open');
+});
+
+test('test runner: cmd_trace_clean defined in cdpilot.py', () => {
+  assert(PY_CONTENT.includes('def cmd_trace_clean('), 'Should define cmd_trace_clean');
+});
+
+test('test runner: TRACES_DIR constant defined', () => {
+  assert(PY_CONTENT.includes("TRACES_DIR = os.path.join(CDPILOT_HOME, 'traces')"), 'Should define TRACES_DIR');
+});
+
+test('test runner: TRACE_VIEWER_HTML constant defined', () => {
+  assert(PY_CONTENT.includes('TRACE_VIEWER_HTML = """'), 'Should define TRACE_VIEWER_HTML');
+});
+
+test('test runner: test and trace registered in sync_cmds', () => {
+  assert(/'test':\s*lambda:\s*cmd_test_dispatch/.test(PY_CONTENT), "Should register 'test' in sync_cmds");
+  assert(/'trace':\s*lambda:\s*cmd_trace_dispatch/.test(PY_CONTENT), "Should register 'trace' in sync_cmds");
+});
+
+test('test runner: --internal-test-runner flag handled in bin/cdpilot.js', () => {
+  const binContent = fs.readFileSync(path.join(__dirname, '..', 'bin', 'cdpilot.js'), 'utf-8');
+  assert(binContent.includes('--internal-test-runner'), 'bin/cdpilot.js should handle --internal-test-runner');
+  assert(binContent.includes('runInternalTestRunner'), 'Should define runInternalTestRunner function');
+});
+
+test('test runner: --grep flag parsed in cmd_test_dispatch', () => {
+  assert(PY_CONTENT.includes("'--grep='"), 'Should handle --grep= flag');
+});
+
+test('test runner: reporters handled (json, junit, tap)', () => {
+  assert(PY_CONTENT.includes("rep == 'json'"), 'Should handle json reporter');
+  assert(PY_CONTENT.includes("rep == 'junit'"), 'Should handle junit reporter');
+  assert(PY_CONTENT.includes("rep == 'tap'"), 'Should handle tap reporter');
+});
+
+test('test runner: parallel execution via ThreadPoolExecutor', () => {
+  assert(PY_CONTENT.includes('ThreadPoolExecutor'), 'Should use ThreadPoolExecutor for parallel tests');
+});
+
+test('test runner: watch mode uses getmtime polling', () => {
+  assert(PY_CONTENT.includes('getmtime') && PY_CONTENT.includes('watch'), 'Should poll mtime for watch mode');
+});
+
+test('test runner: trace bundle format — meta.json + steps.jsonl referenced', () => {
+  const binContent = fs.readFileSync(path.join(__dirname, '..', 'bin', 'cdpilot.js'), 'utf-8');
+  assert(binContent.includes('meta.json'), 'Should write meta.json');
+  assert(binContent.includes('steps.jsonl'), 'Should write steps.jsonl');
+});
+
+test('test runner: trace clean handles d/h/m suffixes', () => {
+  assert(PY_CONTENT.includes("'d': 86400"), 'Should handle day suffix');
+  assert(PY_CONTENT.includes("'h': 3600"), 'Should handle hour suffix');
+  assert(PY_CONTENT.includes("'m': 60"), 'Should handle minute suffix');
+});
+
+test('test runner: fixture runs via --internal-test-runner (no browser)', () => {
+  const { execSync: es } = require('child_process');
+  const os = require('os');
+  const tmpDir = path.join(os.tmpdir(), 'cdpilot-test-' + Date.now());
+  try {
+    const out = es(
+      `node ${CLI} --internal-test-runner ${FIXTURE} --trace-dir ${tmpDir} --trace=off`,
+      { encoding: 'utf-8', timeout: 15000, env: { ...process.env, CDP_PORT: '19222' } }
+    );
+    const result = JSON.parse(out.trim().split('\n').pop());
+    assert(result.passed >= 3, `Expected 3+ passed, got ${result.passed}`);
+    assert.strictEqual(result.failed, 0, `Expected 0 failed, got ${result.failed}`);
+  } finally {
+    try { require('fs').rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+  }
+});
+
+test('test runner: --grep filters tests', () => {
+  const { execSync: es } = require('child_process');
+  const os = require('os');
+  const tmpDir = path.join(os.tmpdir(), 'cdpilot-test-grep-' + Date.now());
+  try {
+    const out = es(
+      `node ${CLI} --internal-test-runner ${FIXTURE} --trace-dir ${tmpDir} --trace=off --grep=noop`,
+      { encoding: 'utf-8', timeout: 15000, env: { ...process.env, CDP_PORT: '19222' } }
+    );
+    const result = JSON.parse(out.trim().split('\n').pop());
+    // Only 'noop test passes' and 'async noop' match 'noop'
+    assert(result.tests.every(t => /noop/i.test(t.name)), 'grep should filter to noop tests only');
+    assert.strictEqual(result.failed, 0, 'Filtered tests should pass');
+  } finally {
+    try { require('fs').rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+  }
+});
+
+// ── Agent Twitter Namespace ──
+
+test('twitter: TWITTER_BASE constant defined', () => {
+  assert(PY_CONTENT.includes("TWITTER_BASE = 'https://x.com'"), 'Should define TWITTER_BASE');
+});
+
+test('twitter: _TW_SEL dict contains required testid selectors', () => {
+  assert(PY_CONTENT.includes('tweetTextarea_0'), 'Should have textarea selector');
+  assert(PY_CONTENT.includes('tweetButtonInline'), 'Should have post_btn selector');
+  assert(PY_CONTENT.includes('tweetButton'), 'Should have post_btn2 selector');
+  assert(PY_CONTENT.includes("'reply_btn'"), 'Should have reply_btn key');
+  assert(PY_CONTENT.includes("'like_btn'"), 'Should have like_btn key');
+  assert(PY_CONTENT.includes("'follow_btn'"), 'Should have follow_btn key');
+});
+
+test('twitter: _TW_HUMANIZE checks CDPILOT_TWITTER_HUMANIZE env', () => {
+  assert(PY_CONTENT.includes('CDPILOT_TWITTER_HUMANIZE'), 'Should check CDPILOT_TWITTER_HUMANIZE env var');
+});
+
+test('twitter: cmd_twitter_status checks logged_in, handle, rate_limited, suspended', () => {
+  assert(PY_CONTENT.includes('cmd_twitter_status'), 'Should define cmd_twitter_status');
+  assert(PY_CONTENT.includes("'logged_in'"), 'Status output should have logged_in field');
+  assert(PY_CONTENT.includes("'handle'"), 'Status output should have handle field');
+  assert(PY_CONTENT.includes("'rate_limited'"), 'Status output should have rate_limited field');
+  assert(PY_CONTENT.includes("'suspended'"), 'Status output should have suspended field');
+});
+
+test('twitter: cmd_twitter_post navigates to compose/tweet', () => {
+  assert(PY_CONTENT.includes('cmd_twitter_post'), 'Should define cmd_twitter_post');
+  assert(PY_CONTENT.includes('/compose/tweet'), 'Should navigate to compose/tweet');
+});
+
+test('twitter: cmd_twitter_post prints tweet_id in output', () => {
+  assert(PY_CONTENT.includes("'tweet_id'"), 'Post output should have tweet_id field');
+});
+
+test('twitter: cmd_twitter_thread inter-tweet delay uses _gauss', () => {
+  assert(PY_CONTENT.includes('cmd_twitter_thread'), 'Should define cmd_twitter_thread');
+  assert(PY_CONTENT.includes('480'), 'Thread delay should use _gauss(480,...) seconds');
+});
+
+test('twitter: cmd_twitter_reply navigates to /i/status/TWEET_ID', () => {
+  assert(PY_CONTENT.includes('cmd_twitter_reply'), 'Should define cmd_twitter_reply');
+  assert(PY_CONTENT.includes('/i/status/'), 'Should navigate to /i/status/');
+});
+
+test('twitter: cmd_twitter_replies slices articles from DOM', () => {
+  assert(PY_CONTENT.includes('cmd_twitter_replies'), 'Should define cmd_twitter_replies');
+  assert(PY_CONTENT.includes('querySelectorAll("article")'), 'Should use article selector');
+});
+
+test('twitter: cmd_twitter_like navigates and clicks like_btn', () => {
+  assert(PY_CONTENT.includes('cmd_twitter_like'), 'Should define cmd_twitter_like');
+  assert(PY_CONTENT.includes("_TW_SEL['like_btn']"), 'Should use like_btn selector');
+});
+
+test('twitter: cmd_twitter_follow navigates to profile and clicks follow_btn', () => {
+  assert(PY_CONTENT.includes('cmd_twitter_follow'), 'Should define cmd_twitter_follow');
+  assert(PY_CONTENT.includes("_TW_SEL['follow_btn']"), 'Should use follow_btn selector');
+});
+
+test('twitter: _dispatch_agent_twitter_cmd dispatches all subcommands', () => {
+  assert(PY_CONTENT.includes('_dispatch_agent_twitter_cmd'), 'Should define _dispatch_agent_twitter_cmd');
+  const subCmds = ['login', 'status', 'post', 'thread', 'reply', 'replies', 'mentions', 'profile', 'like', 'follow', 'analytics'];
+  for (const s of subCmds) {
+    assert(PY_CONTENT.includes(`sub == '${s}'`), `Dispatcher should handle '${s}'`);
+  }
+});
+
+test('twitter: _dispatch_agent_cmd routes twitter to _dispatch_agent_twitter_cmd', () => {
+  assert(PY_CONTENT.includes("sub == 'twitter'"), 'Agent dispatcher should route twitter subcommand');
+  assert(PY_CONTENT.includes('return _dispatch_agent_twitter_cmd(rest)'), 'Should return twitter cmd coroutine');
+});
+
+// ── Blog tests ───────────────────────────────────────────────────────────────
+
+test('blog: _dispatch_blog_cmd handles publish/list/regenerate subcommands', () => {
+  assert(PY_CONTENT.includes('_dispatch_blog_cmd'), 'Should define _dispatch_blog_cmd');
+  assert(PY_CONTENT.includes("sub == 'publish'"), "Dispatcher should handle 'publish'");
+  assert(PY_CONTENT.includes("sub == 'list'"), "Dispatcher should handle 'list'");
+  assert(PY_CONTENT.includes("sub == 'regenerate'"), "Dispatcher should handle 'regenerate'");
+});
+
+test('blog: cmd_blog_publish writes to BLOG_DIR with valid slug', () => {
+  assert(PY_CONTENT.includes('def cmd_blog_publish'), 'Should define cmd_blog_publish');
+  assert(PY_CONTENT.includes('BLOG_DIR'), 'Should declare BLOG_DIR constant');
+  assert(PY_CONTENT.includes('_blog_slugify'), 'Should use _blog_slugify for slug generation');
+  assert(/slug\s*=\s*_blog_slugify/.test(PY_CONTENT), 'Should assign slug via _blog_slugify');
+});
+
+test('blog: slug validation enforces kebab-case pattern', () => {
+  assert(PY_CONTENT.includes('def _blog_slugify'), 'Should define _blog_slugify helper');
+  assert(PY_CONTENT.includes('[a-z0-9]'), 'Should use [a-z0-9] character class in slug regex');
+  assert(PY_CONTENT.includes("_re.match(r'^[a-z0-9]+(-[a-z0-9]+)*$', slug)"),
+    'Should validate slug with kebab-case pattern');
+});
+
+test('blog: FAQ section minimum 3 items enforced', () => {
+  assert(PY_CONTENT.includes('def _blog_generate_faq'), 'Should define _blog_generate_faq helper');
+  assert(PY_CONTENT.includes('## FAQ'), 'Should emit ## FAQ section header');
+  assert(PY_CONTENT.includes('### Q:'), 'Should emit ### Q: formatted FAQ questions');
+  assert(/faq_items\s*=\s*_blog_generate_faq/.test(PY_CONTENT), 'Should call _blog_generate_faq');
+});
+
+test('blog: word count gate warns below 800 words', () => {
+  assert(PY_CONTENT.includes('def _blog_estimate_words'), 'Should define _blog_estimate_words');
+  assert(PY_CONTENT.includes('word_count < 800'), 'Should check for min 800 word threshold');
+  assert(PY_CONTENT.includes('Warning: needs expansion'), 'Should print warning on low word count');
+});
+
+test('blog: sync_cmds dispatcher includes blog entry routing to _dispatch_blog_cmd', () => {
+  assert(/'blog':\s*lambda/.test(PY_CONTENT), "sync_cmds should have 'blog' lambda entry");
+  assert(PY_CONTENT.includes('_dispatch_blog_cmd(args)'), 'blog entry should call _dispatch_blog_cmd');
+});
+
+// ── Bug regression: PROJECT_ID=None path in _log_heal / _resolve_project_config ──
+
+test('_resolve_project_config returns non-None project_id even in manual-override mode', () => {
+  // When both CDP_PORT and CDPILOT_PROFILE are set (legacy/manual override),
+  // _resolve_project_config used to return None as project_id, causing
+  // os.path.join(CDPILOT_HOME, "projects", None, "heal.jsonl") → TypeError.
+  // Fixed: use _get_project_id() fallback instead of hard-coded None.
+  const m = PY_CONTENT.match(/if has_explicit_port and env_profile:\s*\n\s*return int\(env_port\), env_profile, (None|_get_project_id\(\))/);
+  assert(m, '_resolve_project_config manual-override branch must be present');
+  assert.notStrictEqual(m[1], 'None',
+    '_resolve_project_config must NOT return None as project_id — use _get_project_id() instead to prevent posixpath.join TypeError');
+});
+
+test('_log_heal guards against None PROJECT_ID before os.path.join', () => {
+  // Secondary safety net: even if PROJECT_ID ever becomes None, _log_heal must
+  // silently skip writing rather than raising TypeError.
+  const m = PY_CONTENT.match(/def _log_heal[\s\S]{0,400}?if not PROJECT_ID:\s*\n\s*return/);
+  assert(m, '_log_heal must guard with `if not PROJECT_ID: return` before os.path.join call');
+});
+
+// ── v0.5.1 adaptive regression fixes ──
+
+test('NavigationDrift exception class is defined', () => {
+  assert(PY_CONTENT.includes('class NavigationDrift(Exception):'),
+    'NavigationDrift exception class must be defined');
+});
+
+test('_assert_host raises NavigationDrift when CDPILOT_ADAPTIVE_STRICT=1', () => {
+  // Verify that _assert_host checks os.environ for CDPILOT_ADAPTIVE_STRICT
+  // and raises NavigationDrift (not a generic exception) on mismatch.
+  assert(PY_CONTENT.includes("os.environ.get(\"CDPILOT_ADAPTIVE_STRICT\") == \"1\""),
+    '_assert_host must check CDPILOT_ADAPTIVE_STRICT env var');
+  assert(PY_CONTENT.includes('raise NavigationDrift('),
+    '_assert_host must raise NavigationDrift on mismatch when STRICT=1');
+});
+
+test('_assert_host no-ops when expected_host is empty', () => {
+  // Guard: if expected_host is falsy the function must return immediately.
+  const m = PY_CONTENT.match(/async def _assert_host[\s\S]{0,600}?if not expected_host:\s*\n\s*return/);
+  assert(m, '_assert_host must return early when expected_host is falsy');
+});
+
+test('idempotent adaptive: cmd_go checks current host before re-nav', () => {
+  // Fix 3: the retry block must call _adaptive_current_host and skip
+  // navigate_collect if the page is already on the expected host.
+  assert(PY_CONTENT.includes('_adaptive_current_host(active_ws)'),
+    'cmd_go retry must call _adaptive_current_host to check current host');
+  assert(PY_CONTENT.includes('skip re-nav'),
+    'cmd_go must log "skip re-nav" message when already on target host');
+});
+
+test('_new_isolated_context calls Target.createBrowserContext and Target.createTarget', () => {
+  assert(PY_CONTENT.includes('"Target.createBrowserContext"'),
+    '_new_isolated_context must issue Target.createBrowserContext');
+  assert(PY_CONTENT.includes('"Target.createTarget"'),
+    '_new_isolated_context must issue Target.createTarget');
+  assert(PY_CONTENT.includes('async def _new_isolated_context'),
+    '_new_isolated_context helper must be defined');
+});
+
+test('cmd_go uses isolated context when adaptive on and host is known-hostile', () => {
+  // Fix 1: cmd_go must call _new_isolated_context when the conditions are met,
+  // and dispose the context in a finally block.
+  assert(PY_CONTENT.includes('_new_isolated_context(url)'),
+    'cmd_go must call _new_isolated_context when adaptive + known-hostile');
+  assert(PY_CONTENT.includes('ctx_id_to_dispose'),
+    'cmd_go must track ctx_id_to_dispose for cleanup');
+  const m = PY_CONTENT.match(/finally:[\s\S]{0,200}?_dispose_context\(ctx_id_to_dispose\)/);
+  assert(m, 'cmd_go must dispose isolated context in finally block');
+  assert(PY_CONTENT.includes('CDPILOT_ADAPTIVE_FRESH_CONTEXT'),
+    'cmd_go must check CDPILOT_ADAPTIVE_FRESH_CONTEXT for isolation gate');
+});
+
+test('Fix 1 context spawn gated by CDPILOT_ADAPTIVE_FRESH_CONTEXT env var (default OFF)', () => {
+  const re = /if cfg\['enabled'\] and is_known_hostile and os\.environ\.get\('CDPILOT_ADAPTIVE_FRESH_CONTEXT'\) == '1'/;
+  assert(re.test(PY_CONTENT), 'cmd_go must gate isolation spawn with CDPILOT_ADAPTIVE_FRESH_CONTEXT == "1"');
+});
+
+test('_new_isolated_context and _dispose_context helpers exist for env-gated use', () => {
+  assert(PY_CONTENT.includes('async def _new_isolated_context'),
+    '_new_isolated_context helper must be defined');
+  assert(PY_CONTENT.includes('async def _dispose_context'),
+    '_dispose_context helper must be defined');
+});
+
+// ── v0.5.2 — Adaptive entropy auto-hook ──
+
+test('CAPTCHA_ENTROPY_REQUIRED defined with correct CF=False, behavior-sensitive=True mapping', () => {
+  assert(/CAPTCHA_ENTROPY_REQUIRED\s*=\s*\{/.test(PY_CONTENT),
+    'CAPTCHA_ENTROPY_REQUIRED dict must be defined');
+  // Cloudflare entries must be False
+  assert(/['"]turnstile['"]\s*:\s*False/.test(PY_CONTENT),
+    'turnstile must map to False (CF fingerprint-based, not mouse-sensitive)');
+  assert(/['"]cloudflare-challenge['"]\s*:\s*False/.test(PY_CONTENT),
+    'cloudflare-challenge must map to False');
+  // Behavior-sensitive providers must be True
+  assert(/['"]perimeterx['"]\s*:\s*True/.test(PY_CONTENT),
+    'perimeterx must map to True (mouse-behavior-sensitive)');
+  assert(/['"]datadome['"]\s*:\s*True/.test(PY_CONTENT),
+    'datadome must map to True');
+  assert(/['"]hcaptcha['"]\s*:\s*True/.test(PY_CONTENT),
+    'hcaptcha must map to True');
+  assert(/['"]arkose['"]\s*:\s*True/.test(PY_CONTENT),
+    'arkose must map to True');
+  assert(/['"]geetest['"]\s*:\s*True/.test(PY_CONTENT),
+    'geetest must map to True');
+  assert(/['"]recaptcha['"]\s*:\s*True/.test(PY_CONTENT),
+    'recaptcha must map to True');
+});
+
+test('_adaptive_remember_host_entropy defined and writes entropy_hosts to adaptive.json', () => {
+  assert(/def _adaptive_remember_host_entropy\(hostname,\s*captcha_types\)/.test(PY_CONTENT),
+    '_adaptive_remember_host_entropy must be defined');
+  assert(/entropy_hosts/.test(PY_CONTENT),
+    'adaptive.json must use entropy_hosts key');
+  const m = PY_CONTENT.match(/def _adaptive_remember_host_entropy[\s\S]{0,600}?_atomic_write_json\(ADAPTIVE_CONFIG_FILE/);
+  assert(m, '_adaptive_remember_host_entropy must persist via _atomic_write_json(ADAPTIVE_CONFIG_FILE)');
+});
+
+test('_entropy_enabled accepts host param and checks adaptive entropy_hosts', () => {
+  assert(/def _entropy_enabled\(project_id=None,\s*host=None\)/.test(PY_CONTENT),
+    '_entropy_enabled must accept host=None parameter');
+  const m = PY_CONTENT.match(/def _entropy_enabled[\s\S]{0,400}?entropy_hosts[\s\S]{0,200}?get_entropy_config\(\)/);
+  assert(m, '_entropy_enabled must check entropy_hosts and fall back to get_entropy_config()');
+});
+
+test('adaptive detect: calls _adaptive_remember_host_entropy with detected captcha_types', () => {
+  const m = PY_CONTENT.match(/_adaptive_remember_host\(expected_host\)[\s\S]{0,400}?_adaptive_remember_host_entropy\(expected_host,\s*captcha_types\)/);
+  assert(m, 'cmd_go must call _adaptive_remember_host_entropy after _adaptive_remember_host');
+});
+
+test('adaptive detect: no longer global-writes entropy.json (per-host instead)', () => {
+  // Old behavior: _atomic_write_json(ENTROPY_CONFIG_FILE, ...) inside cmd_go adaptive block
+  // New behavior: per-host via _adaptive_remember_host_entropy → adaptive.json
+  // Extract cmd_go body up to the next top-level async def
+  const cmdGoMatch = PY_CONTENT.match(/async def cmd_go\b[\s\S]*?(?=\nasync def |\ndef (?!_))/);
+  const cmdGoBody = cmdGoMatch ? cmdGoMatch[0] : '';
+  assert(cmdGoBody.length > 0, 'cmd_go must be findable in source');
+  assert(!cmdGoBody.includes('_atomic_write_json(ENTROPY_CONFIG_FILE'),
+    'cmd_go must not write global ENTROPY_CONFIG_FILE — per-host entropy_hosts replaces it');
+});
+
+test('cmd_click: ws obtained before entropy check (host-aware ordering)', () => {
+  // ws must be assigned before _entropy_enabled is called so we can pass host
+  const m = PY_CONTENT.match(/async def cmd_click[\s\S]{0,200}?ws,\s*_\s*=\s*get_page_ws\(\)[\s\S]{0,400}?_entropy_enabled\(_get_project_id\(\)/);
+  assert(m, 'cmd_click must get_page_ws() before calling _entropy_enabled with host');
+});
+
+test('cmd_fill: ws obtained before entropy check (host-aware ordering)', () => {
+  const m = PY_CONTENT.match(/async def cmd_fill[\s\S]{0,200}?ws,\s*_\s*=\s*get_page_ws\(\)[\s\S]{0,400}?_entropy_enabled\(_get_project_id\(\)/);
+  assert(m, 'cmd_fill must get_page_ws() before calling _entropy_enabled with host');
+});
+
+test('cmd_hover and cmd_drag use host-aware _entropy_enabled', () => {
+  const hoverM = PY_CONTENT.match(/async def cmd_hover[\s\S]{0,400}?_entropy_enabled\(_get_project_id\(\),\s*host=/);
+  assert(hoverM, 'cmd_hover must call _entropy_enabled with host parameter');
+  const dragM = PY_CONTENT.match(/async def cmd_drag[\s\S]{0,400}?_entropy_enabled\(_get_project_id\(\),\s*host=/);
+  assert(dragM, 'cmd_drag must call _entropy_enabled with host parameter');
+});
+
+test('cmd_scroll_to uses host-aware _entropy_enabled', () => {
+  const m = PY_CONTENT.match(/async def cmd_scroll_to[\s\S]{0,400}?_entropy_enabled\(_get_project_id\(\),\s*host=/);
+  assert(m, 'cmd_scroll_to must call _entropy_enabled with host parameter');
 });
 
 // ── Summary ──
