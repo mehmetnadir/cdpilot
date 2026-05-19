@@ -40,12 +40,12 @@ console.log('\n  cdpilot tests\n');
 
 test('--version prints version', () => {
   const out = run('--version');
-  assert(out.includes('0.5.2'), 'Should print version');
+  assert(out.includes('0.5.3'), 'Should print version');
 });
 
 test('-v prints version', () => {
   const out = run('-v');
-  assert(out.includes('0.5.2'), 'Should print version');
+  assert(out.includes('0.5.3'), 'Should print version');
 });
 
 test('help shows usage', () => {
@@ -1626,8 +1626,9 @@ test('CAPTCHA_ENTROPY_REQUIRED defined with correct CF=False, behavior-sensitive
   // Behavior-sensitive providers must be True
   assert(/['"]perimeterx['"]\s*:\s*True/.test(PY_CONTENT),
     'perimeterx must map to True (mouse-behavior-sensitive)');
-  assert(/['"]datadome['"]\s*:\s*True/.test(PY_CONTENT),
-    'datadome must map to True');
+  // v0.5.3: datadome OFF — bench data showed entropy adds latency, not mouse-behavior-based
+  assert(/['"]datadome['"]\s*:\s*False/.test(PY_CONTENT),
+    'datadome must map to False (v0.5.3: bench -2 tasks, TLS+JS challenge, not mouse-sensitive)');
   assert(/['"]hcaptcha['"]\s*:\s*True/.test(PY_CONTENT),
     'hcaptcha must map to True');
   assert(/['"]arkose['"]\s*:\s*True/.test(PY_CONTENT),
@@ -1636,6 +1637,11 @@ test('CAPTCHA_ENTROPY_REQUIRED defined with correct CF=False, behavior-sensitive
     'geetest must map to True');
   assert(/['"]recaptcha['"]\s*:\s*True/.test(PY_CONTENT),
     'recaptcha must map to True');
+  // TLS-based detectors — entropy irrelevant
+  assert(/['"]kasada['"]\s*:\s*False/.test(PY_CONTENT),
+    'kasada must map to False (TLS-based)');
+  assert(/['"]shape['"]\s*:\s*False/.test(PY_CONTENT),
+    'shape must map to False (TLS-based)');
 });
 
 test('_adaptive_remember_host_entropy defined and writes entropy_hosts to adaptive.json', () => {
