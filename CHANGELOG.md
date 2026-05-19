@@ -2,6 +2,20 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [0.5.3] - 2026-05-20
+
+### Changed
+- `CAPTCHA_ENTROPY_REQUIRED` scope narrowed based on v0.5.2 bench data: entropy auto-enable now only on PerimeterX, hCaptcha, reCaptcha, Arkose, GeeTest, Temu Slider. Datadome/Akamai/Cloudflare/Custom Antibot/Kasada/Shape get OFF (entropy added latency without bypass benefit on those detectors).
+
+### Bench
+- v0.5.3 full: 30/80 (37.5%) — matches v0.5.0 baseline
+- Adaptive layer is now neutral vs baseline; stealth-only (v0.5.0: 32/80 = 40%) remains the best-performing variant
+- Recommended: use `cdpilot stealth on` standalone unless captcha-heavy site requires adaptive escalation
+
+### Internal
+- Removed `datadome`, `custom_antibot` from entropy_required dict
+- Added `kasada`, `shape` with False (explicit, TLS-based)
+
 ## [0.5.2] - 2026-05-19
 
 ### Added

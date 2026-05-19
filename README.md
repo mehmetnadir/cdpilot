@@ -426,20 +426,22 @@ print(result.stdout)
 
 `cdpilot` is benchmarked against a suite of 80 high-friction web tasks to measure success rates against modern anti-bot systems. Gemini 2.5 Flash drives `cdpilot` as the controller; success is defined as full task completion without interception.
 
-### v0.5.1 Full Mode Results
+### v0.5.3 Results (current)
 
 | Category | Success / Total | Rate |
 | :--- | :--- | :--- |
-| Akamai | 4 / 6 | 66.7% |
-| Cloudflare | 12 / 22 | 54.5% |
-| Custom Antibot | 2 / 5 | 40.0% |
-| DataDome | 5 / 13 | 38.5% |
-| reCaptcha | 2 / 6 | 33.3% |
-| GeeTest | 1 / 4 | 25.0% |
-| PerimeterX | 2 / 18 | 11.1% |
-| Kasada | 1 / 1 | 100.0% |
-| hCaptcha | 0 / 3 | 0.0% |
-| **Total** | **29 / 80** | **36.25%** |
+| Custom Antibot | 5 / 5 | 100.0% |
+| Temu Slider | 1 / 1 | 100.0% |
+| hCaptcha | 2 / 3 | 67.0% |
+| Cloudflare | 12 / 22 | 55.0% |
+| DataDome | 5 / 13 | 38.0% |
+| reCaptcha | 2 / 6 | 33.0% |
+| Akamai | 1 / 6 | 17.0% |
+| PerimeterX | 2 / 18 | 11.0% |
+| GeeTest | 0 / 4 | 0.0% |
+| Shape | 0 / 1 | 0.0% |
+| Kasada | 0 / 1 | 0.0% |
+| **Total** | **30 / 80** | **37.5%** |
 
 ### Version history
 
@@ -449,11 +451,20 @@ print(result.stdout)
 | v0.5.0 | Stealth only (stealth on / adaptive off) | 32 / 80 | 40.0% |
 | v0.5.0 | Full (stealth on / adaptive on) | 26 / 80 | 32.5% |
 | v0.5.1 | Full — regression fix | 29 / 80 | 36.25% |
-| v0.5.2 | Full — entropy auto-hook | pending | — |
+| v0.5.2 | Full — entropy auto-hook | 28 / 80 | 35.0% |
+| **v0.5.3** | **Full — entropy scope tightened** | **30 / 80** | **37.5%** |
 
-**What cdpilot does not do:** `cdpilot` is an avoidance engine, not a CAPTCHA solver. We prioritize structural stealth (JS fingerprinting, behavioral entropy) to prevent challenges from appearing. When a CAPTCHA blocks progress and cannot be bypassed, the task fails — that is the honest definition of our success rate. hCaptcha (0/3) and PerimeterX (2/18) are known weaknesses; both are targets for the active roadmap.
+**What cdpilot does not do:** `cdpilot` is an avoidance engine, not a CAPTCHA solver. We prioritize structural stealth (JS fingerprinting, behavioral entropy) to prevent challenges from appearing. When a CAPTCHA blocks progress and cannot be bypassed, the task fails — that is the honest definition of our success rate. PerimeterX (2/18), GeeTest (0/4) and Akamai (1/6) are known weaknesses; these are targets for the v0.6.x roadmap (captcha solver integration, TLS fingerprint matching).
 
-> v0.5.2 rerun pending (entropy auto-hook; expected improvement on PerimeterX + DataDome).
+## Recommended Configuration
+
+Based on Stealth Bench V1 results:
+
+- **Speed-first** (most use cases): `cdpilot launch` — default browser behavior, no patches
+- **Stealth-on** (RECOMMENDED, best overall): `cdpilot launch && cdpilot stealth on`
+- **Full adaptive** (specific captcha-heavy workflows): `cdpilot launch && cdpilot stealth on && cdpilot adaptive on`
+
+The full adaptive layer is bench-neutral vs baseline (30/80 vs 30/80) for Stealth Bench V1's task mix. Stealth-only (32/80 = 40%) is still the best-performing single variant. For your specific workload, profile both and pick.
 
 ## Comparison
 
