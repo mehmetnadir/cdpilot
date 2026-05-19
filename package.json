@@ -1,6 +1,6 @@
 {
   "name": "cdpilot",
-  "version": "0.5.0",
+  "version": "0.5.2",
   "description": "Zero-dependency browser automation from your terminal. One command, full control.",
   "bin": {
     "cdpilot": "./bin/cdpilot.js",
@@ -11,12 +11,29 @@
     "start": "node bin/cdpilot.js"
   },
   "keywords": [
-    "browser-automation", "cdp", "chrome-devtools-protocol", "cli",
-    "mcp", "ai-agent", "web-scraping", "zero-dependency",
-    "headless-browser", "puppeteer-alternative", "playwright-alternative",
-    "screenshot", "pdf", "automation", "devtools", "browser",
-    "model-context-protocol", "claude", "brave", "testing",
-    "web-testing", "accessibility", "a11y"
+    "browser-automation",
+    "cdp",
+    "chrome-devtools-protocol",
+    "cli",
+    "mcp",
+    "ai-agent",
+    "web-scraping",
+    "zero-dependency",
+    "headless-browser",
+    "puppeteer-alternative",
+    "playwright-alternative",
+    "screenshot",
+    "pdf",
+    "automation",
+    "devtools",
+    "browser",
+    "model-context-protocol",
+    "claude",
+    "brave",
+    "testing",
+    "web-testing",
+    "accessibility",
+    "a11y"
   ],
   "author": "Mehmet Nadir",
   "license": "MIT",
@@ -32,5 +49,10 @@
     "src/cdpilot.py",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "devDependencies": {
+    "gray-matter": "^4.0.3",
+    "remark": "^15.0.1",
+    "remark-html": "^16.0.1"
+  }
 }

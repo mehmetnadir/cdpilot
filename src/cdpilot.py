@@ -14,7 +14,7 @@ Environment:
   CDPILOT_PROFILE      Isolated browser profile directory
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.2"
 
 import asyncio
 import atexit
@@ -31,6 +31,11 @@ import socket
 import difflib
 import hashlib
 import re as _re
+import secrets
+import glob
+import datetime
+import concurrent.futures
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ─── Project-Based Multi-Instance Configuration ───
 # Each project directory (cwd) gets its own browser instance with
@@ -155,7 +160,7 @@ def _resolve_project_config():
 
     # Full manual override (legacy behavior)
     if has_explicit_port and env_profile:
-        return int(env_port), env_profile, None
+        return int(env_port), env_profile, _get_project_id()
 
     project_id = _get_project_id()
     registry = _load_registry()
@@ -469,6 +474,7 @@ STEALTH_CONFIG_FILE = os.path.join(PROFILE_DIR, 'stealth.json')
 BLOCK_CONFIG_FILE = os.path.join(PROFILE_DIR, 'block.json')
 FAST_CONFIG_FILE = os.path.join(PROFILE_DIR, 'fast.json')
 ADAPTIVE_CONFIG_FILE = os.path.join(PROFILE_DIR, 'adaptive.json')
+ENTROPY_CONFIG_FILE = os.path.join(PROFILE_DIR, 'entropy.json')
 DOWNLOAD_CONFIG_FILE = os.path.join(PROFILE_DIR, 'download-config.json')
 SESSION_FILE = os.path.join(PROFILE_DIR, 'sessions.json')
 
@@ -2066,54 +2072,88 @@ async def cmd_go(url):
 
     ws, page = get_page_ws()
 
+    try:
+        from urllib.parse import urlparse
+        expected_host = (urlparse(url).hostname or '').lower()
+    except Exception:
+        expected_host = ''
+
+    cfg = get_adaptive_config()
+    adaptive_stealth = False
+    is_known_hostile = _adaptive_host_requires_stealth(url)
+
     # Adaptive mode: if this hostname is in the learned stealth-required list,
     # temporarily enable stealth for the navigation that's about to happen.
-    # We do this by setting the env var (which get_stealth_config honors first)
-    # instead of writing to stealth.json — keeps the user's permanent setting
-    # untouched and only changes behavior for this one cmd_go call.
-    adaptive_stealth = False
-    if _adaptive_host_requires_stealth(url) and not get_stealth_config():
+    if is_known_hostile and not get_stealth_config():
         os.environ['CDPILOT_STEALTH'] = '1'
         adaptive_stealth = True
         sys.stderr.write(f"🛡️  Adaptive: enabling stealth for known-hostile host\n")
 
-    content, _ = await navigate_collect(ws, url)
-    print(content)
+    # Fix 1: Per-task context isolation (opt-in via CDPILOT_ADAPTIVE_FRESH_CONTEXT=1) — spawn a fresh BrowserContext when
+    # adaptive is on and we know this host is hostile. Prevents cross-task
+    # cookie/TLS bleed that caused wrong-site landings in the bench regression.
+    ctx_id_to_dispose = None
+    active_ws = ws
+    if cfg['enabled'] and is_known_hostile and os.environ.get('CDPILOT_ADAPTIVE_FRESH_CONTEXT') == '1':
+        try:
+            ctx_id, _tgt_id, tab_ws = await _new_isolated_context(url)
+            ctx_id_to_dispose = ctx_id
+            active_ws = tab_ws
+        except Exception as e:
+            sys.stderr.write(f"⚠️  Adaptive: isolated context failed ({e}), using default tab\n")
 
-    # Post-navigation CAPTCHA probe. Non-blocking: stderr warning only.
-    # Users can run `cdpilot captcha-wait` to pause for manual solve.
     try:
-        info = await _detect_captcha(ws)
-        if info.get("detected"):
-            types = ",".join(info.get("types", [])) or "unknown"
-            sys.stderr.write(f"⚠️  CAPTCHA tespit edildi ({types}). Çözüm için: cdpilot captcha-wait\n")
+        content, _ = await navigate_collect(active_ws, url)
+        print(content)
 
-            # Adaptive escalation: remember this host so the next visit starts
-            # in stealth, and if stealth was off this round, try once more
-            # right now with stealth on. Re-nav is gated to once-per-call to
-            # avoid an infinite loop if stealth doesn't actually fix it.
-            cfg = get_adaptive_config()
-            if cfg['enabled']:
-                try:
-                    from urllib.parse import urlparse
-                    host = (urlparse(url).hostname or '').lower()
-                except Exception:
-                    host = ''
-                if host:
-                    _adaptive_remember_host(host)
-                    sys.stderr.write(f"🛡️  Adaptive: remembered {host} as stealth-required\n")
-                if not adaptive_stealth and not get_stealth_config():
-                    sys.stderr.write("🛡️  Adaptive: retrying once with stealth on...\n")
-                    os.environ['CDPILOT_STEALTH'] = '1'
-                    await navigate_collect(ws, url)
-                    # Re-probe after stealth re-nav
-                    info2 = await _detect_captcha(ws)
-                    if info2.get("detected"):
-                        sys.stderr.write("⚠️  Adaptive: CAPTCHA still present after stealth retry. Manual solve needed.\n")
-                    else:
-                        sys.stderr.write("✅ Adaptive: CAPTCHA cleared with stealth.\n")
-    except Exception:
-        pass
+        # Fix 4: Host assert — detect silent wrong-site landings immediately.
+        try:
+            await _assert_host(active_ws, expected_host)
+        except NavigationDrift:
+            raise
+        except Exception:
+            pass
+
+        # Post-navigation CAPTCHA probe. Non-blocking: stderr warning only.
+        try:
+            info = await _detect_captcha(active_ws)
+            if info.get("detected"):
+                types = ",".join(info.get("types", [])) or "unknown"
+                sys.stderr.write(f"⚠️  CAPTCHA tespit edildi ({types}). Çözüm için: cdpilot captcha-wait\n")
+
+                # Adaptive escalation: remember this host so the next visit
+                # starts in stealth. Re-nav is gated to once-per-call.
+                if cfg['enabled']:
+                    if expected_host:
+                        _adaptive_remember_host(expected_host)
+                        sys.stderr.write(f"🛡️  Adaptive: remembered {expected_host} as stealth-required\n")
+                        captcha_types = info.get('types', [])
+                        _adaptive_remember_host_entropy(expected_host, captcha_types)
+                        needs_entropy = any(CAPTCHA_ENTROPY_REQUIRED.get(t, True) for t in captcha_types)
+                        if needs_entropy:
+                            sys.stderr.write(f"🧬 Adaptive: per-host entropy enabled for {expected_host} ({','.join(captcha_types)})\n")
+                    if not adaptive_stealth and not get_stealth_config():
+                        sys.stderr.write("🛡️  Adaptive: retrying once with stealth on...\n")
+                        os.environ['CDPILOT_STEALTH'] = '1'
+                        # Fix 3: Idempotent re-nav — skip if already on target.
+                        current_host = await _adaptive_current_host(active_ws)
+                        norm = lambda h: h[4:] if h.startswith("www.") else h
+                        if expected_host and norm(current_host) == norm(expected_host):
+                            sys.stderr.write("🛡️  Adaptive: already on target host, skip re-nav\n")
+                        else:
+                            await navigate_collect(active_ws, url)
+                        # Re-probe after stealth re-nav
+                        info2 = await _detect_captcha(active_ws)
+                        if info2.get("detected"):
+                            sys.stderr.write("⚠️  Adaptive: CAPTCHA still present after stealth retry. Manual solve needed.\n")
+                        else:
+                            sys.stderr.write("✅ Adaptive: CAPTCHA cleared with stealth.\n")
+        except Exception:
+            pass
+    finally:
+        # Dispose the isolated context regardless of outcome.
+        if ctx_id_to_dispose:
+            await _dispose_context(ctx_id_to_dispose)
 
 
 async def cmd_content():
@@ -2354,9 +2394,320 @@ async def cmd_eval_batch(exprs_json):
     print(json.dumps(val, indent=2, ensure_ascii=False))
 
 
-async def cmd_click(selector):
+# ─── Selector Ladder ──────────────────────────────────────────────────────────
+
+def _levenshtein(a, b):
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return len(a)
+    prev = range(len(b) + 1)
+    for i, c1 in enumerate(a):
+        curr = [i + 1]
+        for j, c2 in enumerate(b):
+            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (c1 != c2)))
+        prev = curr
+    return prev[-1]
+
+
+async def _resolve_selector_ladder(ws_url, inp, strategies=None):
+    import re as _re2
+    if strategies is None:
+        strategies = ["css", "xpath", "role-name", "text-exact", "text-fuzzy", "stable-attr", "a11y-ref"]
+    tried = []
+    token = "p" + format(time.time_ns() % 0xFFFFFF, 'x')
+
+    async def _inject(expr):
+        js = f"(function(){{var el={expr};if(el){{el.setAttribute('data-cdpilot-tmp','{token}');return true;}}return false;}})()"""
+        r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+        return r.get(1, {}).get("result", {}).get("value") is True
+
+    for s in strategies:
+        hit = False
+        if s == "css":
+            r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {
+                "expression": f"!!document.querySelector({json.dumps(inp)})", "returnByValue": True})])
+            if r.get(1, {}).get("result", {}).get("value"):
+                tried.append({"strategy": "css", "hit": True, "selector": inp})
+                return inp, tried
+            tried.append({"strategy": "css", "hit": False})
+            continue
+
+        elif s == "xpath" and (inp.startswith("/") or inp.startswith(".//")):
+            hit = await _inject(
+                f"document.evaluate({json.dumps(inp)},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue")
+
+        elif s == "role-name":
+            m = _re2.match(r'^(\w+)=(.+)$', inp)
+            if m:
+                role_part, name_part = m.groups()
+                name_safe = json.dumps(name_part)
+                if role_part == "button":
+                    cond = f"(e.tagName==='BUTTON'||e.getAttribute('role')==='button')&&e.innerText.trim()==={name_safe}"
+                elif role_part == "role":
+                    cond = f"e.getAttribute('role')==={name_safe}"
+                else:
+                    cond = f"e.getAttribute({json.dumps(role_part)})==={name_safe}"
+                hit = await _inject(
+                    f"Array.from(document.querySelectorAll('*')).find(e=>e.offsetParent!==null&&({cond}))")
+
+        elif s == "text-exact":
+            hit = await _inject(
+                f"Array.from(document.querySelectorAll('*')).find(e=>e.offsetParent!==null&&e.innerText.trim()==={json.dumps(inp)})")
+
+        elif s == "text-fuzzy":
+            js_lev = ("function _lev(a,b){if(a.length<b.length){var t=a;a=b;b=t;}"
+                      "if(!b)return a.length;"
+                      "var p=[];for(var i=0;i<=b.length;i++)p[i]=i;"
+                      "for(var i=0;i<a.length;i++){var c=[i+1];"
+                      "for(var j=0;j<b.length;j++)c.push(Math.min(p[j+1]+1,c[j]+1,p[j]+(a[i]===b[j]?0:1)));"
+                      "p=c;}return p[b.length];}")
+            hit = await _inject(
+                f"(function(){{{js_lev} return Array.from(document.querySelectorAll('*'))"
+                f".find(e=>e.offsetParent!==null&&e.children.length===0"
+                f"&&_lev(e.innerText.trim().toLowerCase(),{json.dumps(inp.lower())})<3);}})()")
+
+        elif s == "stable-attr":
+            for attr in ["data-testid", "data-cy", "name", "id"]:
+                inp_safe = inp.replace('"', '\\"')
+                if await _inject(f'document.querySelector(\'[{attr}="{inp_safe}"]\')'):
+                    hit = True
+                    break
+
+        elif s == "a11y-ref" and inp.startswith("@") and inp[1:].isdigit():
+            ref_map = _A11Y_REF_MAP or _load_a11y_refs()
+            node_id = ref_map.get(int(inp[1:]))
+            if node_id:
+                await cdp_send(ws_url, [(0, "DOM.enable", {})])
+                res = await cdp_send(ws_url, [(1, "DOM.resolveNode", {"backendNodeId": node_id})])
+                obj_id = res.get(1, {}).get("object", {}).get("objectId")
+                if obj_id:
+                    await cdp_send(ws_url, [(2, "Runtime.callFunctionOn", {
+                        "functionDeclaration": f"function(){{this.setAttribute('data-cdpilot-tmp','{token}');}}",
+                        "objectId": obj_id,
+                    })])
+                    hit = True
+
+        if hit:
+            sel = f'[data-cdpilot-tmp="{token}"]'
+            tried.append({"strategy": s, "hit": True, "selector": sel})
+            return sel, tried
+        tried.append({"strategy": s, "hit": False})
+
+    return None, tried
+
+
+# ─── Behavioral Entropy ───
+# Randomized human-like mouse/keyboard timing. Default OFF.
+# Enable: cdpilot entropy on  |  Per-command: --entropy=on / --entropy=off
+
+_ENTROPY_SEED = os.environ.get('CDPILOT_ENTROPY_SEED')
+
+
+def get_entropy_config():
+    """Return True if behavioral entropy is enabled."""
+    env = os.environ.get('CDPILOT_ENTROPY', '')
+    if env:
+        return env.lower() in ('1', 'true', 'yes', 'on')
+    if os.path.exists(ENTROPY_CONFIG_FILE):
+        try:
+            with open(ENTROPY_CONFIG_FILE) as f:
+                return bool(json.load(f).get('entropy', False))
+        except (OSError, ValueError):
+            pass
+    return False
+
+
+# CAPTCHA types that benefit from behavioral entropy (mouse-behavior-sensitive providers).
+# Cloudflare JS challenges are fingerprint-based, not mouse-behavior-based → False.
+CAPTCHA_ENTROPY_REQUIRED = {
+    'turnstile': False,
+    'cloudflare-challenge': False,
+    'hcaptcha': True,
+    'recaptcha': True,
+    'datadome': True,
+    'perimeterx': True,
+    'arkose': True,
+    'geetest': True,
+}
+
+
+def _adaptive_remember_host_entropy(hostname, captcha_types):
+    """Set entropy_hosts[hostname]=True in adaptive.json if any captcha_type needs entropy."""
+    needs_entropy = any(CAPTCHA_ENTROPY_REQUIRED.get(t, True) for t in captcha_types)
+    if not needs_entropy:
+        return
+    cfg = get_adaptive_config()
+    entropy_hosts = cfg.get('entropy_hosts', {})
+    if entropy_hosts.get(hostname):
+        return  # already set, skip write
+    entropy_hosts[hostname] = True
+    cfg['entropy_hosts'] = entropy_hosts
+    _atomic_write_json(ADAPTIVE_CONFIG_FILE, cfg)
+
+
+def _entropy_enabled(project_id=None, host=None):
+    """Return True if behavioral entropy should be used.
+
+    Priority:
+      1. If host is given and adaptive memory marks it entropy_required → True.
+      2. Global get_entropy_config() (env override or ENTROPY_CONFIG_FILE).
+    """
+    if host:
+        try:
+            cfg = get_adaptive_config()
+            if cfg.get('entropy_hosts', {}).get(host):
+                return True
+        except Exception:
+            pass
+    return get_entropy_config()
+
+
+def _gauss(mu, sigma, lo, hi):
+    """Gaussian sample clamped to [lo, hi]."""
+    import random as _r
+    if _ENTROPY_SEED:
+        r = _r.Random(int(_ENTROPY_SEED))
+    else:
+        r = _r
+    return max(lo, min(hi, r.gauss(mu, sigma)))
+
+
+def _quartic_easeout(t):
+    """1 - (1-t)^4, maps [0,1] -> [0,1]."""
+    return 1.0 - (1.0 - t) ** 4
+
+
+def _bezier_path(start_xy, end_xy, points=15):
+    """Quadratic Bezier from start to end via a random control point.
+    Returns list of (x, y) tuples including start and end."""
+    import random as _r
+    if _ENTROPY_SEED:
+        r = _r.Random(int(_ENTROPY_SEED))
+    else:
+        r = _r.Random()
+    x0, y0 = start_xy
+    x1, y1 = end_xy
+    mx = (x0 + x1) / 2
+    my = (y0 + y1) / 2
+    cx = mx + r.uniform(-60, 60)
+    cy = my + r.uniform(-60, 60)
+    result = []
+    for i in range(points):
+        t = i / (points - 1) if points > 1 else 0.0
+        x = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t ** 2 * x1
+        y = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t ** 2 * y1
+        result.append((int(round(x)), int(round(y))))
+    return result
+
+
+async def _humanize_mouse_move(ws_url, x, y):
+    """Move mouse along a Bezier curve to (x, y) with random delays."""
+    import random as _r
+    r = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
+    start = (r.randint(100, 800), r.randint(100, 600))
+    path = _bezier_path(start, (x, y), points=r.randint(10, 20))
+    for px, py in path[:-1]:
+        await cdp_send(ws_url, [(998, "Input.dispatchMouseEvent",
+            {"type": "mouseMoved", "x": px, "y": py, "button": "none", "modifiers": 0})])
+        await asyncio.sleep(r.uniform(0.008, 0.025))
+
+
+async def _humanize_click(ws_url, x, y):
+    """Pre-pause + Bezier move + jitter + mousePressed/Released + post-pause."""
+    import random as _r
+    r = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
+    await asyncio.sleep(r.uniform(0.05, 0.15))
+    jx = x + r.randint(-2, 2)
+    jy = y + r.randint(-2, 2)
+    await _humanize_mouse_move(ws_url, jx, jy)
+    cmds = [
+        (991, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": jx, "y": jy,
+            "button": "left", "clickCount": 1}),
+        (992, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": jx, "y": jy,
+            "button": "left", "clickCount": 1}),
+    ]
+    await cdp_send(ws_url, cmds)
+    await asyncio.sleep(r.uniform(0.08, 0.20))
+
+
+async def _humanize_type(ws_url, text):
+    """Type text with Gaussian inter-key and dwell delays via CDP key events."""
+    import random as _r
+    r = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
+    for ch in text:
+        key_code = ord(ch) if ord(ch) < 256 else 0
+        await cdp_send(ws_url, [(993, "Input.dispatchKeyEvent", {
+            "type": "keyDown", "key": ch, "text": ch,
+            "windowsVirtualKeyCode": key_code, "nativeVirtualKeyCode": key_code,
+        })])
+        await asyncio.sleep(_gauss(55, 15, 30, 100) / 1000.0)
+        await cdp_send(ws_url, [(994, "Input.dispatchKeyEvent", {
+            "type": "keyUp", "key": ch, "text": ch,
+            "windowsVirtualKeyCode": key_code, "nativeVirtualKeyCode": key_code,
+        })])
+        await asyncio.sleep(_gauss(85, 25, 40, 200) / 1000.0)
+
+
+async def _humanize_scroll(ws_url, delta_y, x=400, y=400):
+    """Scroll deltaY pixels with quartic ease-out chunking."""
+    import random as _r
+    r = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
+    steps = r.randint(20, 30)
+    prev = 0
+    for i in range(1, steps + 1):
+        t = i / steps
+        eased = _quartic_easeout(t)
+        chunk = int(round(delta_y * eased)) - prev
+        prev = int(round(delta_y * eased))
+        if chunk == 0:
+            continue
+        await cdp_send(ws_url, [(997, "Input.dispatchMouseEvent", {
+            "type": "mouseWheel", "x": x, "y": y,
+            "deltaX": 0, "deltaY": chunk, "modifiers": 0,
+        })])
+        await asyncio.sleep(r.uniform(0.012, 0.022))
+
+
+def _log_heal(cmd, inp, tried, duration_ms, no_heal=False):
+    if no_heal:
+        return
+    if not PROJECT_ID:
+        return
+    import datetime as _dt2
+    path = os.path.join(CDPILOT_HOME, "projects", PROJECT_ID, "heal.jsonl")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    entry = {
+        "ts": _dt2.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "cmd": cmd,
+        "input": inp,
+        "tried": tried,
+        "duration_ms": round(duration_ms),
+    }
+    with open(path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
+    if selector.startswith("@") and selector[1:].isdigit():
+        return await cmd_click_ref(selector)
     ws, _ = get_page_ws()
-    safe_sel = json.dumps(selector)
+    if entropy is None:
+        try:
+            _h = await _adaptive_current_host(ws)
+        except Exception:
+            _h = None
+        entropy = _entropy_enabled(_get_project_id(), host=_h)
+    t0 = time.time()
+    res_sel, tried = await _resolve_selector_ladder(ws, selector, ladder)
+    dur = (time.time() - t0) * 1000
+    if not res_sel:
+        _log_heal("click", selector, tried, dur, no_heal)
+        print(f"Error: selector '{selector}' not resolved.", file=sys.stderr)
+        sys.exit(1)
+    if len(tried) > 1 or (tried and not tried[0]["hit"]):
+        _log_heal("click", selector, tried, dur, no_heal)
+    safe_sel = json.dumps(res_sel)
     wait_ms = get_auto_wait_ms()
     js = WAIT_AND_QUERY_JS + f"""
 (function() {{
@@ -2369,21 +2720,103 @@ async def cmd_click(selector):
             window.__cdpilot_vfx.moveCursor(cx, cy);
             window.__cdpilot_vfx.ripple(cx, cy);
         }}
+        var rect = el.getBoundingClientRect();
+        var cx = Math.round(rect.left + rect.width/2), cy = Math.round(rect.top + rect.height/2);
         el.click();
-        return 'Clicked: ' + el.tagName + ' ' + (el.textContent || '').substring(0, 60).trim();
+        var res = 'Clicked: ' + el.tagName + ' ' + (el.textContent || '').substring(0, 60).trim();
+        if (el.hasAttribute('data-cdpilot-tmp')) el.removeAttribute('data-cdpilot-tmp');
+        return JSON.stringify({{res: res, cx: cx, cy: cy}});
     }});
 }})()"""
-    r = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})])
-    print(r.get(1, {}).get("result", {}).get("value", "?"))
+    if entropy:
+        r2 = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})])
+        raw = r2.get(1, {}).get("result", {}).get("value", "{}")
+        try:
+            data = json.loads(raw)
+            cx, cy = data.get("cx", 0), data.get("cy", 0)
+            print(data.get("res", "?"))
+        except (ValueError, TypeError):
+            print(raw)
+            return
+        await _humanize_click(ws, cx, cy)
+    else:
+        # Fast path: rewrite JS to return plain string
+        js_fast = WAIT_AND_QUERY_JS + f"""
+(function() {{
+    return window.__cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
+        if (!el) return 'Timeout waiting for: ' + {safe_sel};
+        el.scrollIntoView({{behavior:'instant', block:'center'}});
+        if (window.__cdpilot_vfx) {{
+            var r = el.getBoundingClientRect();
+            var cx = Math.round(r.left + r.width/2), cy = Math.round(r.top + r.height/2);
+            window.__cdpilot_vfx.moveCursor(cx, cy);
+            window.__cdpilot_vfx.ripple(cx, cy);
+        }}
+        el.click();
+        var res = 'Clicked: ' + el.tagName + ' ' + (el.textContent || '').substring(0, 60).trim();
+        if (el.hasAttribute('data-cdpilot-tmp')) el.removeAttribute('data-cdpilot-tmp');
+        return res;
+    }});
+}})()"""
+        r2 = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js_fast, "returnByValue": True, "awaitPromise": True})])
+        print(r2.get(1, {}).get("result", {}).get("value", "?"))
 
 
-async def cmd_fill(selector, value):
-    """Fill an input field with auto-wait (React/Vue compatible)."""
+async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
     ws, _ = get_page_ws()
-    safe_sel = json.dumps(selector)
+    if entropy is None:
+        try:
+            _h = await _adaptive_current_host(ws)
+        except Exception:
+            _h = None
+        entropy = _entropy_enabled(_get_project_id(), host=_h)
+    t0 = time.time()
+    res_sel, tried = await _resolve_selector_ladder(ws, selector, ladder)
+    dur = (time.time() - t0) * 1000
+    if not res_sel:
+        _log_heal("fill", selector, tried, dur, no_heal)
+        print(f"Error: selector '{selector}' not resolved.", file=sys.stderr)
+        sys.exit(1)
+    if len(tried) > 1 or (tried and not tried[0]["hit"]):
+        _log_heal("fill", selector, tried, dur, no_heal)
+    safe_sel = json.dumps(res_sel)
     safe_value = json.dumps(value)
     wait_ms = get_auto_wait_ms()
-    js = WAIT_AND_QUERY_JS + f"""
+    if entropy:
+        # Focus element, field-focus pause, then humanize typing
+        js_focus = WAIT_AND_QUERY_JS + f"""
+(function() {{
+    return window.__cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
+        if (!el) return JSON.stringify({{err: 'Timeout waiting for: ' + {safe_sel}}});
+        el.scrollIntoView({{behavior:'instant', block:'center'}});
+        el.focus();
+        el.click();
+        var r = el.getBoundingClientRect();
+        var cx = Math.round(r.left + r.width/2), cy = Math.round(r.top + r.height/2);
+        if (window.__cdpilot_vfx) {{
+            window.__cdpilot_vfx.moveCursor(cx, cy);
+        }}
+        if (el.hasAttribute('data-cdpilot-tmp')) el.removeAttribute('data-cdpilot-tmp');
+        return JSON.stringify({{cx: cx, cy: cy, tag: el.tagName}});
+    }});
+}})()"""
+        r2 = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js_focus, "returnByValue": True, "awaitPromise": True})])
+        raw = r2.get(1, {}).get("result", {}).get("value", "{}")
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            data = {}
+        if data.get("err"):
+            print(data["err"])
+            return
+        # field-focus pause: human moves hand to keyboard
+        import random as _r
+        _fr = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
+        await asyncio.sleep(_fr.uniform(0.2, 0.4))
+        await _humanize_type(ws, value)
+        print(f"Filled (entropy): {selector} = {value[:50]}")
+    else:
+        js = WAIT_AND_QUERY_JS + f"""
 (function() {{
     return window.__cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
         if (!el) return 'Timeout waiting for: ' + {safe_sel};
@@ -2403,23 +2836,36 @@ async def cmd_fill(selector, value):
         }}
         el.dispatchEvent(new Event('input', {{bubbles: true}}));
         el.dispatchEvent(new Event('change', {{bubbles: true}}));
-        return 'Filled: ' + el.tagName + ' = ' + el.value.substring(0, 50);
+        var res = 'Filled: ' + el.tagName + ' = ' + el.value.substring(0, 50);
+        if (el.hasAttribute('data-cdpilot-tmp')) el.removeAttribute('data-cdpilot-tmp');
+        return res;
     }});
 }})()"""
-    r = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})])
-    print(r.get(1, {}).get("result", {}).get("value", "?"))
+        r2 = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})])
+        print(r2.get(1, {}).get("result", {}).get("value", "?"))
 
 
-async def cmd_submit(selector="form"):
+async def cmd_submit(selector="form", ladder=None, no_heal=False):
     ws, _ = get_page_ws()
-    safe_sel = json.dumps(selector)
+    t0 = time.time()
+    res_sel, tried = await _resolve_selector_ladder(ws, selector, ladder)
+    dur = (time.time() - t0) * 1000
+    if not res_sel:
+        _log_heal("submit", selector, tried, dur, no_heal)
+        print(f"Error: selector '{selector}' not resolved.", file=sys.stderr)
+        sys.exit(1)
+    if len(tried) > 1 or (tried and not tried[0]["hit"]):
+        _log_heal("submit", selector, tried, dur, no_heal)
+    safe_sel = json.dumps(res_sel)
     js = f"""(function() {{
         const form = document.querySelector({safe_sel});
         if (!form) return 'Form not found: ' + {safe_sel};
         const btn = form.querySelector('button[type=submit], input[type=submit], button:last-of-type');
-        if (btn) {{ btn.click(); return 'Submit clicked: ' + btn.textContent.trim(); }}
-        form.submit();
-        return 'Form submitted';
+        var res;
+        if (btn) {{ btn.click(); res = 'Submit clicked: ' + btn.textContent.trim(); }}
+        else {{ form.submit(); res = 'Form submitted'; }}
+        if (form.hasAttribute('data-cdpilot-tmp')) form.removeAttribute('data-cdpilot-tmp');
+        return res;
     }})()"""
     r = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
     print(r.get(1, {}).get("result", {}).get("value", "?"))
@@ -3832,6 +4278,88 @@ def cmd_fast(state=None):
 # detection has a false negative.
 
 
+# ─── v0.5.1 Adaptive regression fixes ────────────────────────────────────────
+
+class NavigationDrift(Exception):
+    """Raised when post-navigation host differs from the requested host."""
+    pass
+
+
+async def _new_isolated_context(url='about:blank'):
+    """Spawn a fresh BrowserContext + tab. Returns (ctx_id, tgt_id, tab_ws_url).
+
+    Each call produces a fully isolated cookie/storage namespace inside the
+    existing browser process. Used by adaptive escalation so known-hostile
+    hosts cannot bleed cookies/TLS state from previous tasks.
+    """
+    browser_ws = await _get_browser_ws()
+    r = await cdp_send(browser_ws, [(1, "Target.createBrowserContext", {})])
+    ctx_id = r.get(1, {}).get("browserContextId")
+    if not ctx_id:
+        raise RuntimeError(f"Target.createBrowserContext failed: {r.get(1)}")
+    r2 = await cdp_send(browser_ws, [
+        (2, "Target.createTarget", {"url": url, "browserContextId": ctx_id}),
+    ])
+    tgt_id = r2.get(2, {}).get("targetId")
+    if not tgt_id:
+        try:
+            await cdp_send(browser_ws, [
+                (3, "Target.disposeBrowserContext", {"browserContextId": ctx_id})
+            ])
+        except Exception:
+            pass
+        raise RuntimeError(f"Target.createTarget failed: {r2.get(2)}")
+    cdp_cache_invalidate()
+    tab_ws = f"ws://127.0.0.1:{CDP_PORT}/devtools/page/{tgt_id}"
+    return (ctx_id, tgt_id, tab_ws)
+
+
+async def _dispose_context(ctx_id):
+    """Dispose a browser context. Best-effort — silent on any error."""
+    try:
+        browser_ws = await _get_browser_ws()
+        await cdp_send(browser_ws, [
+            (1, "Target.disposeBrowserContext", {"browserContextId": ctx_id})
+        ])
+    except Exception:
+        pass
+
+
+async def _adaptive_current_host(ws_url):
+    """Return location.host from the active tab, or '' on any failure."""
+    try:
+        r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {
+            "expression": "location.host",
+            "returnByValue": True,
+        })])
+        return r.get(1, {}).get("result", {}).get("value", "") or ""
+    except Exception:
+        return ""
+
+
+async def _assert_host(ws_url, expected_host):
+    """Verify that the active tab's host matches expected_host.
+
+    Strips leading 'www.' from both sides before comparing.
+    If CDPILOT_ADAPTIVE_STRICT=1: raises NavigationDrift on mismatch.
+    Otherwise: writes a warning to stderr (silent log, never breaks callers).
+    """
+    if not expected_host:
+        return
+    try:
+        actual = await _adaptive_current_host(ws_url)
+        norm = lambda h: h[4:] if h.startswith("www.") else h
+        if norm(actual) != norm(expected_host):
+            msg = f"navigation drift: expected {expected_host}, got {actual}"
+            if os.environ.get("CDPILOT_ADAPTIVE_STRICT") == "1":
+                raise NavigationDrift(msg)
+            sys.stderr.write(f"⚠️  {msg}\n")
+    except NavigationDrift:
+        raise
+    except Exception:
+        pass
+
+
 def get_adaptive_config():
     """Return {'enabled': bool, 'stealth_hosts': [hostname,...]}."""
     if not os.path.exists(ADAPTIVE_CONFIG_FILE):
@@ -3931,6 +4459,37 @@ def cmd_adaptive_forget(hostname):
     cfg['stealth_hosts'].remove(hostname)
     _atomic_write_json(ADAPTIVE_CONFIG_FILE, cfg)
     print(f'Adaptive: forgot "{hostname}"')
+
+
+def cmd_entropy(state=None):
+    """Toggle behavioral entropy — humanized mouse paths, key timing, scroll easing.
+
+    Usage:
+      cdpilot entropy            # show status
+      cdpilot entropy on|off     # toggle
+      cdpilot entropy status     # alias
+
+    When ON, click/fill/type/hover/drag/scroll commands use randomized
+    Bezier mouse paths, Gaussian key dwell/inter-key delays, and quartic
+    scroll easing. 2-5x slower per action — intentional anti-bot behavior.
+    Default: OFF. Auto-enabled by adaptive escalation on CAPTCHA detect.
+    Env override: CDPILOT_ENTROPY=on  |  Test seed: CDPILOT_ENTROPY_SEED=42
+    """
+    if state is None or state.lower() == 'status':
+        current = get_entropy_config()
+        print(f'Entropy: {"on" if current else "off"}')
+        if current:
+            print('  Behaviors: Bezier mouse, Gaussian key timing, quartic scroll, click jitter')
+        return
+    s = state.lower()
+    if s not in ('on', 'off', '1', '0', 'true', 'false', 'yes', 'no'):
+        print(f"Invalid state: {state}. Use 'on', 'off', or 'status'.", file=sys.stderr)
+        sys.exit(1)
+    enabled = s in ('on', '1', 'true', 'yes')
+    _atomic_write_json(ENTROPY_CONFIG_FILE, {'entropy': enabled})
+    print(f'Entropy: {"on" if enabled else "off"}')
+    if enabled:
+        print('  Effect: next click/fill/type/hover will use humanized timing (2-5x slower).')
 
 
 async def _detect_captcha(ws_url):
@@ -4051,6 +4610,202 @@ def _stop_browser_on_port(port):
             return True
     except Exception:
         return False
+
+
+# ─── Browserbase-Compatible Local API ───
+
+DEFAULT_MAX_SESSIONS = int(os.environ.get('CDPILOT_MAX_SESSIONS', '10'))
+_api_session_store: dict = {}  # session_id -> session_dict
+
+
+def _api_make_session_id() -> str:
+    """Generate sess_<8 hex chars> unique ID."""
+    return 'sess_' + secrets.token_hex(4)
+
+
+def _api_create_session(opts: dict) -> dict:
+    """Launch browser for a new API session. Returns session dict."""
+    if len(_api_session_store) >= DEFAULT_MAX_SESSIONS:
+        raise ValueError("Maximum session limit reached")
+
+    session_id = _api_make_session_id()
+    proj_id = f'api-{session_id}'
+    port = _allocate_port(proj_id)
+    created_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+    sess = {
+        'id': session_id,
+        'createdAt': created_at,
+        'projectId': proj_id,
+        'status': 'RUNNING',
+        'connectUrl': '',
+        'seleniumRemoteUrl': None,
+        'signingKey': None,
+        'port': port,
+    }
+
+    if os.environ.get('CDPILOT_API_TEST_MODE') == '1':
+        sess['connectUrl'] = 'ws://localhost:19999/devtools/browser/test-uuid'
+    else:
+        py_bin = sys.executable
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cdpilot.py')
+        env = os.environ.copy()
+        env['CDP_PORT'] = str(port)
+        env['CDPILOT_PROJECT_ID'] = proj_id
+        subprocess.Popen([py_bin, script, 'launch'], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        found = False
+        for _ in range(20):  # 10 seconds timeout
+            try:
+                with urllib.request.urlopen(
+                    f'http://127.0.0.1:{port}/json/version', timeout=1
+                ) as r:
+                    data = json.loads(r.read().decode())
+                    sess['connectUrl'] = data.get('webSocketDebuggerUrl', '')
+                    found = True
+                    break
+            except Exception:
+                time.sleep(0.5)
+
+        if not found:
+            _stop_browser_on_port(port)
+            raise RuntimeError("Browser failed to start or CDP endpoint unreachable")
+
+    _api_session_store[session_id] = sess
+    return sess
+
+
+def _api_get_session(session_id: str) -> dict | None:
+    return _api_session_store.get(session_id)
+
+
+def _api_release_session(session_id: str) -> bool:
+    """Stop browser for session, remove from store."""
+    sess = _api_session_store.get(session_id)
+    if not sess:
+        return False
+    port = sess.get('port')
+    if port:
+        _stop_browser_on_port(port)
+    sess['status'] = 'STOPPED'
+    del _api_session_store[session_id]
+    return True
+
+
+class BrowserbaseHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args): pass  # quiet
+
+    def _send_json(self, code: int, data):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _parse_body(self) -> dict:
+        try:
+            clen = int(self.headers.get('Content-Length', 0))
+            if clen == 0:
+                return {}
+            return json.loads(self.rfile.read(clen).decode())
+        except Exception:
+            return {}
+
+    def do_GET(self):
+        path = self.path.split('?')[0].rstrip('/')
+        if not path:
+            path = '/'
+        parts = [p for p in path.split('/') if p]  # non-empty segments
+
+        if path == '/healthz':
+            return self._send_json(200, {'status': 'ok', 'version': __version__})
+
+        if path == '/v1/sessions':
+            return self._send_json(200, list(_api_session_store.values()))
+
+        # /v1/sessions/{id}
+        if len(parts) == 3 and parts[0] == 'v1' and parts[1] == 'sessions':
+            sess = _api_get_session(parts[2])
+            if sess:
+                return self._send_json(200, sess)
+            return self._send_json(404, {'error': {'message': 'Session not found', 'code': 'not_found'}})
+
+        # /v1/sessions/{id}/debug
+        if (len(parts) == 4 and parts[0] == 'v1' and parts[1] == 'sessions'
+                and parts[3] == 'debug'):
+            sess = _api_get_session(parts[2])
+            if sess:
+                port = sess.get('port', 9222)
+                ws = sess.get('connectUrl', '')
+                inspector = (f'http://localhost:{port}/devtools/inspector.html?ws='
+                             + ws.replace('ws://', '').replace('wss://', ''))
+                return self._send_json(200, {
+                    'debuggerUrl': inspector,
+                    'debuggerFullscreenUrl': inspector + '&fill',
+                })
+            return self._send_json(404, {'error': {'message': 'Session not found', 'code': 'not_found'}})
+
+        self._send_json(404, {'error': {'message': 'Not found', 'code': 'not_found'}})
+
+    def do_POST(self):
+        path = self.path.split('?')[0].rstrip('/')
+        parts = [p for p in path.split('/') if p]
+
+        if path == '/v1/sessions':
+            try:
+                sess = _api_create_session(self._parse_body())
+                return self._send_json(201, sess)
+            except ValueError as e:
+                return self._send_json(400, {'error': {'message': str(e), 'code': 'limit_exceeded'}})
+            except Exception as e:
+                return self._send_json(500, {'error': {'message': str(e), 'code': 'server_error'}})
+
+        # /v1/sessions/{id}/release
+        if (len(parts) == 4 and parts[0] == 'v1' and parts[1] == 'sessions'
+                and parts[3] == 'release'):
+            if _api_release_session(parts[2]):
+                return self._send_json(200, {'status': 'ok'})
+            return self._send_json(404, {'error': {'message': 'Session not found', 'code': 'not_found'}})
+
+        self._send_json(404, {'error': {'message': 'Not found', 'code': 'not_found'}})
+
+    def do_DELETE(self):
+        path = self.path.split('?')[0].rstrip('/')
+        parts = [p for p in path.split('/') if p]
+
+        # DELETE /v1/sessions/{id}
+        if len(parts) == 3 and parts[0] == 'v1' and parts[1] == 'sessions':
+            if _api_release_session(parts[2]):
+                return self._send_json(200, {'status': 'ok'})
+            return self._send_json(404, {'error': {'message': 'Session not found', 'code': 'not_found'}})
+
+        self._send_json(404, {'error': {'message': 'Not found', 'code': 'not_found'}})
+
+
+def cmd_serve(api: bool = False, port: int = 9333):
+    """Start Browserbase-compatible local API server (cdpilot serve --api [--port N])."""
+    if not api:
+        print('Usage: cdpilot serve --api [--port N]')
+        sys.exit(1)
+
+    server = ThreadingHTTPServer(('127.0.0.1', port), BrowserbaseHandler)
+    print(f'cdpilot API server listening on http://127.0.0.1:{port}')
+    print(f'Set BROWSERBASE_API_URL=http://localhost:{port}  BROWSERBASE_API_KEY=dummy')
+
+    def _shutdown():
+        for sess_id in list(_api_session_store.keys()):
+            _api_release_session(sess_id)
+
+    atexit.register(_shutdown)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print('\nShutting down...')
+        _shutdown()
+        server.server_close()
 
 
 def cmd_stop():
@@ -5737,15 +6492,1151 @@ async def cmd_click_ref(ref_str):
     print(f"Clicked @{ref_num} (backendNodeId={backend_node_id}): ({x}, {y})")
 
 
+# ─── Agent Token-Budget Mode ──────────────────────────────────────────────────
+
+AGENT_INTERACTIVE_ROLES = {
+    'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox', 'listbox',
+    'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'spinbutton',
+    'slider', 'switch', 'tab', 'treeitem', 'searchbox', 'gridcell',
+}
+
+AGENT_ROLE_NORMALIZE = {
+    'textField': 'textbox', 'comboBox': 'combobox',
+    'checkBox': 'checkbox', 'radioButton': 'radio',
+}
+
+AGENT_SKIP_ROLES = {
+    'none', 'presentation', 'generic', 'LineBreak', 'InlineTextBox',
+    'ignored', 'unknown', 'RootWebArea',
+}
+
+
+def _agent_state_path():
+    return os.path.join(CDPILOT_HOME, 'projects', PROJECT_ID, 'agent-state.json')
+
+
+def _load_agent_state():
+    path = _agent_state_path()
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {
+            'last_url': None,
+            'last_snapshot_hash': None,
+            'actions_map': {},
+            'ref_counter': 0,
+            'total_tokens_full': 0,
+            'total_tokens_diff': 0,
+            'step': 0,
+        }
+
+
+def _save_agent_state(state):
+    path = _agent_state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Drop oldest entries if map exceeds 1000 to stay under ~50KB
+    amap = state.get('actions_map', {})
+    if len(amap) > 1000:
+        sorted_refs = sorted(amap.keys(), key=lambda r: int(r.lstrip('@')))
+        for ref in sorted_refs[:200]:
+            del amap[ref]
+        state['actions_map'] = amap
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def _estimate_tokens(obj):
+    return max(1, len(json.dumps(obj)) // 4)
+
+
+def _extract_text_summary(nodes, max_chars=2000):
+    text_roles = {'staticText', 'text', 'paragraph', 'heading'}
+    parts = []
+    for node in nodes:
+        if node.get('ignored'):
+            continue
+        role = node.get('role', {}).get('value', '')
+        if role in text_roles:
+            name = node.get('name', {}).get('value', '')
+            if name:
+                parts.append(name)
+    summary = ' '.join(parts)
+    return summary[:max_chars]
+
+
+def _snapshot_to_actions(nodes, state):
+    """Convert AXTree nodes to numbered action list. Updates state in place."""
+    amap = state['actions_map']
+    # Build reverse map: backend_node_id -> existing @ref
+    bid_to_ref = {v['backend_node_id']: k for k, v in amap.items()}
+    new_actions = []
+    seen_names = {}
+
+    for node in nodes:
+        if node.get('ignored'):
+            continue
+        raw_role = node.get('role', {}).get('value', '')
+        if not raw_role or raw_role in AGENT_SKIP_ROLES:
+            continue
+        role = AGENT_ROLE_NORMALIZE.get(raw_role, raw_role)
+        name = node.get('name', {}).get('value', '') or ''
+        bid = node.get('backendDOMNodeId') or node.get('backendNodeId')
+        if not bid:
+            continue
+
+        is_interactive = role in AGENT_INTERACTIVE_ROLES
+        # text-anchor fallback: unique non-empty name with any role
+        is_text_anchor = (
+            not is_interactive
+            and len(name) > 2
+            and seen_names.get(name, 0) == 0
+        )
+        if not is_interactive and not is_text_anchor:
+            continue
+
+        seen_names[name] = seen_names.get(name, 0) + 1
+
+        # Assign ref — reuse if same backend node already tracked
+        ref = bid_to_ref.get(bid)
+        if ref is None:
+            state['ref_counter'] += 1
+            ref = f"@{state['ref_counter']}"
+            bid_to_ref[bid] = ref
+
+        # Build action descriptor
+        action = {'ref': ref, 'role': role, 'name': name, 'backend_node_id': bid}
+        if role in ('textbox', 'combobox', 'searchbox'):
+            val = node.get('value', {}).get('value')
+            if val is not None:
+                action['value'] = val
+        new_actions.append(action)
+
+    return new_actions
+
+
+def _diff_snapshots(old_map, new_actions):
+    """Compute added/removed/value_changed between old state map and new actions."""
+    new_map = {a['ref']: a for a in new_actions}
+    old_refs = set(old_map.keys())
+    new_refs = set(new_map.keys())
+
+    added = list(new_refs - old_refs)
+    removed = list(old_refs - new_refs)
+    value_changed = []
+    for ref in new_refs & old_refs:
+        old_val = old_map[ref].get('value', '')
+        new_val = new_map[ref].get('value', '')
+        old_name = old_map[ref].get('name', '')
+        new_name = new_map[ref].get('name', '')
+        if old_val != new_val:
+            value_changed.append(f"{ref}:{repr(new_val)}")
+        elif old_name != new_name:
+            value_changed.append(f"{ref}:name->{repr(new_name)}")
+
+    return {'added': added, 'removed': removed, 'value_changed': value_changed}
+
+
+async def _agent_full_snapshot():
+    """Internal: take full AXTree snapshot, return (page, nodes, actions, state)."""
+    ws_url, page = get_page_ws()
+    await cdp_send(ws_url, [(0, 'Accessibility.enable', {})])
+    res = await cdp_send(ws_url, [(1, 'Accessibility.getFullAXTree', {})])
+    nodes = res.get(1, {}).get('nodes', [])
+    state = _load_agent_state()
+    actions = _snapshot_to_actions(nodes, state)
+    # Rebuild actions_map from new actions
+    state['actions_map'] = {a['ref']: a for a in actions}
+    # Sync _A11Y_REF_MAP for compatibility with click-ref
+    global _A11Y_REF_MAP
+    _A11Y_REF_MAP = {int(a['ref'].lstrip('@')): a['backend_node_id'] for a in actions}
+    _save_a11y_refs(_A11Y_REF_MAP)
+    return page, nodes, actions, state
+
+
+async def cmd_agent_observe():
+    """Minimal-token page state for AI agents."""
+    page, nodes, actions, state = await _agent_full_snapshot()
+    text = _extract_text_summary(nodes)
+    # Actions for output — exclude backend_node_id (internal only)
+    out_actions = [
+        {k: v for k, v in a.items() if k != 'backend_node_id'}
+        for a in actions
+    ]
+    snap = {
+        'url': page.get('url', ''),
+        'title': page.get('title', ''),
+        'actions': out_actions,
+        'text': text,
+        'token_estimate': _estimate_tokens(out_actions),
+    }
+    snap_str = json.dumps(snap)
+    token_est = _estimate_tokens(snap_str)
+    snap['token_estimate'] = token_est
+    state['last_url'] = page.get('url', '')
+    state['last_snapshot_hash'] = hashlib.md5(snap_str.encode()).hexdigest()[:8]
+    state['step'] = state.get('step', 0) + 1
+    state['total_tokens_full'] = state.get('total_tokens_full', 0) + token_est
+    _save_agent_state(state)
+    print(json.dumps(snap, indent=2))
+
+
+async def cmd_agent_act(ref=None, url=None, action='click', text=None):
+    """Perform action, return diff observation."""
+    state = _load_agent_state()
+    old_map = dict(state.get('actions_map', {}))
+
+    if url:
+        await cmd_go(url)
+    elif ref:
+        if ref not in old_map:
+            print(json.dumps({'error': f'Unknown ref {ref}. Run: cdpilot agent observe'}), file=sys.stderr)
+            sys.exit(1)
+        bid = old_map[ref]['backend_node_id']
+        ws_url, _ = get_page_ws()
+        if action == 'click':
+            await cmd_click_ref(ref)
+        elif action in ('type', 'fill'):
+            # Focus via backendNodeId then insert text
+            await cdp_send(ws_url, [(1, 'DOM.enable', {})])
+            res_r = await cdp_send(ws_url, [(2, 'DOM.resolveNode', {'backendNodeId': bid})])
+            oid = res_r.get(2, {}).get('object', {}).get('objectId')
+            if oid:
+                await cdp_send(ws_url, [(3, 'Runtime.callFunctionOn', {
+                    'objectId': oid,
+                    'functionDeclaration': 'function(){this.focus();}',
+                    'returnByValue': True,
+                })])
+            await cdp_send(ws_url, [(4, 'Input.insertText', {'text': text or ''})])
+        elif action == 'hover':
+            res_b = await cdp_send(ws_url, [(5, 'DOM.getBoxModel', {'backendNodeId': bid})])
+            content = res_b.get(5, {}).get('model', {}).get('content', [])
+            if len(content) >= 8:
+                mx = int((content[0] + content[2] + content[4] + content[6]) / 4)
+                my = int((content[1] + content[3] + content[5] + content[7]) / 4)
+                await cdp_send(ws_url, [(6, 'Input.dispatchMouseEvent', {
+                    'type': 'mouseMoved', 'x': mx, 'y': my,
+                })])
+        elif action == 'submit':
+            await cdp_send(ws_url, [(7, 'DOM.enable', {})])
+            res_r = await cdp_send(ws_url, [(8, 'DOM.resolveNode', {'backendNodeId': bid})])
+            oid = res_r.get(8, {}).get('object', {}).get('objectId')
+            if oid:
+                await cdp_send(ws_url, [(9, 'Runtime.callFunctionOn', {
+                    'objectId': oid,
+                    'functionDeclaration': "function(){var f=this.closest('form');if(f)f.submit();else this.click();}",
+                    'returnByValue': True,
+                })])
+    else:
+        print(json.dumps({'error': 'Provide --ref @N or --url URL'}), file=sys.stderr)
+        sys.exit(1)
+
+    # Take new snapshot for diff
+    page, nodes, new_actions, new_state = await _agent_full_snapshot()
+    diff = _diff_snapshots(old_map, new_actions)
+    new_text = _extract_text_summary(nodes)
+    diff_tok = _estimate_tokens(diff)
+    full_tok = _estimate_tokens(new_actions)
+    saved = max(0.0, 1.0 - diff_tok / full_tok) if full_tok > 0 else 0.0
+
+    new_state['total_tokens_diff'] = new_state.get('total_tokens_diff', 0) + diff_tok
+    new_state['step'] = new_state.get('step', 0)  # already incremented in _agent_full_snapshot
+    _save_agent_state(new_state)
+
+    result = {
+        'url': page.get('url', ''),
+        'changed': diff,
+        'new_text_blocks': [b for b in new_text.split('. ') if b.strip()],
+        'token_estimate': diff_tok,
+        'saved_vs_full': round(saved, 3),
+    }
+    print(json.dumps(result, indent=2))
+
+
+async def cmd_agent_reset():
+    path = _agent_state_path()
+    if os.path.exists(path):
+        os.remove(path)
+    print(json.dumps({'status': 'reset', 'project_id': PROJECT_ID}))
+
+
+async def cmd_agent_stats():
+    state = _load_agent_state()
+    full_tok = state.get('total_tokens_full', 0)
+    diff_tok = state.get('total_tokens_diff', 0)
+    saved = full_tok - diff_tok
+    pct = f"{saved / full_tok * 100:.1f}%" if full_tok > 0 else "0%"
+    print(json.dumps({
+        'project_id': PROJECT_ID,
+        'step': state.get('step', 0),
+        'ref_counter': state.get('ref_counter', 0),
+        'last_url': state.get('last_url'),
+        'total_tokens_full': full_tok,
+        'total_tokens_diff': diff_tok,
+        'estimated_savings': saved,
+        'savings_pct': pct,
+    }, indent=2))
+
+
+def _dispatch_agent_cmd(args):
+    """Parse agent subcommand args, return coroutine for asyncio.run in main()."""
+    sub = args[0] if args else ''
+    rest = args[1:]
+
+    if sub == 'observe':
+        return cmd_agent_observe()
+    if sub == 'reset':
+        return cmd_agent_reset()
+    if sub == 'stats':
+        return cmd_agent_stats()
+    if sub == 'act':
+        ref = None
+        url = None
+        action = 'click'
+        text = None
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok == '--ref' and i + 1 < len(rest):
+                ref = rest[i + 1]; i += 2
+            elif tok.startswith('--ref='):
+                ref = tok.split('=', 1)[1]; i += 1
+            elif tok == '--url' and i + 1 < len(rest):
+                url = rest[i + 1]; i += 2
+            elif tok.startswith('--url='):
+                url = tok.split('=', 1)[1]; i += 1
+            elif tok == '--action' and i + 1 < len(rest):
+                action = rest[i + 1]; i += 2
+            elif tok.startswith('--action='):
+                action = tok.split('=', 1)[1]; i += 1
+            elif tok == '--text' and i + 1 < len(rest):
+                text = rest[i + 1]; i += 2
+            elif tok.startswith('--text='):
+                text = tok.split('=', 1)[1]; i += 1
+            else:
+                i += 1
+        return cmd_agent_act(ref=ref, url=url, action=action, text=text)
+
+    if sub == 'twitter':
+        return _dispatch_agent_twitter_cmd(rest)
+
+    print(f"Usage: agent [observe|act|reset|stats|twitter]", file=sys.stderr)
+    print(f"  agent observe", file=sys.stderr)
+    print(f"  agent act --ref @N [--action click|type|fill|hover|submit] [--text X]", file=sys.stderr)
+    print(f"  agent act --url URL", file=sys.stderr)
+    print(f"  agent reset", file=sys.stderr)
+    print(f"  agent stats", file=sys.stderr)
+    print(f"  agent twitter --help", file=sys.stderr)
+    sys.exit(1)
+
+# ─── End Agent Token-Budget Mode ──────────────────────────────────────────────
+
+
+# ─── Agent Twitter Namespace ──────────────────────────────────────────────────
+
+TWITTER_BASE = 'https://x.com'
+_TW_SEL = {
+    'textarea':       '[data-testid="tweetTextarea_0"]',
+    'post_btn':       '[data-testid="tweetButtonInline"]',
+    'post_btn2':      '[data-testid="tweetButton"]',
+    'reply_btn':      '[data-testid="reply"]',
+    'like_btn':       '[data-testid="like"]',
+    'unlike_btn':     '[data-testid="unlike"]',
+    'retweet_btn':    '[data-testid="retweet"]',
+    'unretweet_btn':  '[data-testid="unretweet"]',
+    'retweet_confirm':'[data-testid="retweetConfirm"]',
+    'unretweet_confirm':'[data-testid="unretweetConfirm"]',
+    'bookmark_btn':   '[data-testid="bookmark"]',
+    'follow_btn':     '[data-testid="placementTracking"]',
+    'unfollow_btn':   '[data-testid$="-unfollow"]',
+    'unfollow_confirm':'[data-testid="confirmationSheetConfirm"]',
+    'user_name':      '[data-testid="UserName"]',
+    'tweet_text':     '[data-testid="tweetText"]',
+    'caret_btn':      '[data-testid="caret"]',
+    'pin_menu_item':  '[data-testid="pin"]',
+    'unpin_menu_item':'[data-testid="unpin"]',
+    'pin_confirm':    '[data-testid="confirmationSheetConfirm"]',
+    'add_tweet_btn':  '[data-testid="addButton"]',
+    'file_input':     'input[type="file"][data-testid="fileInput"]',
+    'media_alt_btn':  '[data-testid="ALT_overlay"]',
+    'media_alt_text': '[data-testid="alt_text"]',
+    'media_alt_save': '[data-testid="alt-text-save"]',
+    'poll_btn':       '[data-testid="pollButton"]',
+    'poll_opt_input': '[data-testid^="pollChoice"]',
+    'quote_btn':      '[data-testid="quote"]',  # tweet'in retweet menüsünde "Quote"
+    'long_form_btn':  '[data-testid="longFormButton"]',  # Premium long-form mode
+}
+
+_TW_HUMANIZE = lambda: os.environ.get('CDPILOT_TWITTER_HUMANIZE') != 'off'
+
+
+async def _tw_pause(mu=1.0, sigma=0.3):
+    if _TW_HUMANIZE():
+        await asyncio.sleep(_gauss(mu * 1000, sigma * 1000, mu * 500, mu * 2000) / 1000.0)
+
+
+async def _tw_navigate(ws, path):
+    url = f"{TWITTER_BASE}{path}" if path.startswith('/') else path
+    await navigate_collect(ws, url)
+    await asyncio.sleep(2.0 if _TW_HUMANIZE() else 0.5)
+
+
+async def _tw_type(ws, text):
+    humanize = _TW_HUMANIZE()
+    if humanize:
+        await _tw_pause(1.2, 0.3)
+    expr = f"""(() => {{
+        const ta = document.querySelector('[data-testid="tweetTextarea_0"]');
+        if (!ta) return {{ok: false, error: 'textarea not found'}};
+        ta.focus();
+        const ok = document.execCommand('insertText', false, {json.dumps(text)});
+        return {{ok: ok, content: ta.innerText}};
+    }})()"""
+    result = await _tw_eval(ws, expr)
+    if not isinstance(result, dict) or not result.get('ok'):
+        print(json.dumps({'error': 'type_failed', 'details': result}), file=sys.stderr)
+        sys.exit(1)
+    if humanize:
+        await _tw_pause(0.8, 0.2)
+
+
+async def _tw_click_sel(ws, selector):
+    res = await cdp_send(ws, [(802, 'Runtime.evaluate', {
+        'expression': f'(function(){{var e=document.querySelector({json.dumps(selector)});if(!e)return null;var r=e.getBoundingClientRect();return {{x:r.x,y:r.y,w:r.width,h:r.height}};}})();',
+        'returnByValue': True,
+    })])
+    box = res.get(802, {}).get('value')
+    if not box:
+        return False
+    x = box['x'] + box['w'] / 2
+    y = box['y'] + box['h'] / 2
+    if _TW_HUMANIZE():
+        await _humanize_click(ws, int(x), int(y))
+    else:
+        await cdp_send(ws, [
+            (803, 'Input.dispatchMouseEvent', {'type': 'mousePressed', 'x': int(x), 'y': int(y), 'button': 'left', 'clickCount': 1}),
+            (804, 'Input.dispatchMouseEvent', {'type': 'mouseReleased', 'x': int(x), 'y': int(y), 'button': 'left', 'clickCount': 1}),
+        ])
+    return True
+
+
+def _tw_parse_tweet_url(s):
+    import re as _re
+    m = _re.search(r'status/(\d+)', str(s))
+    return m.group(0) if m else None
+
+
+async def _tw_eval(ws, expr):
+    res = await cdp_send(ws, [(810, 'Runtime.evaluate', {'expression': expr, 'returnByValue': True})])
+    return res.get(810, {}).get('value')
+
+
+async def cmd_twitter_login():
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, '/i/flow/login')
+    print('>>> Open the browser and complete login, then press Enter here...', file=sys.stderr)
+    await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
+    await _tw_navigate(ws, '/home')
+    logged = await _tw_eval(ws, f'!!document.querySelector({json.dumps(_TW_SEL["user_name"])})')
+    print(json.dumps({'status': 'logged_in' if logged else 'not_logged_in'}))
+
+
+async def cmd_twitter_status():
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, '/home')
+    url = await _tw_eval(ws, 'location.href')
+    logged_in = bool(url) and '/login' not in url and '/i/flow' not in url
+    handle = None
+    if logged_in:
+        raw = await _tw_eval(ws, f'(document.querySelector({json.dumps(_TW_SEL["user_name"])})?.innerText||"").split("\\n").pop().trim()')
+        handle = raw if raw else None
+    rate_limited = await _tw_eval(ws, '"Rate limit" in document.body.innerText') or False
+    print(json.dumps({'logged_in': logged_in, 'handle': handle, 'rate_limited': bool(rate_limited), 'suspended': False}))
+
+
+async def _tw_attach_media(ws, paths_and_alts):
+    """
+    Compose dialog'una media yükle. paths_and_alts = [(path, alt_text|None), ...].
+    Page.setFileInputFiles ile dosyalar input[type=file]'a aktarılır.
+    Premium hesap alt-text 1000 char'a kadar destekler.
+    """
+    if not paths_and_alts:
+        return
+    paths = [p for p, _ in paths_and_alts]
+    # File input'u bul
+    res = await cdp_send(ws, [(820, 'Runtime.evaluate', {
+        'expression': f'document.querySelector({json.dumps(_TW_SEL["file_input"])})?.getAttribute("name") || ""',
+        'returnByValue': True,
+    })])
+    # CDP DOM.setFileInputFiles: backendNodeId üzerinden file inject
+    node_res = await cdp_send(ws, [(821, 'DOM.getDocument', {})])
+    root_id = node_res.get(821, {}).get('root', {}).get('nodeId')
+    if root_id:
+        q_res = await cdp_send(ws, [(822, 'DOM.querySelector', {
+            'nodeId': root_id, 'selector': _TW_SEL['file_input'],
+        })])
+        node_id = q_res.get(822, {}).get('nodeId')
+        if node_id:
+            await cdp_send(ws, [(823, 'DOM.setFileInputFiles', {
+                'files': paths, 'nodeId': node_id,
+            })])
+            await _tw_pause(2.5, 0.5)  # upload bekle
+
+    # Alt-text ekle (her media için)
+    for idx, (_, alt) in enumerate(paths_and_alts):
+        if not alt:
+            continue
+        # Media item'ı için ALT button'a tıkla
+        await _tw_pause(0.5, 0.1)
+        await _tw_eval(ws, f"""
+        (() => {{
+            const btns = document.querySelectorAll('{_TW_SEL["media_alt_btn"]}');
+            if (btns[{idx}]) btns[{idx}].click();
+        }})()
+        """)
+        await _tw_pause(1.0, 0.2)
+        # Alt-text textarea'ya yaz
+        await _tw_eval(ws, f"""
+        (() => {{
+            const ta = document.querySelector('{_TW_SEL["media_alt_text"]}');
+            if (ta) {{ ta.focus(); document.execCommand('insertText', false, {json.dumps(alt)}); }}
+        }})()
+        """)
+        await _tw_pause(0.5, 0.1)
+        await _tw_click_sel(ws, _TW_SEL['media_alt_save'])
+        await _tw_pause(0.5, 0.1)
+
+
+async def _tw_set_poll(ws, options, duration_hours=24):
+    """Compose'da poll butonuna tıkla, option'ları doldur, süreyi set et."""
+    await _tw_click_sel(ws, _TW_SEL['poll_btn'])
+    await _tw_pause(0.8, 0.2)
+    # Option input'ları sırayla doldur
+    for i, opt in enumerate(options[:4]):
+        await _tw_eval(ws, f"""
+        (() => {{
+            const inputs = document.querySelectorAll('{_TW_SEL["poll_opt_input"]}');
+            if (inputs[{i}]) {{ inputs[{i}].focus(); document.execCommand('insertText', false, {json.dumps(opt)}); }}
+        }})()
+        """)
+        await _tw_pause(0.3, 0.1)
+    # Duration: X UI 1 day / 7 days dropdown'ları sunar. duration_hours'a göre yakın eşleştir.
+    # Default 1 day; özel duration için ileride detaylandır.
+
+
+async def cmd_twitter_post(text, long_form=False, quote_url=None, poll_options=None,
+                            poll_duration=24, media=None):
+    """
+    Tweet at. Modifier'lar:
+      long_form: 280+ karakter (Premium)
+      quote_url: set ise quote tweet
+      poll_options: list of str, set ise poll ekle (duration_hours opsiyonel)
+      media: list of (path, alt_text|None), set ise media yükle
+    """
+    ws, _ = get_page_ws()
+
+    # Quote tweet ayrı bir flow — önce hedef tweet'e git, retweet menüsünden Quote seç
+    if quote_url:
+        tid = _tw_parse_tweet_url(quote_url)
+        if not tid:
+            print(json.dumps({'error': f'invalid quote_url: {quote_url}'}), file=sys.stderr)
+            sys.exit(1)
+        await _tw_navigate(ws, f'/i/status/{tid.split("/")[-1]}')
+        await _tw_pause(1.2, 0.3)
+        await _tw_click_sel(ws, _TW_SEL['retweet_btn'])
+        await _tw_pause(0.6, 0.1)
+        await _tw_click_sel(ws, _TW_SEL['quote_btn'])
+        await _tw_pause(1.2, 0.3)
+    else:
+        await _tw_navigate(ws, '/compose/tweet')
+        await _tw_pause(1.5, 0.4)
+
+    ok = await _tw_click_sel(ws, _TW_SEL['textarea'])
+    if not ok:
+        print(json.dumps({'error': 'textarea not found, are you logged in?'}), file=sys.stderr)
+        sys.exit(1)
+
+    # Long-form mode (Premium) — text 280'i aşıyorsa otomatik veya butonla aç
+    if long_form or (text and len(text) > 280):
+        # Premium UI long-form için ayrı button gösterebilir; selector dene
+        await _tw_click_sel(ws, _TW_SEL['long_form_btn'])
+        await _tw_pause(0.5, 0.1)
+
+    await _tw_pause(0.5, 0.1)
+    await _tw_type(ws, text)
+    await _tw_pause(1.0, 0.2)
+
+    # Media yükle
+    if media:
+        await _tw_attach_media(ws, media)
+
+    # Poll ekle
+    if poll_options:
+        await _tw_set_poll(ws, poll_options, poll_duration)
+
+    await _tw_pause(1.2, 0.3)
+    await _tw_click_sel(ws, _TW_SEL['post_btn2']) or await _tw_click_sel(ws, _TW_SEL['post_btn'])
+    await asyncio.sleep(4.0 if _TW_HUMANIZE() else 1.5)
+    url = await _tw_eval(ws, 'window.location.href')
+    print(json.dumps({'url': url, 'tweet_id': _tw_parse_tweet_url(url or '')}))
+
+
+async def cmd_twitter_thread(texts):
+    """
+    Native thread — compose dialog'unda + butonuyla multi-tweet draft oluştur,
+    tek seferde "Post all" ile gönder. Reply-chain DEĞİL.
+    """
+    if not texts or len(texts) < 2:
+        print(json.dumps({'error': 'thread requires min 2 tweets'}), file=sys.stderr)
+        sys.exit(1)
+
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, '/compose/tweet')
+    await _tw_pause(1.5, 0.4)
+
+    # İlk tweet'i textarea'ya yaz
+    await _tw_click_sel(ws, _TW_SEL['textarea'])
+    await _tw_pause(0.4, 0.1)
+    await _tw_type(ws, texts[0])
+
+    # Sonraki tweet'leri "+" ile ekle
+    for i, t in enumerate(texts[1:], start=1):
+        if not t.strip():
+            continue
+        await _tw_pause(0.6, 0.15)
+        # "+" butonuna tıkla
+        clicked = await _tw_click_sel(ws, _TW_SEL['add_tweet_btn'])
+        if not clicked:
+            print(json.dumps({'error': f'add-tweet button not found for tweet {i}'}), file=sys.stderr)
+            sys.exit(1)
+        await _tw_pause(0.6, 0.15)
+        # i'inci textarea'ya yaz — selector tweetTextarea_i şeklinde
+        expr = f"""(() => {{
+            const ta = document.querySelector('[data-testid="tweetTextarea_{i}"]');
+            if (!ta) return {{ok: false}};
+            ta.focus();
+            const ok = document.execCommand('insertText', false, {json.dumps(t)});
+            return {{ok: ok, content: ta.innerText}};
+        }})()"""
+        await _tw_eval(ws, expr)
+        await _tw_pause(0.5, 0.1)
+
+    # Tüm thread'i tek seferde gönder
+    await _tw_pause(1.2, 0.3)
+    await _tw_click_sel(ws, _TW_SEL['post_btn2']) or await _tw_click_sel(ws, _TW_SEL['post_btn'])
+    await asyncio.sleep(5.0 if _TW_HUMANIZE() else 2.0)
+    url = await _tw_eval(ws, 'window.location.href')
+    first_tid = _tw_parse_tweet_url(url or '')
+    print(json.dumps({
+        'url': url,
+        'first_tweet_id': first_tid,
+        'tweet_count': len(texts),
+        'mode': 'native_thread',
+    }, indent=2))
+
+
+async def cmd_twitter_reply(tweet_id, text):
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, f'/i/status/{tweet_id}')
+    await _tw_pause(1.0, 0.3)
+    await _tw_click_sel(ws, _TW_SEL['reply_btn'])
+    await _tw_pause(0.8, 0.2)
+    await _tw_type(ws, text)
+    await _tw_pause(1.0, 0.2)
+    await _tw_click_sel(ws, _TW_SEL['post_btn']) or await _tw_click_sel(ws, _TW_SEL['post_btn2'])
+    await asyncio.sleep(3.0 if _TW_HUMANIZE() else 0.8)
+    url = await _tw_eval(ws, 'window.location.href')
+    print(json.dumps({'url': url, 'tweet_id': _tw_parse_tweet_url(url or '')}))
+
+
+async def cmd_twitter_replies(tweet_id, limit=20):
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, f'/i/status/{tweet_id}')
+    slice_end = limit + 1
+    expr = (
+        'Array.from(document.querySelectorAll("article")).slice(1,' + str(slice_end) + ')'
+        '.map(function(a){var tt=a.querySelector("[data-testid=\'tweetText\']");var un=a.querySelector("[data-testid=\'UserName\']");var tm=a.querySelector("time");'
+        'return {text:tt?tt.innerText:"",user:un?un.innerText:"",id:tm&&tm.parentElement?tm.parentElement.href.split("/").pop():""}})'
+    )
+    data = await _tw_eval(ws, expr) or []
+    print(json.dumps(data, indent=2))
+
+
+async def cmd_twitter_mentions(since=None):
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, '/notifications/mentions')
+    expr = (
+        'Array.from(document.querySelectorAll("article"))'
+        '.map(function(a){var tt=a.querySelector("[data-testid=\'tweetText\']");var un=a.querySelector("[data-testid=\'UserName\']");var tm=a.querySelector("time");'
+        'return {text:tt?tt.innerText:"",user:un?un.innerText:"",id:tm&&tm.parentElement?tm.parentElement.href.split("/").pop():""}})'
+    )
+    data = await _tw_eval(ws, expr) or []
+    print(json.dumps(data, indent=2))
+
+
+async def cmd_twitter_profile(handle):
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, f'/{handle}')
+    bio = await _tw_eval(ws, '(document.querySelector("[data-testid=\'UserDescription\']")||{}).innerText||""')
+    followers = await _tw_eval(ws, '(document.querySelector("a[href$=\'/followers\'] span")||{}).innerText||""')
+    following = await _tw_eval(ws, '(document.querySelector("a[href$=\'/following\'] span")||{}).innerText||""')
+    print(json.dumps({'handle': handle, 'bio': bio, 'followers': followers, 'following': following}, indent=2))
+
+
+async def cmd_twitter_like(tweet_id):
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, f'/i/status/{tweet_id}')
+    await _tw_pause(0.8, 0.2)
+    # Eğer zaten like'lıysa unlike_btn görünür, like noop
+    already = await _tw_eval(ws, f'!!document.querySelector({json.dumps(_TW_SEL["unlike_btn"])})')
+    if already:
+        print(json.dumps({'status': 'noop', 'reason': 'already_liked', 'tweet_id': tweet_id}))
+        return
+    ok = await _tw_click_sel(ws, _TW_SEL['like_btn'])
+    print(json.dumps({'status': 'ok' if ok else 'failed', 'tweet_id': tweet_id}))
+
+
+async def cmd_twitter_unlike(tweet_id):
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, f'/i/status/{tweet_id}')
+    await _tw_pause(0.8, 0.2)
+    ok = await _tw_click_sel(ws, _TW_SEL['unlike_btn'])
+    if not ok:
+        # Zaten unlike durumda
+        print(json.dumps({'status': 'noop', 'reason': 'not_liked', 'tweet_id': tweet_id}))
+        return
+    print(json.dumps({'status': 'ok', 'tweet_id': tweet_id}))
+
+
+async def cmd_twitter_retweet(tweet_id):
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, f'/i/status/{tweet_id}')
+    await _tw_pause(1.0, 0.3)
+    # Eğer zaten retweet'liyse unretweet_btn görünür
+    already = await _tw_eval(ws, f'!!document.querySelector({json.dumps(_TW_SEL["unretweet_btn"])})')
+    if already:
+        print(json.dumps({'status': 'noop', 'reason': 'already_retweeted', 'tweet_id': tweet_id}))
+        return
+    await _tw_click_sel(ws, _TW_SEL['retweet_btn'])
+    await _tw_pause(0.6, 0.15)
+    # Açılan menüden "Repost" (retweetConfirm) seç
+    ok = await _tw_click_sel(ws, _TW_SEL['retweet_confirm'])
+    print(json.dumps({'status': 'ok' if ok else 'failed', 'tweet_id': tweet_id}))
+
+
+async def cmd_twitter_unretweet(tweet_id):
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, f'/i/status/{tweet_id}')
+    await _tw_pause(1.0, 0.3)
+    clicked = await _tw_click_sel(ws, _TW_SEL['unretweet_btn'])
+    if not clicked:
+        print(json.dumps({'status': 'noop', 'reason': 'not_retweeted', 'tweet_id': tweet_id}))
+        return
+    await _tw_pause(0.6, 0.15)
+    ok = await _tw_click_sel(ws, _TW_SEL['unretweet_confirm'])
+    print(json.dumps({'status': 'ok' if ok else 'failed', 'tweet_id': tweet_id}))
+
+
+async def cmd_twitter_bookmark(tweet_id):
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, f'/i/status/{tweet_id}')
+    await _tw_pause(0.8, 0.2)
+    ok = await _tw_click_sel(ws, _TW_SEL['bookmark_btn'])
+    print(json.dumps({'status': 'ok' if ok else 'failed', 'tweet_id': tweet_id}))
+
+
+async def cmd_twitter_pin(tweet_id):
+    """Kendi tweet'ini profile'a pin'le. ... menüsünden 'Pin to profile' seç."""
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, f'/i/status/{tweet_id}')
+    await _tw_pause(1.0, 0.3)
+    # ... butonuna tıkla (tweet'in üst sağ köşesi)
+    await _tw_click_sel(ws, _TW_SEL['caret_btn'])
+    await _tw_pause(0.6, 0.15)
+    # Menüden "Pin to profile" tıkla
+    clicked = await _tw_click_sel(ws, _TW_SEL['pin_menu_item'])
+    if not clicked:
+        print(json.dumps({'error': 'pin menu item not found — tweet not yours or already pinned?'}), file=sys.stderr)
+        sys.exit(1)
+    await _tw_pause(0.6, 0.15)
+    # Confirmation dialog
+    ok = await _tw_click_sel(ws, _TW_SEL['pin_confirm'])
+    print(json.dumps({'status': 'ok' if ok else 'failed', 'tweet_id': tweet_id, 'action': 'pin'}))
+
+
+async def cmd_twitter_unpin(tweet_id):
+    """Pinli tweet'i unpin'le."""
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, f'/i/status/{tweet_id}')
+    await _tw_pause(1.0, 0.3)
+    await _tw_click_sel(ws, _TW_SEL['caret_btn'])
+    await _tw_pause(0.6, 0.15)
+    clicked = await _tw_click_sel(ws, _TW_SEL['unpin_menu_item'])
+    if not clicked:
+        print(json.dumps({'error': 'unpin menu item not found — tweet not pinned?'}), file=sys.stderr)
+        sys.exit(1)
+    await _tw_pause(0.6, 0.15)
+    ok = await _tw_click_sel(ws, _TW_SEL['pin_confirm'])
+    print(json.dumps({'status': 'ok' if ok else 'failed', 'tweet_id': tweet_id, 'action': 'unpin'}))
+
+
+async def cmd_twitter_follow(handle):
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, f'/{handle}')
+    await _tw_pause(0.8, 0.2)
+    # Zaten following ise unfollow_btn görünür
+    already = await _tw_eval(ws, f'!!document.querySelector({json.dumps(_TW_SEL["unfollow_btn"])})')
+    if already:
+        print(json.dumps({'status': 'noop', 'reason': 'already_following', 'handle': handle}))
+        return
+    ok = await _tw_click_sel(ws, _TW_SEL['follow_btn'])
+    print(json.dumps({'status': 'ok' if ok else 'failed', 'handle': handle}))
+
+
+async def cmd_twitter_unfollow(handle):
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, f'/{handle}')
+    await _tw_pause(0.8, 0.2)
+    clicked = await _tw_click_sel(ws, _TW_SEL['unfollow_btn'])
+    if not clicked:
+        print(json.dumps({'status': 'noop', 'reason': 'not_following', 'handle': handle}))
+        return
+    await _tw_pause(0.6, 0.15)
+    # Confirmation dialog
+    ok = await _tw_click_sel(ws, _TW_SEL['unfollow_confirm'])
+    print(json.dumps({'status': 'ok' if ok else 'failed', 'handle': handle, 'action': 'unfollow'}))
+
+
+async def cmd_twitter_analytics(days=7):
+    """
+    Gerçek analytics scrape. X'in /i/account/analytics sayfasından son N gün:
+      - Impressions, profile visits, mentions, follower change
+    Tweet-level metrics için /username/tweet/ID/analytics sayfası gerekir.
+
+    Çıktı schema'sı:
+      {
+        "date": "YYYY-MM-DD",  # bugün
+        "window_days": N,
+        "follower_count": int,
+        "following_count": int,
+        "impressions": int,
+        "profile_visits": int,
+        "posts": [
+          {"id": "...", "content": "...", "impressions": int, "likes": int, "retweets": int, "replies": int, "hour": int},
+          ...
+        ]
+      }
+    """
+    ws, _ = get_page_ws()
+    await _tw_navigate(ws, '/i/account/analytics')
+    await _tw_pause(3.0, 0.5)
+
+    # Sayfadan metrics scrape — exact selector'lar X tarafından sık değişir
+    metrics = await _tw_eval(ws, """
+    (() => {
+      const out = {};
+      // Top-level metric kartları
+      document.querySelectorAll('[data-testid="analytics-metric-card"]').forEach(card => {
+        const label = card.querySelector('span')?.innerText?.toLowerCase() || '';
+        const value = card.querySelector('span:last-child')?.innerText || '';
+        if (label.includes('impression')) out.impressions = value;
+        else if (label.includes('profile')) out.profile_visits = value;
+        else if (label.includes('mention')) out.mentions = value;
+        else if (label.includes('follower')) out.follower_delta = value;
+      });
+      // Fallback: tüm metric değerlerini grab et
+      out._raw_metrics = Array.from(document.querySelectorAll('article, [role="article"]'))
+        .slice(0, 20)
+        .map(a => a.innerText?.slice(0, 200));
+      return out;
+    })()
+    """) or {}
+
+    # Profil sayfasından follower/following say
+    handle_data = await _tw_eval(ws, """
+    (() => {
+      const link = document.querySelector('a[href$="/followers"] span');
+      const fl = link?.innerText || '';
+      const link2 = document.querySelector('a[href$="/following"] span');
+      const fg = link2?.innerText || '';
+      return {followers: fl, following: fg};
+    })()
+    """) or {}
+
+    today = datetime_now_iso_date()
+    out = {
+        'date': today,
+        'window_days': days,
+        'follower_count': handle_data.get('followers', ''),
+        'following_count': handle_data.get('following', ''),
+        'impressions': metrics.get('impressions', ''),
+        'profile_visits': metrics.get('profile_visits', ''),
+        'mentions': metrics.get('mentions', ''),
+        'follower_delta': metrics.get('follower_delta', ''),
+        'posts': [],  # tweet-level scraping ayrı flow gerektirir; ileride genişlet
+        '_raw': metrics.get('_raw_metrics', [])[:5],
+    }
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+def datetime_now_iso_date():
+    """Today's date in YYYY-MM-DD."""
+    from datetime import date
+    return date.today().isoformat()
+
+
+def _parse_post_flags(rest):
+    """
+    post komutu için flag parser.
+    Returns (text, long_form, quote_url, poll_options, poll_duration, media_list)
+    media_list = [(path, alt_text|None), ...]
+    """
+    long_form = False
+    quote_url = None
+    poll_options = []
+    poll_duration = 24
+    media_list = []
+    pending_alt = None  # son --media için alt-text bekliyor
+
+    positional = []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == '--long':
+            long_form = True; i += 1
+        elif a == '--quote' and i + 1 < len(rest):
+            quote_url = rest[i + 1]; i += 2
+        elif a == '--poll' and i + 1 < len(rest):
+            poll_options.append(rest[i + 1]); i += 2
+        elif a == '--poll-duration' and i + 1 < len(rest):
+            poll_duration = int(rest[i + 1]); i += 2
+        elif a == '--media' and i + 1 < len(rest):
+            media_list.append((rest[i + 1], None)); i += 2
+        elif a == '--alt' and i + 1 < len(rest):
+            # Son --media'ya bağla
+            if media_list:
+                media_list[-1] = (media_list[-1][0], rest[i + 1])
+            i += 2
+        else:
+            positional.append(a); i += 1
+
+    text = positional[0] if positional else sys.stdin.read().strip()
+    return text, long_form, quote_url, (poll_options or None), poll_duration, (media_list or None)
+
+
+def _dispatch_agent_twitter_cmd(args):
+    if not args:
+        print('Usage: agent twitter SUBCMD ...', file=sys.stderr)
+        print('Content actions:', file=sys.stderr)
+        print('  login | status', file=sys.stderr)
+        print('  post "text" [--long] [--quote URL] [--poll opt1 --poll opt2 ...] [--poll-duration N]', file=sys.stderr)
+        print('       [--media PATH [--alt "alt text"]] (repeatable)', file=sys.stderr)
+        print('  thread "t1" "t2" "t3"... (native multi-tweet draft)', file=sys.stderr)
+        print('  reply TWEET_ID "text"', file=sys.stderr)
+        print('  pin TWEET_ID | unpin TWEET_ID', file=sys.stderr)
+        print('Engagement actions:', file=sys.stderr)
+        print('  like TWEET_ID | unlike TWEET_ID', file=sys.stderr)
+        print('  retweet TWEET_ID | unretweet TWEET_ID', file=sys.stderr)
+        print('  bookmark TWEET_ID', file=sys.stderr)
+        print('  follow HANDLE | unfollow HANDLE', file=sys.stderr)
+        print('Read actions:', file=sys.stderr)
+        print('  replies TWEET_ID [--limit N]', file=sys.stderr)
+        print('  mentions [--since ISO]', file=sys.stderr)
+        print('  profile HANDLE', file=sys.stderr)
+        print('  analytics [--days N]', file=sys.stderr)
+        sys.exit(1)
+    sub = args[0]
+    rest = args[1:]
+
+    # Content actions
+    if sub == 'login':
+        return cmd_twitter_login()
+    if sub == 'status':
+        return cmd_twitter_status()
+    if sub == 'post':
+        text, long_form, quote_url, poll_opts, poll_dur, media = _parse_post_flags(rest)
+        return cmd_twitter_post(text, long_form=long_form, quote_url=quote_url,
+                                 poll_options=poll_opts, poll_duration=poll_dur, media=media)
+    if sub == 'thread':
+        if rest:
+            texts = list(rest)
+        else:
+            texts = [l.rstrip('\n') for l in sys.stdin.readlines()]
+        return cmd_twitter_thread(texts)
+    if sub == 'reply':
+        # --to flag desteği (executor öyle çağırıyor)
+        to = None; pos = []
+        i = 0
+        while i < len(rest):
+            if rest[i] == '--to' and i + 1 < len(rest):
+                to = rest[i + 1]; i += 2
+            else:
+                pos.append(rest[i]); i += 1
+        if to and pos:
+            return cmd_twitter_reply(to, pos[0])
+        if len(rest) >= 2:
+            return cmd_twitter_reply(rest[0], rest[1])
+        print('Usage: agent twitter reply TWEET_ID "text"  OR  reply --to TWEET_ID "text"', file=sys.stderr)
+        sys.exit(1)
+    if sub == 'pin':
+        if not rest: print('Usage: agent twitter pin TWEET_ID', file=sys.stderr); sys.exit(1)
+        return cmd_twitter_pin(rest[0])
+    if sub == 'unpin':
+        if not rest: print('Usage: agent twitter unpin TWEET_ID', file=sys.stderr); sys.exit(1)
+        return cmd_twitter_unpin(rest[0])
+
+    # Engagement actions
+    if sub == 'like':
+        if not rest: print('Usage: agent twitter like TWEET_ID', file=sys.stderr); sys.exit(1)
+        return cmd_twitter_like(rest[0])
+    if sub == 'unlike':
+        if not rest: print('Usage: agent twitter unlike TWEET_ID', file=sys.stderr); sys.exit(1)
+        return cmd_twitter_unlike(rest[0])
+    if sub == 'retweet':
+        if not rest: print('Usage: agent twitter retweet TWEET_ID', file=sys.stderr); sys.exit(1)
+        return cmd_twitter_retweet(rest[0])
+    if sub == 'unretweet':
+        if not rest: print('Usage: agent twitter unretweet TWEET_ID', file=sys.stderr); sys.exit(1)
+        return cmd_twitter_unretweet(rest[0])
+    if sub == 'bookmark':
+        if not rest: print('Usage: agent twitter bookmark TWEET_ID', file=sys.stderr); sys.exit(1)
+        return cmd_twitter_bookmark(rest[0])
+    if sub == 'follow':
+        if not rest: print('Usage: agent twitter follow HANDLE', file=sys.stderr); sys.exit(1)
+        return cmd_twitter_follow(rest[0])
+    if sub == 'unfollow':
+        if not rest: print('Usage: agent twitter unfollow HANDLE', file=sys.stderr); sys.exit(1)
+        return cmd_twitter_unfollow(rest[0])
+
+    # Read actions
+    if sub == 'replies':
+        lim = 20
+        tweet_id = rest[0] if rest else None
+        i = 1
+        while i < len(rest):
+            if rest[i] == '--limit' and i + 1 < len(rest):
+                lim = int(rest[i + 1]); i += 2
+            else:
+                i += 1
+        if not tweet_id:
+            print('Usage: agent twitter replies TWEET_ID [--limit N]', file=sys.stderr); sys.exit(1)
+        return cmd_twitter_replies(tweet_id, lim)
+    if sub == 'mentions':
+        sinc = None
+        i = 0
+        while i < len(rest):
+            if rest[i] == '--since' and i + 1 < len(rest):
+                sinc = rest[i + 1]; i += 2
+            else:
+                i += 1
+        return cmd_twitter_mentions(sinc)
+    if sub == 'profile':
+        if not rest: print('Usage: agent twitter profile HANDLE', file=sys.stderr); sys.exit(1)
+        return cmd_twitter_profile(rest[0])
+    if sub == 'analytics':
+        ds = 7
+        i = 0
+        while i < len(rest):
+            if rest[i] == '--days' and i + 1 < len(rest):
+                ds = int(rest[i + 1]); i += 2
+            else:
+                i += 1
+        return cmd_twitter_analytics(ds)
+
+    print(f'Unknown twitter subcommand: {sub}', file=sys.stderr)
+    sys.exit(1)
+
+# ─── End Agent Twitter Namespace ──────────────────────────────────────────────
+
+
+# ─── Heal Log Commands ────────────────────────────────────────────────────────
+
+def cmd_heal_log(last_n=20):
+    path = os.path.join(CDPILOT_HOME, "projects", PROJECT_ID, "heal.jsonl")
+    if not os.path.exists(path):
+        print("No heal log found.")
+        return
+    with open(path) as f:
+        lines = f.readlines()
+    for line in lines[-last_n:]:
+        try:
+            d = json.loads(line)
+            win = next((t["strategy"] for t in reversed(d["tried"]) if t.get("hit")), "MISS")
+            print(f"[{d['ts']}] {d['cmd']}: {d['input']!r} -> {win} ({d['duration_ms']}ms)")
+        except Exception:
+            pass
+
+
+def cmd_heal_stats():
+    path = os.path.join(CDPILOT_HOME, "projects", PROJECT_ID, "heal.jsonl")
+    if not os.path.exists(path):
+        print("No heal log found.")
+        return
+    stats = {}
+    cmd_wins = {}
+    with open(path) as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+                c = d["cmd"]
+                if c not in cmd_wins:
+                    cmd_wins[c] = {}
+                for t in d["tried"]:
+                    s = t["strategy"]
+                    if s not in stats:
+                        stats[s] = {"hits": 0, "misses": 0}
+                    if t.get("hit"):
+                        stats[s]["hits"] += 1
+                        cmd_wins[c][s] = cmd_wins[c].get(s, 0) + 1
+                    else:
+                        stats[s]["misses"] += 1
+            except Exception:
+                pass
+    print(f"{'Strategy':<15} | {'Hits':<5} | {'Misses':<6} | Win%")
+    print("-" * 40)
+    for s, v in stats.items():
+        total = v["hits"] + v["misses"]
+        pct = v["hits"] / total * 100 if total else 0
+        print(f"{s:<15} | {v['hits']:<5} | {v['misses']:<6} | {pct:.1f}%")
+    if cmd_wins:
+        print("\nTop fallback by command:")
+        for c, s_map in cmd_wins.items():
+            if s_map:
+                top = max(s_map.items(), key=lambda x: x[1])[0]
+                print(f"  {c}: {top}")
+
+
 # ─── 3. Advanced Input Commands ───
 
-async def cmd_hover(selector):
-    """Move the mouse cursor to the specified element."""
+async def cmd_hover(selector, ladder=None, no_heal=False, entropy=None):
     ws_url, _ = get_page_ws()
-    x, y = await _get_element_center(ws_url, selector)
-    await _vfx_move_cursor(ws_url, x, y)
-    await cdp_send(ws_url, [(1, "Input.dispatchMouseEvent",
-        {"type": "mouseMoved", "x": x, "y": y, "button": "none", "modifiers": 0})])
+    if entropy is None:
+        try:
+            _h = await _adaptive_current_host(ws_url)
+        except Exception:
+            _h = None
+        entropy = _entropy_enabled(_get_project_id(), host=_h)
+    t0 = time.time()
+    res_sel, tried = await _resolve_selector_ladder(ws_url, selector, ladder)
+    dur = (time.time() - t0) * 1000
+    if not res_sel:
+        _log_heal("hover", selector, tried, dur, no_heal)
+        print(f"Error: selector '{selector}' not resolved.", file=sys.stderr)
+        sys.exit(1)
+    if len(tried) > 1 or (tried and not tried[0]["hit"]):
+        _log_heal("hover", selector, tried, dur, no_heal)
+    x, y = await _get_element_center(ws_url, res_sel)
+    if entropy:
+        await _humanize_mouse_move(ws_url, x, y)
+    else:
+        await _vfx_move_cursor(ws_url, x, y)
+        await cdp_send(ws_url, [(1, "Input.dispatchMouseEvent",
+            {"type": "mouseMoved", "x": x, "y": y, "button": "none", "modifiers": 0})])
+    # cleanup tmp attr if used
+    await cdp_send(ws_url, [(2, "Runtime.evaluate", {
+        "expression": f"(function(){{var e=document.querySelector({json.dumps(res_sel)});if(e)e.removeAttribute('data-cdpilot-tmp')}})()"})])
     print(f"Hover: {selector} ({x}, {y})")
 
 
@@ -5777,9 +7668,15 @@ async def cmd_rightclick(selector):
     print(f"Right-clicked: {selector}")
 
 
-async def cmd_drag(from_selector, to_selector):
+async def cmd_drag(from_selector, to_selector, entropy=None):
     """Drag an element onto another element."""
     ws_url, _ = get_page_ws()
+    if entropy is None:
+        try:
+            _h = await _adaptive_current_host(ws_url)
+        except Exception:
+            _h = None
+        entropy = _entropy_enabled(_get_project_id(), host=_h)
     fx, fy = await _get_element_center(ws_url, from_selector)
     tx, ty = await _get_element_center(ws_url, to_selector)
     await _vfx_ripple(ws_url, fx, fy)
@@ -5792,13 +7689,21 @@ async def cmd_drag(from_selector, to_selector):
             await asyncio.wait_for(ws.recv(), timeout=3)
 
         await send_mouse(1, "mousePressed", fx, fy)
-        steps = 5
-        for i in range(1, steps + 1):
-            ix = int(fx + (tx - fx) * i / steps)
-            iy = int(fy + (ty - fy) * i / steps)
-            await _vfx_move_cursor(ws_url, ix, iy)
-            await send_mouse(10 + i, "mouseMoved", ix, iy)
-            await asyncio.sleep(0.05)
+        if entropy:
+            path = _bezier_path((fx, fy), (tx, ty), points=15)
+            for i, (ix, iy) in enumerate(path[1:], start=10):
+                await send_mouse(i, "mouseMoved", ix, iy)
+                import random as _r
+                _dr = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
+                await asyncio.sleep(_dr.uniform(0.02, 0.06))
+        else:
+            steps = 5
+            for i in range(1, steps + 1):
+                ix = int(fx + (tx - fx) * i / steps)
+                iy = int(fy + (ty - fy) * i / steps)
+                await _vfx_move_cursor(ws_url, ix, iy)
+                await send_mouse(10 + i, "mouseMoved", ix, iy)
+                await asyncio.sleep(0.05)
         await send_mouse(20, "mouseReleased", tx, ty)
 
     print(f"Dragged: {from_selector} → {to_selector}")
@@ -5852,17 +7757,41 @@ async def cmd_keys(combo):
     print(f"Key sent: {combo}")
 
 
-async def cmd_scroll_to(selector):
+async def cmd_scroll_to(selector, entropy=None):
     """Scroll the specified element into view."""
     ws_url, _ = get_page_ws()
-    js = f"(function(){{ var el=document.querySelector({json.dumps(selector)}); if(!el) return false; el.scrollIntoView({{behavior:'instant',block:'center'}}); return true; }})()"
-    res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-    ok = res.get(1, {}).get("result", {}).get("value", False)
-    if ok:
-        print(f"Scrolled to: {selector}")
+    if entropy is None:
+        try:
+            _h = await _adaptive_current_host(ws_url)
+        except Exception:
+            _h = None
+        entropy = _entropy_enabled(_get_project_id(), host=_h)
+    if entropy:
+        # Get element position then humanize scroll
+        js_pos = f"""(function(){{
+            var el=document.querySelector({json.dumps(selector)});
+            if(!el) return null;
+            var r=el.getBoundingClientRect();
+            return {{top: r.top, height: r.height}};
+        }})()"""
+        res_pos = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js_pos, "returnByValue": True})])
+        val = res_pos.get(1, {}).get("result", {}).get("value")
+        if not val:
+            print(f"Error: element '{selector}' not found.", file=sys.stderr)
+            sys.exit(1)
+        delta = int(val.get("top", 0))
+        if delta != 0:
+            await _humanize_scroll(ws_url, delta)
+        print(f"Scrolled to (entropy): {selector}")
     else:
-        print(f"Error: element '{selector}' not found.", file=sys.stderr)
-        sys.exit(1)
+        js = f"(function(){{ var el=document.querySelector({json.dumps(selector)}); if(!el) return false; el.scrollIntoView({{behavior:'instant',block:'center'}}); return true; }})()"
+        res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+        ok = res.get(1, {}).get("result", {}).get("value", False)
+        if ok:
+            print(f"Scrolled to: {selector}")
+        else:
+            print(f"Error: element '{selector}' not found.", file=sys.stderr)
+            sys.exit(1)
 
 
 # ─── 4. iframe / Shadow DOM ───
@@ -6299,6 +8228,684 @@ class MCPServer:
                 sys.stderr.flush()
 
 
+# ─── Test Runner ───
+
+TRACES_DIR = os.path.join(CDPILOT_HOME, 'traces')
+
+TRACE_VIEWER_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>cdpilot Trace Viewer</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; display: flex; height: 100vh; margin: 0; background: #f8f9fa; color: #1a1a1a; }
+        #list { width: 320px; border-right: 1px solid #dee2e6; overflow-y: auto; background: white; }
+        #main { flex: 1; display: flex; flex-direction: column; padding: 24px; overflow-y: auto; }
+        .step { padding: 14px 18px; cursor: pointer; border-bottom: 1px solid #f1f3f5; transition: all 0.1s; }
+        .step:hover { background: #f8f9fa; }
+        .step.active { background: #e7f5ff; border-left: 4px solid #228be6; font-weight: 600; }
+        .badge { padding: 4px 10px; border-radius: 4px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+        .pass { background: #ebfbee; color: #2b8a3e; border: 1px solid #d3f9d8; }
+        .fail { background: #fff5f5; color: #c92a2a; border: 1px solid #ffe3e3; }
+        img { max-width: 100%; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.08); margin: 20px 0; background: #fff; border: 1px solid #dee2e6; }
+        pre { background: #1a1b1e; color: #ced4da; padding: 16px; border-radius: 8px; font-size: 13px; line-height: 1.5; overflow-x: auto; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+        h3 { margin-top: 32px; font-size: 16px; border-bottom: 1px solid #dee2e6; padding-bottom: 8px; color: #495057; }
+        .meta { color: #868e96; font-size: 13px; }
+        #header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+        .nav-hint { font-size: 12px; color: #adb5bd; margin-top: 8px; }
+    </style>
+</head>
+<body>
+    <div id="list"></div>
+    <div id="main">
+        <div id="header">
+            <div>
+                <span id="status-badge" class="badge"></span>
+                <h2 id="step-name" style="display:inline; margin-left:12px; font-size: 20px;">Select a step</h2>
+            </div>
+            <div id="step-info" class="meta"></div>
+        </div>
+        <div class="nav-hint">Use &uarr;/&darr; or &larr;/&rarr; arrows to navigate steps</div>
+        <img id="screenshot" style="display:none">
+        <div id="details">
+            <h3>A11y Tree</h3><pre id="a11y">No data</pre>
+            <h3>Console</h3><pre id="console-log">No data</pre>
+            <h3>Network</h3><pre id="network">No data</pre>
+        </div>
+    </div>
+    <script>
+        let steps = []; let currentIdx = -1;
+        async function load() {
+            try {
+                const [sRes, mRes] = await Promise.all([fetch('/steps.jsonl'), fetch('/meta.json').then(r=>r.json()).catch(()=>({}))]);
+                steps = (await sRes.text()).trim().split('\\n').filter(Boolean).map(JSON.parse);
+                const badge = document.getElementById('status-badge');
+                badge.textContent = mRes.failed > 0 ? 'FAILED' : 'PASSED';
+                badge.className = 'badge ' + (mRes.failed > 0 ? 'fail' : 'pass');
+                const list = document.getElementById('list');
+                steps.forEach((s, i) => {
+                    const div = document.createElement('div');
+                    div.className = 'step';
+                    div.innerHTML = '<div style="font-size:11px;color:#adb5bd;margin-bottom:2px">STEP ' + (i+1) + '</div><div style="font-size:14px">' + (s.action || 'Navigation') + '</div>';
+                    div.onclick = () => selectStep(i);
+                    list.appendChild(div);
+                });
+                if (steps.length > 0) selectStep(0);
+            } catch (e) { document.getElementById('main').innerHTML = '<h1>Error loading trace data</h1>'; }
+        }
+        async function selectStep(i) {
+            if (i < 0 || i >= steps.length) return;
+            currentIdx = i;
+            document.querySelectorAll('.step').forEach((el, idx) => el.classList.toggle('active', idx === i));
+            const s = steps[i];
+            document.getElementById('step-name').textContent = s.action || 'Navigation';
+            document.getElementById('step-info').textContent = 'Duration: ' + (s.duration_ms || 0) + 'ms';
+            const img = document.getElementById('screenshot');
+            const pad = String(i).padStart(3, '0');
+            img.src = '/screenshots/step-' + pad + '.png';
+            img.style.display = 'block';
+            img.onerror = () => { img.style.display = 'none'; };
+            const fetchText = path => fetch(path).then(r => r.ok ? r.text() : 'No data').catch(() => 'No data');
+            const [a11y, conLog, network] = await Promise.all([
+                fetch('/a11y/step-' + pad + '.json').then(r => r.json()).catch(() => 'No data'),
+                fetchText('/console.jsonl'),
+                fetchText('/network.jsonl')
+            ]);
+            document.getElementById('a11y').textContent = typeof a11y === 'string' ? a11y : JSON.stringify(a11y, null, 2);
+            document.getElementById('console-log').textContent = conLog;
+            document.getElementById('network').textContent = network;
+            document.getElementById('list').children[i].scrollIntoView({ block: 'nearest' });
+        }
+        window.onkeydown = e => {
+            if (e.key === 'ArrowDown' || e.key === 'ArrowRight') { e.preventDefault(); selectStep(currentIdx + 1); }
+            if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') { e.preventDefault(); selectStep(currentIdx - 1); }
+        };
+        load();
+    </script>
+</body>
+</html>
+"""
+
+
+def cmd_test(files=None, watch=False, parallel=1, reporter='default', trace='default', grep=None):
+    """Run *.cdpt.js test files via Node internal test runner."""
+    bin_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'bin', 'cdpilot.js')
+
+    def find_tests():
+        if files:
+            found = []
+            for f in files:
+                if os.path.isdir(f):
+                    found.extend(glob.glob(os.path.join(f, '**', '*.cdpt.js'), recursive=True))
+                elif f.endswith('.cdpt.js') and os.path.exists(f):
+                    found.append(f)
+            return found
+        return sorted(glob.glob('**/*.cdpt.js', recursive=True))
+
+    def run_one(file):
+        run_id = datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + os.path.basename(file).replace('.cdpt.js', '')
+        trace_dir = os.path.join(TRACES_DIR, run_id)
+        cmd = ['node', bin_path, '--internal-test-runner', file, '--trace-dir', trace_dir, '--parallel', str(parallel)]
+        if trace == 'off':
+            cmd.append('--trace=off')
+        if grep:
+            cmd.extend(['--grep', grep])
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            try:
+                data = json.loads(res.stdout)
+            except Exception:
+                data = {
+                    "passed": 0, "failed": 1,
+                    "tests": [{"name": file, "status": "failed", "duration_ms": 0,
+                               "error": (res.stdout + res.stderr).strip()[:500]}],
+                }
+            if trace == 'retain-on-failure' and data.get('failed', 0) == 0:
+                if os.path.exists(trace_dir):
+                    shutil.rmtree(trace_dir)
+            return data
+        except subprocess.TimeoutExpired:
+            return {"passed": 0, "failed": 1, "tests": [{"name": file, "status": "failed", "duration_ms": 120000, "error": "Timeout"}]}
+        except Exception as e:
+            return {"passed": 0, "failed": 1, "tests": [{"name": file, "status": "failed", "duration_ms": 0, "error": str(e)}]}
+
+    def print_results(all_results, rep):
+        if rep == 'json':
+            print(json.dumps({"results": all_results}))
+            return
+        if rep == 'tap':
+            total = sum(len(r.get('tests', [])) for r in all_results)
+            print(f"TAP version 13\n1..{total}")
+            n = 1
+            for r in all_results:
+                for t in r.get('tests', []):
+                    ok = 'ok' if t.get('status') == 'passed' else 'not ok'
+                    print(f"{ok} {n} - {t.get('name', 'test')}")
+                    n += 1
+            return
+        if rep == 'junit':
+            lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<testsuites>']
+            for r in all_results:
+                for t in r.get('tests', []):
+                    lines.append(f'  <testcase name="{t.get("name", "")}" time="{t.get("duration_ms", 0)/1000:.3f}">')
+                    if t.get('status') != 'passed':
+                        err = (t.get('error') or '').replace('&', '&amp;').replace('<', '&lt;')
+                        lines.append(f'    <failure>{err}</failure>')
+                    lines.append('  </testcase>')
+            lines.append('</testsuites>')
+            print('\n'.join(lines))
+            return
+        # default
+        tp = tf = 0
+        for r in all_results:
+            tp += r.get('passed', 0)
+            tf += r.get('failed', 0)
+            for t in r.get('tests', []):
+                sym = "\033[32m  ✓\033[0m" if t.get('status') == 'passed' else "\033[31m  ✗\033[0m"
+                print(f"{sym} {t.get('name', '?')} ({t.get('duration_ms', 0)}ms)")
+                if t.get('status') != 'passed' and t.get('error'):
+                    print(f"    \033[31m{t.get('error')}\033[0m")
+        print(f"\n  {tp} passed, {tf} failed")
+
+    def run_suite():
+        test_files = find_tests()
+        if not test_files:
+            print("No tests found.")
+            return False
+        workers = max(1, min(parallel, len(test_files)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            all_results = list(executor.map(run_one, test_files))
+        print_results(all_results, reporter)
+        return any(r.get('failed', 0) > 0 for r in all_results)
+
+    if not watch:
+        if run_suite():
+            sys.exit(1)
+    else:
+        print("Watching for changes... (Ctrl+C to stop)")
+        last_m = 0
+        while True:
+            try:
+                cur_files = find_tests()
+                curr_m = max((os.path.getmtime(f) for f in cur_files), default=0) if cur_files else 0
+                if curr_m > last_m:
+                    run_suite()
+                    last_m = curr_m
+                time.sleep(1)
+            except KeyboardInterrupt:
+                break
+
+
+def cmd_trace_list():
+    """List all trace runs in ~/.cdpilot/traces/."""
+    if not os.path.exists(TRACES_DIR):
+        print("No traces found.")
+        return
+    dirs = sorted(
+        (d for d in os.listdir(TRACES_DIR) if os.path.isdir(os.path.join(TRACES_DIR, d))),
+        key=lambda x: os.path.getmtime(os.path.join(TRACES_DIR, x)),
+        reverse=True,
+    )
+    if not dirs:
+        print("No traces found.")
+        return
+    print(f"{'RUN ID':<50} | {'STATUS':<6} | {'TESTS':<5} | DATE")
+    print("-" * 80)
+    for d in dirs:
+        meta = os.path.join(TRACES_DIR, d, 'meta.json')
+        if os.path.exists(meta):
+            try:
+                with open(meta) as f:
+                    m = json.load(f)
+                status = "PASS" if m.get('failed', 0) == 0 else "FAIL"
+                total = m.get('passed', 0) + m.get('failed', 0)
+                date = datetime.datetime.fromtimestamp(os.path.getmtime(meta)).strftime('%Y-%m-%d %H:%M')
+                print(f"{d:<50} | {status:<6} | {total:<5} | {date}")
+            except Exception:
+                print(f"{d:<50} | {'?':<6} | {'?':<5} | ?")
+
+
+def cmd_trace_open(run_id=None, port=9444):
+    """Start trace viewer HTTP server for a run. Default: most recent."""
+    from http.server import SimpleHTTPRequestHandler
+    if not run_id:
+        if not os.path.exists(TRACES_DIR):
+            print("No traces found.")
+            return
+        dirs = sorted(
+            (d for d in os.listdir(TRACES_DIR) if os.path.isdir(os.path.join(TRACES_DIR, d))),
+            key=lambda x: os.path.getmtime(os.path.join(TRACES_DIR, x)),
+            reverse=True,
+        )
+        if not dirs:
+            print("No traces found.")
+            return
+        run_id = dirs[0]
+    trace_path = os.path.join(TRACES_DIR, run_id)
+    if not os.path.exists(trace_path):
+        print(f"Trace not found: {run_id}", file=sys.stderr)
+        sys.exit(1)
+
+    class TraceHandler(SimpleHTTPRequestHandler):
+        def log_message(self, fmt, *a):
+            pass  # suppress request logs
+
+        def do_GET(self):
+            if self.path == '/':
+                body = TRACE_VIEWER_HTML.encode()
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                rel = self.path.lstrip('/')
+                target = os.path.join(trace_path, rel)
+                target = os.path.realpath(target)
+                # Security: only serve files within trace_path
+                if not target.startswith(os.path.realpath(trace_path)):
+                    self.send_error(403)
+                    return
+                if os.path.exists(target) and os.path.isfile(target):
+                    with open(target, 'rb') as f:
+                        data = f.read()
+                    self.send_response(200)
+                    if target.endswith('.jsonl') or target.endswith('.json'):
+                        self.send_header('Content-type', 'application/json')
+                    elif target.endswith('.png'):
+                        self.send_header('Content-type', 'image/png')
+                    else:
+                        self.send_header('Content-type', 'application/octet-stream')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
+                    self.send_error(404)
+
+    sys.stderr.write(f"Trace viewer: http://localhost:{port}  (run: {run_id})\nCtrl+C to stop.\n")
+    try:
+        ThreadingHTTPServer(('127.0.0.1', port), TraceHandler).serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_trace_clean(older_than='7d'):
+    """Remove trace directories older than a given age."""
+    import re as _re_local
+    m = _re_local.match(r'^(\d+)([dhm])$', older_than)
+    if not m:
+        print("Invalid format. Use e.g. 7d, 24h, 30m.")
+        return
+    multiplier = {'d': 86400, 'h': 3600, 'm': 60}[m.group(2)]
+    cutoff = time.time() - int(m.group(1)) * multiplier
+    count = 0
+    if os.path.exists(TRACES_DIR):
+        for d in os.listdir(TRACES_DIR):
+            p = os.path.join(TRACES_DIR, d)
+            if os.path.isdir(p) and os.path.getmtime(p) < cutoff:
+                shutil.rmtree(p)
+                count += 1
+    print(f"Removed {count} trace(s).")
+
+
+def cmd_test_dispatch(args):
+    opts = {'watch': False, 'parallel': 1, 'reporter': 'default', 'trace': 'default', 'grep': None, 'files': []}
+    for arg in args:
+        if arg == '--watch':
+            opts['watch'] = True
+        elif arg.startswith('--parallel='):
+            opts['parallel'] = int(arg.split('=', 1)[1])
+        elif arg.startswith('--reporter='):
+            opts['reporter'] = arg.split('=', 1)[1]
+        elif arg.startswith('--trace='):
+            opts['trace'] = arg.split('=', 1)[1]
+        elif arg.startswith('--grep='):
+            opts['grep'] = arg.split('=', 1)[1]
+        elif not arg.startswith('--'):
+            opts['files'].append(arg)
+    cmd_test(
+        files=opts['files'] if opts['files'] else None,
+        watch=opts['watch'],
+        parallel=opts['parallel'],
+        reporter=opts['reporter'],
+        trace=opts['trace'],
+        grep=opts['grep'],
+    )
+
+
+def cmd_trace_dispatch(args):
+    sub = args[0] if args else 'list'
+    rest = args[1:] if len(args) > 1 else []
+    if sub == 'list':
+        cmd_trace_list()
+    elif sub == 'open':
+        port = 9444
+        run_id = None
+        for a in rest:
+            if a.startswith('--port='):
+                port = int(a.split('=', 1)[1])
+            elif not a.startswith('--'):
+                run_id = a
+        cmd_trace_open(run_id, port)
+    elif sub == 'clean':
+        cmd_trace_clean(rest[0] if rest else '7d')
+    else:
+        print(f"Unknown trace subcommand: {sub}. Use: list | open [run-id] | clean [--older-than 7d]")
+
+
+# ─── Blog Publish Namespace ───────────────────────────────────────────────────
+
+BLOG_DIR = '/Users/nadir/01dev/cdpilot-site/content/blog'
+
+# day-NNN.md master plan file lookup (relative to cdpilot project root)
+_BLOG_DAY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              '.claude', 'docs', 'twitter-master-plan', 'days')
+
+
+def _blog_slugify(text):
+    """Generate valid kebab-case slug, max 50 chars."""
+    text = text.lower()
+    text = _re.sub(r'[^a-z0-9\s-]', '', text)
+    text = _re.sub(r'[\s-]+', '-', text).strip('-')
+    return text[:50]
+
+
+def _blog_estimate_words(text):
+    """Rough word count for gate checking."""
+    return len(text.split())
+
+
+def _blog_parse_day_file(content):
+    """Parse day-NNN.md format. Returns dict: topic, tweets[], metadata{}."""
+    data = {'topic': 'Untitled', 'tweets': [], 'metadata': {}}
+
+    # Topic: text on the line(s) after '## Topic'
+    topic_m = _re.search(r'^## Topic\s*\n+([^\n#]+)', content, _re.MULTILINE)
+    if topic_m:
+        data['topic'] = topic_m.group(1).strip()
+
+    # Tweets: ## Tweet N/M — optional label, then text until next ##
+    tweet_blocks = _re.findall(
+        r'^## Tweet \d+/\d+(?:[^\n]*)?\n+(.*?)(?=\n## |\Z)',
+        content, _re.DOTALL | _re.MULTILINE
+    )
+    data['tweets'] = [t.strip() for t in tweet_blocks if t.strip()]
+
+    # Metadata block: lines like "- hashtags: #devtools"
+    meta_block_m = _re.search(r'^## Metadata\s*\n(.*?)(?=\n## |\Z)', content,
+                               _re.DOTALL | _re.MULTILINE)
+    if meta_block_m:
+        for line in meta_block_m.group(1).splitlines():
+            kv = _re.match(r'^\s*-\s*(\w+):\s*(.+)', line)
+            if kv:
+                data['metadata'][kv.group(1).strip()] = kv.group(2).strip()
+
+    return data
+
+
+def _blog_generate_frontmatter(meta):
+    """Render YAML frontmatter block."""
+    lines = ['---']
+    for k, v in meta.items():
+        if isinstance(v, list):
+            lines.append(f'{k}:')
+            for item in v:
+                lines.append(f'  - {item}')
+        else:
+            val = str(v).replace('"', '\\"')
+            lines.append(f'{k}: "{val}"')
+    lines.append('---')
+    return '\n'.join(lines)
+
+
+def _blog_section_title(tweet_text):
+    """Derive a short H2 title from tweet text (first 6 words, title-cased)."""
+    words = tweet_text.split()[:6]
+    title = ' '.join(words).rstrip('.,!?:')
+    return title if title else 'Key Insight'
+
+
+def _blog_generate_faq(tweets, topic):
+    """Generate 3-5 FAQ Q&A pairs from tweet content."""
+    faq_templates = [
+        ("What problem does {topic} solve?",
+         "It addresses the overhead and abstraction layers in traditional browser automation. "
+         "By working directly at the CDP level, {topic} eliminates middleman processes and reduces latency."),
+        ("How does this compare to existing tools like Selenium or Playwright?",
+         "Those tools add driver layers between your code and the browser. This approach connects directly "
+         "via WebSocket, giving lower latency, direct event access, and zero binary version mismatches."),
+        ("Do I need to install anything to get started?",
+         "No external dependencies are required. cdpilot uses only stdlib — no driver binaries, "
+         "no package managers beyond npm for the CLI entry point."),
+        ("Is this suitable for production automation?",
+         "Yes. The direct CDP connection is the same mechanism DevTools itself uses. "
+         "It is stable, well-documented, and used in large-scale scraping and testing pipelines."),
+        ("Can I use this for parallel automation tasks?",
+         "Yes. cdpilot supports browser context pools (Target.createBrowserContext) for true "
+         "parallelism across isolated sessions without spawning multiple browser processes."),
+    ]
+    # Inject topic into templates
+    items = []
+    for q_tmpl, a_tmpl in faq_templates[:max(3, min(5, len(tweets) + 1))]:
+        q = q_tmpl.format(topic=topic)
+        a = a_tmpl.format(topic=topic)
+        items.append((q, a))
+    return items
+
+
+def cmd_blog_publish(source):
+    """Transform a tweet thread or day-NNN.md file into a blog post."""
+    source_tweet = source
+    parsed = {'topic': 'Browser Automation', 'tweets': [], 'metadata': {}}
+
+    is_url = source.startswith(('https://x.com', 'https://twitter.com'))
+
+    if is_url:
+        print(f"Note: live URL fetch for {source} requires cdpilot browser running. "
+              f"Storing URL as reference — content will need manual expansion.", file=sys.stderr)
+        parsed['topic'] = 'Browser Automation Insight'
+        parsed['tweets'] = [f'Read the full thread at {source}']
+    else:
+        # Resolve file path
+        file_path = None
+        if _re.match(r'^day-\d{3}$', source):
+            file_path = os.path.join(_BLOG_DAY_DIR, f'{source}.md')
+        elif source.endswith('.md') or os.sep in source:
+            file_path = source
+        else:
+            # Try day-NNN format without .md
+            candidate = os.path.join(_BLOG_DAY_DIR, f'{source}.md')
+            file_path = candidate if os.path.exists(candidate) else source
+
+        if not os.path.exists(file_path):
+            print(f"Error: source file not found: {file_path}", file=sys.stderr)
+            sys.exit(1)
+
+        with open(file_path, encoding='utf-8') as f:
+            raw = f.read()
+        parsed = _blog_parse_day_file(raw)
+
+    tweets = parsed['tweets']
+    topic = parsed['topic']
+
+    if len(tweets) < 1:
+        print("Error: needs more depth — add more tweets or richer content", file=sys.stderr)
+        sys.exit(1)
+
+    hook = tweets[0]
+    # Title: topic + hook first 6 words, capped at 60 chars
+    hook_preview = ' '.join(hook.split()[:6]).rstrip('.,!?')
+    raw_title = f"{topic}: {hook_preview}"
+    title = raw_title[:60].strip()
+
+    description = hook[:160].strip()
+    slug = _blog_slugify(topic)
+
+    if not slug or not _re.match(r'^[a-z0-9]+(-[a-z0-9]+)*$', slug):
+        print(f"Error: could not generate valid slug from \"{topic}\".", file=sys.stderr)
+        sys.exit(1)
+
+    # Tags: from metadata hashtags + defaults
+    tags = ['cdpilot', 'browser-automation']
+    raw_hashtags = parsed['metadata'].get('hashtags', '')
+    for ht in raw_hashtags.split():
+        cleaned = ht.strip('# ')
+        if cleaned and cleaned not in tags:
+            tags.append(cleaned)
+
+    meta = {
+        'title': title,
+        'description': description,
+        'date': datetime.date.today().isoformat(),
+        'tags': tags,
+        'slug': slug,
+        'author': 'cdpilot',
+        'source_tweet': source_tweet,
+    }
+
+    parts = [_blog_generate_frontmatter(meta), f'\n# {title}\n']
+
+    # Introduction (tweet 1 expanded)
+    parts.append(
+        f'\n## Introduction\n\n'
+        f'[EXPAND: Expand into ~300 words. Hook: {hook}]\n\n'
+        f'{hook}\n'
+    )
+
+    # Body sections: each middle tweet → H2
+    for tweet in tweets[1:]:
+        section_title = _blog_section_title(tweet)
+        parts.append(
+            f'\n## {section_title}\n\n'
+            f'[EXPAND: 200-400 words expanding this point.]\n\n'
+            f'{tweet}\n'
+        )
+
+    # Why It Matters
+    parts.append(
+        f'\n## Why This Matters\n\n'
+        f'[EXPAND: 1-2 paragraphs on developer impact. '
+        f'What changes in practice when you adopt this approach?]\n'
+    )
+
+    # FAQ (GEO-optimized)
+    faq_items = _blog_generate_faq(tweets, topic)
+    faq_lines = ['\n## FAQ\n']
+    for q, a in faq_items:
+        faq_lines.append(f'### Q: {q}\n{a}\n')
+    parts.append('\n'.join(faq_lines))
+
+    # Related
+    parts.append(f'\n## Related\n\nOriginal thread: [{source_tweet}]({source_tweet})\n')
+
+    final_md = '\n'.join(parts)
+
+    # Check for slug collision
+    out_dir = BLOG_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f'{slug}.md')
+    if os.path.exists(out_path):
+        print(f"Warning: {slug}.md already exists. Use: cdpilot blog regenerate {slug} to overwrite.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write(final_md)
+
+    word_count = _blog_estimate_words(final_md)
+    print(f"Published: {out_path}")
+    print(f"Estimated word count: {word_count}")
+    if word_count < 800:
+        print(f"Warning: needs expansion (estimated {word_count} words, target 800+)")
+
+
+def cmd_blog_list():
+    """List all published blog posts with slug, date, and title."""
+    if not os.path.isdir(BLOG_DIR):
+        print("No blog posts found")
+        return
+
+    files = sorted(
+        [f for f in os.listdir(BLOG_DIR) if f.endswith('.md')],
+        reverse=True
+    )
+    if not files:
+        print("No blog posts found")
+        return
+
+    print(f"{'SLUG':<35} | {'DATE':<12} | TITLE")
+    print('-' * 80)
+    for fname in files:
+        fpath = os.path.join(BLOG_DIR, fname)
+        with open(fpath, encoding='utf-8') as f:
+            content = f.read()
+        t_m = _re.search(r'^title:\s*"(.*?)"', content, _re.MULTILINE)
+        d_m = _re.search(r'^date:\s*"(.*?)"', content, _re.MULTILINE)
+        title = t_m.group(1) if t_m else 'Untitled'
+        date = d_m.group(1) if d_m else 'Unknown'
+        slug = fname[:-3]
+        print(f"{slug[:35]:<35} | {date:<12} | {title}")
+
+
+def cmd_blog_regenerate(slug):
+    """Re-generate a blog post from its original source_tweet frontmatter field."""
+    out_path = os.path.join(BLOG_DIR, f'{slug}.md')
+    if not os.path.exists(out_path):
+        print(f"Error: blog post not found: {out_path}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(out_path, encoding='utf-8') as f:
+        content = f.read()
+
+    s_m = _re.search(r'^source_tweet:\s*"(.*?)"', content, _re.MULTILINE)
+    if not s_m:
+        print("Error: could not find source_tweet in frontmatter", file=sys.stderr)
+        sys.exit(1)
+
+    # Remove existing file so publish doesn't hit collision guard
+    os.remove(out_path)
+    cmd_blog_publish(s_m.group(1))
+
+
+def _dispatch_blog_cmd(args):
+    """Parse blog subcommand args. Sync — called directly from sync_cmds."""
+    sub = args[0] if args else ''
+
+    if not sub or sub in ('--help', 'help', '-h'):
+        print("Usage: cdpilot blog <subcommand> [options]", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Subcommands:", file=sys.stderr)
+        print("  publish <source>      Source: tweet URL, day-NNN, or .md file path", file=sys.stderr)
+        print("  list                  List all published blog posts", file=sys.stderr)
+        print("  regenerate <slug>     Re-generate post from its original source", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Examples:", file=sys.stderr)
+        print("  cdpilot blog publish day-001", file=sys.stderr)
+        print("  cdpilot blog publish https://x.com/user/status/123", file=sys.stderr)
+        print("  cdpilot blog list", file=sys.stderr)
+        print("  cdpilot blog regenerate cdp-websocket-session-init", file=sys.stderr)
+        sys.exit(0)
+
+    if sub == 'publish':
+        if len(args) < 2:
+            print("Error: publish requires a source argument.", file=sys.stderr)
+            print("Usage: cdpilot blog publish <tweet-url|day-NNN|file.md>", file=sys.stderr)
+            sys.exit(1)
+        cmd_blog_publish(args[1])
+    elif sub == 'list':
+        cmd_blog_list()
+    elif sub == 'regenerate':
+        if len(args) < 2:
+            print("Error: regenerate requires a slug argument.", file=sys.stderr)
+            sys.exit(1)
+        cmd_blog_regenerate(args[1])
+    else:
+        print(f"Unknown blog subcommand: {sub}. Run: cdpilot blog --help", file=sys.stderr)
+        sys.exit(1)
+
+# ─── End Blog Publish Namespace ───────────────────────────────────────────────
+
+
 # ─── CLI ───
 
 if __name__ == "__main__":
@@ -6332,6 +8939,7 @@ if __name__ == "__main__":
         'show': lambda: cmd_show(args[0] if args else None),
         'fast': lambda: cmd_fast(args[0] if args else None),
         'adaptive': (lambda: cmd_adaptive_forget(args[1])) if (len(args) >= 2 and args[0].lower() == 'forget') else (lambda: cmd_adaptive(args[0] if args else None)),
+        'entropy': lambda: cmd_entropy(args[0] if args else None),
         'browser': lambda: cmd_browser(args[0] if args else None),
         'health': cmd_health,
         'session': cmd_session,
@@ -6340,7 +8948,25 @@ if __name__ == "__main__":
         'projects': cmd_projects,
         'project-stop': lambda: cmd_project_stop(args[0] if args else ''),
         'stop-all': cmd_stop_all,
+        'heal': lambda: (
+            cmd_heal_stats() if args and args[0] == 'stats'
+            else cmd_heal_log(int(args[1]) if len(args) >= 2 and args[1].isdigit() else 20)
+        ),
+        'test': lambda: cmd_test_dispatch(args),
+        'trace': lambda: cmd_trace_dispatch(args),
+        'blog': lambda: _dispatch_blog_cmd(args),
     }
+
+    if cmd == "serve":
+        _api_flag = '--api' in args
+        _port_val = 9333
+        for _a in args:
+            if _a.startswith('--port='):
+                _port_val = int(_a.split('=', 1)[1])
+            elif _a == '--port' and args.index(_a) + 1 < len(args):
+                _port_val = int(args[args.index(_a) + 1])
+        cmd_serve(api=_api_flag, port=_port_val)
+        sys.exit(0)
 
     if cmd == "mcp":
         server = MCPServer()
@@ -6391,10 +9017,31 @@ if __name__ == "__main__":
         "batch": cmd_batch,
         "eval": lambda: (require_args(1, "eval <js>"), None)[1] if not args else cmd_eval(" ".join(args)),
         "eval-batch": lambda: (require_args(1, "eval-batch <json_array_of_expressions>"), None)[1] if not args else cmd_eval_batch(args[0]),
-        "click": lambda: (require_args(1, "click <selector>"), None)[1] if not args else cmd_click(args[0]),
-        "fill": lambda: (require_args(2, "fill <selector> <value>"), None)[1] if len(args) < 2 else cmd_fill(args[0], " ".join(args[1:])),
-        "submit": lambda: cmd_submit(args[0] if args else "form"),
-        "type": lambda: (require_args(2, "type <selector> <value>"), None)[1] if len(args) < 2 else cmd_fill(args[0], " ".join(args[1:])),
+        "click": lambda: (require_args(1, "click <selector> [--ladder s1,s2] [--no-heal] [--entropy=on|off]"), None)[1] if not args else cmd_click(
+            next(a for a in args if not a.startswith("--")),
+            ladder=next((a.split("=")[1].split(",") for a in args if a.startswith("--ladder=")), None),
+            no_heal="--no-heal" in args,
+            entropy=True if "--entropy=on" in args else (False if "--entropy=off" in args else None),
+        ),
+        "fill": lambda: (require_args(2, "fill <selector> <value> [--ladder s1,s2] [--no-heal] [--entropy=on|off]"), None)[1] if len([a for a in args if not a.startswith("--")]) < 2 else cmd_fill(
+            [a for a in args if not a.startswith("--")][0],
+            " ".join([a for a in args if not a.startswith("--")][1:]),
+            ladder=next((a.split("=")[1].split(",") for a in args if a.startswith("--ladder=")), None),
+            no_heal="--no-heal" in args,
+            entropy=True if "--entropy=on" in args else (False if "--entropy=off" in args else None),
+        ),
+        "submit": lambda: cmd_submit(
+            next((a for a in args if not a.startswith("--")), "form"),
+            ladder=next((a.split("=")[1].split(",") for a in args if a.startswith("--ladder=")), None),
+            no_heal="--no-heal" in args,
+        ),
+        "type": lambda: (require_args(2, "type <selector> <value> [--ladder s1,s2] [--no-heal] [--entropy=on|off]"), None)[1] if len([a for a in args if not a.startswith("--")]) < 2 else cmd_fill(
+            [a for a in args if not a.startswith("--")][0],
+            " ".join([a for a in args if not a.startswith("--")][1:]),
+            ladder=next((a.split("=")[1].split(",") for a in args if a.startswith("--ladder=")), None),
+            no_heal="--no-heal" in args,
+            entropy=True if "--entropy=on" in args else (False if "--entropy=off" in args else None),
+        ),
         "wait": lambda: (require_args(1, "wait <selector>"), None)[1] if not args else cmd_wait(args[0], int(args[1]) if len(args) > 1 else 5),
         "tabs": cmd_tabs,
         "network": lambda: cmd_network(args[0] if args else None),
@@ -6435,12 +9082,24 @@ if __name__ == "__main__":
         'assert-hidden': lambda: (require_args(1, 'assert-hidden <selector>'), None)[1] if not args else cmd_assert_visible(args[0], False),
         'screenshot-diff': lambda: (require_args(2, 'screenshot-diff <path1> <path2>'), None)[1] if len(args) < 2 else cmd_screenshot_diff(args[0], args[1]),
         'click-ref': lambda: (require_args(1, 'click-ref <@N>'), None)[1] if not args else cmd_click_ref(args[0]),
-        'hover': lambda: (require_args(1, 'hover <selector>'), None)[1] if not args else cmd_hover(args[0]),
+        'hover': lambda: (require_args(1, 'hover <selector> [--ladder s1,s2] [--no-heal] [--entropy=on|off]'), None)[1] if not args else cmd_hover(
+            next(a for a in args if not a.startswith("--")),
+            ladder=next((a.split("=")[1].split(",") for a in args if a.startswith("--ladder=")), None),
+            no_heal="--no-heal" in args,
+            entropy=True if "--entropy=on" in args else (False if "--entropy=off" in args else None),
+        ),
         'dblclick': lambda: (require_args(1, 'dblclick <selector>'), None)[1] if not args else cmd_dblclick(args[0]),
         'rightclick': lambda: (require_args(1, 'rightclick <selector>'), None)[1] if not args else cmd_rightclick(args[0]),
-        'drag': lambda: (require_args(2, 'drag <from-sel> <to-sel>'), None)[1] if len(args) < 2 else cmd_drag(args[0], args[1]),
+        'drag': lambda: (require_args(2, 'drag <from-sel> <to-sel> [--entropy=on|off]'), None)[1] if len([a for a in args if not a.startswith("--")]) < 2 else cmd_drag(
+            [a for a in args if not a.startswith("--")][0],
+            [a for a in args if not a.startswith("--")][1],
+            entropy=True if "--entropy=on" in args else (False if "--entropy=off" in args else None),
+        ),
         'keys': lambda: (require_args(1, 'keys <combo>'), None)[1] if not args else cmd_keys(args[0]),
-        'scroll-to': lambda: (require_args(1, 'scroll-to <selector>'), None)[1] if not args else cmd_scroll_to(args[0]),
+        'scroll-to': lambda: (require_args(1, 'scroll-to <selector> [--entropy=on|off]'), None)[1] if not args else cmd_scroll_to(
+            next(a for a in args if not a.startswith("--")),
+            entropy=True if "--entropy=on" in args else (False if "--entropy=off" in args else None),
+        ),
         'frame': lambda: (require_args(1, 'frame [list|eval <js>|shadow <selector>]'), None)[1] if not args else cmd_frame(args[0], *args[1:]),
         'dialog': lambda: (require_args(1, 'dialog [auto-accept|auto-dismiss|prompt <text>|off]'), None)[1] if not args else cmd_dialog(args[0], *args[1:]),
         'download': lambda: (require_args(1, 'download [set <directory>|status]'), None)[1] if not args else cmd_download(args[0], *args[1:]),
@@ -6449,6 +9108,7 @@ if __name__ == "__main__":
         'permission': lambda: (require_args(1, 'permission [grant|deny|reset] [<permission>]'), None)[1] if not args else cmd_permission(args[0], args[1] if len(args) > 1 else None),
         'captcha-check': cmd_captcha_check,
         'captcha-wait': lambda: cmd_captcha_wait(args[0] if args else None),
+        'agent': lambda: _dispatch_agent_cmd(args),
     }
 
     # Commands that do not require the visual indicator / input blocker
