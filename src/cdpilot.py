@@ -14,7 +14,7 @@ Environment:
   CDPILOT_PROFILE      Isolated browser profile directory
 """
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 import asyncio
 import atexit
@@ -2518,17 +2518,22 @@ def get_entropy_config():
     return False
 
 
-# CAPTCHA types that benefit from behavioral entropy (mouse-behavior-sensitive providers).
-# Cloudflare JS challenges are fingerprint-based, not mouse-behavior-based → False.
+# Tightened in v0.5.3 based on bench data — entropy adds latency/timeouts on
+# non-behavioral detectors, only enable where mouse/keyboard pattern scoring
+# is the primary defense.
 CAPTCHA_ENTROPY_REQUIRED = {
     'turnstile': False,
     'cloudflare-challenge': False,
     'hcaptcha': True,
     'recaptcha': True,
-    'datadome': True,
-    'perimeterx': True,
-    'arkose': True,
-    'geetest': True,
+    'datadome': False,         # OFF — bench: -2 tasks, latency hurts (not mouse-based)
+    'perimeterx': True,        # KEEP — bench: +3 tasks, behavioral scoring
+    'arkose': True,            # KEEP — heavy behavioral scoring
+    'geetest': True,           # KEEP — slider gestures need entropy
+    'custom_antibot': False,   # OFF — generic, inconsistent benefit
+    'kasada': False,           # OFF — TLS-based detection
+    'shape': False,            # OFF — TLS-based detection
+    'temu_slider': True,       # KEEP — slider gesture, behavioral
 }
 
 
