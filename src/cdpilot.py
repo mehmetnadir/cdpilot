@@ -14,7 +14,7 @@ Environment:
   CDPILOT_PROFILE      Isolated browser profile directory
 """
 
-__version__ = "0.5.3"
+__version__ = "0.6.0"
 
 import asyncio
 import atexit
@@ -472,11 +472,17 @@ PROXY_CONFIG_FILE = os.path.join(PROFILE_DIR, 'proxy.json')
 HEADLESS_CONFIG_FILE = os.path.join(PROFILE_DIR, 'headless.json')
 STEALTH_CONFIG_FILE = os.path.join(PROFILE_DIR, 'stealth.json')
 BLOCK_CONFIG_FILE = os.path.join(PROFILE_DIR, 'block.json')
+CAPTCHA_PROVIDERS_FILE = os.path.join(CDPILOT_HOME, 'captcha-providers.json')
+CAPTCHA_AUTO_FILE = os.path.join(PROFILE_DIR, 'captcha-auto.json')
+CAPTCHA_SOLVE_TIMEOUT = int(os.environ.get('CDPILOT_CAPTCHA_TIMEOUT', 120))
 FAST_CONFIG_FILE = os.path.join(PROFILE_DIR, 'fast.json')
 ADAPTIVE_CONFIG_FILE = os.path.join(PROFILE_DIR, 'adaptive.json')
 ENTROPY_CONFIG_FILE = os.path.join(PROFILE_DIR, 'entropy.json')
 DOWNLOAD_CONFIG_FILE = os.path.join(PROFILE_DIR, 'download-config.json')
 SESSION_FILE = os.path.join(PROFILE_DIR, 'sessions.json')
+COOKIES_DIR = os.path.join(CDPILOT_HOME, 'cookies')
+COOKIES_AUTO_CONFIG_FILE = os.path.join(PROFILE_DIR, 'cookies-auto.json')
+CF_CLEARANCE_COOKIES = frozenset({'cf_clearance', '__cf_bm', '_cfuvid'})
 
 # ─── Session Management ───
 # Each session gets its own browser window.
@@ -2148,6 +2154,11 @@ async def cmd_go(url):
                             sys.stderr.write("⚠️  Adaptive: CAPTCHA still present after stealth retry. Manual solve needed.\n")
                         else:
                             sys.stderr.write("✅ Adaptive: CAPTCHA cleared with stealth.\n")
+                # Captcha solver auto-mode: if provider configured + auto on, attempt solve
+                try:
+                    await _captcha_auto_solve_if_enabled(active_ws, info, url)
+                except Exception:
+                    pass
         except Exception:
             pass
     finally:
@@ -2969,6 +2980,77 @@ async def cmd_console(url=None):
     if not events["console"]:
         print("  (empty)")
     print(f"\n=== Content (first 3000 chars) ===\n{content[:3000]}")
+
+
+# ─── Per-host cookie persistence helpers ───
+
+def _cookies_safe_host(host):
+    """Make a hostname safe for use as a filesystem directory name."""
+    return host.replace(':', '_').replace('/', '_')
+
+
+def _cookies_host_dir(host):
+    """Return the directory path for a host's cookie store."""
+    return os.path.join(COOKIES_DIR, _cookies_safe_host(host))
+
+
+def _save_host_cookies(host, cookies):
+    """Save cookies to ~/.cdpilot/cookies/<safe_host>/cookies.json atomically.
+
+    Returns the path of the written file.
+    """
+    d = _cookies_host_dir(host)
+    os.makedirs(d, exist_ok=True)
+    f_path = os.path.join(d, 'cookies.json')
+    expires_vals = [c.get('expires', 0) for c in cookies if c.get('expires', 0) > 0]
+    expires_soonest = min(expires_vals) if expires_vals else 0
+    meta = {
+        'cf_clearance_present': any(c.get('name') in CF_CLEARANCE_COOKIES for c in cookies),
+        'expires_soonest_unix': expires_soonest,
+        'saved_at': datetime.datetime.utcnow().isoformat() + 'Z',
+    }
+    _atomic_write_json(f_path, {'host': host, 'cookies': cookies, 'metadata': meta})
+    try:
+        os.chmod(f_path, 0o600)
+    except OSError:
+        pass
+    return f_path
+
+
+def _load_host_cookies(host):
+    """Load cookies from per-host store.
+
+    Returns list of cookies, or None if missing / all expired / corrupt.
+    """
+    f_path = os.path.join(_cookies_host_dir(host), 'cookies.json')
+    if not os.path.exists(f_path):
+        return None
+    try:
+        with open(f_path) as f:
+            data = json.load(f)
+        meta = data.get('metadata', {})
+        exp = meta.get('expires_soonest_unix', 0)
+        if exp and exp < time.time():
+            return None
+        return data.get('cookies') or None
+    except (OSError, ValueError):
+        return None
+
+
+def _cookies_auto_enabled():
+    """Return True if cookie auto-persistence is enabled."""
+    if not os.path.exists(COOKIES_AUTO_CONFIG_FILE):
+        return False
+    try:
+        with open(COOKIES_AUTO_CONFIG_FILE) as f:
+            return bool(json.load(f).get('enabled', False))
+    except (OSError, ValueError):
+        return False
+
+
+def _set_cookies_auto(enabled):
+    """Enable or disable cookie auto-persistence."""
+    _atomic_write_json(COOKIES_AUTO_CONFIG_FILE, {'enabled': bool(enabled)})
 
 
 async def cmd_cookies(*args):
@@ -4592,6 +4674,742 @@ async def cmd_captcha_wait(timeout_arg=None):
             return
     print(json.dumps({"detected": True, "status": "timeout", "types": info.get("types", []), "waited": timeout}, ensure_ascii=False), flush=True)
     sys.exit(2)
+
+
+# ─── Captcha Solver Plugin ──────────────────────────────────────────────────
+# Opt-in 3rd-party captcha solver integration: 2captcha, anti-captcha, capmonster.
+# API keys stored in ~/.cdpilot/captcha-providers.json (chmod 600, never in git).
+# Supported types: recaptcha-v2, recaptcha-v3, hcaptcha, turnstile, funcaptcha.
+# Per-solve cost ~$0.001–0.003 depending on provider and type.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class CaptchaSolverError(Exception):
+    """Raised when a captcha solver API call fails or misconfiguration is detected."""
+    pass
+
+
+def _captcha_normalize_provider(name: str) -> str:
+    """Normalize provider name variants to canonical form."""
+    n = name.lower().strip()
+    if '2captcha' in n or 'twocaptcha' in n:
+        return '2captcha'
+    if 'anti' in n:
+        return 'anticaptcha'
+    if 'monster' in n or 'capmon' in n:
+        return 'capmonster'
+    return n
+
+
+def _captcha_load_config() -> dict:
+    """Load captcha provider config from CAPTCHA_PROVIDERS_FILE.
+
+    Returns default empty config if file is missing or corrupt.
+    Format: {'providers': {'2captcha': {'api_key': '...', 'enabled': True}, ...}, 'preferred': '2captcha'}
+    """
+    try:
+        with open(CAPTCHA_PROVIDERS_FILE) as f:
+            data = json.load(f)
+        return {
+            'providers': {k: dict(v) for k, v in data.get('providers', {}).items()},
+            'preferred': data.get('preferred', ''),
+        }
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {'providers': {}, 'preferred': ''}
+
+
+def _captcha_save_config(cfg: dict) -> None:
+    """Write captcha config atomically with chmod 600 (API keys must not be world-readable)."""
+    os.makedirs(CDPILOT_HOME, mode=0o700, exist_ok=True)
+    _atomic_write_json(CAPTCHA_PROVIDERS_FILE, cfg)
+    try:
+        os.chmod(CAPTCHA_PROVIDERS_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def _captcha_get_preferred_provider(name: str = None):
+    """Return (provider_name, api_key) for the requested or auto-selected enabled provider.
+
+    Returns (None, None) if no enabled provider is configured.
+    """
+    cfg = _captcha_load_config()
+    providers = cfg.get('providers', {})
+
+    if name:
+        name = _captcha_normalize_provider(name)
+        p = providers.get(name, {})
+        if p.get('enabled') and p.get('api_key'):
+            return name, p['api_key']
+        return None, None
+
+    preferred = cfg.get('preferred', '')
+    if preferred and preferred in providers:
+        p = providers[preferred]
+        if p.get('enabled') and p.get('api_key'):
+            return preferred, p['api_key']
+
+    for pname, p in providers.items():
+        if p.get('enabled') and p.get('api_key'):
+            return pname, p['api_key']
+
+    return None, None
+
+
+def _captcha_auto_enabled() -> bool:
+    """Return True if captcha auto-solve mode is enabled."""
+    try:
+        with open(CAPTCHA_AUTO_FILE) as f:
+            return bool(json.load(f).get('enabled', False))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return False
+
+
+def _captcha_set_auto(enabled: bool) -> None:
+    """Write captcha auto-solve toggle state."""
+    _atomic_write_json(CAPTCHA_AUTO_FILE, {'enabled': enabled})
+
+
+async def _captcha_urlopen_async(url: str, data: bytes = None, headers: dict = None, timeout: int = 30) -> bytes:
+    """urllib.request wrapper that runs in a thread executor to avoid blocking the event loop."""
+    import urllib.request as _ureq
+    _headers = headers or {}
+    req = _ureq.Request(url, data=data, headers=_headers)
+
+    def _sync():
+        with _ureq.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _sync)
+
+
+# ─── 2captcha provider ────────────────────────────────────────────────────
+
+async def _solve_2captcha(api_key: str, captcha_type: str, site_key: str, url: str, **kwargs) -> dict:
+    """Solve via 2captcha REST API (urlencoded form POST + poll).
+
+    Returns {'token': '...', 'duration_ms': N, 'cost': 0.003, 'provider': '2captcha'}
+    Raises CaptchaSolverError on API error or timeout.
+    """
+    import urllib.parse as _uparse
+
+    _type_method = {
+        'recaptcha-v2': 'userrecaptcha',
+        'recaptcha-v3': 'userrecaptcha',
+        'hcaptcha': 'hcaptcha',
+        'turnstile': 'turnstile',
+        'funcaptcha': 'funcaptcha',
+    }
+    method = _type_method.get(captcha_type, 'userrecaptcha')
+
+    params: dict = {
+        'key': api_key,
+        'method': method,
+        'pageurl': url,
+        'json': '1',
+    }
+    if captcha_type in ('recaptcha-v2', 'recaptcha-v3'):
+        params['googlekey'] = site_key
+    elif captcha_type == 'hcaptcha':
+        params['sitekey'] = site_key
+    elif captcha_type == 'turnstile':
+        params['sitekey'] = site_key
+    elif captcha_type == 'funcaptcha':
+        params['publickey'] = site_key
+    else:
+        params['googlekey'] = site_key
+
+    if captcha_type == 'recaptcha-v3':
+        params['version'] = 'v3'
+        params['action'] = kwargs.get('action', 'verify')
+        params['min_score'] = str(kwargs.get('min_score', '0.3'))
+
+    t0 = time.time()
+
+    body = _uparse.urlencode(params).encode()
+    raw = await _captcha_urlopen_async('https://2captcha.com/in.php', data=body)
+    try:
+        resp = json.loads(raw)
+    except (ValueError, TypeError):
+        raise CaptchaSolverError(f"2captcha in.php non-JSON response: {raw[:200]!r}")
+
+    if resp.get('status') != 1:
+        raise CaptchaSolverError(f"2captcha submission failed: {resp.get('request', resp)}")
+
+    task_id = resp['request']
+    poll_url = f"https://2captcha.com/res.php?key={api_key}&action=get&id={task_id}&json=1"
+
+    deadline = t0 + CAPTCHA_SOLVE_TIMEOUT
+    while time.time() < deadline:
+        await asyncio.sleep(5)
+        raw2 = await _captcha_urlopen_async(poll_url)
+        try:
+            r2 = json.loads(raw2)
+        except (ValueError, TypeError):
+            continue
+        if r2.get('status') == 1:
+            return {
+                'token': r2['request'],
+                'duration_ms': int((time.time() - t0) * 1000),
+                'cost': 0.003,
+                'provider': '2captcha',
+            }
+        req_val = r2.get('request', '')
+        if req_val != 'CAPCHA_NOT_READY':
+            raise CaptchaSolverError(f"2captcha error: {req_val}")
+
+    raise CaptchaSolverError(f"2captcha timeout after {CAPTCHA_SOLVE_TIMEOUT}s")
+
+
+# ─── anti-captcha provider ────────────────────────────────────────────────
+
+async def _solve_anticaptcha(api_key: str, captcha_type: str, site_key: str, url: str, **kwargs) -> dict:
+    """Solve via anti-captcha.com v2 JSON API.
+
+    Returns {'token': '...', 'duration_ms': N, 'cost': 0.003, 'provider': 'anticaptcha'}
+    Raises CaptchaSolverError on API error or timeout.
+    """
+    _type_map = {
+        'recaptcha-v2': 'NoCaptchaTaskProxyless',
+        'recaptcha-v3': 'RecaptchaV3TaskProxyless',
+        'hcaptcha': 'HCaptchaTaskProxyless',
+        'turnstile': 'TurnstileTaskProxyless',
+        'funcaptcha': 'FunCaptchaTaskProxyless',
+    }
+    task_type = _type_map.get(captcha_type, 'NoCaptchaTaskProxyless')
+
+    task_body: dict = {'type': task_type, 'websiteURL': url, 'websiteKey': site_key}
+    if captcha_type == 'funcaptcha':
+        task_body['websitePublicKey'] = site_key
+        del task_body['websiteKey']
+    if captcha_type == 'recaptcha-v3':
+        task_body['minScore'] = kwargs.get('min_score', 0.3)
+        task_body['pageAction'] = kwargs.get('action', 'verify')
+
+    payload = json.dumps({'clientKey': api_key, 'task': task_body}).encode()
+    headers = {'Content-Type': 'application/json'}
+
+    t0 = time.time()
+
+    raw = await _captcha_urlopen_async('https://api.anti-captcha.com/createTask', data=payload, headers=headers)
+    try:
+        r = json.loads(raw)
+    except (ValueError, TypeError):
+        raise CaptchaSolverError(f"anticaptcha createTask non-JSON: {raw[:200]!r}")
+
+    if r.get('errorId', 0) != 0:
+        raise CaptchaSolverError(f"anticaptcha createTask error: {r.get('errorDescription', r)}")
+
+    task_id = r['taskId']
+    poll_payload = json.dumps({'clientKey': api_key, 'taskId': task_id}).encode()
+    deadline = t0 + CAPTCHA_SOLVE_TIMEOUT
+
+    while time.time() < deadline:
+        await asyncio.sleep(5)
+        raw2 = await _captcha_urlopen_async('https://api.anti-captcha.com/getTaskResult', data=poll_payload, headers=headers)
+        try:
+            r2 = json.loads(raw2)
+        except (ValueError, TypeError):
+            continue
+        if r2.get('errorId', 0) != 0:
+            raise CaptchaSolverError(f"anticaptcha poll error: {r2.get('errorDescription', r2)}")
+        if r2.get('status') == 'ready':
+            sol = r2.get('solution', {})
+            token = sol.get('gRecaptchaResponse') or sol.get('token') or sol.get('text', '')
+            return {
+                'token': token,
+                'duration_ms': int((time.time() - t0) * 1000),
+                'cost': 0.003,
+                'provider': 'anticaptcha',
+            }
+
+    raise CaptchaSolverError(f"anticaptcha timeout after {CAPTCHA_SOLVE_TIMEOUT}s")
+
+
+# ─── capmonster provider ──────────────────────────────────────────────────
+
+async def _solve_capmonster(api_key: str, captcha_type: str, site_key: str, url: str, **kwargs) -> dict:
+    """Solve via capmonster.cloud (same API structure as anti-captcha).
+
+    Returns {'token': '...', 'duration_ms': N, 'cost': 0.002, 'provider': 'capmonster'}
+    Raises CaptchaSolverError on API error or timeout.
+    """
+    _type_map = {
+        'recaptcha-v2': 'NoCaptchaTaskProxyless',
+        'recaptcha-v3': 'RecaptchaV3TaskProxyless',
+        'hcaptcha': 'HCaptchaTaskProxyless',
+        'turnstile': 'TurnstileTaskProxyless',
+        'funcaptcha': 'FunCaptchaTaskProxyless',
+    }
+    task_type = _type_map.get(captcha_type, 'NoCaptchaTaskProxyless')
+
+    task_body: dict = {'type': task_type, 'websiteURL': url, 'websiteKey': site_key}
+    if captcha_type == 'funcaptcha':
+        task_body['websitePublicKey'] = site_key
+        del task_body['websiteKey']
+
+    payload = json.dumps({'clientKey': api_key, 'task': task_body}).encode()
+    headers = {'Content-Type': 'application/json'}
+
+    t0 = time.time()
+
+    raw = await _captcha_urlopen_async('https://api.capmonster.cloud/createTask', data=payload, headers=headers)
+    try:
+        r = json.loads(raw)
+    except (ValueError, TypeError):
+        raise CaptchaSolverError(f"capmonster createTask non-JSON: {raw[:200]!r}")
+
+    if r.get('errorId', 0) != 0:
+        raise CaptchaSolverError(f"capmonster createTask error: {r.get('errorCode', r)}")
+
+    task_id = r['taskId']
+    poll_payload = json.dumps({'clientKey': api_key, 'taskId': task_id}).encode()
+    deadline = t0 + CAPTCHA_SOLVE_TIMEOUT
+
+    while time.time() < deadline:
+        await asyncio.sleep(5)
+        raw2 = await _captcha_urlopen_async('https://api.capmonster.cloud/getTaskResult', data=poll_payload, headers=headers)
+        try:
+            r2 = json.loads(raw2)
+        except (ValueError, TypeError):
+            continue
+        if r2.get('errorId', 0) != 0:
+            raise CaptchaSolverError(f"capmonster poll error: {r2.get('errorCode', r2)}")
+        if r2.get('status') == 'ready':
+            sol = r2.get('solution', {})
+            token = sol.get('gRecaptchaResponse') or sol.get('token') or sol.get('text', '')
+            return {
+                'token': token,
+                'duration_ms': int((time.time() - t0) * 1000),
+                'cost': 0.002,
+                'provider': 'capmonster',
+            }
+
+    raise CaptchaSolverError(f"capmonster timeout after {CAPTCHA_SOLVE_TIMEOUT}s")
+
+
+_CAPTCHA_SOLVERS = {
+    '2captcha': _solve_2captcha,
+    'anticaptcha': _solve_anticaptcha,
+    'capmonster': _solve_capmonster,
+}
+
+
+# ─── Site key extraction ──────────────────────────────────────────────────
+
+_SITE_KEY_JS = r"""
+(() => {
+  const types = [
+    { type: 'recaptcha-v2', sels: [
+        '[data-sitekey]',
+        '.g-recaptcha[data-sitekey]',
+        'iframe[src*="recaptcha"]',
+      ], attr: 'data-sitekey', srcParam: 'k' },
+    { type: 'hcaptcha', sels: [
+        '.h-captcha[data-sitekey]',
+        '[data-hcaptcha-sitekey]',
+        'iframe[src*="hcaptcha.com"]',
+      ], attr: 'data-sitekey', srcParam: 'sitekey' },
+    { type: 'turnstile', sels: [
+        '.cf-turnstile[data-sitekey]',
+        '[data-cf-turnstile-sitekey]',
+        'div[data-sitekey]',
+      ], attr: 'data-sitekey' },
+    { type: 'funcaptcha', sels: [
+        '[data-pkey]',
+        'iframe[src*="arkoselabs.com"]',
+        'iframe[src*="funcaptcha.com"]',
+      ], attr: 'data-pkey', srcParam: 'pk' },
+  ];
+  for (const t of types) {
+    for (const sel of t.sels) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      const key = el.getAttribute(t.attr);
+      if (key) return JSON.stringify({type: t.type, site_key: key});
+      if (t.srcParam && el.src) {
+        try {
+          const u = new URL(el.src);
+          const k = u.searchParams.get(t.srcParam);
+          if (k) return JSON.stringify({type: t.type, site_key: k});
+        } catch(e) {}
+      }
+    }
+  }
+  return null;
+})()
+"""
+
+
+async def _extract_site_key(ws_url: str, captcha_type: str = None):
+    """Extract captcha site key from the current page DOM via CDP Runtime.evaluate.
+
+    Returns dict {'type': 'recaptcha-v2', 'site_key': '...'} or None.
+    captcha_type is used only as a hint; the JS probes all known types.
+    """
+    try:
+        r = await cdp_send(ws_url, [(1, 'Runtime.evaluate', {
+            'expression': _SITE_KEY_JS,
+            'returnByValue': True,
+        })], timeout=5)
+        raw = r.get(1, {}).get('result', {}).get('value')
+        if not raw:
+            return None
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+# ─── Token injection ──────────────────────────────────────────────────────
+
+_TOKEN_INJECT_JS = r"""
+(function(token, captchaType) {
+  try {
+    var injected = false;
+    if (captchaType === 'recaptcha-v2' || captchaType === 'recaptcha-v3' || captchaType === 'recaptcha') {
+      var el = document.getElementById('g-recaptcha-response');
+      if (!el) el = document.querySelector('[name="g-recaptcha-response"]');
+      if (el) { el.value = token; el.innerHTML = token; injected = true; }
+      // Trigger grecaptcha callback
+      try {
+        var clients = window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients;
+        if (clients) {
+          for (var k in clients) {
+            var c = clients[k];
+            if (c && c.callback) { c.callback(token); break; }
+          }
+        }
+      } catch(e) {}
+    } else if (captchaType === 'hcaptcha') {
+      var el = document.querySelector('[name="h-captcha-response"]');
+      if (!el) el = document.querySelector('textarea[name="h-captcha-response"]');
+      if (el) { el.value = token; injected = true; }
+      try { if (window.hcaptcha) window.hcaptcha.setResponse(token); } catch(e) {}
+    } else if (captchaType === 'turnstile') {
+      var el = document.querySelector('[name="cf-turnstile-response"]');
+      if (el) { el.value = token; injected = true; }
+    } else if (captchaType === 'funcaptcha') {
+      var el = document.querySelector('[name="fc-token"]');
+      if (!el) el = document.querySelector('[id*="FunCaptcha"]');
+      if (el) { el.value = token; injected = true; }
+    }
+    // Generic callback probe
+    var cbAttr = document.querySelector('[data-callback]');
+    if (cbAttr) {
+      var cbName = cbAttr.getAttribute('data-callback');
+      if (cbName && window[cbName]) { try { window[cbName](token); } catch(e) {} }
+    }
+    return injected;
+  } catch(e) {
+    return false;
+  }
+})(CDPILOT_TOKEN_PLACEHOLDER, CDPILOT_TYPE_PLACEHOLDER)
+"""
+
+
+async def _inject_captcha_token(ws_url: str, captcha_type: str, token: str) -> bool:
+    """Inject solved captcha token into the active page via CDP Runtime.evaluate.
+
+    Returns True if at least one response element was found and filled.
+    Never raises — all errors return False.
+    """
+    # Safe string interpolation — token is base64-like, no JS injection risk
+    # but we still json.dumps() to properly escape quotes/backslashes.
+    js = _TOKEN_INJECT_JS.replace(
+        'CDPILOT_TOKEN_PLACEHOLDER', json.dumps(token)
+    ).replace(
+        'CDPILOT_TYPE_PLACEHOLDER', json.dumps(captcha_type)
+    )
+    try:
+        r = await cdp_send(ws_url, [(1, 'Runtime.evaluate', {
+            'expression': js,
+            'returnByValue': True,
+        })], timeout=5)
+        return bool(r.get(1, {}).get('result', {}).get('value', False))
+    except Exception:
+        return False
+
+
+# ─── Internal solve entry point ──────────────────────────────────────────
+
+async def _captcha_solve_internal(captcha_type: str, site_key: str, url: str,
+                                   provider_name: str = None) -> dict | None:
+    """Solve a captcha using the configured provider. Returns result dict or None.
+
+    Used by both cmd_captcha_solve and _captcha_auto_solve_if_enabled.
+    Never raises — errors returned as {'error': '...'}.
+    """
+    pname, api_key = _captcha_get_preferred_provider(provider_name)
+    if not pname:
+        return {'error': 'no_provider_configured'}
+
+    solver_fn = _CAPTCHA_SOLVERS.get(pname)
+    if not solver_fn:
+        return {'error': f'unknown_provider:{pname}'}
+
+    try:
+        return await solver_fn(api_key, captcha_type, site_key, url)
+    except CaptchaSolverError as e:
+        return {'error': str(e)}
+    except Exception as e:
+        return {'error': f'unexpected:{e}'}
+
+
+# ─── Adaptive auto-solve integration ─────────────────────────────────────
+
+async def _captcha_auto_solve_if_enabled(ws_url: str, info: dict, current_url: str) -> None:
+    """If auto-solve is enabled and a provider is configured, attempt to solve the captcha.
+
+    Called from cmd_go after adaptive escalation block. Best-effort, non-blocking —
+    all output goes to stderr so stdout (page content) is unaffected.
+    """
+    if not _captcha_auto_enabled():
+        return
+    pname, _ = _captcha_get_preferred_provider()
+    if not pname:
+        return
+
+    types = info.get('types', [])
+    # Priority order: recaptcha-v2 > hcaptcha > turnstile
+    preferred_order = ['recaptcha-v2', 'hcaptcha', 'turnstile', 'recaptcha-v3', 'funcaptcha']
+    captcha_type = None
+    for t in preferred_order:
+        if t in types:
+            captcha_type = t
+            break
+    if not captcha_type and types:
+        captcha_type = types[0]
+    if not captcha_type:
+        return
+
+    try:
+        meta = await _extract_site_key(ws_url, captcha_type)
+        if not meta or not meta.get('site_key'):
+            sys.stderr.write(f'⚙️  Captcha auto-solve: could not extract site key for {captcha_type}\n')
+            return
+        resolved_type = meta.get('type', captcha_type)
+        site_key = meta['site_key']
+        sys.stderr.write(f'⚙️  Captcha auto-solve: solving {resolved_type} via {pname}...\n')
+        result = await _captcha_solve_internal(resolved_type, site_key, current_url)
+        if not result or 'error' in result:
+            sys.stderr.write(f'⚙️  Captcha auto-solve failed: {result}\n')
+            return
+        injected = await _inject_captcha_token(ws_url, resolved_type, result['token'])
+        sys.stderr.write(
+            f'⚙️  Captcha auto-solve: token injected={injected}, '
+            f'duration={result.get("duration_ms", "?")}ms\n'
+        )
+    except Exception as e:
+        sys.stderr.write(f'⚙️  Captcha auto-solve error: {e}\n')
+
+
+# ─── CLI command functions ────────────────────────────────────────────────
+
+def cmd_captcha_config(*args):
+    """Configure a captcha solver provider.
+
+    Usage:
+      cdpilot captcha config --provider 2captcha --api-key YOUR_KEY
+      cdpilot captcha config --provider anticaptcha --api-key YOUR_KEY
+      cdpilot captcha config --provider 2captcha --disable
+      cdpilot captcha config --provider 2captcha --enable
+
+    Saves to ~/.cdpilot/captcha-providers.json (chmod 600).
+    Sets saved provider as preferred unless --no-preferred is given.
+    """
+    arg_list = list(args)
+
+    def _get_flag(flag):
+        for i, a in enumerate(arg_list):
+            if a == flag and i + 1 < len(arg_list):
+                return arg_list[i + 1]
+        return None
+
+    provider = _get_flag('--provider') or _get_flag('-p')
+    api_key = _get_flag('--api-key') or _get_flag('--key')
+    disable = '--disable' in arg_list
+    enable = '--enable' in arg_list
+    no_preferred = '--no-preferred' in arg_list
+
+    if not provider:
+        print("Usage: cdpilot captcha config --provider <name> --api-key <key>", file=sys.stderr)
+        sys.exit(1)
+
+    provider = _captcha_normalize_provider(provider)
+    cfg = _captcha_load_config()
+    entry = cfg['providers'].get(provider, {'api_key': '', 'enabled': True})
+
+    if api_key:
+        entry['api_key'] = api_key
+    if disable:
+        entry['enabled'] = False
+    if enable:
+        entry['enabled'] = True
+    if not disable and not enable:
+        entry['enabled'] = True
+
+    cfg['providers'][provider] = entry
+
+    if not no_preferred and api_key:
+        cfg['preferred'] = provider
+
+    _captcha_save_config(cfg)
+    pref_note = ' (preferred)' if cfg.get('preferred') == provider else ''
+    action = 'disabled' if disable else ('enabled' if enable else 'configured')
+    print(f'Provider {action}: {provider}{pref_note}')
+
+
+async def cmd_captcha_solve_cli(*args):
+    """Solve a captcha manually (debug / testing).
+
+    Usage:
+      cdpilot captcha solve --type recaptcha-v2 --site-key SK --url URL
+      cdpilot captcha solve --provider 2captcha --type hcaptcha --site-key SK --url URL
+
+    Returns JSON: {"token": "...", "duration_ms": N, "cost": 0.003, "provider": "..."}
+    """
+    arg_list = list(args)
+
+    def _get_flag(flag):
+        for i, a in enumerate(arg_list):
+            if a == flag and i + 1 < len(arg_list):
+                return arg_list[i + 1]
+        return None
+
+    captcha_type = _get_flag('--type') or _get_flag('-t')
+    site_key = _get_flag('--site-key') or _get_flag('--sitekey')
+    url = _get_flag('--url') or _get_flag('-u')
+    provider = _get_flag('--provider') or _get_flag('-p')
+
+    if not captcha_type or not site_key or not url:
+        print("Usage: cdpilot captcha solve --type TYPE --site-key SK --url URL", file=sys.stderr)
+        sys.exit(1)
+
+    result = await _captcha_solve_internal(captcha_type, site_key, url, provider_name=provider)
+    if result and 'error' in result:
+        print(json.dumps({'error': result['error']}, ensure_ascii=False))
+        sys.exit(1)
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def cmd_captcha_auto_toggle(*args):
+    """Toggle captcha auto-solve mode (integrated with adaptive layer).
+
+    Usage:
+      cdpilot captcha auto on   # enable: adaptive layer will auto-solve on detect
+      cdpilot captcha auto off  # disable
+      cdpilot captcha auto      # show status
+    """
+    arg_list = list(args)
+    if not arg_list or arg_list[0].lower() in ('status', ''):
+        current = _captcha_auto_enabled()
+        print(f'Captcha auto-solve: {"on" if current else "off"}')
+        return
+    s = arg_list[0].lower()
+    if s not in ('on', 'off', '1', '0', 'true', 'false', 'yes', 'no'):
+        print(f"Invalid state: {s}. Use 'on' or 'off'.", file=sys.stderr)
+        sys.exit(1)
+    enabled = s in ('on', '1', 'true', 'yes')
+    _captcha_set_auto(enabled)
+    print(f'Captcha auto-solve: {"on" if enabled else "off"}')
+    if enabled:
+        pname, _ = _captcha_get_preferred_provider()
+        if not pname:
+            print("  Warning: no provider configured. Run: cdpilot captcha config --provider 2captcha --api-key KEY")
+
+
+async def cmd_captcha_status():
+    """Show captcha solver configuration status.
+
+    Prints JSON: {"configured": [...], "preferred": "...", "auto_enabled": bool}
+    """
+    cfg = _captcha_load_config()
+    configured = [
+        {'name': k, 'enabled': bool(v.get('enabled')), 'has_key': bool(v.get('api_key'))}
+        for k, v in cfg.get('providers', {}).items()
+    ]
+    print(json.dumps({
+        'configured': configured,
+        'preferred': cfg.get('preferred', ''),
+        'auto_enabled': _captcha_auto_enabled(),
+    }, ensure_ascii=False))
+
+
+async def cmd_captcha_balance():
+    """Query account balance for each configured enabled provider.
+
+    Prints JSON: {"2captcha": 1.23, "anticaptcha": 0.50, ...}
+    """
+    import urllib.parse as _uparse
+    cfg = _captcha_load_config()
+    results = {}
+
+    for pname, pdata in cfg.get('providers', {}).items():
+        if not pdata.get('enabled') or not pdata.get('api_key'):
+            continue
+        api_key = pdata['api_key']
+        try:
+            if pname == '2captcha':
+                url = f'https://2captcha.com/res.php?key={_uparse.quote(api_key)}&action=getbalance&json=1'
+                raw = await _captcha_urlopen_async(url)
+                r = json.loads(raw)
+                if r.get('status') == 1:
+                    results[pname] = float(r.get('request', 0))
+                else:
+                    results[pname] = {'error': r.get('request', 'unknown')}
+            elif pname in ('anticaptcha', 'capmonster'):
+                base = 'https://api.anti-captcha.com' if pname == 'anticaptcha' else 'https://api.capmonster.cloud'
+                payload = json.dumps({'clientKey': api_key}).encode()
+                raw = await _captcha_urlopen_async(f'{base}/getBalance', data=payload,
+                                                    headers={'Content-Type': 'application/json'})
+                r = json.loads(raw)
+                if r.get('errorId', 0) == 0:
+                    results[pname] = float(r.get('balance', 0))
+                else:
+                    results[pname] = {'error': r.get('errorDescription', 'unknown')}
+        except Exception as e:
+            results[pname] = {'error': str(e)[:120]}
+
+    print(json.dumps(results, ensure_ascii=False))
+
+
+async def cmd_captcha_dispatch(args: list) -> None:
+    """Top-level dispatcher for 'cdpilot captcha <subcommand> [args...]'.
+
+    Subcommands: config, solve, auto, status, balance
+    """
+    if not args:
+        print(
+            "Usage: cdpilot captcha <subcommand> [options]\n"
+            "  config  --provider NAME --api-key KEY\n"
+            "  solve   --type TYPE --site-key SK --url URL [--provider NAME]\n"
+            "  auto    on|off\n"
+            "  status\n"
+            "  balance",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    sub = args[0].lower()
+    rest = args[1:]
+
+    if sub == 'config':
+        cmd_captcha_config(*rest)
+    elif sub == 'solve':
+        await cmd_captcha_solve_cli(*rest)
+    elif sub == 'auto':
+        cmd_captcha_auto_toggle(*rest)
+    elif sub == 'status':
+        await cmd_captcha_status()
+    elif sub == 'balance':
+        await cmd_captcha_balance()
+    else:
+        print(f"Unknown captcha subcommand: {sub}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ─── End Captcha Solver Plugin ───────────────────────────────────────────
 
 
 def _stop_browser_on_port(port):
@@ -9113,6 +9931,7 @@ if __name__ == "__main__":
         'permission': lambda: (require_args(1, 'permission [grant|deny|reset] [<permission>]'), None)[1] if not args else cmd_permission(args[0], args[1] if len(args) > 1 else None),
         'captcha-check': cmd_captcha_check,
         'captcha-wait': lambda: cmd_captcha_wait(args[0] if args else None),
+        'captcha': lambda: cmd_captcha_dispatch(args),
         'agent': lambda: _dispatch_agent_cmd(args),
     }
 
@@ -9120,7 +9939,7 @@ if __name__ == "__main__":
     NO_CONTROL_CMDS = {'glow', 'stop', 'tabs', 'close', 'close-tab', 'new-tab',
                        'dialog', 'download', 'throttle', 'permission', 'intercept',
                        'batch', 'screenshot-diff', 'run',
-                       'captcha-check', 'captcha-wait'}
+                       'captcha-check', 'captcha-wait', 'captcha'}
     # Clean up idle sessions before running any command
     _cleanup_idle_sessions()
 
