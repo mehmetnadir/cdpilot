@@ -338,6 +338,41 @@ cdpilot adaptive clear        # Drop the stealth host memory entirely
 > when it sees one — adds the host to a persistent list, retries once with
 > stealth on. Never auto-demotes. Conservative by design.
 
+### Captcha Solver Plugins (v0.6+)
+
+Optional integration with 2captcha, anti-captcha, and capmonster. Per-solve
+cost ~$0.001–0.003. API keys stored in `~/.cdpilot/captcha-providers.json`
+(chmod 600) — **never committed to git**.
+
+```bash
+# One-time setup
+cdpilot captcha config --provider 2captcha --api-key YOUR_KEY
+cdpilot captcha config --provider anticaptcha --api-key YOUR_KEY  # fallback
+
+# Enable auto-solve (adaptive layer auto-solves on detect)
+cdpilot captcha auto on
+
+# Manual solve (debug / scripting)
+cdpilot captcha solve --type recaptcha-v2 --site-key SK --url https://example.com
+# returns: {"token": "03AGdBq2...", "duration_ms": 12500, "cost": 0.003, "provider": "2captcha"}
+
+cdpilot captcha solve --type hcaptcha --site-key SK --url URL
+cdpilot captcha solve --type turnstile --site-key SK --url URL
+cdpilot captcha solve --type funcaptcha --site-key SK --url URL
+
+# Status & balance
+cdpilot captcha status   # {"configured": [...], "preferred": "2captcha", "auto_enabled": true}
+cdpilot captcha balance  # {"2captcha": 1.23, "anticaptcha": 0.50}
+```
+
+Supported types: `recaptcha-v2`, `recaptcha-v3`, `hcaptcha`, `turnstile`, `funcaptcha`
+
+Tokens are injected via `Runtime.evaluate` CDP — no browser-side libraries required.
+When `captcha auto on` is set, the adaptive layer detects and solves automatically
+after each navigation. Without auto-on, detection still works but solving is manual.
+
+> **Expected bench improvement (v0.6):** reCaptcha 2/6 → 5+/6, hCaptcha 2/3 → 3/3
+
 Verified against public bot-detection panels:
 - **bot.sannysoft.com:** 24/24 PASS (WebDriver, Chrome obj, Plugins as PluginArray, WebGL, PHANTOM_*, HEADCHR_*, SELENIUM_DRIVER)
 - **bot.incolumitas.com** intoli: 6/6 OK — new-tests: 6/7 OK (one FAIL = pure CDP presence, cannot be JS-patched)

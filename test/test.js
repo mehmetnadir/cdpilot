@@ -40,12 +40,12 @@ console.log('\n  cdpilot tests\n');
 
 test('--version prints version', () => {
   const out = run('--version');
-  assert(out.includes('0.5.3'), 'Should print version');
+  assert(out.includes('0.6.0'), 'Should print version');
 });
 
 test('-v prints version', () => {
   const out = run('-v');
-  assert(out.includes('0.5.3'), 'Should print version');
+  assert(out.includes('0.6.0'), 'Should print version');
 });
 
 test('help shows usage', () => {
@@ -1697,6 +1697,101 @@ test('cmd_hover and cmd_drag use host-aware _entropy_enabled', () => {
 test('cmd_scroll_to uses host-aware _entropy_enabled', () => {
   const m = PY_CONTENT.match(/async def cmd_scroll_to[\s\S]{0,400}?_entropy_enabled\(_get_project_id\(\),\s*host=/);
   assert(m, 'cmd_scroll_to must call _entropy_enabled with host parameter');
+});
+
+// ── Captcha Solver Plugin (v0.6) ──
+
+test('captcha: CAPTCHA_PROVIDERS_FILE points to CDPILOT_HOME', () => {
+  assert(PY_CONTENT.includes("CAPTCHA_PROVIDERS_FILE = os.path.join(CDPILOT_HOME, 'captcha-providers.json')"),
+    'CAPTCHA_PROVIDERS_FILE must be in CDPILOT_HOME (shared across projects)');
+});
+
+test('captcha: CAPTCHA_AUTO_FILE in PROFILE_DIR (per-project)', () => {
+  assert(PY_CONTENT.includes("CAPTCHA_AUTO_FILE = os.path.join(PROFILE_DIR, 'captcha-auto.json')"),
+    'CAPTCHA_AUTO_FILE must be per-project in PROFILE_DIR');
+});
+
+test('captcha: CaptchaSolverError defined', () => {
+  assert(/class CaptchaSolverError\(Exception\)/.test(PY_CONTENT),
+    'CaptchaSolverError must be a proper Exception subclass');
+});
+
+test('captcha: _captcha_load_config returns default dict on missing file', () => {
+  assert(/def _captcha_load_config/.test(PY_CONTENT), '_captcha_load_config must exist');
+  // Must handle FileNotFoundError gracefully
+  assert(PY_CONTENT.includes('FileNotFoundError'), '_captcha_load_config must handle missing file');
+});
+
+test('captcha: _captcha_save_config uses atomic write and chmod 600', () => {
+  assert(/def _captcha_save_config/.test(PY_CONTENT), '_captcha_save_config must exist');
+  assert(PY_CONTENT.includes('_atomic_write_json(CAPTCHA_PROVIDERS_FILE'), '_captcha_save_config must use _atomic_write_json');
+  assert(PY_CONTENT.includes('os.chmod(CAPTCHA_PROVIDERS_FILE, 0o600)'), '_captcha_save_config must chmod 600');
+});
+
+test('captcha: _solve_2captcha polls res.php every 5s', () => {
+  const m = PY_CONTENT.match(/async def _solve_2captcha[\s\S]{0,2000}?2captcha\.com\/res\.php/);
+  assert(m, '_solve_2captcha must poll 2captcha.com/res.php');
+  const body = PY_CONTENT.match(/async def _solve_2captcha[\s\S]+?(?=\nasync def |\ndef (?!_))/);
+  assert(body && body[0].includes('asyncio.sleep(5)'), '_solve_2captcha must use asyncio.sleep(5) for polling');
+  assert(body && body[0].includes('CAPCHA_NOT_READY'), '_solve_2captcha must handle CAPCHA_NOT_READY response');
+});
+
+test('captcha: _solve_anticaptcha uses JSON API with createTask/getTaskResult', () => {
+  const m = PY_CONTENT.match(/async def _solve_anticaptcha[\s\S]{0,2000}?anti-captcha\.com\/createTask/);
+  assert(m, '_solve_anticaptcha must POST to api.anti-captcha.com/createTask');
+  const body = PY_CONTENT.match(/async def _solve_anticaptcha[\s\S]+?(?=\nasync def |\ndef (?!_))/);
+  assert(body && body[0].includes('getTaskResult'), '_solve_anticaptcha must poll getTaskResult');
+  assert(body && body[0].includes("'status') == 'ready'"), "_solve_anticaptcha must check status == 'ready'");
+});
+
+test('captcha: _solve_capmonster uses capmonster.cloud base URL', () => {
+  const m = PY_CONTENT.match(/async def _solve_capmonster[\s\S]{0,2000}?capmonster\.cloud/);
+  assert(m, '_solve_capmonster must use api.capmonster.cloud');
+});
+
+test('captcha: provider preferred fallback (first enabled if preferred unavailable)', () => {
+  const m = PY_CONTENT.match(/def _captcha_get_preferred_provider[\s\S]+?(?=\ndef |\nasync def )/);
+  assert(m, '_captcha_get_preferred_provider must exist');
+  assert(m[0].includes("preferred"), '_captcha_get_preferred_provider must check preferred provider');
+  // Must have a fallback loop
+  assert(m[0].includes('for pname'), '_captcha_get_preferred_provider must iterate providers as fallback');
+});
+
+test('captcha: _extract_site_key probes recaptcha, hcaptcha, turnstile selectors', () => {
+  assert(/async def _extract_site_key/.test(PY_CONTENT), '_extract_site_key must exist');
+  assert(PY_CONTENT.includes('g-recaptcha'), '_extract_site_key must probe recaptcha selector');
+  assert(PY_CONTENT.includes('h-captcha'), '_extract_site_key must probe hcaptcha selector');
+  assert(PY_CONTENT.includes('cf-turnstile'), '_extract_site_key must probe turnstile selector');
+});
+
+test('captcha: _inject_captcha_token handles recaptcha, hcaptcha, turnstile', () => {
+  assert(/async def _inject_captcha_token/.test(PY_CONTENT), '_inject_captcha_token must exist');
+  assert(PY_CONTENT.includes('g-recaptcha-response'), '_inject_captcha_token must handle recaptcha-v2 response field');
+  assert(PY_CONTENT.includes('h-captcha-response'), '_inject_captcha_token must handle hcaptcha response field');
+  assert(PY_CONTENT.includes('cf-turnstile-response'), '_inject_captcha_token must handle turnstile response field');
+});
+
+test('captcha: adaptive auto-solve hook fires in cmd_go after captcha detect', () => {
+  const cmdGoBlock = PY_CONTENT.match(/async def cmd_go\b[\s\S]+?(?=\nasync def cmd_content)/);
+  assert(cmdGoBlock, 'cmd_go must be findable');
+  assert(cmdGoBlock[0].includes('_captcha_auto_solve_if_enabled'),
+    'cmd_go must call _captcha_auto_solve_if_enabled when captcha is detected');
+});
+
+test('captcha: cmd_captcha_dispatch subcommand routing', () => {
+  assert(/async def cmd_captcha_dispatch/.test(PY_CONTENT), 'cmd_captcha_dispatch must exist');
+  const m = PY_CONTENT.match(/async def cmd_captcha_dispatch[\s\S]+?(?=\n# ─── End Captcha)/);
+  assert(m, 'cmd_captcha_dispatch must be followed by End Captcha comment');
+  assert(m[0].includes("'config'"), "cmd_captcha_dispatch must route 'config'");
+  assert(m[0].includes("'solve'"), "cmd_captcha_dispatch must route 'solve'");
+  assert(m[0].includes("'auto'"), "cmd_captcha_dispatch must route 'auto'");
+  assert(m[0].includes("'status'"), "cmd_captcha_dispatch must route 'status'");
+  assert(m[0].includes("'balance'"), "cmd_captcha_dispatch must route 'balance'");
+});
+
+test('captcha: captcha command in async_map dispatch table', () => {
+  assert(PY_CONTENT.includes("'captcha': lambda: cmd_captcha_dispatch(args)"),
+    "main() async_map must include 'captcha' -> cmd_captcha_dispatch");
 });
 
 // ── Summary ──
