@@ -264,10 +264,17 @@ cdpilot session-close [id]    # Close session
 ### Advanced
 
 ```bash
-cdpilot cookies [domain]      # List cookies (filter by domain)
-cdpilot cookies save <file> [<domain>]
-                              # Export cookies as JSON (optional domain filter)
-cdpilot cookies load <file>   # Import cookies (replay CF clearance across runs)
+cdpilot cookies [domain]             # List cookies (filter by domain)
+cdpilot cookies save <file> [<domain>]  # Export cookies as JSON
+cdpilot cookies load <file>          # Import cookies (replay CF clearance)
+cdpilot cookies save --host x.com    # Save to per-host cache
+cdpilot cookies load --host x.com    # Load from per-host cache
+cdpilot cookies list                 # Cached hosts + age + CF clearance flag
+cdpilot cookies clear --host x.com   # Remove one host
+cdpilot cookies clear --all          # Wipe entire cache
+cdpilot cookies clear --older-than 7d  # Remove stale entries
+cdpilot cookies auto on              # Auto-save/replay cookies on every navigate
+cdpilot cookies cf-replay <url>      # Inject cached CF clearance before nav
 cdpilot storage               # localStorage contents
 cdpilot upload <sel> <file>   # Upload file to input
 cdpilot multi-eval <js>       # Execute JS in all tabs
@@ -531,6 +538,29 @@ Future paid offerings:
 - **No dependencies** — Zero npm/Python runtime dependencies means zero supply-chain attack surface.
 
 Found a vulnerability? Please email the maintainer directly instead of opening a public issue.
+
+## Cookie Persistence (v0.6+)
+
+Per-host cookie cache with auto-replay before navigation. Particularly useful for
+sites with expensive challenges (Cloudflare, DataDome) — once passed, clearance
+cookies (`cf_clearance`, `__cf_bm`) are cached and replayed on next visit.
+
+```bash
+# Enable auto-mode — cookies saved/replayed on every navigate
+cdpilot cookies auto on
+
+# Manual per-host workflow
+cdpilot cookies save --host x.com   # cache current session cookies
+cdpilot cookies load --host x.com   # inject before navigating
+cdpilot cookies cf-replay https://x.com  # explicit CF clearance injection
+
+# Inspect and clean
+cdpilot cookies list                     # all cached hosts + age + CF flag
+cdpilot cookies clear --older-than 7d   # prune stale cache
+```
+
+Storage: `~/.cdpilot/cookies/<host>/cookies.json` (chmod 600, never committed to git).
+Expired cookies are filtered automatically on load.
 
 ## Roadmap
 

@@ -1794,6 +1794,106 @@ test('captcha: captcha command in async_map dispatch table', () => {
     "main() async_map must include 'captcha' -> cmd_captcha_dispatch");
 });
 
+// ── Per-host cookie persistence (v0.6) ──
+
+test('COOKIES_DIR constant defined under CDPILOT_HOME', () => {
+  assert(/COOKIES_DIR\s*=\s*os\.path\.join\(CDPILOT_HOME/.test(PY_CONTENT),
+    "COOKIES_DIR must be os.path.join(CDPILOT_HOME, 'cookies')");
+});
+
+test('CF_CLEARANCE_COOKIES frozenset contains cf_clearance and __cf_bm', () => {
+  const m = PY_CONTENT.match(/CF_CLEARANCE_COOKIES\s*=\s*frozenset\(\{[^}]+\}\)/);
+  assert(m, "CF_CLEARANCE_COOKIES frozenset must be defined");
+  assert(m[0].includes('cf_clearance'), "must include cf_clearance");
+  assert(m[0].includes('__cf_bm'), "must include __cf_bm");
+});
+
+test('_cookies_safe_host replaces : and / with _', () => {
+  const m = PY_CONTENT.match(/def _cookies_safe_host[\s\S]{0,200}?replace\(':',\s*'_'\)/);
+  assert(m, "_cookies_safe_host must replace ':' with '_'");
+});
+
+test('_cookies_host_dir returns path under COOKIES_DIR', () => {
+  const m = PY_CONTENT.match(/def _cookies_host_dir[\s\S]{0,200}?os\.path\.join\(COOKIES_DIR/);
+  assert(m, "_cookies_host_dir must use os.path.join(COOKIES_DIR, ...)");
+});
+
+test('_save_host_cookies: atomic write + chmod 600 + returns path', () => {
+  const body = PY_CONTENT.match(/def _save_host_cookies[\s\S]{0,1200}?def _/);
+  assert(body, "_save_host_cookies must be present");
+  assert(body[0].includes('_atomic_write_json'), "must use _atomic_write_json");
+  assert(body[0].includes('0o600'), "must chmod 0o600");
+  assert(body[0].includes('return f_path'), "must return file path");
+});
+
+test('_save_host_cookies: metadata contains cf_clearance_present and expires_soonest_unix', () => {
+  const m = PY_CONTENT.match(/def _save_host_cookies[\s\S]{0,600}?cf_clearance_present[\s\S]{0,200}?expires_soonest_unix/);
+  assert(m, "metadata must include cf_clearance_present and expires_soonest_unix");
+});
+
+test('_load_host_cookies: returns None on expiry', () => {
+  const m = PY_CONTENT.match(/def _load_host_cookies[\s\S]{0,600}?expires_soonest_unix[\s\S]{0,200}?time\.time\(\)/);
+  assert(m, "_load_host_cookies must check expires_soonest_unix < time.time()");
+});
+
+test('_load_host_cookies: returns None on OSError/ValueError', () => {
+  const m = PY_CONTENT.match(/def _load_host_cookies[\s\S]{0,600}?except \(OSError, ValueError\)[\s\S]{0,100}?return None/);
+  assert(m, "_load_host_cookies must catch OSError/ValueError and return None");
+});
+
+test('_cookies_auto_enabled reads COOKIES_AUTO_CONFIG_FILE', () => {
+  const m = PY_CONTENT.match(/def _cookies_auto_enabled[\s\S]{0,300}?COOKIES_AUTO_CONFIG_FILE/);
+  assert(m, "_cookies_auto_enabled must reference COOKIES_AUTO_CONFIG_FILE");
+});
+
+test('cmd_cookies: save --host mode writes per-host via _save_host_cookies', () => {
+  // Check that per-host branch and _save_host_cookies both appear in cmd_cookies body
+  const fnBody = PY_CONTENT.match(/async def cmd_cookies[\s\S]{0,12000}?(?=\nasync def |\ndef [a-z])/);
+  assert(fnBody, "cmd_cookies function must be present");
+  assert(fnBody[0].includes("'--host'") && fnBody[0].includes('_save_host_cookies'),
+    "cookies save --host must call _save_host_cookies");
+});
+
+test('cmd_cookies: load --host mode calls _load_host_cookies', () => {
+  const m = PY_CONTENT.match(/sub == 'load'[\s\S]{0,300}?--host[\s\S]{0,300}?_load_host_cookies/);
+  assert(m, "cookies load --host must call _load_host_cookies");
+});
+
+test('cmd_cookies: list subcommand lists COOKIES_DIR', () => {
+  const m = PY_CONTENT.match(/sub == 'list'[\s\S]{0,600}?COOKIES_DIR/);
+  assert(m, "cookies list must read COOKIES_DIR");
+});
+
+test('cmd_cookies: clear --all removes entire COOKIES_DIR', () => {
+  const m = PY_CONTENT.match(/--all[\s\S]{0,200}?shutil\.rmtree\(COOKIES_DIR/);
+  assert(m, "cookies clear --all must shutil.rmtree(COOKIES_DIR)");
+});
+
+test('cmd_cookies: auto on|off toggles _set_cookies_auto', () => {
+  const m = PY_CONTENT.match(/sub == 'auto'[\s\S]{0,400}?_set_cookies_auto/);
+  assert(m, "cookies auto must call _set_cookies_auto");
+});
+
+test('cmd_cookies: cf-replay injects cookies via Network.setCookies', () => {
+  const m = PY_CONTENT.match(/sub == 'cf-replay'[\s\S]{0,800}?Network\.setCookies/);
+  assert(m, "cookies cf-replay must inject via Network.setCookies");
+});
+
+test('cmd_go: auto pre-navigate hook injects cached cookies', () => {
+  const m = PY_CONTENT.match(/COOKIES AUTO PRE-NAVIGATE[\s\S]{0,400}?_cookies_auto_enabled[\s\S]{0,200}?_load_host_cookies/);
+  assert(m, "cmd_go must have COOKIES AUTO PRE-NAVIGATE hook with _load_host_cookies");
+});
+
+test('cmd_go: auto post-navigate hook saves cookies after navigation', () => {
+  const m = PY_CONTENT.match(/COOKIES AUTO POST-NAVIGATE[\s\S]{0,600}?_save_host_cookies/);
+  assert(m, "cmd_go must have COOKIES AUTO POST-NAVIGATE hook with _save_host_cookies");
+});
+
+test('cmd_cookies: clear --older-than guards against missing COOKIES_DIR', () => {
+  const m = PY_CONTENT.match(/--older-than[\s\S]{0,200}?os\.path\.exists\(COOKIES_DIR\)/);
+  assert(m, "clear --older-than must guard with os.path.exists(COOKIES_DIR)");
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);

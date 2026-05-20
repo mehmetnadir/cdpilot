@@ -2108,6 +2108,17 @@ async def cmd_go(url):
         except Exception as e:
             sys.stderr.write(f"⚠️  Adaptive: isolated context failed ({e}), using default tab\n")
 
+    # --- COOKIES AUTO PRE-NAVIGATE ---
+    if _cookies_auto_enabled() and expected_host:
+        try:
+            cached = _load_host_cookies(expected_host)
+            if cached:
+                await cdp_send(active_ws, [(910, 'Network.setCookies', {'cookies': cached})])
+                sys.stderr.write(f"🍪 Cookie auto: injected {len(cached)} cached cookies for {expected_host}\n")
+        except Exception:
+            pass
+    # --- END COOKIES AUTO PRE-NAVIGATE ---
+
     try:
         content, _ = await navigate_collect(active_ws, url)
         print(content)
@@ -2161,6 +2172,21 @@ async def cmd_go(url):
                     pass
         except Exception:
             pass
+
+        # --- COOKIES AUTO POST-NAVIGATE ---
+        if _cookies_auto_enabled() and expected_host:
+            try:
+                r2 = await cdp_send(active_ws, [(912, 'Network.getCookies', {})])
+                all_c = r2.get(912, {}).get('cookies', [])
+                host_c = [c for c in all_c
+                          if expected_host.endswith(c.get('domain', '').lstrip('.'))]
+                if host_c:
+                    _save_host_cookies(expected_host, host_c)
+                    sys.stderr.write(f"🍪 Cookie auto: saved {len(host_c)} cookies for {expected_host}\n")
+            except Exception:
+                pass
+        # --- END COOKIES AUTO POST-NAVIGATE ---
+
     finally:
         # Dispose the isolated context regardless of outcome.
         if ctx_id_to_dispose:
@@ -3057,10 +3083,18 @@ async def cmd_cookies(*args):
     """List, export, or import cookies.
 
     Usage:
-      cdpilot cookies                          # list all cookies (or for current page)
-      cdpilot cookies <domain>                 # list cookies for a specific domain
-      cdpilot cookies save <file> [<domain>]   # export to JSON (all or scoped)
-      cdpilot cookies load <file>              # import cookies from JSON
+      cdpilot cookies                              # list all cookies (or for current page)
+      cdpilot cookies <domain>                     # list cookies for a specific domain
+      cdpilot cookies save <file> [<domain>]       # export to JSON (all or scoped)
+      cdpilot cookies load <file>                  # import cookies from JSON
+      cdpilot cookies save --host <hostname>       # save to per-host cache
+      cdpilot cookies load --host <hostname>       # load from per-host cache
+      cdpilot cookies list                         # list all cached hosts + age + CF flag
+      cdpilot cookies clear --host <hostname>      # remove one host's cache
+      cdpilot cookies clear --all                  # wipe entire cookie cache
+      cdpilot cookies clear --older-than <Nd>      # remove stale entries (e.g. 7d)
+      cdpilot cookies auto on|off|status           # toggle auto-save/replay on navigate
+      cdpilot cookies cf-replay <url>              # inject cached CF clearance before nav
 
     Why save/load: once you've beaten a Cloudflare/DataDome challenge in one
     cdpilot process, the `cf_clearance` (or equivalent) cookie sits in this
@@ -3071,6 +3105,20 @@ async def cmd_cookies(*args):
     sub = args[0].lower() if args else None
 
     if sub == 'save':
+        # Per-host mode: cookies save --host <hostname>
+        if len(args) >= 3 and args[1] == '--host':
+            host = args[2]
+            ws, _ = get_page_ws()
+            r = await cdp_send(ws, [(1, "Network.getCookies", {})])
+            all_c = r.get(1, {}).get("cookies", [])
+            host_c = [c for c in all_c if host.endswith(c.get('domain', '').lstrip('.'))]
+            if not host_c:
+                print(f"No cookies found for host: {host}", file=sys.stderr)
+                return
+            path = _save_host_cookies(host, host_c)
+            print(f"Saved {len(host_c)} cookies for {host} -> {path}")
+            return
+        # Global file mode (backward compat)
         if len(args) < 2:
             print('Usage: cdpilot cookies save <file> [<domain>]', file=sys.stderr)
             sys.exit(1)
@@ -3087,10 +3135,22 @@ async def cmd_cookies(*args):
                        if c.get('domain', '').lstrip('.').endswith(d)]
         with open(out_path, 'w') as f:
             json.dump(cookies, f, indent=2)
-        print(f'Saved {len(cookies)} cookies → {out_path}')
+        print(f'Saved {len(cookies)} cookies -> {out_path}')
         return
 
     if sub == 'load':
+        # Per-host mode: cookies load --host <hostname>
+        if len(args) >= 3 and args[1] == '--host':
+            host = args[2]
+            cookies = _load_host_cookies(host)
+            if not cookies:
+                print(f"No valid cached cookies for {host}", file=sys.stderr)
+                return
+            ws, _ = get_page_ws()
+            await cdp_send(ws, [(1, "Network.setCookies", {"cookies": cookies})])
+            print(f"Injected {len(cookies)} cookies for {host}")
+            return
+        # Global file mode (backward compat)
         if len(args) < 2:
             print('Usage: cdpilot cookies load <file>', file=sys.stderr)
             sys.exit(1)
@@ -3124,7 +3184,97 @@ async def cmd_cookies(*args):
             print(f'  ({len(cookies) - accepted} rejected by CDP — usually because of expiry or domain mismatch)')
         return
 
-    # List mode
+    if sub == 'list':
+        if not os.path.exists(COOKIES_DIR):
+            print("No per-host cookies stored.")
+            return
+        entries = sorted(os.listdir(COOKIES_DIR))
+        if not entries:
+            print("No per-host cookies stored.")
+            return
+        print(f"  {'HOST':40} {'AGE':10} CF")
+        print("  " + "-" * 56)
+        for host_dir in entries:
+            f_path = os.path.join(COOKIES_DIR, host_dir, 'cookies.json')
+            if not os.path.exists(f_path):
+                continue
+            try:
+                with open(f_path) as f:
+                    data = json.load(f)
+                meta = data.get('metadata', {})
+                saved_at = datetime.datetime.fromisoformat(meta['saved_at'].rstrip('Z'))
+                age = datetime.datetime.utcnow() - saved_at
+                age_str = f"{age.days}d" if age.days > 0 else f"{age.seconds // 3600}h"
+                cf = "cf_clearance" if meta.get('cf_clearance_present') else ""
+                print(f"  {host_dir:40} {age_str:10} {cf}")
+            except Exception:
+                continue
+        return
+
+    if sub == 'clear':
+        if len(args) >= 3 and args[1] == '--host':
+            shutil.rmtree(_cookies_host_dir(args[2]), ignore_errors=True)
+            print(f"Cleared cookies for {args[2]}")
+        elif len(args) >= 2 and args[1] == '--all':
+            shutil.rmtree(COOKIES_DIR, ignore_errors=True)
+            print("Cleared all per-host cookies")
+        elif len(args) >= 3 and args[1] == '--older-than':
+            if not os.path.exists(COOKIES_DIR):
+                print("No per-host cookies stored.")
+                return
+            days = int(args[2].rstrip('d'))
+            now = datetime.datetime.utcnow()
+            removed = 0
+            for host_dir in os.listdir(COOKIES_DIR):
+                d = os.path.join(COOKIES_DIR, host_dir)
+                f = os.path.join(d, 'cookies.json')
+                if not os.path.exists(f):
+                    continue
+                try:
+                    with open(f) as j:
+                        saved_at = datetime.datetime.fromisoformat(
+                            json.load(j)['metadata']['saved_at'].rstrip('Z'))
+                    if (now - saved_at).days >= days:
+                        shutil.rmtree(d, ignore_errors=True)
+                        removed += 1
+                except Exception:
+                    pass
+            print(f"Removed {removed} host(s) older than {days}d")
+        else:
+            print("Usage: cdpilot cookies clear --host <h>|--all|--older-than <Nd>",
+                  file=sys.stderr)
+        return
+
+    if sub == 'auto':
+        state = args[1].lower() if len(args) >= 2 else 'status'
+        if state == 'on':
+            _set_cookies_auto(True)
+        elif state == 'off':
+            _set_cookies_auto(False)
+        status = "on" if _cookies_auto_enabled() else "off"
+        print(f"Cookie auto-persistence: {status}")
+        return
+
+    if sub == 'cf-replay':
+        if len(args) < 2:
+            print("Usage: cdpilot cookies cf-replay <url>", file=sys.stderr)
+            return
+        from urllib.parse import urlparse
+        host = urlparse(args[1]).hostname or ''
+        if not host:
+            print(f"Cannot parse hostname from: {args[1]}", file=sys.stderr)
+            return
+        cookies = _load_host_cookies(host)
+        if not cookies:
+            print(f"No cached cookies for {host}")
+            return
+        ws, _ = get_page_ws()
+        await cdp_send(ws, [(1, "Network.setCookies", {"cookies": cookies})])
+        cf_count = sum(1 for c in cookies if c.get('name') in CF_CLEARANCE_COOKIES)
+        print(f"Injected {len(cookies)} cookies for {host} ({cf_count} CF clearance)")
+        return
+
+    # List mode (default) — show browser's live cookie jar
     domain = args[0] if args else None
     ws, _ = get_page_ws()
     params = {}
