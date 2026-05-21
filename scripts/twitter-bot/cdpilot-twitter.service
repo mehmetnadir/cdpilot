@@ -1,0 +1,19 @@
+[Unit]
+Description=cdpilot Twitter Bot - single-shot post run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=nadir
+Group=nadir
+WorkingDirectory=/home/nadir/cdpilot-twitter-bot
+EnvironmentFile=/etc/cdpilot-twitter.env
+Environment=CDPILOT_PROJECT_ID=twitter-bot
+Environment=HOME=/home/nadir
+ExecStart=/home/nadir/cdpilot-twitter-bot/cdpilot-twitter-run.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cdpilot-twitter
+TimeoutStartSec=300
+NoNewPrivileges=yes

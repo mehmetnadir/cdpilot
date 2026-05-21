@@ -1,0 +1,32 @@
+[Unit]
+Description=cdpilot Twitter Bot Timer - daily posting schedule
+# Requires yerine BindsTo kullanmıyoruz — timer bağımsız active olabilmeli
+After=cdpilot-twitter.service
+
+[Timer]
+# 5 sabit slot (UTC+3 → UTC dönüşümü):
+#   13:00 TR → 10:00 UTC
+#   15:30 TR → 12:30 UTC
+#   17:30 TR → 14:30 UTC
+#   21:00 TR → 18:00 UTC
+#   22:30 TR → 19:30 UTC
+#
+# Her slot ±30 dakika jitter alır (RandomizedDelaySec=1800)
+# Net sonuç: günde 5 tweet, her biri random bir an içinde.
+OnCalendar=*-*-* 10:00:00
+OnCalendar=*-*-* 12:30:00
+OnCalendar=*-*-* 14:30:00
+OnCalendar=*-*-* 18:00:00
+OnCalendar=*-*-* 19:30:00
+
+# Jitter: gerçekçi davranış için kritik (bot tespitini azaltır)
+AccuracySec=15min
+RandomizedDelaySec=1800
+
+# Sunucu downtime varsa kalan run'ları telafi eder
+Persistent=true
+
+Unit=cdpilot-twitter.service
+
+[Install]
+WantedBy=timers.target

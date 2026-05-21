@@ -1,0 +1,17 @@
+[Unit]
+Description=cdpilot Twitter Bot Queue Executor Timer — every 5 minutes
+After=cdpilot-twitter-executor.service
+
+[Timer]
+# Her 5 dakikada bir çalış. queue_executor.py kendi içinde
+# scheduled_time <= now olan pending item'ları işler.
+OnCalendar=*:0/5
+AccuracySec=30s
+# Server downtime'da kaçırılan run'ları telafi etme — executor zaten
+# scheduled_time'a göre çalıştığı için catch-up doğal.
+Persistent=false
+
+Unit=cdpilot-twitter-executor.service
+
+[Install]
+WantedBy=timers.target

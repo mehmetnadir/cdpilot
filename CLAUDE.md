@@ -7,147 +7,43 @@
 > Zero-dependency browser automation CLI. Tek komut, tam kontrol.
 
 ## Kimlik
-
 - **Stack:** Node.js (entry) + Python 3 (core) | Pure CDP over HTTP/WebSocket
-- **Port:** CDP: 9222 (varsayılan, `CDP_PORT` ile değiştirilebilir)
-- **Paket Yöneticisi:** npm
-- **Monorepo:** Hayır — tek modül
-- **Bağımlılık:** Sıfır (npm + Python stdlib)
+- **Port:** CDP 9222 (varsayılan, `CDP_PORT` ile değiştirilebilir)
+- **Paket Yöneticisi:** npm | **Bağımlılık:** Sıfır (npm + Python stdlib)
 
 ## Hızlı Başlangıç
-
 - `npx cdpilot launch` — Tarayıcı başlat (CDP modunda)
 - `npx cdpilot setup` — Otomatik tarayıcı algılama, profil oluşturma
 - `npx cdpilot status` — Bağlantı kontrolü
 - `node test/test.js` — Test çalıştır
 - `npm publish` — npm'e yayınla
 
-## Dosya Haritası (Nereye Bakmalısın?)
+## Dosya Haritası
+| Ne arıyorsun | Nereye bak |
+|---|---|
+| Mimari, CLI komutları, tüm fonksiyon listesi | `.claude/docs/architecture.md` |
+| Rakip analizi | `.claude/docs/browserless-analysis.md` |
+| Site kaynak kodu | `/Users/nadir/01dev/cdpilot-site/` |
 
-> **EN KRİTİK BÖLÜM.** "X yapmak istiyorum" → "Y'ye bak"
-
-| Yapmak İstediğin | Bakman Gereken Yer | Not |
-|---|---|---|
-| Yeni CLI komutu ekleme | `src/cdpilot.py` → `main()` dispatch (~satır 2460) | `cmd_` prefix convention |
-| Tarayıcı algılama/başlatma | `src/cdpilot.py` → `_find_browser()`, `cmd_launch()` | Platform-specific yollar |
-| CDP WebSocket iletişimi | `src/cdpilot.py` → `cdp_send()`, `get_page_ws()` | asyncio tabanlı |
-| MCP server (AI entegrasyonu) | `src/cdpilot.py` → `class MCPServer` (~satır 2320) | stdin/stdout JSON-RPC |
-| Node.js entry point | `bin/cdpilot.js` | Python bulma + browser detect + delegate |
-| Cross-platform tarayıcı yolları | `bin/cdpilot.js` → `findBrowser()` | macOS, Linux, Windows |
-| Oturum yönetimi | `src/cdpilot.py` → `_load_sessions()`, `_save_sessions()` | JSON dosya tabanlı |
-| Request interception | `src/cdpilot.py` → `cmd_intercept()`, `_run_intercept_session()` | Fetch.enable CDP |
-| Cihaz emülasyonu | `src/cdpilot.py` → `cmd_emulate()` | iPhone, iPad, Android preset |
-| Geolocation override | `src/cdpilot.py` → `cmd_geo()` | Şehir preset + custom koordinat |
-| Erişilebilirlik (a11y) | `src/cdpilot.py` → `cmd_a11y()` | ARIA tree, role filter |
-| DevExtension sistemi | `src/cdpilot.py` → `cmd_extensions()`, `cmd_ext_install()` | Native JS injection |
-| Vision fallback | `src/cdpilot.py` → `cmd_describe()` | a11y + screenshot + text |
-| Annotated screenshot | `src/cdpilot.py` → `cmd_shot_annotated()` | Badge overlay |
-| Auto-wait | `src/cdpilot.py` → `WAIT_AND_QUERY_JS` | MutationObserver 5s |
-| Batch commands | `src/cdpilot.py` → `cmd_batch()` | JSON stdin pipe |
-| Glow/VFX sistemi | `src/cdpilot.py` → `GLOW_CSS`, `VISUAL_FEEDBACK_JS` | Kalıcı glow, cursor, ripple |
-| Multi-project isolation | `src/cdpilot.py` → `_allocate_port()`, `_resolve_project_config()` | Registry tabanlı |
-| Duyuru içerikleri | `docs/` → blog, twitter, HN, reddit | Hazır, yayınlanacak |
-| Site kaynak kodu | `/Users/nadir/01dev/cdpilot-site/` | Ayrı repo |
-| Rakip analizi | `.claude/docs/browserless-analysis.md` | Browserless deep dive |
-| Testler | `test/test.js` | Node.js tabanlı, basit assertions |
-| npm paket yapılandırması | `package.json` → `files`, `bin` | Yayınlanan dosyalar: bin/, src/, README |
-
-## Mimari Özet
-
-```
-bin/cdpilot.js (Node.js entry)
-    │
-    ├── Python kontrolü (python3 arama)
-    ├── Tarayıcı algılama (Brave > Chrome > Chromium)
-    └── → spawn python3 src/cdpilot.py <komut> <args>
-
-src/cdpilot.py (~2600 satır, TEK DOSYA)
-    │
-    ├── CDP iletişim katmanı (HTTP + WebSocket)
-    │   ├── cdp_get() — HTTP GET (tab listesi vb.)
-    │   ├── cdp_send() — WebSocket komutları
-    │   └── navigate_collect() — Sayfa yükleme + veri toplama
-    │
-    ├── 40+ CLI komutu (cmd_* fonksiyonları)
-    │   ├── Navigasyon: go, content, html, shot, pdf
-    │   ├── Etkileşim: click, fill, type, submit, hover, drag, keys
-    │   ├── Debug: console, network, perf, eval, debug
-    │   ├── Tab: tabs, new-tab, switch-tab, close-tab
-    │   ├── Ağ: throttle, proxy, intercept
-    │   ├── Emülasyon: emulate, geo, permission
-    │   └── Gelişmiş: cookies, storage, upload, a11y, frame, dialog
-    │
-    ├── Oturum yönetimi (izole profil)
-    └── MCP Server (class MCPServer — stdin/stdout)
-
-Brave/Chrome/Chromium (CDP modu, port 9222)
-    └── --remote-debugging-port=9222
-        --user-data-dir=~/.cdpilot/profile
-```
-
-- **İletişim:** Pure HTTP + WebSocket (urllib + asyncio)
-- **Profil:** `~/.cdpilot/profile` — izole, kişisel tarayıcıdan bağımsız
-- **MCP:** JSON-RPC over stdin/stdout, Claude Code uyumlu
+## Dikkat Edilecekler
+- **Tek dosya mimari:** Tüm Python kodu `src/cdpilot.py` (~2600 satır)
+- **Sıfır bağımlılık:** Harici Python/npm paketi eklenmez — stdlib only
+- **Port 9222:** Varsayılan CDP, `CDP_PORT` env ile değişir
+- **Brave öncelikli:** Brave > Chrome > Chromium
+- **İzole profil:** `~/.cdpilot/profile` — kullanıcı tarayıcısına dokunulmaz
+- **Stealth session-bound:** `Page.addScriptToEvaluateOnNewDocument` WS kapanınca silinir
+- **cdpilot-site:** Ayrı dizin `/Users/nadir/01dev/cdpilot-site/`, Server 21 port 3400
 
 ## Aktif Çalışma
-
 | Durum | Alan | Açıklama |
 |-------|------|----------|
-| ✅ | Core CLI | 50+ komut, cross-platform |
-| ✅ | MCP Server | Claude Code entegrasyonu + browser_describe tool |
-| ✅ | DevExtension | Native JS injection sistemi |
-| ✅ | Visual Feedback | Yeşil glow (kalıcı), cursor, ripple, keystroke, AI uyarı toast |
-| ✅ | Multi-Project | Proje bazlı izole tarayıcı (otomatik port/profil) |
-| ✅ | A11y Snapshot | Yapılandırılmış a11y tree + @ref click |
-| ✅ | Vision Fallback | describe komutu (a11y + screenshot + text) |
-| ✅ | Annotated Shot | Screenshot üzerinde @N badge'leri |
-| ✅ | Auto-Wait | 5s MutationObserver bekleme |
-| ✅ | Batch Commands | JSON pipe desteği |
-| ✅ | Site | cdpilot.ndr.ist canlı (landing + 63 komut docs, browser+health dahil) |
-| ✅ | GitHub & npm | **v0.5.0 hazırlandı** (lokal); npm publish onay bekliyor |
-| ✅ | Stealth Layer | Zero-dep fingerprint patches (webdriver smart no-op, plugins PluginArray-typed, WebGL spoof, Worker wrap) — opt-in via `cdpilot stealth on` |
-| ✅ | CAPTCHA Detection | 8 sağlayıcı (Turnstile, hCaptcha, reCAPTCHA, DataDome, PerimeterX, Arkose, GeeTest, CF-interstitial). `captcha-check` + `captcha-wait` komutları |
-| ✅ | Adaptive Escalation (v0.5.0) | `cdpilot adaptive on` — CAPTCHA detect → per-host stealth memory + auto re-nav. "Run fast, climb walls when seen" |
-| ✅ | Auto-Dismiss (v0.5.0) | `cdpilot dismiss` — EN+TR pattern lib, destructive-action guards, LLM sign-up wall escape |
-| ✅ | Cookies save/load (v0.5.0) | CF/DataDome clearance replay across runs |
-| ✅ | Context Pool (v0.5.0) | `Target.createBrowserContext` × N + `CDPILOT_TARGET` env pin → true parallel automation |
-| ✅ | Efficient Mode (v0.5.0) | Visual feedback default OFF (`cdpilot show on` opt-in), `cdpilot fast`, scroll instant, post-load 1.5s → 0.3s |
-| ✅ | WS Pool (v0.5.0) | Per-target connection reuse, atexit cleanup, zero tekil-CLI regression |
-| ✅ | `wait-for-text` (v0.5.0) | rAF-throttled MutationObserver — streaming AI response wait |
-| ✅ | `eval-batch` (v0.5.0) | N JS expressions in 1 CDP roundtrip |
-| ✅ | `block` (v0.5.0) | `Network.setBlockedURLs` + image/font/ad presets |
-| ✅ | Browser Selection | `cdpilot browser [name|auto]` — workload-aware (ext var→Vivaldi/Brave, ext yok→Chrome) + macOS 26 Brave demote + per-browser profile izolasyonu |
-| ✅ | Health Probe | `cdpilot health` JSON output — alive, port, tabs, browser, today's crashes. Watchdog loop için exit 0/2 |
+| ✅ | v0.8.0 | Core CLI (50+ komut), MCP, DevExtension, Stealth, CAPTCHA, Adaptive, Context Pool, Proxy, TLS probe |
+| ✅ | Site | cdpilot.ndr.ist canlı (63 komut docs) |
+| ✅ | GitHub & npm | v0.5.0 hazırlandı; npm publish onay bekliyor |
 | 🔄 | cdpilot Cloud | Hosted browser sessions API (roadmap) |
-| ⏳ | v0.5.0 release | npm publish + site update + sosyal medya duyurusu (onay bekliyor) |
+| ⏳ | v0.9 tls-proxy | Optional local TLS-MITM (curl-impersonate semantics) |
 
-## Dikkat Edilecekler (Gotchas)
-
-- **Tek dosya mimari:** Tüm Python kodu `src/cdpilot.py` içinde (~2600 satır), modüllere bölünmemiş
-- **Sıfır bağımlılık kuralı:** Harici Python/npm paketi eklenmez — stdlib only
-- **Port 9222:** Varsayılan CDP portu, `CDP_PORT` env ile değişir
-- **Brave öncelikli:** Tarayıcı arama sırası: Brave > Chrome > Chromium
-- **Python 3 zorunlu:** `bin/cdpilot.js` Python3 bulamazsa hata verir
-- **İzole profil:** `~/.cdpilot/profile` — kullanıcının kişisel tarayıcısına dokunulmaz
-- **MCP screenshot güvenliği:** Dosya adları sanitize edilir, path traversal engellenir
-- **Glow kalıcılığı:** `_control_end` glow+vfx'i yeni sayfaya re-inject eder, persistent script 10s sonra JS timeout ile temizlenir
-- **Multi-project:** `CDPILOT_PROJECT_ID` env var'ı Node→Python aktarılır, `_get_project_id()` bunu öncelikli okur
-- **cdpilot-site:** Ayrı dizin `/Users/nadir/01dev/cdpilot-site/`, Server 21'de port 3400
-- **Stealth session-bound:** `Page.addScriptToEvaluateOnNewDocument` cdp_send connection kapanınca silinir → `STEALTH_JS` `_control_start`'ta DEĞİL `navigate_collect`'te aynı WS'de register edilir
-- **Stealth smart no-op:** `navigator.webdriver` patch'i sadece value=true ise devreye girer; benign Chrome'da hiç dokunmaz (defineProperty'nin kendisi de bir tell olduğundan)
-- **CDP detection:** `incolumitas.overflowTest` ve `fpscanner.WEBDRIVER` JS patch ile aşılamaz, CDP'nin kendisini tespit ediyorlar — kabul edilen sınır
-
-## İlgili Dosyalar
-
-| Dosya | Amaç |
-|-------|------|
-| `CONTRIBUTING.md` | Katkı rehberi |
-| `LICENSE` | MIT lisansı |
-| `cdpilot-demo.gif` | README'deki demo animasyonu |
-| `cdpilot-video.mp4` | Tam demo videosu (1080x1080, 30fps) |
-
----
-Son Güncelleme: 2026-05-17
+Son Güncelleme: 2026-05-21
 
 <!-- gitnexus:start -->
 ## GitNexus — Code Intelligence

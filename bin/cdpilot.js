@@ -374,7 +374,156 @@ function showHelp() {
 `);
 }
 
+// ── Internal Test Runner ──
+
+function runInternalTestRunner(testFile, traceDir, traceMode, grepPattern) {
+  if (traceDir) {
+    fs.mkdirSync(path.join(traceDir, 'screenshots'), { recursive: true });
+    fs.mkdirSync(path.join(traceDir, 'a11y'), { recursive: true });
+  }
+
+  const metaPath = traceDir ? path.join(traceDir, 'meta.json') : null;
+  const stepsPath = traceDir && traceMode !== 'off' ? path.join(traceDir, 'steps.jsonl') : null;
+
+  const meta = { name: path.basename(testFile), started_at: new Date().toISOString(), status: 'running', tests: [] };
+  if (metaPath) fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+
+  const testQueue = [];
+  global.test = (name, fn) => testQueue.push({ name, fn });
+
+  try {
+    require(path.resolve(testFile));
+  } catch (err) {
+    const out = { passed: 0, failed: 1, skipped: 0, tests: [{ name: testFile, status: 'failed', duration_ms: 0, error: err.message }] };
+    process.stdout.write(JSON.stringify(out) + '\n');
+    process.exit(1);
+  }
+
+  const results = { passed: 0, failed: 0, skipped: 0, tests: [] };
+  const cdpPort = process.env.CDP_PORT || '9222';
+  const SCRIPT = path.join(__dirname, '..', 'src', 'cdpilot.py');
+  const python = 'python3';
+  let stepIdx = 0;
+
+  const makeT = () => {
+    const runCmd = (cmd, ...cargs) => {
+      const padded = String(stepIdx).padStart(3, '0');
+      const step = { action: cmd + ' ' + cargs.join(' '), ts_ms: Date.now(), duration_ms: 0, error: null };
+      const t0 = Date.now();
+      try {
+        const quoted = cargs.map(a => JSON.stringify(String(a))).join(' ');
+        execSync(`${python} ${SCRIPT} ${cmd} ${quoted}`, {
+          stdio: 'pipe',
+          env: { ...process.env, CDP_PORT: cdpPort },
+          timeout: 30000,
+        });
+        step.duration_ms = Date.now() - t0;
+        if (stepsPath) fs.appendFileSync(stepsPath, JSON.stringify(step) + '\n');
+        // Screenshot after each step (best-effort — no browser = skipped)
+        if (traceDir && traceMode !== 'off') {
+          try {
+            const shotPath = path.join(traceDir, 'screenshots', `step-${padded}.png`);
+            execSync(`${python} ${SCRIPT} shot ${shotPath}`, { stdio: 'pipe', env: { ...process.env, CDP_PORT: cdpPort }, timeout: 10000 });
+          } catch (_) { /* no browser is OK in unit-style tests */ }
+        }
+        stepIdx++;
+      } catch (err) {
+        step.duration_ms = Date.now() - t0;
+        step.error = err.stderr ? err.stderr.toString().trim() : err.message;
+        if (stepsPath) fs.appendFileSync(stepsPath, JSON.stringify(step) + '\n');
+        stepIdx++;
+        throw new Error(`${cmd} failed: ${step.error}`);
+      }
+    };
+
+    const t = {
+      goto: (url) => runCmd('go', url),
+      click: (sel) => runCmd('click', sel),
+      fill: (sel, val) => runCmd('fill', sel, val),
+      type: (sel, val) => runCmd('type', sel, val),
+      hover: (sel) => runCmd('hover', sel),
+      screenshot: (p) => runCmd('shot', p),
+      eval: (js) => {
+        try {
+          const out = execSync(`${python} ${SCRIPT} eval ${JSON.stringify(js)}`, { stdio: 'pipe', env: { ...process.env, CDP_PORT: cdpPort }, timeout: 10000 });
+          return out.toString().trim();
+        } catch (e) { throw new Error('eval failed: ' + e.message); }
+      },
+      a11y: () => runCmd('a11y-snapshot'),
+    };
+
+    t.expect = (textOrSel) => runCmd('assert', textOrSel);
+    t.expect.url = (expected) => runCmd('assert-url', expected);
+    t.expect.visible = (sel) => runCmd('assert-visible', sel);
+    t.expect.hidden = (sel) => runCmd('assert-hidden', sel);
+
+    return t;
+  };
+
+  // Run tests sequentially (parallel is managed at the Python level across files)
+  const runAll = async () => {
+    for (const tst of testQueue) {
+      if (grepPattern && !tst.name.match(new RegExp(grepPattern, 'i'))) {
+        results.skipped++;
+        continue;
+      }
+      const t0 = Date.now();
+      const rec = { name: tst.name, status: 'passed', duration_ms: 0, error: null };
+      try {
+        await tst.fn(makeT());
+        rec.status = 'passed';
+        results.passed++;
+      } catch (err) {
+        rec.status = 'failed';
+        rec.error = err.message;
+        results.failed++;
+      }
+      rec.duration_ms = Date.now() - t0;
+      results.tests.push(rec);
+      if (metaPath) {
+        meta.tests.push(rec);
+        meta.status = 'running';
+        fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+      }
+    }
+
+    // Finalize meta
+    if (metaPath) {
+      meta.status = results.failed > 0 ? 'failed' : 'passed';
+      meta.passed = results.passed;
+      meta.failed = results.failed;
+      meta.skipped = results.skipped;
+      meta.ended_at = new Date().toISOString();
+      fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+    }
+
+    process.stdout.write(JSON.stringify(results) + '\n');
+    process.exit(results.failed > 0 ? 1 : 0);
+  };
+
+  runAll().catch(err => {
+    process.stderr.write('Test runner error: ' + err.message + '\n');
+    process.exit(1);
+  });
+}
+
 // ── Main ──
+
+// Internal test runner mode — intercept before normal CLI dispatch
+if (process.argv.includes('--internal-test-runner')) {
+  const idx = process.argv.indexOf('--internal-test-runner');
+  const testFile = process.argv[idx + 1];
+  const traceDirArg = process.argv.find(a => a.startsWith('--trace-dir='));
+  const traceArg = process.argv.find(a => a.startsWith('--trace='));
+  const grepArg = process.argv.find(a => a.startsWith('--grep='));
+  runInternalTestRunner(
+    testFile,
+    traceDirArg ? traceDirArg.split('=').slice(1).join('=') : null,
+    traceArg ? traceArg.split('=')[1] : 'default',
+    grepArg ? grepArg.split('=').slice(1).join('=') : null,
+  );
+  return; // runAll() is async, this exits via process.exit
+}
 
 const args = process.argv.slice(2);
 const cmd = args[0];

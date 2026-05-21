@@ -1,0 +1,22 @@
+[Unit]
+Description=cdpilot — inject x.com cookies into Chrome session
+After=cdpilot-chrome.service
+Requires=cdpilot-chrome.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/cdpilot-twitter-bot
+ExecStartPre=/bin/sleep 6
+ExecStart=/opt/cdpilot-twitter-bot/inject-cookies.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cdpilot-cookies
+
+Environment=CDP_PORT=9222
+Environment=CDPILOT_PROFILE=/opt/cdpilot-twitter-bot/profile
+Environment=DISPLAY=:99
+Environment=HOME=/root
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=cdpilot — snapshot fresh cookies from running Chrome
+After=cdpilot-chrome.service cdpilot-cookies.service
+Wants=cdpilot-chrome.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cdpilot-twitter-bot/snapshot-cookies.sh
+TimeoutStartSec=60
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

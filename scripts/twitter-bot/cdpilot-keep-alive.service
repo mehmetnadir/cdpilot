@@ -1,0 +1,13 @@
+[Unit]
+Description=cdpilot — keep x.com session alive (Twitter activity ping)
+After=cdpilot-chrome.service
+Wants=cdpilot-chrome.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cdpilot-twitter-bot/keep-alive.sh
+TimeoutStartSec=60
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

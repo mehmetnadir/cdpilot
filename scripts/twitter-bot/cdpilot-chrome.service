@@ -1,0 +1,20 @@
+[Unit]
+Description=cdpilot — persistent Chrome inside Xvfb (port 9222)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cdpilot-twitter-bot
+# Xvfb sanal display + Chrome foreground (CDP port 9222)
+ExecStart=/opt/cdpilot-twitter-bot/run-chrome.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cdpilot-chrome
+
+Environment=HOME=/root
+
+[Install]
+WantedBy=default.target

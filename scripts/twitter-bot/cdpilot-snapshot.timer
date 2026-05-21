@@ -1,0 +1,15 @@
+[Unit]
+Description=cdpilot — snapshot timer (every 2 hours)
+After=cdpilot-snapshot.service
+
+[Timer]
+# Her 2 saatte bir (boot'tan 10dk sonra ilk, sonra her 2 saat)
+OnBootSec=10min
+OnUnitActiveSec=2h
+AccuracySec=5min
+Persistent=false
+
+Unit=cdpilot-snapshot.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=cdpilot — keep-alive timer (every 30 min, randomized)
+After=cdpilot-keep-alive.service
+
+[Timer]
+# Her 30 dakikada bir, ±10 dakika jitter
+OnCalendar=*:0/30
+AccuracySec=2min
+RandomizedDelaySec=600
+Persistent=false
+
+Unit=cdpilot-keep-alive.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,25 @@
+[Unit]
+Description=cdpilot Twitter Bot — Queue Executor (every 5min)
+After=network-online.target cdpilot-chrome.service cdpilot-cookies.service
+Wants=network-online.target cdpilot-chrome.service
+Requires=cdpilot-cookies.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/cdpilot-twitter-bot
+ExecStart=/usr/bin/python3 /opt/cdpilot-twitter-bot/queue_executor.py --queue-dir /opt/cdpilot-twitter-bot/queue
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cdpilot-twitter-executor
+TimeoutStartSec=300
+NoNewPrivileges=yes
+
+# CDP bağlantı parametreleri — Chrome cdpilot-chrome.service'te ayrı çalışıyor
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=CDP_PORT=9222
+Environment=CDPILOT_PROFILE=/opt/cdpilot-twitter-bot/profile
+Environment=CDPILOT_TWITTER_LOG_DIR=/opt/cdpilot-twitter-bot/logs
+Environment=DISPLAY=:99
+
+[Install]
+WantedBy=default.target
