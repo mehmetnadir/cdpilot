@@ -9,3 +9,7 @@ __pycache__/
 .npmrc
 .gitnexus
 .claude/docs/browserless-analysis.md
+# Twitter bot — credentials (ASLA commit etme)
+scripts/twitter-bot/*.env
+# Twitter bot — lokal profil yedek
+.cdpilot-backup-twitter-profile/
