@@ -1,11 +1,21 @@
 ---
 title: cdpilot Twitter Daily Routine
-schedule: daily, randomized 09:00-11:00 Istanbul
-description: Plan today's tweets, apply humanizer/strategy skills, sync queue to server
+schedule: daily, 4 invocations — 08:30, 13:00, 17:30, 22:00 Istanbul
+description: Plan today's tweets + reply batches, apply algo+humanizer+timing rules, sync queue to server. Cold-start aware (Faz 0/0.5/1/2/3).
 ---
 
-> Bu playbook Claude Cowork tarafından sabah session açılışında okunur ve adım adım uygulanır.
-> Her step spesifik komut ve format içerir — vague instruction yoktur.
+> Bu playbook Claude Cowork tarafından **günde 4 kez** invocation ile okunur:
+> - **08:30 Morning Batch** — Step 0-7 (full daily plan)
+> - **13:00 Midday Check** — Step 8 (mention/reply batch — 4-saatlik)
+> - **17:30 Evening Engagement** — Step 9 (Tier 1 outbound + quote opportunities)
+> - **22:00 Closing Note** — Step 10 (analytics + tomorrow seed)
+>
+> **Zorunlu okumalar** (her invocation başı):
+> - `x-algo-rules.md` — algoritma kuralları + crisis keyword listesi
+> - `reply-timing.md` — inbound/outbound timing
+> - `reply-policy.md` — reply içerik politikası (URL/mention/promo kuralları)
+> - `calendar-cold-start.md` — mevcut faz (Hafta 1-2 / 3-4 / 5-8 / ay 3+)
+>
 > Adım sırası önemlidir: önce kriz kontrol, sonra içerik, sonra sync.
 
 ---
@@ -583,6 +593,149 @@ macOS notification:
 ```bash
 osascript -e 'display notification "Day N: X posts queued" with title "cdpilot Twitter" subtitle "Sync: OK"'
 ```
+
+---
+
+## Step 8 — Midday Mention/Reply Batch (13:00 invocation)
+
+> Bu step, **sadece 13:00 invocation'da** çalışır. Sabah ve gece atlanır.
+
+### 8a. Mention scrape (son 4 saat)
+
+```bash
+# cdpilot agent twitter mentions --since 4h
+/opt/homebrew/bin/python3.13 ops/_check_mentions.py --since 4h
+```
+
+Çıktı: JSON list — author, text, tweet_url, age_minutes
+
+### 8b. Crisis filter
+
+Her mention için `x-algo-rules.md` §3 keyword listesi ile match.
+- Match → `crisis: true` etiketi ekle, Telegram'a **🚨 URGENT** prefix
+- Match yok → normal draft kuyruğuna gir
+
+### 8c. Reply draft generation
+
+`reply-timing.md` § Inbound'a göre bekleme süresi hesaplandı mı?
+- Çok erken (15 dk altı) → 30-90 dk daha bekle (jitter)
+- Hazır → reply draft
+- Çok geç (3 saat üstü) → "geç oldu, doğal cevap mümkün değil" işaretle, atma
+
+Draft format:
+- Tier 1 reply ise: değer kat, spesifik yorum
+- Random mention ise: kısa, samimi, soruysa cevap
+- Soru tonu varsa: kesinlikle cevap (engagement boost)
+
+### 8d. Telegram batch
+
+```
+📥 13:00 batch — 4 reply drafts
+
+1. @user1 — "your post on X..."  →  draft: "..."
+2. @user2 — "..."  →  draft: "..."
+...
+[Reply All ✅] [Edit] [Skip]
+```
+
+Onaylananlar 13:30–17:30 arası **stagger ile** atılır (min 20 dk aralık).
+
+---
+
+## Step 9 — Evening Engagement (17:30 invocation)
+
+### 9a. Tier 1 outbound fırsatlar
+
+`engagement-targets.md` Tier 1 hesapların son 4 saatte attığı tweet'ler tara:
+- Yorum katacak fırsat var mı?
+- Soru atılmış mı? (cevap fırsatı)
+- Polemik konu mu? (Crisis filter uygula — varsa Telegram approval)
+
+Reply içeriği `reply-policy.md` §4'e uygun olmalı (link/mention/promo yok).
+
+Draft sayısı: 3-5 reply / 0-1 quote tweet.
+
+### 9a.5 Playwright/Selenium pain monitoring (yeni — soft outreach)
+
+X search ile büyük tartışmaları tara (son 24 saat):
+```
+"playwright stealth" OR "selenium detection" OR "puppeteer captcha"
+  min_replies:50 min_likes:200 -is:retweet
+```
+
+Her bulunan post için `reply-policy.md` §3 üçlü koşulu uygula:
+1. Engagement eşiği geçti mi? (200+ reply VEYA 1000+ like)
+2. Spesifik teknik acı/soru var mı?
+3. cdpilot'un gerçekten farklı yaptığı bir nokta var mı?
+
+3 koşul tutuyorsa draft hazırla, formül `reply-policy.md` §3'te.
+- 4 cümle max
+- 0 URL
+- 0 mention
+- Profile click yetsin
+
+Maks **2 outreach reply/gün** (volume kalitesini öldürür).
+
+Crisis filter (politik/legal/hassas konu) → URGENT escalate.
+
+### 9b. Quote tweet kontrolü
+
+Faz'a göre quote tweet izinli mi?
+- Faz 0 (Hafta 1-2): YOK
+- Faz 0.5+ (Hafta 3+): 1-2/hafta
+- Faz 1+ (Hafta 5+): günde 1-2
+
+Quote tweet seçimi:
+- Tier 1 + dayanılmaz şekilde değer katacak yorum
+- Polemik değil — eklemek, kavga etmek değil
+
+### 9c. Telegram batch
+
+```
+🌆 17:30 batch — 4 reply + 1 quote draft
+
+[outbound Tier 1 replies + quote opportunities]
+[Approve All ✅] [Select] [Skip]
+```
+
+Stagger 17:30–21:00 arası.
+
+---
+
+## Step 10 — Evening Close (22:00 invocation)
+
+### 10a. Bugünün performansı
+
+Analytics scrape — bugün attığımız tüm tweet/reply için:
+- Impression
+- Engagement (reply, RT, like, profile click)
+- Yeni takipçi
+
+Update `~/cdpilot-twitter-data/daily-log.md`:
+```
+## 2026-05-21
+- Tweets: 1 / Replies: 6 / Followers gained: +X
+- Top engagement: [tweet snippet] — 234 impressions, 4 reply, 12 like
+- Bottom engagement: [tweet snippet] — 21 impressions (low)
+```
+
+### 10b. Tomorrow seed
+
+`calendar-cold-start.md` mevcut Faz tema'sından **yarın için 1 tweet konusu önerisi**.
+Sabah 08:30 batch için baseline olacak.
+
+Output: `~/cdpilot-twitter-data/tomorrow-seed.md` (max 100 kelime, sadece tema önerisi).
+
+### 10c. Son acil reply check
+
+Akşam 19:00–22:00 arası bir şey patlamış mı? (Tier 1 hesabımızdan büyük bir paylaşım, viral mention, vb.)
+- Varsa: 1-2 final reply draft, Telegram'a gönder.
+- Yoksa: gece sessiz, sabah devralır.
+
+### 10d. Gece-modu
+
+22:00 sonrası **POSTING YOK** (uyku saatleri sinyali).
+İstisna: crisis durumunda Telegram URGENT → sen karar.
 
 ---
 

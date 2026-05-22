@@ -1,0 +1,10 @@
+[Unit]
+Description=cdpilot Twitter poster — 5 dakikada bir kuyruğu tara
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=cdpilot-poster.service
+
+[Install]
+WantedBy=timers.target

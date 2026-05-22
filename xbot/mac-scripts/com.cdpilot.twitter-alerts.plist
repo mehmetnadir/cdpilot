@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cdpilot.twitter-alerts</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/nadir/01dev/cdpilot/xbot/mac-scripts/check-alerts-mac.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/nadir/cdpilot-twitter-data/logs/alert-watcher.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/nadir/cdpilot-twitter-data/logs/alert-watcher.err.log</string>
+</dict>
+</plist>
+<!--
+KURULUM (Faz 3'te otomasyon açılınca):
+  cp com.cdpilot.twitter-alerts.plist ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.cdpilot.twitter-alerts.plist
+ŞU AN: durdurulmuş (Faz 0/1 manuel-first).
+-->

@@ -1,0 +1,13 @@
+[Unit]
+Description=cdpilot Twitter cycle — günde 4 kez (08:30, 13:00, 17:30, 22:00 TR/Europe-Istanbul)
+
+[Timer]
+OnCalendar=*-*-* 08:30:00 Europe/Istanbul
+OnCalendar=*-*-* 13:00:00 Europe/Istanbul
+OnCalendar=*-*-* 17:30:00 Europe/Istanbul
+OnCalendar=*-*-* 22:00:00 Europe/Istanbul
+Persistent=true
+Unit=cdpilot-cycle.service
+
+[Install]
+WantedBy=timers.target

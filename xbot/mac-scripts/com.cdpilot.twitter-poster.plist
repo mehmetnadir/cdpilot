@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cdpilot.twitter-poster</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/nadir/cdpilot-twitter-data/twikit-venv/bin/python</string>
+    <string>/Users/nadir/01dev/cdpilot/xbot/ops/poster_twikit.py</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/Users/nadir/cdpilot-twitter-data/logs/poster-stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/nadir/cdpilot-twitter-data/logs/poster-stderr.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>

@@ -1,0 +1,26 @@
+{
+  "_doc": "Tier 1: high-signal accounts we watch daily. Tier 2: weekly. Updated by hand or by tools. handle without @.",
+  "_updated": "2026-05-21",
+  "tier1": [
+    {"handle": "addyosmani", "topic": "web perf, devtools", "follow_priority": "high"},
+    {"handle": "paul_irish", "topic": "chrome devtools, CDP", "follow_priority": "high"},
+    {"handle": "ChromeDevTools", "topic": "chrome devtools, puppeteer", "follow_priority": "high"},
+    {"handle": "playwrightweb", "topic": "playwright", "follow_priority": "medium"},
+    {"handle": "browser_use", "topic": "ai browser agents", "follow_priority": "high"},
+    {"handle": "antirez", "topic": "systems, redis", "follow_priority": "medium"},
+    {"handle": "simonw", "topic": "llm tooling, sqlite", "follow_priority": "high"},
+    {"handle": "swyx", "topic": "ai ecosystem", "follow_priority": "medium"}
+  ],
+  "tier2": [
+    {"handle": "anthropicai", "topic": "claude, sdk"},
+    {"handle": "openaidevs", "topic": "openai dev rel"},
+    {"handle": "vercel", "topic": "infra/dev"},
+    {"handle": "supabase", "topic": "infra"},
+    {"handle": "nodejs", "topic": "node"},
+    {"handle": "denoland", "topic": "deno"},
+    {"handle": "bunjavascript", "topic": "bun"},
+    {"handle": "jarred_sumner", "topic": "bun, systems"}
+  ],
+  "blocklist": [],
+  "crisis_skip_handles": []
+}

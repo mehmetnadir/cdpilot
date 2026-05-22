@@ -1,0 +1,11 @@
+[Unit]
+Description=cdpilot Twitter poster (twikit, HTTP-only)
+After=network.target
+
+[Service]
+Type=oneshot
+Environment=CDPILOT_XBOT_DATA=/opt/cdpilot-twitter-bot
+Environment=CDPILOT_TELEGRAM_ENV=/opt/cdpilot-twitter-bot/telegram.env
+ExecStart=/opt/cdpilot-twitter-bot/twikit-venv/bin/python /opt/cdpilot-twitter-bot/ops/poster_twikit.py
+StandardOutput=append:/opt/cdpilot-twitter-bot/logs/poster.log
+StandardError=append:/opt/cdpilot-twitter-bot/logs/poster.log

@@ -1,0 +1,829 @@
+"""telegram_bridge.py — Cowork ↔ Mobile approval pipe.
+
+Two-way Telegram bridge for cdpilot Twitter approval flow:
+  - Outbound: send batch of drafts to user with inline approve/edit/skip buttons
+  - Inbound: poll getUpdates, parse user replies (commands, callback_queries)
+
+Zero deps: pure stdlib (urllib + json). Same philosophy as cdpilot core.
+
+Credentials loaded from ~/cdpilot-twitter-data/telegram.env (chmod 600).
+Never logs the token. Chat-id pinned — only the configured user can drive the bot.
+
+Usage:
+  python3 telegram_bridge.py setup           # auto-detect chat_id from /start
+  python3 telegram_bridge.py send "msg"      # send a plain message
+  python3 telegram_bridge.py batch <file>    # send a structured draft batch (JSON)
+  python3 telegram_bridge.py poll            # one-shot getUpdates dump
+  python3 telegram_bridge.py wait-approval   # block until user clicks a button
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+_DATA = Path(os.environ.get("CDPILOT_XBOT_DATA", str(Path.home() / "cdpilot-twitter-data")))
+ENV_PATH = Path(os.environ.get("CDPILOT_TELEGRAM_ENV", str(_DATA / "telegram.env")))
+STATE_PATH = _DATA / "telegram-state.json"
+PENDING_PATH = _DATA / "telegram-pending.json"
+QUEUE_DIR = _DATA / "queue"
+POSTED_DIR = _DATA / "posted"
+API = "https://api.telegram.org"
+
+
+def _load_env() -> dict:
+    if not ENV_PATH.exists():
+        sys.exit(f"missing {ENV_PATH} — create it with TELEGRAM_BOT_TOKEN first")
+    env = {}
+    for line in ENV_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip()
+    if not env.get("TELEGRAM_BOT_TOKEN"):
+        sys.exit("TELEGRAM_BOT_TOKEN missing in telegram.env")
+    return env
+
+
+def _save_env(env: dict) -> None:
+    lines = [
+        "# cdpilot Twitter Approvals — Telegram Bridge",
+        "# chmod 600. NEVER commit. NEVER share.",
+        f"TELEGRAM_BOT_TOKEN={env.get('TELEGRAM_BOT_TOKEN', '')}",
+        f"TELEGRAM_BOT_USERNAME={env.get('TELEGRAM_BOT_USERNAME', '')}",
+        "# TELEGRAM_CHAT_ID populated by ops/telegram_setup.py after user /start",
+        f"TELEGRAM_CHAT_ID={env.get('TELEGRAM_CHAT_ID', '')}",
+    ]
+    ENV_PATH.write_text("\n".join(lines) + "\n")
+    os.chmod(ENV_PATH, 0o600)
+
+
+def _api(env: dict, method: str, params: dict | None = None, timeout: int = 30) -> dict:
+    """POST to Telegram Bot API. Returns parsed JSON or raises."""
+    url = f"{API}/bot{env['TELEGRAM_BOT_TOKEN']}/{method}"
+    data = json.dumps(params or {}).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read().decode())
+    if not body.get("ok"):
+        raise RuntimeError(f"Telegram API {method} failed: {body.get('description')}")
+    return body.get("result", {})
+
+
+def _load_state() -> dict:
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text())
+        except (OSError, ValueError):
+            pass
+    return {"last_update_id": 0}
+
+
+def _save_state(state: dict) -> None:
+    STATE_PATH.write_text(json.dumps(state, indent=2))
+    os.chmod(STATE_PATH, 0o600)
+
+
+def _load_pending() -> dict:
+    """Map of {message_id (str): draft_dict} for daemon to process."""
+    if PENDING_PATH.exists():
+        try:
+            return json.loads(PENDING_PATH.read_text())
+        except (OSError, ValueError):
+            pass
+    return {}
+
+
+def _save_pending(pending: dict) -> None:
+    PENDING_PATH.write_text(json.dumps(pending, ensure_ascii=False, indent=2))
+    os.chmod(PENDING_PATH, 0o600)
+    # Best-effort sync to srv21 so the daemon there has the same view.
+    remote = os.environ.get("CDPILOT_PENDING_RSYNC",
+                            "srv21:/opt/cdpilot-twitter-bot/telegram-pending.json")
+    if remote and os.environ.get("CDPILOT_PENDING_RSYNC_DISABLE") != "1":
+        try:
+            import subprocess
+            subprocess.run(
+                ["rsync", "-a", str(PENDING_PATH), remote],
+                check=False, timeout=15, capture_output=True,
+            )
+        except Exception:
+            pass
+
+
+def _register_pending(message_id: int, draft: dict) -> None:
+    """Persist a draft as pending so daemon can act on its callback later."""
+    pending = _load_pending()
+    pending[str(message_id)] = {
+        "draft_id": draft["id"],
+        "draft": draft,
+        "registered_at": int(time.time()),
+    }
+    _save_pending(pending)
+
+
+def _resolve_pending(message_id: int) -> dict | None:
+    """Lookup + remove the pending draft for a given message_id."""
+    pending = _load_pending()
+    rec = pending.pop(str(message_id), None)
+    _save_pending(pending)
+    return rec
+
+
+def cmd_setup() -> None:
+    """Auto-detect chat_id from the most recent /start.
+
+    User MUST send /start (or any message) to the bot before this runs.
+    Pulls getUpdates, picks the latest private chat that messaged us.
+    """
+    env = _load_env()
+    print("Fetching updates from Telegram...")
+    updates = _api(env, "getUpdates", {"timeout": 1, "limit": 50})
+
+    candidates: list[tuple[int, str]] = []
+    for u in updates:
+        msg = u.get("message") or u.get("edited_message") or {}
+        chat = msg.get("chat") or {}
+        if chat.get("type") == "private":
+            candidates.append((chat["id"], chat.get("username") or chat.get("first_name", "?")))
+
+    if not candidates:
+        sys.exit("No private messages found. Open https://t.me/{} and send /start, then re-run.".format(
+            env.get("TELEGRAM_BOT_USERNAME", "your-bot")))
+
+    chat_id, who = candidates[-1]
+    env["TELEGRAM_CHAT_ID"] = str(chat_id)
+    _save_env(env)
+    print(f"Linked chat_id={chat_id} (user={who})")
+    print("Sending test message...")
+    _api(env, "sendMessage", {
+        "chat_id": chat_id,
+        "text": (
+            "🤖 *cdpilot Twitter Onay Sistemi* — köprü bağlandı.\n"
+            "Buradan tweet/reply taslakları için onay batch'leri alacaksın.\n\n"
+            "_İçerik dili:_ İngilizce (X paylaşımları)\n"
+            "_Arayüz dili:_ Türkçe (bu mesajlar, butonlar)\n"
+        ),
+        "parse_mode": "Markdown",
+    })
+    print("Done.")
+
+
+def cmd_send(text: str) -> None:
+    env = _load_env()
+    if not env.get("TELEGRAM_CHAT_ID"):
+        sys.exit("TELEGRAM_CHAT_ID not set — run: telegram_bridge.py setup")
+    # Plain sender — no Markdown parse to avoid escape headaches on URLs etc.
+    _api(env, "sendMessage", {
+        "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+        "text": text,
+        "disable_web_page_preview": True,
+    })
+    print("sent")
+
+
+def cmd_draft(json_path: str) -> None:
+    """Send a SINGLE draft as one message with Approve/Skip buttons.
+
+    User can press a button OR reply to the message with corrected text (= edit).
+
+    Expected JSON:
+    {
+      "id": "fz0-1",
+      "kind": "tweet|reply|quote|thread|follow|like|retweet",
+      "to": "@username" (optional, for reply/quote),
+      "context": "neden bu tweet" (TR, kullanıcıya),
+      "text_tr": "Türkçe önizleme (sen okursun)",
+      "text": "English post (atılacak metin)"
+    }
+
+    Prints: {"draft_id": "...", "message_id": N}  (Cowork bunu wait-decision'a verir)
+    """
+    env = _load_env()
+    if not env.get("TELEGRAM_CHAT_ID"):
+        sys.exit("TELEGRAM_CHAT_ID not set — run: telegram_bridge.py setup")
+
+    d = json.loads(Path(json_path).read_text())
+    did = d["id"]
+
+    kind_tr = {"tweet": "yeni tweet", "reply": "yanıt", "quote": "alıntı tweet",
+               "thread": "thread", "follow": "takip", "like": "beğeni",
+               "retweet": "retweet"}
+    prefix = "🐦" if d.get("kind") == "tweet" else ("💬" if d.get("kind") == "reply" else "🔁")
+    kind_label = kind_tr.get(d.get("kind", ""), d.get("kind", "öğe"))
+    target = f" → {d.get('to')}" if d.get("to") else ""
+    ctx = f"\n_bağlam:_ {d['context']}\n" if d.get("context") else ""
+    tr_preview = d.get("text_tr") or d.get("text", "")
+    en_post = d.get("text", "")
+
+    # Plain text — Telegram Markdown is too brittle for arbitrary tweet content
+    # (underscores in code, asymmetric backticks, parens in italic markers, etc).
+    body = f"{prefix} {kind_label}{target}  · {did}\n"
+    if d.get("context"):
+        body += f"bağlam: {d['context']}\n"
+    body += f"\n📖 türkçe önizleme:\n{tr_preview}\n"
+    if d.get("text_tr") and en_post and en_post != tr_preview:
+        body += f"\n🐦 atılacak (EN):\n{en_post}\n"
+    if d.get("followup_text"):
+        body += f"\n🔗 ilk reply (URL):\n{d['followup_text']}\n"
+    body += "\n— düzeltmek için: bu mesaja reply yap, doğru metni yaz —"
+
+    # Generate image on-demand if draft has image_content
+    image_path = d.get("image_path")
+    if not image_path and d.get("image_content"):
+        try:
+            from image_gen import generate as _img_generate  # type: ignore
+        except ImportError:
+            sys.path.insert(0, str(Path(__file__).parent))
+            from image_gen import generate as _img_generate  # type: ignore
+        try:
+            img_id = f"draft-{did}"
+            img_out = _img_generate(img_id, d["image_content"],
+                                    title=d.get("image_title"),
+                                    size=d.get("image_size", "1080x1080"))
+            image_path = img_out["path"]
+            d["image_path"] = image_path
+        except Exception as e:
+            sys.stderr.write(f"image gen failed for {did}: {e}\n")
+
+    # Build button rows — add regen + no-image when an image is present
+    if image_path:
+        rows = [
+            [{"text": "✅ Onayla", "callback_data": f"approve:{did}"},
+             {"text": "🔁 Yeni görsel", "callback_data": f"regen:{did}"}],
+            [{"text": "📝 Görselsiz at", "callback_data": f"noimage:{did}"},
+             {"text": "⏭ Geç", "callback_data": f"skip:{did}"}],
+        ]
+    else:
+        rows = [[
+            {"text": "✅ Onayla", "callback_data": f"approve:{did}"},
+            {"text": "⏭ Geç", "callback_data": f"skip:{did}"},
+        ]]
+
+    # If image generated locally, mirror to srv21 so the daemon (which runs there)
+    # can reference the same path when queueing for poster.
+    if image_path and Path(image_path).exists():
+        remote_root = os.environ.get(
+            "CDPILOT_IMAGE_RSYNC_ROOT", "srv21:/opt/cdpilot-twitter-bot/images/")
+        if remote_root and os.environ.get("CDPILOT_IMAGE_RSYNC_DISABLE") != "1":
+            try:
+                import subprocess
+                subprocess.run(["rsync", "-a", str(image_path), remote_root],
+                               check=False, timeout=20, capture_output=True)
+                # Translate path: srv21 sees it at /opt/cdpilot-twitter-bot/images/<name>
+                d["image_path"] = f"/opt/cdpilot-twitter-bot/images/{Path(image_path).name}"
+            except Exception as e:
+                sys.stderr.write(f"image rsync to srv21 failed: {e}\n")
+
+    if image_path and Path(image_path).exists():
+        # sendPhoto with caption + inline buttons
+        result = _send_photo(env, int(env["TELEGRAM_CHAT_ID"]), image_path,
+                              caption=body[:1024], reply_markup={"inline_keyboard": rows})
+    else:
+        result = _api(env, "sendMessage", {
+            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+            "text": body[:4000],
+            "reply_markup": {"inline_keyboard": rows},
+            "disable_web_page_preview": True,
+        })
+    msg_id = result.get("message_id")
+    # Register so the daemon can act on user's later button press/reply.
+    if msg_id is not None:
+        _register_pending(msg_id, d)
+    print(json.dumps({"draft_id": did, "message_id": msg_id}))
+
+
+def _send_photo(env: dict, chat_id: int, photo_path: str, *,
+                caption: str = "", reply_markup: dict | None = None,
+                timeout: int = 60) -> dict:
+    """sendPhoto via multipart/form-data (stdlib only)."""
+    import secrets
+    boundary = "----cdpilotbnd" + secrets.token_hex(8)
+    parts: list[bytes] = []
+
+    def _field(name: str, value: str):
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; "
+                     f"name=\"{name}\"\r\n\r\n{value}\r\n".encode())
+
+    _field("chat_id", str(chat_id))
+    if caption:
+        _field("caption", caption)
+    if reply_markup is not None:
+        _field("reply_markup", json.dumps(reply_markup))
+
+    with open(photo_path, "rb") as f:
+        photo_bytes = f.read()
+    fname = Path(photo_path).name
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; "
+        f"filename=\"{fname}\"\r\nContent-Type: image/png\r\n\r\n".encode()
+    )
+    parts.append(photo_bytes)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+
+    url = f"{API}/bot{env['TELEGRAM_BOT_TOKEN']}/sendPhoto"
+    req = urllib.request.Request(url, data=body, headers={
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        data = json.loads(e.read().decode())
+    if not data.get("ok"):
+        raise RuntimeError(f"sendPhoto failed: {data.get('description')}")
+    return data.get("result", {})
+
+
+def _schedule_time_for(now_ts: float, kind: str, index: int) -> int:
+    """Plan a scheduled_time for a draft post.
+
+    Rules (basic, Faz 2 makul defaults):
+      - First draft of the day: next peak window (16:00-19:00 TR or 22:00-01:00 TR)
+      - Subsequent drafts: previous + 4-8h Gauss jitter
+      - Replies: 30-90 min after now (faster than tweets)
+      - Never schedule between 23:00-08:00 TR (night quiet window)
+
+    Caller can override by including `scheduled_time` in the draft JSON.
+    """
+    import datetime
+    import random
+    tz_offset = 3 * 3600  # TR
+    now = datetime.datetime.fromtimestamp(now_ts + tz_offset, tz=datetime.timezone.utc)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    peak1_start = today + datetime.timedelta(hours=16)
+    peak1_end = today + datetime.timedelta(hours=19)
+    peak2_start = today + datetime.timedelta(hours=22)
+    quiet_end = today + datetime.timedelta(hours=8)  # next morning
+    if kind in ("reply", "quote"):
+        # 30-90 min from now, jittered
+        delta = random.randint(30 * 60, 90 * 60)
+        sched = now + datetime.timedelta(seconds=delta)
+    else:
+        # Tweet: target peak window
+        if now < peak1_start:
+            base = peak1_start + datetime.timedelta(minutes=random.randint(0, 180))
+        elif now < peak1_end:
+            base = now + datetime.timedelta(minutes=random.randint(10, 60))
+        elif now < peak2_start:
+            base = peak2_start + datetime.timedelta(minutes=random.randint(0, 90))
+        else:
+            # Past peak2 — schedule for tomorrow peak1
+            tomorrow_peak1 = peak1_start + datetime.timedelta(days=1)
+            base = tomorrow_peak1 + datetime.timedelta(minutes=random.randint(0, 180))
+        # Index-based spacing — multi-tweets spread across days
+        base += datetime.timedelta(hours=index * 18 + random.randint(-3, 3))
+        sched = base
+    # Quiet hours guard
+    if 23 <= sched.hour or sched.hour < 8:
+        sched = sched.replace(hour=9, minute=random.randint(0, 59))
+        if sched < now:
+            sched += datetime.timedelta(days=1)
+    return int(sched.timestamp() - tz_offset)
+
+
+def _queue_draft(d: dict, decision: dict, idx: int) -> Path:
+    """Write an approved draft to local queue/<id>.json + auto-rsync to srv21.
+
+    Local file goes to ~/cdpilot-twitter-data/queue/.
+    If CDPILOT_QUEUE_RSYNC is set (e.g. 'srv21:/opt/cdpilot-twitter-bot/queue/'),
+    the file is also pushed there immediately after write. Server-side systemd
+    timer (cdpilot-poster.timer) picks it up within 5 minutes.
+    """
+    QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    final_text = decision.get("edited_text") or d.get("text", "")
+    item = {
+        "id": d["id"],
+        "kind": d.get("kind", "tweet"),
+        "to": d.get("to"),
+        "text": final_text,
+        "context": d.get("context"),
+        "status": "pending",
+        "approved_at": int(time.time()),
+        "scheduled_time": d.get("scheduled_time") or _schedule_time_for(
+            time.time(), d.get("kind", "tweet"), idx
+        ),
+        "edited": bool(decision.get("edited_text")),
+    }
+    if d.get("followup_text"):
+        item["followup_text"] = d["followup_text"]
+    if d.get("image_path"):
+        item["image_path"] = d["image_path"]
+    p = QUEUE_DIR / f"{d['id']}.json"
+    p.write_text(json.dumps(item, ensure_ascii=False, indent=2))
+
+    # Auto-rsync to remote queue (best-effort)
+    remote = os.environ.get("CDPILOT_QUEUE_RSYNC", "srv21:/opt/cdpilot-twitter-bot/queue/")
+    if remote:
+        try:
+            import subprocess
+            subprocess.run(
+                ["rsync", "-a", str(p), remote],
+                check=False, timeout=20, capture_output=True,
+            )
+        except Exception:
+            pass
+    return p
+
+
+def cmd_batch_seq(json_path: str) -> None:
+    """Sequential batch helper: send N drafts one-by-one, wait for each decision.
+
+    On approve (or edit), the draft is automatically queued to
+    ~/cdpilot-twitter-data/queue/<id>.json with a scheduled_time chosen
+    according to peak windows + jitter + per-kind rules. The local posting
+    worker (cdpilot-twitter-poster.plist) picks them up at scheduled_time.
+
+    Designed to be called by Cowork as the daily orchestrator.
+    """
+    env = _load_env()
+    if not env.get("TELEGRAM_CHAT_ID"):
+        sys.exit("TELEGRAM_CHAT_ID not set — run: telegram_bridge.py setup")
+
+    data = json.loads(Path(json_path).read_text())
+    label = data.get("label", "Batch")
+    drafts = data["drafts"]
+    timeout_per = int(data.get("timeout_per_draft", 7200))
+
+    _api(env, "sendMessage", {
+        "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+        "text": f"📬 *{label}*\n{len(drafts)} taslak sırayla gelecek. Her birine ayrı karar ver.",
+        "parse_mode": "Markdown",
+    })
+
+    decisions = []
+    queued = 0
+    for idx, d in enumerate(drafts):
+        tmp = Path(f"/tmp/draft-{d['id']}.json")
+        tmp.write_text(json.dumps(d))
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_draft(str(tmp))
+        send_out = json.loads(buf.getvalue().strip())
+        msg_id = send_out["message_id"]
+        dec = _wait_one_decision(env, d["id"], msg_id, timeout_per)
+        decisions.append(dec)
+        tmp.unlink(missing_ok=True)
+
+        # AUTO-QUEUE on approve/edit
+        if dec.get("action") in ("approve", "edit"):
+            qp = _queue_draft(d, dec, idx)
+            queued += 1
+            # Notify scheduled time back
+            sched_iso = time.strftime("%Y-%m-%d %H:%M", time.localtime(json.loads(qp.read_text())["scheduled_time"]))
+            try:
+                _api(env, "sendMessage", {
+                    "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+                    "text": f"📥 `{d['id']}` kuyrukta — planlanan: *{sched_iso}*",
+                    "parse_mode": "Markdown",
+                })
+            except Exception:
+                pass
+
+        if dec.get("action") == "abort":
+            break
+
+    # Summary
+    try:
+        _api(env, "sendMessage", {
+            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+            "text": (
+                f"🏁 *Batch tamamlandı:* `{label}`\n"
+                f"Onaylanan: {sum(1 for x in decisions if x['action'] in ('approve','edit'))} · "
+                f"Geçilen: {sum(1 for x in decisions if x['action']=='skip')} · "
+                f"Kuyrukta: {queued}"
+            ),
+            "parse_mode": "Markdown",
+        })
+    except Exception:
+        pass
+    print(json.dumps({"label": label, "decisions": decisions, "queued": queued}, ensure_ascii=False, indent=2))
+
+
+def _wait_one_decision(env: dict, draft_id: str, message_id: int, timeout_sec: int) -> dict:
+    """Block until user makes a decision on draft `draft_id` (msg `message_id`).
+
+    Decision is one of:
+      - {action: approve, draft_id}             — button ✅
+      - {action: skip, draft_id}                — button ⏭
+      - {action: edit, draft_id, edited_text}   — user replied to the message
+      - {action: timeout, draft_id}             — elapsed without decision
+      - {action: abort, draft_id}               — user sent /stop
+
+    Edits original message to reflect the decision (strips buttons + adds status line).
+    """
+    state = _load_state()
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        wait = min(50, max(1, int(deadline - time.time())))
+        updates = _api(env, "getUpdates", {
+            "timeout": wait, "offset": state["last_update_id"] + 1, "limit": 20,
+        })
+        if updates:
+            state["last_update_id"] = max(u["update_id"] for u in updates)
+            _save_state(state)
+        for u in updates:
+            # /stop = abort
+            msg = u.get("message") or u.get("edited_message") or {}
+            if msg.get("text", "").strip().lower() in ("/stop", "/iptal", "/dur"):
+                return {"action": "abort", "draft_id": draft_id}
+
+            # Reply to our draft message = edit
+            reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+            if reply_to == message_id and msg.get("text"):
+                new_text = msg["text"]
+                _edit_msg_status(env, message_id, "✏️ Düzeltildi", suffix=f"\n_yeni metin:_\n```\n{new_text}\n```")
+                return {"action": "edit", "draft_id": draft_id, "edited_text": new_text}
+
+            cb = u.get("callback_query")
+            if not cb:
+                continue
+            data = cb.get("data", "")
+            parts = data.split(":", 1)
+            action = parts[0]
+            cb_did = parts[1] if len(parts) > 1 else ""
+            if cb_did != draft_id:
+                _api(env, "answerCallbackQuery", {"callback_query_id": cb["id"], "text": "stale"})
+                continue
+            action_tr = {"approve": "✅ Onaylandı", "skip": "⏭ Geçildi"}.get(action, action)
+            _api(env, "answerCallbackQuery", {"callback_query_id": cb["id"], "text": action_tr})
+            _edit_msg_status(env, message_id, action_tr)
+            return {"action": action, "draft_id": draft_id}
+    return {"action": "timeout", "draft_id": draft_id}
+
+
+def _edit_msg_status(env: dict, message_id: int, status: str, suffix: str = "") -> None:
+    """Update an existing draft message: strip buttons, append status line."""
+    chat_id = int(env["TELEGRAM_CHAT_ID"])
+    now_hm = time.strftime("%H:%M")
+    # First, remove the buttons (works even if text edit fails)
+    try:
+        _api(env, "editMessageReplyMarkup", {
+            "chat_id": chat_id, "message_id": message_id,
+            "reply_markup": {"inline_keyboard": []},
+        })
+    except Exception:
+        pass
+    # Then try to append status (best-effort; Markdown may fail on edge cases)
+    try:
+        _api(env, "sendMessage", {
+            "chat_id": chat_id,
+            "text": f"— *{status}* — {now_hm}{suffix}",
+            "parse_mode": "Markdown",
+            "reply_to_message_id": message_id,
+            "disable_web_page_preview": True,
+        })
+    except Exception:
+        pass
+
+
+def cmd_wait_decision(draft_id: str, message_id: int, timeout: int) -> None:
+    """One-shot wait for a single draft's decision. Prints JSON, exits."""
+    env = _load_env()
+    dec = _wait_one_decision(env, draft_id, message_id, timeout)
+    print(json.dumps(dec, ensure_ascii=False))
+    sys.exit({"approve": 0, "skip": 2, "edit": 3, "timeout": 1, "abort": 4}.get(dec["action"], 1))
+
+
+def cmd_poll(timeout: int = 1) -> None:
+    """One-shot dump of pending updates (debug)."""
+    env = _load_env()
+    state = _load_state()
+    updates = _api(env, "getUpdates", {
+        "timeout": timeout, "offset": state["last_update_id"] + 1, "limit": 50,
+    })
+    if updates:
+        state["last_update_id"] = max(u["update_id"] for u in updates)
+        _save_state(state)
+    print(json.dumps(updates, indent=2, ensure_ascii=False))
+
+
+def cmd_daemon(idle_timeout: int = 50) -> None:
+    """Long-running poller that processes approval callbacks for any pending draft.
+
+    Drafts created via `draft` are persisted to telegram-pending.json keyed by
+    message_id. When user presses Approve/Skip or replies (= edit), we look up
+    the original draft and queue it (approve/edit) or drop it (skip).
+
+    Designed to run forever under systemd. SIGINT/SIGTERM stops cleanly.
+
+    State file lifecycle:
+      - draft sent → pending[message_id] = {draft_id, draft, registered_at}
+      - approve/edit → _queue_draft(...) + remove pending entry
+      - skip → remove pending entry
+    """
+    import signal
+    env = _load_env()
+    state = _load_state()
+    stop = {"flag": False}
+
+    def _handler(signum, frame):
+        stop["flag"] = True
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
+
+    sys.stderr.write(f"[daemon] started, polling every ~{idle_timeout}s\n")
+    sys.stderr.flush()
+
+    while not stop["flag"]:
+        try:
+            updates = _api(env, "getUpdates", {
+                "timeout": idle_timeout,
+                "offset": state["last_update_id"] + 1,
+                "limit": 30,
+            }, timeout=idle_timeout + 10)
+        except Exception as e:
+            sys.stderr.write(f"[daemon] poll error: {e}\n")
+            time.sleep(5)
+            continue
+
+        if updates:
+            state["last_update_id"] = max(u["update_id"] for u in updates)
+            _save_state(state)
+
+        for u in updates:
+            try:
+                _process_update(env, u)
+            except Exception as e:
+                sys.stderr.write(f"[daemon] update process error: {e}\n")
+
+    sys.stderr.write("[daemon] stopped cleanly\n")
+
+
+def _process_update(env: dict, u: dict) -> None:
+    """Handle one Telegram update against the pending-drafts state file."""
+    msg = u.get("message") or u.get("edited_message") or {}
+
+    # /stop or /iptal — abort EVERY pending draft
+    if msg.get("text", "").strip().lower() in ("/stop", "/iptal", "/dur"):
+        pending = _load_pending()
+        if pending:
+            _api(env, "sendMessage", {
+                "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+                "text": f"⛔ {len(pending)} bekleyen taslak iptal edildi.",
+            })
+            _save_pending({})
+        return
+
+    # Reply to a pending draft = edit
+    reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+    if reply_to:
+        rec = _resolve_pending(reply_to)
+        if rec and msg.get("text"):
+            new_text = msg["text"]
+            _edit_msg_status(env, reply_to, "✏️ Düzeltildi",
+                             suffix=f"\n_yeni metin:_\n```\n{new_text}\n```")
+            _queue_and_notify(env, rec["draft"],
+                              {"action": "edit", "edited_text": new_text})
+        return
+
+    cb = u.get("callback_query")
+    if not cb:
+        return
+    cb_msg_id = (cb.get("message") or {}).get("message_id")
+    data = cb.get("data", "")
+    parts = data.split(":", 1)
+    action = parts[0]
+
+    rec = _resolve_pending(cb_msg_id) if cb_msg_id else None
+    if not rec:
+        try:
+            _api(env, "answerCallbackQuery",
+                 {"callback_query_id": cb["id"], "text": "stale"})
+        except Exception:
+            pass
+        return
+
+    action_tr = {
+        "approve": "✅ Onaylandı",
+        "skip": "⏭ Geçildi",
+        "regen": "🔁 Yeni görsel üretiliyor…",
+        "noimage": "📝 Görselsiz atılacak",
+    }.get(action, action)
+    # Best-effort ack — query may be expired ("query is too old"); don't lose the draft over it.
+    try:
+        _api(env, "answerCallbackQuery",
+             {"callback_query_id": cb["id"], "text": action_tr})
+    except Exception:
+        pass
+
+    if action == "regen":
+        # Re-generate image for the same draft, post a fresh card.
+        draft = rec["draft"]
+        try:
+            sys.path.insert(0, str(Path(__file__).parent))
+            from image_gen import generate as _img_generate  # type: ignore
+            img_id = f"draft-{draft['id']}-r{int(time.time())}"
+            img_out = _img_generate(img_id, draft.get("image_content", ""),
+                                    title=draft.get("image_title"),
+                                    size=draft.get("image_size", "1080x1080"))
+            draft["image_path"] = img_out["path"]
+        except Exception as e:
+            sys.stderr.write(f"[daemon] regen failed: {e}\n")
+            _api(env, "sendMessage", {
+                "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+                "text": f"🔴 görsel üretilemedi: {str(e)[:200]}",
+                "reply_to_message_id": cb_msg_id,
+            })
+            # Re-register so user can try again
+            _register_pending(cb_msg_id, draft)
+            return
+        # Edit old message status; send fresh card with new image
+        try:
+            _edit_msg_status(env, cb_msg_id, "🔁 Yeni görsel")
+        except Exception:
+            pass
+        # Reissue cmd_draft pipeline manually — write temp + call cmd_draft
+        import tempfile
+        tmp = Path(tempfile.gettempdir()) / f"draft-{draft['id']}-{int(time.time())}.json"
+        tmp.write_text(json.dumps(draft, ensure_ascii=False))
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_draft(str(tmp))
+        tmp.unlink(missing_ok=True)
+        return
+
+    try:
+        _edit_msg_status(env, cb_msg_id, action_tr)
+    except Exception:
+        pass
+
+    if action == "approve":
+        _queue_and_notify(env, rec["draft"], {"action": "approve"})
+    elif action == "noimage":
+        d = dict(rec["draft"])
+        d.pop("image_path", None)
+        d.pop("image_content", None)
+        _queue_and_notify(env, d, {"action": "approve"})
+    # skip = nothing to queue
+
+
+def _queue_and_notify(env: dict, draft: dict, decision: dict) -> None:
+    """Queue an approved/edited draft, notify Telegram with the scheduled time."""
+    qp = _queue_draft(draft, decision, idx=0)
+    try:
+        sched_ts = json.loads(qp.read_text())["scheduled_time"]
+        sched_iso = time.strftime("%Y-%m-%d %H:%M", time.localtime(sched_ts))
+    except Exception:
+        sched_iso = "?"
+    try:
+        _api(env, "sendMessage", {
+            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+            "text": f"📥 `{draft['id']}` kuyrukta — planlanan: *{sched_iso}*",
+            "parse_mode": "Markdown",
+        })
+    except Exception:
+        pass
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Telegram bridge for cdpilot Twitter approvals")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("setup", help="auto-detect chat_id from /start")
+    s_send = sub.add_parser("send", help="send a plain message")
+    s_send.add_argument("text")
+    s_draft = sub.add_parser("draft", help="send a SINGLE draft (JSON file)")
+    s_draft.add_argument("json_path")
+    s_seq = sub.add_parser("batch-seq", help="send N drafts sequentially, wait on each (orchestrator)")
+    s_seq.add_argument("json_path")
+    s_wait1 = sub.add_parser("wait-decision", help="wait for one draft's decision (approve/skip/edit)")
+    s_wait1.add_argument("draft_id")
+    s_wait1.add_argument("message_id", type=int)
+    s_wait1.add_argument("--timeout", type=int, default=7200)
+    s_poll = sub.add_parser("poll", help="one-shot getUpdates dump")
+    s_poll.add_argument("--timeout", type=int, default=1)
+    s_daemon = sub.add_parser("daemon", help="long-running approval-loop daemon")
+    s_daemon.add_argument("--idle-timeout", type=int, default=50)
+    args = p.parse_args()
+    if args.cmd == "setup":
+        cmd_setup()
+    elif args.cmd == "send":
+        cmd_send(args.text)
+    elif args.cmd == "draft":
+        cmd_draft(args.json_path)
+    elif args.cmd == "batch-seq":
+        cmd_batch_seq(args.json_path)
+    elif args.cmd == "wait-decision":
+        cmd_wait_decision(args.draft_id, args.message_id, args.timeout)
+    elif args.cmd == "poll":
+        cmd_poll(args.timeout)
+    elif args.cmd == "daemon":
+        cmd_daemon(args.idle_timeout)
+
+
+if __name__ == "__main__":
+    main()
