@@ -15,3 +15,11 @@ xbot/*.env
 xbot/telegram.env
 # Twitter bot — lokal profil yedek
 .cdpilot-backup-twitter-profile/
+# Claude runtime + local skill cache (not part of project)
+.claude/scheduled_tasks.lock
+.claude/skills/
+# Misplaced Next.js scaffolding from a wrong-cwd accident — real files live in cdpilot-site/
+content/
+src/app/
+src/components/
+src/lib/
