@@ -14,7 +14,7 @@ Environment:
   CDPILOT_PROFILE      Isolated browser profile directory
 """
 
-__version__ = "0.6.0"
+__version__ = "0.8.0"
 
 import asyncio
 import atexit
@@ -1561,6 +1561,13 @@ BROWSER_BINARIES = {
     'chromium': {'Darwin':  ["/Applications/Chromium.app/Contents/MacOS/Chromium"],
                  'Linux':   ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium"],
                  'Windows': [os.path.expandvars(r"C:\Program Files\Chromium\Application\chromium.exe")]},
+    # v0.8.0 NOTE: there is currently no Chromium-based TLS-corrected browser
+    # that ships as a standalone binary with --remote-debugging-port. Camoufox
+    # is Firefox+Juggler (no CDP). Patchright/undetected-chromedriver are
+    # Playwright/Python wrappers, not standalone browsers. cdpilot's CDP-only
+    # architecture is incompatible with all of them without an adapter.
+    # TLS-correction roadmap is v0.9: either ship a thin TLS-MITM plugin
+    # (curl-impersonate semantics) or build our own BoringSSL-patched Chromium.
 }
 
 BROWSER_CONFIG_FILE = os.path.join(CDPILOT_HOME, 'browser.json')
@@ -1831,19 +1838,112 @@ async def inject_dev_extension_scripts(ws_url, page_url):
         print(f"  Dev extension scripts injected: {', '.join(injected)}")
 
 
-def get_proxy_config():
-    """Read proxy configuration."""
-    proxy = os.environ.get('CHROME_PROXY', '')
-    if proxy:
-        return proxy
+def _proxy_config_raw():
+    """Return raw proxy config dict ({'active': str|None, 'pools': {...}, 'proxy': legacy_url})."""
     if os.path.exists(PROXY_CONFIG_FILE):
         try:
             with open(PROXY_CONFIG_FILE) as f:
-                data = json.load(f)
-            return data.get('proxy', '')
-        except:
+                return json.load(f) or {}
+        except (OSError, ValueError):
             pass
-    return ''
+    return {}
+
+
+def get_proxy_config():
+    """Read effective proxy URL.
+
+    Resolution order (v0.7.0):
+      1. CHROME_PROXY env var (highest priority — bench/CI override)
+      2. Active named pool (`{"active": "<name>", "pools": {...}}`)
+      3. Legacy `{"proxy": "<url>"}` (backward compat)
+    """
+    proxy = os.environ.get('CHROME_PROXY', '')
+    if proxy:
+        return proxy
+    data = _proxy_config_raw()
+    # New schema: active pool
+    active = data.get('active')
+    pools = data.get('pools') or {}
+    if active and active in pools:
+        return pools[active].get('url', '')
+    # Legacy fallback
+    return data.get('proxy', '')
+
+
+def _proxy_pools():
+    """Return the named pool dict."""
+    return _proxy_config_raw().get('pools') or {}
+
+
+def _proxy_active_name():
+    """Return the active pool name, or None."""
+    data = _proxy_config_raw()
+    if data.get('active') and data['active'] in (data.get('pools') or {}):
+        return data['active']
+    return None
+
+
+def _proxy_save(data):
+    """Atomically persist proxy config."""
+    os.makedirs(os.path.dirname(PROXY_CONFIG_FILE), exist_ok=True)
+    _atomic_write_json(PROXY_CONFIG_FILE, data)
+
+
+def _proxy_add_pool(name, url, geo=None, sticky=False):
+    data = _proxy_config_raw()
+    pools = data.get('pools') or {}
+    entry = {'url': url}
+    if geo:
+        entry['geo'] = geo
+    if sticky:
+        entry['sticky'] = True
+    pools[name] = entry
+    data['pools'] = pools
+    _proxy_save(data)
+
+
+def _proxy_remove_pool(name):
+    data = _proxy_config_raw()
+    pools = data.get('pools') or {}
+    if name not in pools:
+        return False
+    del pools[name]
+    data['pools'] = pools
+    if data.get('active') == name:
+        data['active'] = None
+    _proxy_save(data)
+    return True
+
+
+def _proxy_set_active(name_or_none):
+    data = _proxy_config_raw()
+    pools = data.get('pools') or {}
+    if name_or_none is None:
+        data['active'] = None
+    elif name_or_none in pools:
+        data['active'] = name_or_none
+    else:
+        return False
+    _proxy_save(data)
+    return True
+
+
+def _proxy_redact(url):
+    """Strip credentials from a proxy URL for safe display."""
+    if not url:
+        return ''
+    try:
+        from urllib.parse import urlparse, urlunparse
+        p = urlparse(url)
+        if p.username or p.password:
+            host = p.hostname or ''
+            if p.port:
+                host = f"{host}:{p.port}"
+            netloc = f"***:***@{host}"
+            return urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+        return url
+    except Exception:
+        return url
 
 def get_headless_config():
     """Return whether headless mode is active."""
@@ -2108,8 +2208,8 @@ async def cmd_go(url):
         except Exception as e:
             sys.stderr.write(f"⚠️  Adaptive: isolated context failed ({e}), using default tab\n")
 
-    # --- COOKIES AUTO PRE-NAVIGATE ---
-    if _cookies_auto_enabled() and expected_host:
+    # --- COOKIES AUTO PRE-NAVIGATE (v0.6.1: safe-host scoped) ---
+    if _cookies_auto_should_apply(expected_host):
         try:
             cached = _load_host_cookies(expected_host)
             if cached:
@@ -2173,8 +2273,8 @@ async def cmd_go(url):
         except Exception:
             pass
 
-        # --- COOKIES AUTO POST-NAVIGATE ---
-        if _cookies_auto_enabled() and expected_host:
+        # --- COOKIES AUTO POST-NAVIGATE (v0.6.1: safe-host scoped) ---
+        if _cookies_auto_should_apply(expected_host):
             try:
                 r2 = await cdp_send(active_ws, [(912, 'Network.getCookies', {})])
                 all_c = r2.get(912, {}).get('cookies', [])
@@ -3063,20 +3163,77 @@ def _load_host_cookies(host):
         return None
 
 
-def _cookies_auto_enabled():
-    """Return True if cookie auto-persistence is enabled."""
+def _cookies_auto_config():
+    """Return the cookies-auto config dict ({'enabled': bool, 'safe_hosts': [str]})."""
     if not os.path.exists(COOKIES_AUTO_CONFIG_FILE):
-        return False
+        return {'enabled': False, 'safe_hosts': []}
     try:
         with open(COOKIES_AUTO_CONFIG_FILE) as f:
-            return bool(json.load(f).get('enabled', False))
+            data = json.load(f) or {}
+        return {
+            'enabled': bool(data.get('enabled', False)),
+            'safe_hosts': list(data.get('safe_hosts') or []),
+        }
     except (OSError, ValueError):
+        return {'enabled': False, 'safe_hosts': []}
+
+
+def _cookies_auto_enabled():
+    """Return True if cookie auto-persistence is enabled (global toggle)."""
+    return _cookies_auto_config()['enabled']
+
+
+def _cookies_auto_should_apply(host):
+    """v0.6.1: Auto save/load only applies to opt-in safe hosts.
+
+    A host matches if it equals a safe-list entry OR ends with `.<entry>`.
+    Empty safe-list means auto is a no-op (safe default — prevents bench-style
+    cross-task cookie pollution observed in v0.6.0).
+    """
+    if not host:
         return False
+    cfg = _cookies_auto_config()
+    if not cfg['enabled']:
+        return False
+    safe = cfg['safe_hosts']
+    if not safe:
+        return False
+    h = host.lower()
+    for entry in safe:
+        e = (entry or '').lower().lstrip('.')
+        if not e:
+            continue
+        if h == e or h.endswith('.' + e):
+            return True
+    return False
 
 
 def _set_cookies_auto(enabled):
-    """Enable or disable cookie auto-persistence."""
-    _atomic_write_json(COOKIES_AUTO_CONFIG_FILE, {'enabled': bool(enabled)})
+    """Enable or disable cookie auto-persistence (preserves safe_hosts)."""
+    cfg = _cookies_auto_config()
+    cfg['enabled'] = bool(enabled)
+    _atomic_write_json(COOKIES_AUTO_CONFIG_FILE, cfg)
+
+
+def _cookies_auto_add_host(host):
+    cfg = _cookies_auto_config()
+    h = (host or '').lower().lstrip('.')
+    if not h:
+        return False
+    if h in (e.lower() for e in cfg['safe_hosts']):
+        return False
+    cfg['safe_hosts'].append(h)
+    _atomic_write_json(COOKIES_AUTO_CONFIG_FILE, cfg)
+    return True
+
+
+def _cookies_auto_remove_host(host):
+    cfg = _cookies_auto_config()
+    h = (host or '').lower().lstrip('.')
+    before = len(cfg['safe_hosts'])
+    cfg['safe_hosts'] = [e for e in cfg['safe_hosts'] if e.lower() != h]
+    _atomic_write_json(COOKIES_AUTO_CONFIG_FILE, cfg)
+    return before != len(cfg['safe_hosts'])
 
 
 async def cmd_cookies(*args):
@@ -3094,7 +3251,15 @@ async def cmd_cookies(*args):
       cdpilot cookies clear --all                  # wipe entire cookie cache
       cdpilot cookies clear --older-than <Nd>      # remove stale entries (e.g. 7d)
       cdpilot cookies auto on|off|status           # toggle auto-save/replay on navigate
+      cdpilot cookies auto add <host>              # add host to auto safe-list (v0.6.1)
+      cdpilot cookies auto remove <host>           # remove host from safe-list
+      cdpilot cookies auto list                    # show enable flag + safe-list
       cdpilot cookies cf-replay <url>              # inject cached CF clearance before nav
+
+    v0.6.1: cookies auto is GATED by a per-host safe-list (default empty).
+    Enabling `cookies auto on` alone is a no-op until you explicitly add hosts
+    via `cookies auto add <host>`. This prevents cross-task cookie pollution
+    in parallel/agent workloads (regression observed in v0.6.0).
 
     Why save/load: once you've beaten a Cloudflare/DataDome challenge in one
     cdpilot process, the `cf_clearance` (or equivalent) cookie sits in this
@@ -3251,8 +3416,37 @@ async def cmd_cookies(*args):
             _set_cookies_auto(True)
         elif state == 'off':
             _set_cookies_auto(False)
-        status = "on" if _cookies_auto_enabled() else "off"
-        print(f"Cookie auto-persistence: {status}")
+        elif state == 'add':
+            if len(args) < 3:
+                print("Usage: cdpilot cookies auto add <host>", file=sys.stderr)
+                return
+            added = _cookies_auto_add_host(args[2])
+            print(f"{'Added' if added else 'Already in safe-list:'} {args[2]}")
+            return
+        elif state in ('remove', 'rm'):
+            if len(args) < 3:
+                print("Usage: cdpilot cookies auto remove <host>", file=sys.stderr)
+                return
+            removed = _cookies_auto_remove_host(args[2])
+            print(f"{'Removed' if removed else 'Not in safe-list:'} {args[2]}")
+            return
+        elif state in ('list', 'ls'):
+            cfg = _cookies_auto_config()
+            status = 'on' if cfg['enabled'] else 'off'
+            hosts = cfg['safe_hosts']
+            print(f"Cookie auto-persistence: {status}")
+            print(f"Safe-list ({len(hosts)} host{'s' if len(hosts) != 1 else ''}):")
+            for h in hosts:
+                print(f"  {h}")
+            if not hosts:
+                print("  (empty — auto is a no-op until hosts are added)")
+            return
+        cfg = _cookies_auto_config()
+        status = 'on' if cfg['enabled'] else 'off'
+        hosts_n = len(cfg['safe_hosts'])
+        print(f"Cookie auto-persistence: {status} (safe-list: {hosts_n} host{'s' if hosts_n != 1 else ''})")
+        if cfg['enabled'] and hosts_n == 0:
+            print("Note: safe-list is empty → auto is a no-op. Use: cdpilot cookies auto add <host>")
         return
 
     if sub == 'cf-replay':
@@ -3302,6 +3496,229 @@ async def cmd_storage():
         print(f"\n{len(data)} entries")
     except:
         print(val)
+
+
+async def cmd_wipe(*args):
+    """v0.6.2: Per-task state hygiene — clear cookies + storage for non-safe hosts.
+
+    Solves cross-task contamination in parallel agent workloads without
+    spawning new BrowserContexts (which break browser-use's target tracking).
+    Designed to be called between tasks by the bench/agent adapter.
+
+    Usage:
+      cdpilot wipe                          # cookies + localStorage + sessionStorage,
+                                              keeps cookies-auto safe-list hosts intact
+      cdpilot wipe --all                    # also wipes safe-list hosts (full reset)
+      cdpilot wipe --keep <host>[,host...]  # explicit keep-list (overrides safe-list)
+      cdpilot wipe --cookies                # cookies only
+      cdpilot wipe --storage                # localStorage + sessionStorage only
+      cdpilot wipe --tabs                   # close all tabs except current
+
+    Returns JSON: {cookies_removed, storage_cleared_origins, tabs_closed}
+    """
+    only_cookies = '--cookies' in args
+    only_storage = '--storage' in args
+    only_tabs = '--tabs' in args
+    wipe_all = '--all' in args
+    do_cookies = only_cookies or (not only_storage and not only_tabs)
+    do_storage = only_storage or (not only_cookies and not only_tabs)
+    do_tabs = only_tabs
+
+    # Build keep-list (safe-list + explicit --keep)
+    keep_hosts = set()
+    if not wipe_all:
+        keep_hosts.update(h.lower() for h in _cookies_auto_config()['safe_hosts'])
+    for i, a in enumerate(args):
+        if a == '--keep' and i + 1 < len(args):
+            keep_hosts.update(h.strip().lower() for h in args[i + 1].split(',') if h.strip())
+
+    def _host_kept(host):
+        h = (host or '').lower().lstrip('.')
+        if not h:
+            return False
+        for k in keep_hosts:
+            if h == k or h.endswith('.' + k):
+                return True
+        return False
+
+    ws, _ = get_page_ws()
+    result = {'cookies_removed': 0, 'storage_cleared_origins': 0, 'tabs_closed': 0}
+
+    if do_cookies:
+        r = await cdp_send(ws, [(1, 'Network.getCookies', {})])
+        cookies = r.get(1, {}).get('cookies', [])
+        to_remove = [c for c in cookies if not _host_kept(c.get('domain', ''))]
+        for c in to_remove:
+            try:
+                await cdp_send(ws, [(2, 'Network.deleteCookies', {
+                    'name': c['name'],
+                    'domain': c.get('domain'),
+                    'path': c.get('path', '/'),
+                })])
+                result['cookies_removed'] += 1
+            except Exception:
+                pass
+
+    if do_storage:
+        # Collect origins from cookies (best-effort — CDP has no enumerate)
+        origins = set()
+        r = await cdp_send(ws, [(1, 'Network.getCookies', {})])
+        for c in r.get(1, {}).get('cookies', []):
+            d = c.get('domain', '').lstrip('.')
+            if d and not _host_kept(d):
+                origins.add(f"https://{d}")
+                origins.add(f"http://{d}")
+        # Also clear current origin storage if not kept
+        try:
+            r2 = await cdp_send(ws, [(2, 'Runtime.evaluate', {
+                'expression': 'location.origin', 'returnByValue': True,
+            })])
+            cur_origin = r2.get(2, {}).get('result', {}).get('value')
+            if cur_origin:
+                from urllib.parse import urlparse
+                h = urlparse(cur_origin).hostname or ''
+                if not _host_kept(h):
+                    origins.add(cur_origin)
+        except Exception:
+            pass
+        for origin in origins:
+            try:
+                await cdp_send(ws, [(3, 'Storage.clearDataForOrigin', {
+                    'origin': origin,
+                    'storageTypes': 'local_storage,session_storage,indexeddb,websql,cache_storage,service_workers',
+                })])
+                result['storage_cleared_origins'] += 1
+            except Exception:
+                pass
+
+    if do_tabs:
+        tabs = get_tabs()
+        page_tabs = [t for t in tabs if t.get('type') == 'page']
+        cur_id = None
+        try:
+            cur_id = (await cdp_send(ws, [(1, 'Target.getTargets', {})])).get(1, {})
+            # Fallback to URL match
+        except Exception:
+            pass
+        for t in page_tabs[1:]:  # keep first tab
+            try:
+                await cdp_send(ws, [(4, 'Target.closeTarget', {'targetId': t['id']})])
+                result['tabs_closed'] += 1
+            except Exception:
+                pass
+
+    print(json.dumps(result))
+
+
+# v0.8.0: known JA3/JA4 prefixes for recent Chrome stable. Updated periodically.
+# Source: tls.peet.ws and browserleaks comparisons against Chrome 130–148 on macOS/Linux.
+# Format: (label, ja3_md5_prefix_or_full, ja4_prefix). Empty values disable that check.
+KNOWN_CHROME_TLS = [
+    # Chrome 130-148, BoringSSL default. Hash varies slightly with GREASE — match prefix.
+    ('chrome-stable-130-148', None, 't13d1516h2_'),
+]
+
+
+async def cmd_tls_check(*args):
+    """v0.8.0: Probe the browser's TLS / HTTP-2 fingerprint via a public echo service.
+
+    Why: anti-bot services (Akamai, Kasada, deeper CF checks) inspect JA3/JA4
+    and HTTP-2 SETTINGS, not just JS-level signals. If the running browser's
+    fingerprint doesn't look like Chrome stable, no amount of JS stealth will
+    save it on TLS-gated sites.
+
+    Usage:
+      cdpilot tls-check                          # default: tls.peet.ws
+      cdpilot tls-check --json                   # raw JSON only
+      cdpilot tls-check --service browserleaks   # alternate echo service
+
+    cdpilot itself does not modify TLS (BoringSSL is hardcoded inside Chromium).
+    There is currently NO Chromium-based TLS-corrected browser that ships as a
+    standalone binary with --remote-debugging-port:
+      - Camoufox is Firefox+Juggler (no CDP)
+      - Patchright / undetected-chromedriver / nodriver are Python/Playwright
+        libraries, not standalone browsers
+    cdpilot's CDP-only architecture is incompatible with all of them. The
+    v0.9 roadmap addresses this via either (a) an optional TLS-MITM plugin
+    using curl-impersonate semantics, or (b) a BoringSSL-patched Chromium fork.
+    """
+    json_only = '--json' in args
+    service = 'tls.peet.ws'
+    for i, a in enumerate(args):
+        if a == '--service' and i + 1 < len(args):
+            service = args[i + 1]
+
+    url_map = {
+        'tls.peet.ws': 'https://tls.peet.ws/api/all',
+        'browserleaks': 'https://browserleaks.com/tls',
+    }
+    url = url_map.get(service, url_map['tls.peet.ws'])
+
+    ws, _ = get_page_ws()
+    try:
+        await navigate_collect(ws, url)
+    except Exception as e:
+        print(json.dumps({'error': f'navigation failed: {e}', 'service': service}),
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Grab the response JSON from the page body
+    r = await cdp_send(ws, [(1, 'Runtime.evaluate', {
+        'expression': "(()=>{ const pre=document.querySelector('pre'); "
+                      "return pre ? pre.textContent : document.body.innerText; })()",
+        'returnByValue': True,
+    })])
+    raw = r.get(1, {}).get('result', {}).get('value', '')
+
+    parsed = None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        pass
+
+    if json_only:
+        print(raw)
+        return
+
+    if not parsed:
+        print(json.dumps({'error': 'could not parse TLS echo response',
+                          'service': service, 'preview': raw[:200]}))
+        return
+
+    # Extract common fields (tls.peet.ws schema)
+    tls = parsed.get('tls', {}) if isinstance(parsed, dict) else {}
+    ja3 = tls.get('ja3', '') or parsed.get('ja3', '')
+    ja3_hash = tls.get('ja3_hash', '') or parsed.get('ja3_hash', '')
+    ja4 = tls.get('ja4', '') or parsed.get('ja4', '')
+    h2 = parsed.get('http2', {}) if isinstance(parsed, dict) else {}
+    h2_settings = h2.get('akamai_fingerprint', '') or h2.get('akamai_hash', '')
+
+    # Chrome-likeness verdict
+    verdict = 'unknown'
+    notes = []
+    if ja4 and any(ja4.startswith(prefix) for (_, _, prefix) in KNOWN_CHROME_TLS if prefix):
+        verdict = 'chrome-like'
+    elif ja4:
+        verdict = 'non-chrome'
+        notes.append(f'JA4 prefix "{ja4[:8]}" not in known Chrome stable set')
+    if h2_settings and isinstance(h2_settings, str) and not h2_settings.startswith('1:65536'):
+        notes.append(f'HTTP/2 SETTINGS differ from Chrome default (got "{h2_settings[:40]}...")')
+
+    print(f"TLS fingerprint probe via {service}")
+    print(f"  JA3:        {ja3 or '(missing)'}")
+    print(f"  JA3 hash:   {ja3_hash or '(missing)'}")
+    print(f"  JA4:        {ja4 or '(missing)'}")
+    print(f"  H2 akamai:  {h2_settings or '(missing)'}")
+    print(f"  Verdict:    {verdict}")
+    if notes:
+        print("  Notes:")
+        for n in notes:
+            print(f"    - {n}")
+    if verdict == 'non-chrome':
+        print("\n  → cdpilot has no in-tree TLS fix in v0.8.0 (no CDP-compatible TLS-corrected")
+        print("    Chromium binary exists on the market). v0.9 will ship an optional")
+        print("    TLS-MITM plugin (curl-impersonate semantics). Track:")
+        print("    https://github.com/cdpilot/cdpilot/issues (v0.9 milestone)")
 
 
 async def cmd_perf():
@@ -4052,26 +4469,139 @@ async def cmd_multi_eval(js_code):
         print(f'  [{title}] → {value}')
     print(f'\nExecuted on {len(results)} tabs')
 
-def cmd_proxy(proxy_url=None):
-    """Set, show, or clear the proxy. Empty = clear."""
-    if proxy_url is None:
-        current = get_proxy_config()
-        if current:
-            print(f'Active proxy: {current}')
+def cmd_proxy(*args):
+    """Proxy chain management (v0.7.0 — provider-agnostic named pools).
+
+    Usage:
+      cdpilot proxy                              # show active proxy + pool list
+      cdpilot proxy <url>                        # legacy: set single proxy URL
+      cdpilot proxy off                          # clear all proxy state
+      cdpilot proxy add <name> <url> [--geo X] [--sticky]
+                                                 # register named pool
+      cdpilot proxy remove <name>                # delete a pool
+      cdpilot proxy use <name>|none              # activate one pool (or clear)
+      cdpilot proxy list                         # show all pools + which is active
+      cdpilot proxy show [<name>]                # raw URL of active or named pool (redacted)
+
+    Examples:
+      cdpilot proxy add brd  http://user-zone-resi:pass@brd.superproxy.io:22225 --geo us
+      cdpilot proxy add ipr  http://user:pass@geo.iproyal.com:12321 --sticky
+      cdpilot proxy use brd
+      cdpilot proxy list
+
+    Auth: include user:pass in the URL (e.g. http://USER:PASS@host:port). Chromium
+    supports HTTP/SOCKS proxy auth via `--proxy-server` URL.
+
+    Browser restart required after any change (stop → launch).
+    """
+    sub = args[0].lower() if args else None
+
+    # Legacy single-URL forms (backward compat): `cdpilot proxy http://...` / `off`
+    if sub and sub not in ('add', 'remove', 'rm', 'use', 'list', 'ls', 'show', 'status', 'off', ''):
+        if sub.startswith('http://') or sub.startswith('https://') or sub.startswith('socks'):
+            os.makedirs(os.path.dirname(PROXY_CONFIG_FILE), exist_ok=True)
+            data = _proxy_config_raw()
+            data['proxy'] = args[0]
+            data.setdefault('pools', {})
+            data.setdefault('active', None)
+            _proxy_save(data)
+            print(f'Proxy set: {_proxy_redact(args[0])}')
+            print('Restart browser (stop → launch).')
+            return
+
+    if sub in (None, 'status'):
+        active = _proxy_active_name()
+        pools = _proxy_pools()
+        effective = get_proxy_config()
+        if active:
+            print(f"Active pool: {active}")
+        elif effective:
+            print(f"Active proxy (legacy): {_proxy_redact(effective)}")
         else:
-            print('No proxy configured.')
+            print("No proxy configured.")
+        print(f"Pools registered: {len(pools)}")
+        for name, info in pools.items():
+            marker = " *" if name == active else "  "
+            geo = f" geo={info.get('geo')}" if info.get('geo') else ""
+            sticky = " sticky" if info.get('sticky') else ""
+            print(f"{marker} {name}: {_proxy_redact(info.get('url', ''))}{geo}{sticky}")
         return
 
-    os.makedirs(os.path.dirname(PROXY_CONFIG_FILE), exist_ok=True)
-    if proxy_url in ('off', ''):
+    if sub == 'off':
         if os.path.exists(PROXY_CONFIG_FILE):
             os.remove(PROXY_CONFIG_FILE)
-        print('Proxy removed. Restart browser (stop → launch).')
-    else:
-        with open(PROXY_CONFIG_FILE, 'w') as f:
-            json.dump({'proxy': proxy_url}, f)
-        print(f'Proxy set: {proxy_url}')
-        print('Restart browser (stop → launch).')
+        print('Proxy cleared. Restart browser (stop → launch).')
+        return
+
+    if sub == 'add':
+        if len(args) < 3:
+            print('Usage: cdpilot proxy add <name> <url> [--geo X] [--sticky]', file=sys.stderr)
+            return
+        name = args[1]
+        url = args[2]
+        geo = None
+        sticky = False
+        for i, a in enumerate(args[3:], start=3):
+            if a == '--geo' and i + 1 < len(args):
+                geo = args[i + 1]
+            elif a == '--sticky':
+                sticky = True
+        _proxy_add_pool(name, url, geo=geo, sticky=sticky)
+        print(f'Pool added: {name} → {_proxy_redact(url)}'
+              + (f' (geo={geo})' if geo else '')
+              + (' (sticky)' if sticky else ''))
+        active = _proxy_active_name()
+        if not active:
+            print(f"Note: pool registered but not active. Use: cdpilot proxy use {name}")
+        return
+
+    if sub in ('remove', 'rm'):
+        if len(args) < 2:
+            print('Usage: cdpilot proxy remove <name>', file=sys.stderr)
+            return
+        removed = _proxy_remove_pool(args[1])
+        print(f"{'Removed' if removed else 'Not found:'} {args[1]}")
+        if removed:
+            print('Restart browser (stop → launch) if it was active.')
+        return
+
+    if sub == 'use':
+        if len(args) < 2:
+            print('Usage: cdpilot proxy use <name>|none', file=sys.stderr)
+            return
+        target = args[1].lower()
+        if target in ('none', 'off', 'clear'):
+            _proxy_set_active(None)
+            print('Active pool cleared. Restart browser (stop → launch).')
+            return
+        ok = _proxy_set_active(args[1])
+        if not ok:
+            print(f"Pool not found: {args[1]}. Available: {', '.join(_proxy_pools().keys()) or '(none)'}",
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f'Active pool: {args[1]}. Restart browser (stop → launch).')
+        return
+
+    if sub in ('list', 'ls'):
+        # Same as status but explicit
+        return cmd_proxy()
+
+    if sub == 'show':
+        target = args[1] if len(args) > 1 else None
+        if target:
+            pools = _proxy_pools()
+            if target in pools:
+                print(_proxy_redact(pools[target].get('url', '')))
+            else:
+                print(f'Pool not found: {target}', file=sys.stderr)
+                sys.exit(1)
+        else:
+            url = get_proxy_config()
+            print(_proxy_redact(url) if url else '(none)')
+        return
+
+    print(f'Unknown subcommand: {sub}. See: cdpilot proxy', file=sys.stderr)
+    sys.exit(1)
 
 def cmd_headless(state=None):
     """Enable or disable headless mode."""
@@ -9904,7 +10434,7 @@ if __name__ == "__main__":
         'extensions': cmd_extensions,
         'stop': cmd_stop,
         'version': cmd_version,
-        'proxy': lambda: cmd_proxy(args[0] if args else None),
+        'proxy': lambda: cmd_proxy(*args),
         'headless': lambda: cmd_headless(args[0] if args else None),
         'stealth': lambda: cmd_stealth(args[0] if args else None),
         'block': lambda: cmd_block(*args),
@@ -10021,6 +10551,8 @@ if __name__ == "__main__":
         "console": lambda: cmd_console(args[0] if args else None),
         "cookies": lambda: cmd_cookies(*args),
         "storage": cmd_storage,
+        "wipe": lambda: cmd_wipe(*args),
+        "tls-check": lambda: cmd_tls_check(*args),
         "perf": cmd_perf,
         "emulate": lambda: (require_args(1, "emulate <device>"), None)[1] if not args else cmd_emulate(args[0]),
         "glow": lambda: cmd_glow(args[0] if args else "on"),
@@ -10089,7 +10621,8 @@ if __name__ == "__main__":
     NO_CONTROL_CMDS = {'glow', 'stop', 'tabs', 'close', 'close-tab', 'new-tab',
                        'dialog', 'download', 'throttle', 'permission', 'intercept',
                        'batch', 'screenshot-diff', 'run',
-                       'captcha-check', 'captcha-wait', 'captcha'}
+                       'captcha-check', 'captcha-wait', 'captcha',
+                       'cookies'}  # v0.6.1: cookies auto-config doesn't need browser
     # Clean up idle sessions before running any command
     _cleanup_idle_sessions()
 

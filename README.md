@@ -213,9 +213,33 @@ cdpilot throttle slow3g       # Simulate slow 3G
 cdpilot throttle fast3g       # Simulate fast 3G
 cdpilot throttle offline      # Go offline
 cdpilot throttle off          # Back to normal
-cdpilot proxy <url>           # Set proxy
+cdpilot proxy <url>           # Set proxy (legacy single-URL form)
 cdpilot proxy off             # Remove proxy
+
+# v0.7.0: named pools (BrightData, IPRoyal, Anchor, etc.)
+cdpilot proxy add brd "http://USER:PASS@brd.superproxy.io:22225" --geo us
+cdpilot proxy add ipr "http://USER:PASS@geo.iproyal.com:12321" --sticky
+cdpilot proxy use brd         # Activate one pool
+cdpilot proxy list            # Show pools (credentials redacted)
+cdpilot proxy show [<name>]   # Active or named pool URL (redacted)
+cdpilot proxy remove <name>   # Drop a pool
 ```
+
+### TLS Fingerprint (v0.8.0)
+
+```bash
+cdpilot tls-check                        # Probe JA3/JA4/H2 via tls.peet.ws
+cdpilot tls-check --service browserleaks # Alternate echo
+cdpilot tls-check --json                 # Raw JSON
+```
+
+**Known limitation:** v0.8.0 ships the **probe** (`tls-check`) but no in-tree TLS fix.
+There is no Chromium-based TLS-corrected browser that ships as a standalone binary
+exposing `--remote-debugging-port`. Camoufox is Firefox+Juggler (no CDP);
+Patchright / undetected-chromedriver / nodriver are Python/Playwright libraries,
+not standalone browsers. cdpilot's CDP-only architecture is incompatible with all
+of them without a protocol adapter. **Tracking:** v0.9 roadmap (TLS-MITM plugin
+using curl-impersonate semantics, OR BoringSSL-patched Chromium fork).
 
 ### Request Interception
 
@@ -273,8 +297,13 @@ cdpilot cookies list                 # Cached hosts + age + CF clearance flag
 cdpilot cookies clear --host x.com   # Remove one host
 cdpilot cookies clear --all          # Wipe entire cache
 cdpilot cookies clear --older-than 7d  # Remove stale entries
-cdpilot cookies auto on              # Auto-save/replay cookies on every navigate
+cdpilot cookies auto on              # Toggle global auto-save/replay flag (v0.6.1: requires safe-list)
+cdpilot cookies auto add <host>      # Opt host into auto save/replay (v0.6.1)
+cdpilot cookies auto remove <host>   # Remove host from safe-list
+cdpilot cookies auto list            # Enable flag + current safe-list
 cdpilot cookies cf-replay <url>      # Inject cached CF clearance before nav
+cdpilot wipe [--cookies|--storage|--tabs|--keep h1,h2]
+                                     # v0.6.2: per-task state hygiene (cross-task contamination)
 cdpilot storage               # localStorage contents
 cdpilot upload <sel> <file>   # Upload file to input
 cdpilot multi-eval <js>       # Execute JS in all tabs
@@ -494,9 +523,13 @@ print(result.stdout)
 | v0.5.0 | Full (stealth on / adaptive on) | 26 / 80 | 32.5% |
 | v0.5.1 | Full — regression fix | 29 / 80 | 36.25% |
 | v0.5.2 | Full — entropy auto-hook | 28 / 80 | 35.0% |
-| **v0.5.3** | **Full — entropy scope tightened** | **30 / 80** | **37.5%** |
+| v0.5.3 | Full — entropy scope tightened | 30 / 80 | 37.5% |
+| v0.6.0 | + captcha solver + cookies-auto (regression) | 15 / 80 | 18.75% |
+| **v0.8.0** | **Full — cookies safe-host scoped + per-task wipe (no proxy, no TLS fork)** | **29 / 80** | **36.25%** |
+| v0.7.0 (slot) | + named proxy pools | _depends on user proxy_ | — |
+| v0.8.0 (slot) | + TLS-aware launcher (camoufox/undetected-chrome) | _depends on browser choice_ | — |
 
-**What cdpilot does not do:** `cdpilot` is an avoidance engine, not a CAPTCHA solver. We prioritize structural stealth (JS fingerprinting, behavioral entropy) to prevent challenges from appearing. When a CAPTCHA blocks progress and cannot be bypassed, the task fails — that is the honest definition of our success rate. PerimeterX (2/18), GeeTest (0/4) and Akamai (1/6) are known weaknesses; these are targets for the v0.6.x roadmap (captcha solver integration, TLS fingerprint matching).
+**What cdpilot does not do:** `cdpilot` is an avoidance engine, not a CAPTCHA solver. We prioritize structural stealth (JS fingerprinting, behavioral entropy) to prevent challenges from appearing. When a CAPTCHA blocks progress and cannot be bypassed, the task fails — that is the honest definition of our success rate. PerimeterX (2/18), GeeTest (0/4) and Akamai (1/6) are known weaknesses; v0.7+ (residential proxy) and v0.8+ (TLS fingerprint correction via camoufox) target these directly.
 
 ## Recommended Configuration
 

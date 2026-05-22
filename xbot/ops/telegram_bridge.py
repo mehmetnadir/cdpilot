@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -192,6 +193,100 @@ def cmd_send(text: str) -> None:
     print("sent")
 
 
+_TLD_RE = re.compile(
+    r"\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"\.(?:com|org|net|io|dev|ai|co|sh|me|app|xyz|gg|so|run|fyi|tech|edu|gov|info|"
+    r"ist|tr|de|uk|us|jp|cn|br|fr|in|tv|cc|ist|live|news|cloud|host|site|store|"
+    r"github\.io|netlify\.app|vercel\.app|workers\.dev)\b(?:/\S*)?",
+    re.IGNORECASE,
+)
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _reply_bait_score(text: str) -> dict:
+    """Score how reply-baity a tweet is. Returns dict with score (0-3) + reasons.
+
+    Reply-baity = ends with question OR provocative claim that invites disagreement.
+    HeavyRanker gives replies a +27 weight; reply-bait = reach amplifier.
+
+    Score:
+      3 = ends with ? + asks for opinion/counter
+      2 = ends with ? OR provocative claim (counter:/disagree?/your take?)
+      1 = some interrogative or invitational phrase, but not at end
+      0 = no reply trigger, will get scroll
+    """
+    t = text.strip()
+    if not t:
+        return {"score": 0, "reasons": ["empty"], "tail": ""}
+
+    # Look at last non-empty line
+    last_line = ""
+    for line in reversed(t.splitlines()):
+        if line.strip():
+            last_line = line.strip()
+            break
+
+    score = 0
+    reasons: list[str] = []
+    tail = last_line[-60:]
+
+    if last_line.endswith("?"):
+        score += 2
+        reasons.append("ends with ?")
+
+    invitations = [
+        "your take", "thoughts?", "counter?", "disagree?", "am i wrong",
+        "is this", "anyone else", "what am i missing", "fight me",
+        "change my mind", "convince me", "is there", "/thread",
+        "karşı?", "sizce?", "yanılıyor muyum", "hangi", "ne dersin",
+    ]
+    if any(inv in last_line.lower() for inv in invitations):
+        score += 1
+        reasons.append("invitation phrase")
+
+    provocative = [
+        "is brutal", "is a choice", "isn't your fault", "you're holding it wrong",
+        "the real reason", "everyone is wrong", "this is the part",
+        "hot take", "controversial:", "burada gördüğüm",
+    ]
+    if any(p in t.lower() for p in provocative):
+        score += 1
+        reasons.append("provocative claim")
+
+    return {"score": min(score, 3), "reasons": reasons or ["no trigger"], "tail": tail}
+
+
+def _twitter_weighted_len(text: str) -> tuple[int, list[str]]:
+    """Compute Twitter weighted character count + URL list.
+
+    - URLs (http(s)://… or bare-domain.tld) are replaced with 23-char t.co stand-in.
+    - Char weighting: 0-4351 = 1; specific punctuation ranges = 1; else = 2.
+
+    Returns: (weighted_count, found_urls)
+    """
+    urls: list[str] = []
+    masked = text
+    # 1) Strip explicit URLs
+    def _sub_explicit(m: "re.Match[str]") -> str:
+        urls.append(m.group(0))
+        return "x" * 23
+    masked = _URL_RE.sub(_sub_explicit, masked)
+    # 2) Strip bare-domain auto-links (only single-word matches not already substituted)
+    def _sub_bare(m: "re.Match[str]") -> str:
+        urls.append(m.group(0))
+        return "x" * 23
+    masked = _TLD_RE.sub(_sub_bare, masked)
+
+    w = 0
+    for c in masked:
+        o = ord(c)
+        if 0 <= o <= 4351 or 8192 <= o <= 8205 or 8208 <= o <= 8223 or 8242 <= o <= 8247:
+            w += 1
+        else:
+            w += 2
+    return w, urls
+
+
 def cmd_draft(json_path: str) -> None:
     """Send a SINGLE draft as one message with Approve/Skip buttons.
 
@@ -231,6 +326,33 @@ def cmd_draft(json_path: str) -> None:
     body = f"{prefix} {kind_label}{target}  · {did}\n"
     if d.get("context"):
         body += f"bağlam: {d['context']}\n"
+
+    # URL-aware Twitter length pre-check on the EN text we'd actually post
+    if en_post:
+        weighted, urls = _twitter_weighted_len(en_post)
+        if weighted > 280:
+            body += (
+                f"\n⛔ UZUN: {weighted}/280 weighted "
+                f"(raw {len(en_post)} char, {len(urls)} auto-link). "
+                "X bunu reddeder — kısalt veya URL'leri kaldır.\n"
+            )
+        elif weighted > 270:
+            body += f"\n⚠️ sınırda: {weighted}/280 weighted ({len(urls)} auto-link)\n"
+        else:
+            body += f"\n📏 length: {weighted}/280 weighted"
+            if urls:
+                body += f" · {len(urls)} auto-link"
+            body += "\n"
+
+        # Reply-bait audit (HeavyRanker reply +27 → end with question/claim)
+        bait = _reply_bait_score(en_post)
+        if bait["score"] >= 2:
+            body += f"🎣 reply-bait: GOOD ({bait['score']}/3 · {', '.join(bait['reasons'])})\n"
+        elif bait["score"] == 1:
+            body += f"🎣 reply-bait: WEAK ({bait['score']}/3 · {', '.join(bait['reasons'])}) — son satırı soru/iddia ile bitirmeyi düşün\n"
+        else:
+            body += f"🎣 reply-bait: NONE (0/3) — bu tweet scroll edilir, son satıra soru/karşıt iddia ekle\n"
+
     body += f"\n📖 türkçe önizleme:\n{tr_preview}\n"
     if d.get("text_tr") and en_post and en_post != tr_preview:
         body += f"\n🐦 atılacak (EN):\n{en_post}\n"

@@ -67,6 +67,72 @@ Hepsi bir gün öne çıkabilir ama önce şu an alakalı olanları öne çıkar
 
 ---
 
+## Reply-bait kuralı (ZORUNLU — 2026-05-22)
+
+Her tweet SON SATIRINDA soru veya iddia ile bitmeli. HeavyRanker reply ağırlığı +27
+(en yüksek). Cold-start için tek en güçlü kaldıraç.
+
+| Pattern | Örnek | Skor |
+|---|---|---|
+| `?` ile biten gerçek soru | "why does X work but Y fail?" | 3/3 |
+| Provokatif iddia + karşıt davet | "anyone disagree?" | 3/3 |
+| Sadece `?` | "where's the leak?" | 2/3 |
+| Sadece iddia (davet yok) | "this is the part i find interesting" | 1/3 |
+| Hiçbiri | düz tespit cümlesi | 0/3 |
+
+Bridge `_reply_bait_score` her draft'ta otomatik skor verir. Telegram önizlemesinde
+🎣 emoji ile gösterilir. **2/3 veya altıysa yeniden yaz.**
+
+### Anti-pattern (yapmama)
+- Genel sorular ("favorite editor?") — algoritma bunları engagement-bait sayıp baskılıyor
+- Soyut provokasyon ("change my mind") — değer üretmiyor, dunk daveti
+- Soruyu HOOK'a yerleştirip cevabı body'de vermek — son satır kuralı
+
+---
+
+## @grok haftalık provokasyon (Salı sabah)
+
+`grok_provocation.py` 8 topic rotation'ı tutuyor. Salı 08:30 cycle'da otomatik
+draft öneriliyor — onayla, Salı öğleden sonraya schedule olur. Bekleyen organic
+boost: 5-50k impression.
+
+Topic havuzu (rotasyon, 2 ay döngü):
+1. Playwright vs raw CDP fingerprint diff
+2. Headless vs headful detection asymmetry
+3. TLS spoof ethics (curl-impersonate dual-use)
+4. CAPTCHA vendor weighting (Cloudflare vs DataDome)
+5. LLM agent + browser latency
+6. SSR vs CSR scraping cost
+7. CDP vs WebDriver BiDi
+8. Bot signal hierarchy rank
+
+---
+
+## Mutual-engagement like loop
+
+Birisi tweet'imize reply atınca 24h içinde son tweet'lerinden 1-2 tanesini
+like'lıyoruz (reciprocity = follow-back probability +60%).
+
+Otomatik akış:
+1. `mention_scraper.py` reply'leri inbox/'a alıyor
+2. `engagement_scanner._scan_mutual_engagement` repliers'ı buluyor, son tweet'lerini scan ediyor
+3. Akşam slot'unda Telegram'a "mutual" tag'li öneri olarak çıkıyor
+
+---
+
+## Crisis auto-detection (2026-05-22)
+
+`crisis_check.py` gece slot'unda çalışır. Tetikleyiciler:
+- Toplam engagement bugün < 7-day median'ın %40'ı
+- Impressions < median'ın %40'ı
+- Follower count düştü
+
+Tetiklenirse `state/crisis-freeze.flag` yazılır → poster bu flag varken hiç
+post atmaz. Telegram'a kırmızı alarm gider. Manuel inceleme + `crisis-playbook`
+skill → `crisis_check.py --clear` ile freeze kaldırılır.
+
+---
+
 ## Tone audit (ANTI-PATTERN)
 
 Yarın atılan her draft'ı şu kontrolden geçir:

@@ -199,6 +199,77 @@ def _format_proposal(c: dict, action: str) -> str:
     )
 
 
+async def _scan_mutual_engagement(client: Client) -> list[dict]:
+    """Find users who replied to our recent tweets → propose likes on their content.
+
+    Reciprocity loop: someone replies to us → we like 1-2 of their recent tweets
+    within 24h → +60% follow-back probability. Caps at 5 candidates/day.
+    """
+    out: list[dict] = []
+    inbox_dir = DATA / "inbox"
+    if not inbox_dir.exists():
+        return out
+
+    # Find users from recent mentions (last 24h files)
+    cutoff = time.time() - 24 * 3600
+    repliers: dict[str, dict] = {}  # handle → {tweet_id, replied_at}
+    for jf in sorted(inbox_dir.glob("*.json"), reverse=True)[:50]:
+        try:
+            m = json.loads(jf.read_text())
+        except ValueError:
+            continue
+        if m.get("created_ts", 0) < cutoff:
+            continue
+        if not m.get("is_reply_to_us"):
+            continue
+        h = m.get("author_handle")
+        if h and h not in repliers and h != "cdpilot_dev":
+            repliers[h] = {"replied_tweet": m.get("tweet_id"), "ts": m.get("created_ts")}
+
+    if not repliers:
+        return out
+
+    # For each replier, fetch last 3-5 tweets, score same way
+    today = _today_iso()
+    likes_today = _audit_action_count("like", today)
+    for handle, meta in list(repliers.items())[:8]:
+        if likes_today >= LIKE_PER_DAY:
+            break
+        try:
+            user = await client.get_user_by_screen_name(handle)
+            tweets = await user.get_tweets("Tweets", count=5)
+        except Exception as e:
+            _log(f"mutual scan @{handle} fail: {e}")
+            continue
+        for tw in tweets[:5]:
+            text = (tw.text or "").strip()
+            if not text or text.startswith("RT @"):
+                continue
+            if getattr(tw, "in_reply_to", None):
+                continue
+            san = sanitize(text)
+            if san["drop"]:
+                continue
+            hours = _hours_since(getattr(tw, "created_at", "") or "")
+            if hours > 48:
+                continue
+            out.append({
+                "handle": handle,
+                "topic_hint": "mutual-engagement",
+                "tweet_id": str(tw.id),
+                "url": f"https://x.com/{handle}/status/{tw.id}",
+                "text": san["clean"],
+                "flags": san["flags"],
+                "hours_old": round(hours, 1),
+                "like_count": getattr(tw, "favorite_count", 0) or 0,
+                "score": 5,  # Fixed score — they engaged with us first
+                "via": "mutual",
+            })
+            break  # one like per replier
+        await asyncio.sleep(1.5)
+    return out
+
+
 async def main_async(propose_top: int) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     if not COOKIES.exists():
@@ -217,6 +288,15 @@ async def main_async(propose_top: int) -> None:
         cands = await _scan_handle(client, handle, entry.get("topic", ""))
         all_candidates.extend(cands)
         await asyncio.sleep(2.0)  # gentle pacing
+
+    # Mutual-engagement: like content from users who replied to us in last 24h
+    try:
+        mutual = await _scan_mutual_engagement(client)
+        all_candidates.extend(mutual)
+        if mutual:
+            _log(f"mutual-engagement: {len(mutual)} candidates from recent repliers")
+    except Exception as e:
+        _log(f"mutual scan exception: {e}")
 
     all_candidates.sort(key=lambda c: c["score"], reverse=True)
     top = all_candidates[:PROPOSAL_CAP]

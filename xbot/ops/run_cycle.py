@@ -83,12 +83,15 @@ def main() -> None:
     # Always: DM inbox poll (Faz 0: max 5 drafts/slot, taslak modu)
     results.append(_run([str(OPS / "dm_handler.py")], "dm_handler"))
 
-    # Morning: discovery + follow proposals
+    # Morning: discovery + follow proposals + (Tue) grok provocation
     if slot == "morning":
         results.append(_run([str(OPS / "discovery_scan.py"), "--limit", "10"], "discovery_scan"))
         results.append(_run([str(OPS / "follow_manager.py")], "follow_manager"))
+        # Grok provocation — weekly, Tuesday morning
+        if datetime.now().weekday() == 1:  # Tuesday
+            results.append(_run([str(OPS / "grok_provocation.py"), "propose"], "grok_provocation"))
 
-    # Evening: engagement scan (Tier 1/2 → like/reply candidates → Telegram)
+    # Evening: engagement scan (Tier 1/2 + mutual → like/reply candidates → Telegram)
     if slot == "evening":
         results.append(_run([str(OPS / "engagement_scanner.py"), "--propose-top=3"], "engagement_scanner"))
 
@@ -96,6 +99,8 @@ def main() -> None:
     if slot == "night":
         results.append(_run([str(OPS / "daily_analytics.py"), "--days", "7"], "daily_analytics"))
         results.append(_run([str(OPS / "engagement_scanner.py")], "engagement_scanner_scan"))
+        # Crisis check — if engagement drops 60% vs 7-day baseline, freeze posting
+        results.append(_run([str(OPS / "crisis_check.py")], "crisis_check"))
 
     print(f"\n== {slot} complete ==")
     print(json.dumps({"slot": slot, "results": results}, ensure_ascii=False, indent=2))

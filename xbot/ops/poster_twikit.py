@@ -32,6 +32,7 @@ QUEUE_DIR = DATA / "queue"
 POSTED_DIR = DATA / "posted"
 FAILED_DIR = DATA / "failed"
 LOG_FILE = DATA / "logs" / "poster.log"
+FREEZE_FLAG = DATA / "state" / "crisis-freeze.flag"
 COOKIES_PATH = Path(os.environ.get(
     "CDPILOT_TWIKIT_COOKIES",
     str(DATA / "cookies" / "cdpilot_dev.json"),
@@ -201,6 +202,11 @@ async def main_async() -> None:
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     POSTED_DIR.mkdir(parents=True, exist_ok=True)
     FAILED_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Crisis freeze short-circuits posting
+    if FREEZE_FLAG.exists():
+        _log("🔴 CRISIS FREEZE active — skipping posting cycle")
+        return
 
     now = int(time.time())
     files = sorted(QUEUE_DIR.glob("*.json"))

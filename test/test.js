@@ -40,12 +40,12 @@ console.log('\n  cdpilot tests\n');
 
 test('--version prints version', () => {
   const out = run('--version');
-  assert(out.includes('0.6.0'), 'Should print version');
+  assert(out.includes('0.8.0'), 'Should print version');
 });
 
 test('-v prints version', () => {
   const out = run('-v');
-  assert(out.includes('0.6.0'), 'Should print version');
+  assert(out.includes('0.8.0'), 'Should print version');
 });
 
 test('help shows usage', () => {
@@ -1449,9 +1449,11 @@ test('twitter: cmd_twitter_post prints tweet_id in output', () => {
   assert(PY_CONTENT.includes("'tweet_id'"), 'Post output should have tweet_id field');
 });
 
-test('twitter: cmd_twitter_thread inter-tweet delay uses _gauss', () => {
+test('twitter: cmd_twitter_thread uses humanized pacing via _tw_pause', () => {
   assert(PY_CONTENT.includes('cmd_twitter_thread'), 'Should define cmd_twitter_thread');
-  assert(PY_CONTENT.includes('480'), 'Thread delay should use _gauss(480,...) seconds');
+  const fn = PY_CONTENT.match(/async def cmd_twitter_thread[\s\S]{0,4000}?(?=\nasync def |\ndef [a-z])/);
+  assert(fn, 'cmd_twitter_thread body must be present');
+  assert(/_tw_pause/.test(fn[0]), 'Thread must use _tw_pause between actions for humanized timing');
 });
 
 test('twitter: cmd_twitter_reply navigates to /i/status/TWEET_ID', () => {
@@ -1841,9 +1843,24 @@ test('_load_host_cookies: returns None on OSError/ValueError', () => {
   assert(m, "_load_host_cookies must catch OSError/ValueError and return None");
 });
 
-test('_cookies_auto_enabled reads COOKIES_AUTO_CONFIG_FILE', () => {
-  const m = PY_CONTENT.match(/def _cookies_auto_enabled[\s\S]{0,300}?COOKIES_AUTO_CONFIG_FILE/);
-  assert(m, "_cookies_auto_enabled must reference COOKIES_AUTO_CONFIG_FILE");
+test('_cookies_auto_config reads COOKIES_AUTO_CONFIG_FILE (v0.6.1)', () => {
+  const m = PY_CONTENT.match(/def _cookies_auto_config[\s\S]{0,500}?COOKIES_AUTO_CONFIG_FILE/);
+  assert(m, "_cookies_auto_config must reference COOKIES_AUTO_CONFIG_FILE");
+});
+
+test('v0.6.1: _cookies_auto_should_apply gates by safe-host list', () => {
+  const m = PY_CONTENT.match(/def _cookies_auto_should_apply[\s\S]{0,1000}?safe_hosts/);
+  assert(m, "_cookies_auto_should_apply must check safe_hosts");
+});
+
+test('v0.6.1: cookies auto add/remove/list CLI subcommands', () => {
+  const fnBody = PY_CONTENT.match(/async def cmd_cookies[\s\S]{0,15000}?(?=\nasync def |\ndef [a-z])/);
+  assert(fnBody, "cmd_cookies function must be present");
+  assert(fnBody[0].includes("'add'") && fnBody[0].includes('_cookies_auto_add_host'),
+    "cookies auto add must call _cookies_auto_add_host");
+  assert(fnBody[0].includes("'remove'") && fnBody[0].includes('_cookies_auto_remove_host'),
+    "cookies auto remove must call _cookies_auto_remove_host");
+  assert(fnBody[0].includes("'list'"), "cookies auto list subcommand required");
 });
 
 test('cmd_cookies: save --host mode writes per-host via _save_host_cookies', () => {
@@ -1879,19 +1896,113 @@ test('cmd_cookies: cf-replay injects cookies via Network.setCookies', () => {
   assert(m, "cookies cf-replay must inject via Network.setCookies");
 });
 
-test('cmd_go: auto pre-navigate hook injects cached cookies', () => {
-  const m = PY_CONTENT.match(/COOKIES AUTO PRE-NAVIGATE[\s\S]{0,400}?_cookies_auto_enabled[\s\S]{0,200}?_load_host_cookies/);
-  assert(m, "cmd_go must have COOKIES AUTO PRE-NAVIGATE hook with _load_host_cookies");
+test('cmd_go: auto pre-navigate hook injects cached cookies (v0.6.1 safe-host gated)', () => {
+  const m = PY_CONTENT.match(/COOKIES AUTO PRE-NAVIGATE[\s\S]{0,500}?_cookies_auto_should_apply[\s\S]{0,300}?_load_host_cookies/);
+  assert(m, "cmd_go must have COOKIES AUTO PRE-NAVIGATE hook gated by _cookies_auto_should_apply");
 });
 
-test('cmd_go: auto post-navigate hook saves cookies after navigation', () => {
-  const m = PY_CONTENT.match(/COOKIES AUTO POST-NAVIGATE[\s\S]{0,600}?_save_host_cookies/);
-  assert(m, "cmd_go must have COOKIES AUTO POST-NAVIGATE hook with _save_host_cookies");
+test('cmd_go: auto post-navigate hook saves cookies after navigation (v0.6.1 safe-host gated)', () => {
+  const m = PY_CONTENT.match(/COOKIES AUTO POST-NAVIGATE[\s\S]{0,800}?_cookies_auto_should_apply[\s\S]{0,400}?_save_host_cookies/);
+  assert(m, "cmd_go must have COOKIES AUTO POST-NAVIGATE hook gated by _cookies_auto_should_apply");
 });
 
 test('cmd_cookies: clear --older-than guards against missing COOKIES_DIR', () => {
   const m = PY_CONTENT.match(/--older-than[\s\S]{0,200}?os\.path\.exists\(COOKIES_DIR\)/);
   assert(m, "clear --older-than must guard with os.path.exists(COOKIES_DIR)");
+});
+
+// ── v0.8.0: TLS fingerprint awareness ──
+
+test('v0.8.0: BROWSER_BINARIES does NOT include camoufox/undetected-chrome (CDP incompatible)', () => {
+  const m = PY_CONTENT.match(/BROWSER_BINARIES\s*=\s*\{[\s\S]{0,4000}?\n\}/);
+  assert(m, 'BROWSER_BINARIES dict must be present');
+  assert(!m[0].includes("'camoufox'"), 'camoufox is Firefox+Juggler — incompatible with cdpilot CDP');
+  assert(!m[0].includes("'undetected-chrome'"), 'undetected-chrome is a Python lib, not a binary');
+});
+
+test('v0.8.0: cmd_tls_check defined and probes via navigate_collect', () => {
+  assert(PY_CONTENT.includes('async def cmd_tls_check'), 'cmd_tls_check must be defined');
+  const m = PY_CONTENT.match(/async def cmd_tls_check[\s\S]{0,5000}?(?=\nasync def |\ndef [a-z])/);
+  assert(m, 'cmd_tls_check body required');
+  assert(/navigate_collect/.test(m[0]), 'cmd_tls_check must use navigate_collect');
+  assert(/tls\.peet\.ws|browserleaks/.test(m[0]), 'cmd_tls_check must reference a known echo service');
+  assert(/ja3|JA3/.test(m[0]), 'cmd_tls_check must extract JA3');
+  assert(/ja4|JA4/.test(m[0]), 'cmd_tls_check must extract JA4');
+});
+
+test('v0.8.0: KNOWN_CHROME_TLS comparison set defined', () => {
+  assert(/KNOWN_CHROME_TLS\s*=/.test(PY_CONTENT), 'KNOWN_CHROME_TLS must exist for verdict logic');
+});
+
+test('v0.8.0: tls-check registered in async dispatch table', () => {
+  assert(/"tls-check":\s*lambda/.test(PY_CONTENT), 'tls-check must be in async_map');
+});
+
+// ── v0.7.0: residential proxy framework ──
+
+test('v0.7.0: _proxy_config_raw + named pool helpers exist', () => {
+  assert(PY_CONTENT.includes('def _proxy_config_raw'), '_proxy_config_raw must be defined');
+  assert(PY_CONTENT.includes('def _proxy_pools'), '_proxy_pools must be defined');
+  assert(PY_CONTENT.includes('def _proxy_active_name'), '_proxy_active_name must be defined');
+  assert(PY_CONTENT.includes('def _proxy_add_pool'), '_proxy_add_pool must be defined');
+  assert(PY_CONTENT.includes('def _proxy_remove_pool'), '_proxy_remove_pool must be defined');
+  assert(PY_CONTENT.includes('def _proxy_set_active'), '_proxy_set_active must be defined');
+});
+
+test('v0.7.0: get_proxy_config returns active pool URL over legacy', () => {
+  const m = PY_CONTENT.match(/def get_proxy_config[\s\S]{0,1500}?(?=\ndef )/);
+  assert(m, 'get_proxy_config body must be present');
+  assert(/active[\s\S]{0,400}?pools/.test(m[0]), 'must consult active pool from pools dict');
+  assert(/CHROME_PROXY/.test(m[0]), 'env override must still work');
+});
+
+test('v0.7.0: _proxy_redact masks credentials in URL', () => {
+  assert(PY_CONTENT.includes('def _proxy_redact'), '_proxy_redact must be defined');
+  const m = PY_CONTENT.match(/def _proxy_redact[\s\S]{0,1000}?(?=\ndef )/);
+  assert(m, '_proxy_redact body required');
+  assert(/\*\*\*/.test(m[0]), 'must replace credentials with ***');
+});
+
+test('v0.7.0: cmd_proxy supports add/remove/use/list/show subcommands', () => {
+  const m = PY_CONTENT.match(/def cmd_proxy[\s\S]{0,8000}?(?=\ndef )/);
+  assert(m, 'cmd_proxy body required');
+  for (const sub of ["'add'", "'remove'", "'use'", "'list'", "'show'", "'off'"]) {
+    assert(m[0].includes(sub), `cmd_proxy must handle ${sub}`);
+  }
+  assert(/--geo/.test(m[0]), 'cmd_proxy must accept --geo flag');
+  assert(/--sticky/.test(m[0]), 'cmd_proxy must accept --sticky flag');
+});
+
+test('v0.7.0: proxy command dispatched with *args', () => {
+  assert(/'proxy':\s*lambda:\s*cmd_proxy\(\*args\)/.test(PY_CONTENT),
+    "'proxy' must dispatch with *args (legacy single-url form still works)");
+});
+
+// ── v0.6.2: cmd_wipe (per-task state hygiene) ──
+
+test('v0.6.2: cmd_wipe defined with --all/--keep/--cookies/--storage/--tabs flags', () => {
+  assert(PY_CONTENT.includes('async def cmd_wipe'), 'cmd_wipe must be defined');
+  const m = PY_CONTENT.match(/async def cmd_wipe[\s\S]{0,5000}?(?=\nasync def |\ndef [a-z])/);
+  assert(m, 'cmd_wipe body must be present');
+  assert(m[0].includes("'--all'"), 'wipe must support --all');
+  assert(m[0].includes("'--keep'"), 'wipe must support --keep');
+  assert(m[0].includes("'--cookies'"), 'wipe must support --cookies');
+  assert(m[0].includes("'--storage'"), 'wipe must support --storage');
+  assert(m[0].includes("'--tabs'"), 'wipe must support --tabs');
+});
+
+test('v0.6.2: cmd_wipe preserves cookies-auto safe-list by default', () => {
+  const m = PY_CONTENT.match(/async def cmd_wipe[\s\S]{0,5000}?_cookies_auto_config/);
+  assert(m, 'cmd_wipe must consult _cookies_auto_config for safe-list');
+});
+
+test('v0.6.2: cmd_wipe uses Network.deleteCookies + Storage.clearDataForOrigin', () => {
+  const m = PY_CONTENT.match(/async def cmd_wipe[\s\S]{0,5000}?Network\.deleteCookies[\s\S]{0,2000}?Storage\.clearDataForOrigin/);
+  assert(m, 'cmd_wipe must use Network.deleteCookies and Storage.clearDataForOrigin');
+});
+
+test('v0.6.2: wipe command registered in async dispatch table', () => {
+  assert(/"wipe":\s*lambda/.test(PY_CONTENT), 'wipe must be in async_map');
 });
 
 // ── Summary ──
