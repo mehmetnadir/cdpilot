@@ -2,6 +2,81 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [0.8.0] - 2026-05-20
+
+### Bench
+- **Full variant: 29 / 80 (36.25%)** — v0.6.0 cookies-auto regression confirmed fixed (was 15/80 = 18.75%). vs v0.5.3 baseline (30/80, 37.5%): -1 task net, well within run-to-run noise.
+- Category lifts: Datadome 7/13 (was 5), Akamai 2/6 (was 1), GeeTest 1/4 (was 0), Shape 1/1 (was 0), reCaptcha 3/6 (was 2)
+- Category drops: Cloudflare 10/22 (was 12), Custom Antibot 3/5 (was 5), hCaptcha 1/3 (was 2)
+- v0.6.2 `wipe` produced no measurable lift in single run — cross-task contamination was either smaller than estimated or `wipe` does not capture the failure mode. Will revisit with multi-run statistics.
+- v0.7.0 / v0.8.0 are no-ops without user-installed residential proxy or TLS-corrected browser (as documented). Score above is BoringSSL-default, datacenter-IP.
+
+### Added
+- **`cdpilot tls-check`** — probes the running browser's TLS / HTTP-2 fingerprint via a public echo service (`tls.peet.ws` default, `browserleaks` alternate). Extracts JA3, JA3 hash, JA4, and Akamai HTTP-2 fingerprint, then verdicts the result against a small `KNOWN_CHROME_TLS` set. Useful before/after switching browsers to confirm what anti-bot services actually see at the TLS layer (the layer Akamai/Kasada inspect before JS stealth even runs).
+### Known limitation (corrected 2026-05-20)
+- The initial v0.8.0 plan referenced `cdpilot browser camoufox` and `cdpilot browser undetected-chrome` as TLS-correction integrations. **This was incorrect.** Camoufox is Firefox+Juggler (no CDP); Patchright / undetected-chromedriver / nodriver are Python/Playwright libraries, not standalone browsers with `--remote-debugging-port`. cdpilot's CDP-only architecture is incompatible with all of them without a protocol adapter. Those `BROWSER_BINARIES` entries have been removed; the related CLI helpers stayed only as documentation pointing at the v0.9 roadmap.
+
+### Why
+- Stealth Bench v0.5.0–v0.7.0 plateau at ~37–40% had a TLS-layer ceiling: BoringSSL inside Brave/Chromium produces a fixed JA3/JA4. Anti-bot services that gate on TLS (Akamai, Kasada, deeper Cloudflare modes) will block the connection before any JS stealth gets a chance to load.
+- Patching BoringSSL in a Chromium fork is a 2–3 week sprint with rebuild and distribution overhead. Out of scope for v0.8.0.
+- v0.8.0 ships the **awareness + integration** layer instead: cdpilot can measure the current TLS surface, and users who need TLS correction can install a TLS-modified browser (Camoufox or undetected-chrome) and select it via `cdpilot browser`. Zero new dependencies on our side, no rebuild burden.
+
+### Roadmap
+- v0.9: evaluate shipping a thin `cdpilot tls-proxy` (local TLS-terminating MITM) using `curl-impersonate` semantics, behind an explicit opt-in (`cdpilot stealth tls-proxy on`). Maintains zero-dep core; proxy ships as optional plugin.
+
+## [0.7.0] - 2026-05-20
+
+### Added
+- **Named proxy pools** — provider-agnostic residential/datacenter proxy management. cdpilot is now a thin wrapper around Chromium's `--proxy-server` with multi-pool config, credential redaction, and per-pool metadata.
+  - `cdpilot proxy add <name> <url> [--geo X] [--sticky]` — register a pool (auth in URL: `http://USER:PASS@host:port`)
+  - `cdpilot proxy remove <name>` / `cdpilot proxy use <name>|none` / `cdpilot proxy list` / `cdpilot proxy show [<name>]`
+  - Legacy single-URL form (`cdpilot proxy http://...`) still works and is preserved as a fallback when no pool is active
+  - All proxy display redacts credentials (`***:***@host:port`)
+- Resolution order: `CHROME_PROXY` env > active pool > legacy single URL
+- Tested with BrightData, IPRoyal, and Anchor URL formats (sticky session and rotating endpoints)
+
+### Why
+- v0.5–v0.6 stealth work plateaued at ~40% on the bench. Commercial providers (browserbase/anchor/onkernel at 46–73%) are partly winning on **IP reputation**, not stealth — datacenter IPs that cdpilot launches from are flagged by Akamai/PerimeterX before stealth even matters.
+- Shipping the framework first (free, zero-dep on our side) lets users plug in any residential provider without waiting for cdpilot-specific integrations.
+
+### Notes
+- Browser restart required after any change (Chromium reads `--proxy-server` at launch).
+- Per-host proxy routing is **not** in v0.7.0 — Chromium's process-wide proxy plus browser-use's target-tracking constraints make per-host switching fragile. Planned for v0.7.x via CDP `Fetch.continueRequest` rewriting, off by default.
+
+## [0.6.2] - 2026-05-20
+
+### Added
+- **`cdpilot wipe`** — per-task state hygiene command. Clears cookies and origin storage for non-safe-listed hosts. Designed for parallel/agent workloads that share one browser across many tasks.
+  - `--all` — wipe everything including safe-list hosts
+  - `--keep host1,host2` — explicit per-call keep-list (overrides safe-list)
+  - `--cookies` / `--storage` / `--tabs` — scope to one channel
+  - Default: cookies + localStorage + sessionStorage + indexeddb + cache for non-safe hosts
+- Bench adapter (`cdpilot-bench/browsers/cdpilot.py`) now calls `cdpilot wipe --cookies --storage` between tasks via `disconnect()`. Disabled with `CDPILOT_NO_WIPE=1`.
+
+### Why
+- v0.5.0 full variant exhibited cross-task contamination: 11 tasks landed on the wrong domain (e.g. anthropologie.com task got a fiverr.com captcha) because cookies from prior tasks bled into later ones in the shared browser.
+- v0.5.1 attempted to fix this with `Target.createBrowserContext` per task, but browser-use's target tracker couldn't see the new context → "Target not found" / "Session corrupted". That fix is opt-in via `CDPILOT_ADAPTIVE_FRESH_CONTEXT=1` only.
+- v0.6.2's approach: don't change target topology, just scrub state between tasks. browser-use sees the same shared browser, but each task starts with a clean cookie jar (except hosts the user explicitly opted-in via `cookies auto add`).
+
+## [0.6.1] - 2026-05-20
+
+### Fixed
+- `cookies auto` is now gated by an opt-in per-host **safe-list** (default empty). Enabling the global toggle alone is now a **no-op** until hosts are explicitly added via `cookies auto add <host>`. This fixes the v0.6.0 bench regression (15/80 vs ~30/80 baseline) caused by indiscriminate cookie save/load across all visited hosts in parallel workloads.
+
+### Added
+- `cookies auto add <host>` — opt-in a host for automatic clearance cookie save/replay (suffix match: adding `cloudflare.com` covers `*.cloudflare.com`).
+- `cookies auto remove <host>` — remove a host from the safe-list.
+- `cookies auto list` — display enable flag + current safe-list.
+- `_cookies_auto_should_apply(host)` — internal gate consulted by the navigate hooks.
+
+### Changed
+- Pre/post-navigate cookie hooks (`_cookies_auto_enabled() && expected_host` → `_cookies_auto_should_apply(expected_host)`).
+- `cookies` command no longer requires browser for `auto add/remove/list/on/off/status` sub-commands.
+- `_cookies_auto_enabled()` now reads via `_cookies_auto_config()` (preserves `safe_hosts` on toggle).
+
+### Why
+- v0.6.0 dropped to 15/80 with `cookies auto on` because browser-use runs 5 parallel tasks against different hosts, and the auto-replay was injecting stale cookies from prior tasks into unrelated targets. Cookies are valuable for known anti-bot walls (CF, DataDome) but harmful when applied indiscriminately across a bench workload.
+
 ## [0.5.3] - 2026-05-20
 
 ### Changed
