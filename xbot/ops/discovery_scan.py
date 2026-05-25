@@ -24,6 +24,10 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).parent))
+import _twikit_patch  # noqa: F401
 from twikit import Client  # type: ignore
 
 DATA = Path(os.environ.get("CDPILOT_XBOT_DATA", str(Path.home() / "cdpilot-twitter-data")))

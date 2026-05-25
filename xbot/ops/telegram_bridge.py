@@ -732,6 +732,106 @@ def cmd_poll(timeout: int = 1) -> None:
     print(json.dumps(updates, indent=2, ensure_ascii=False))
 
 
+def cmd_incoming_reply(json_path: str) -> None:
+    """Notify Telegram of an incoming reply/mention with 3-button decision card.
+
+    Expected JSON (from mention_scraper inbox/*.json):
+      {
+        "tweet_id": "...",
+        "author": "@somebody",
+        "text": "their reply text",
+        "tweet_url": "https://x.com/.../status/...",
+        "is_reply_to_us": true,
+        ...
+      }
+
+    Card actions:
+      💬 Cevap yaz  → user replies to message with text → daemon queues as kind=reply
+      💛 Like       → daemon queues as kind=like
+      ⏭ Atla       → mark inbox seen, no action
+    """
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _sanitize import sanitize, render_flags  # type: ignore
+
+    env = _load_env()
+    if not env.get("TELEGRAM_CHAT_ID"):
+        sys.exit("TELEGRAM_CHAT_ID not set — run: telegram_bridge.py setup")
+
+    m = json.loads(Path(json_path).read_text())
+    tid = m.get("tweet_id")
+    author = m.get("author", "@?")
+    raw_text = m.get("text", "")
+    san = sanitize(raw_text)
+    url = m.get("tweet_url", "")
+
+    # Detect language from the incoming text (heuristic — Turkish-specific chars)
+    lang = "tr" if any(c in san["clean"] for c in "çğıöşüÇĞİÖŞÜ") else "en"
+
+    # Generate AI draft (Claude CLI via reply_drafter) unless flagged unsafe
+    ai_draft = ""
+    if san.get("drop"):
+        ai_draft = ""  # don't draft for dropped (crisis_topic / url_bomb)
+    else:
+        try:
+            from reply_drafter import draft as _make_draft  # type: ignore
+            parent = m.get("parent_tweet_text") or None
+            res = _make_draft(san["clean"], parent=parent, author=author, lang=lang)
+            ai_draft = res.get("draft", "") if not res.get("fallback") else ""
+        except Exception as e:
+            sys.stderr.write(f"reply_drafter failed for {tid}: {e}\n")
+            ai_draft = ""
+
+    flags_str = render_flags(san["flags"])
+    body = (
+        f"💬 yeni yorum · {author}\n"
+        f"{flags_str}\n\n"
+        f"📥 yorum (sanitized):\n{san['clean'][:500]}\n\n"
+    )
+    if ai_draft:
+        body += f"✨ AI taslağı ({lang.upper()}):\n{ai_draft}\n\n"
+    body += (
+        f"🔗 {url}\n"
+        f"— manuel yazmak için: bu mesaja reply yap, kendi metnini gönder —"
+    )
+
+    if ai_draft:
+        rows = [
+            [{"text": "✨ AI taslağını at", "callback_data": f"aireply:{tid}"},
+             {"text": "💬 Manuel yaz", "callback_data": f"replywrite:{tid}"}],
+            [{"text": "💛 Sadece like", "callback_data": f"likemention:{tid}"},
+             {"text": "⏭ Atla", "callback_data": f"mskip:{tid}"}],
+        ]
+    else:
+        rows = [[
+            {"text": "💬 Cevap yaz", "callback_data": f"replywrite:{tid}"},
+            {"text": "💛 Like", "callback_data": f"likemention:{tid}"},
+            {"text": "⏭ Atla", "callback_data": f"mskip:{tid}"},
+        ]]
+
+    result = _api(env, "sendMessage", {
+        "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+        "text": body[:4000],
+        "reply_markup": {"inline_keyboard": rows},
+        "disable_web_page_preview": False,  # show preview of original tweet
+    })
+    msg_id = result.get("message_id")
+    if msg_id is not None:
+        # Register as a special "incoming-reply" pending entry
+        draft_pending = {
+            "id": f"mention-{tid}",
+            "kind": "incoming-reply",
+            "tweet_id": tid,
+            "target_url": url,
+            "author": author,
+            "text": san["clean"],
+            "ai_draft": ai_draft,  # carried for aireply callback
+            "lang": lang,
+        }
+        _register_pending(msg_id, draft_pending)
+    print(json.dumps({"mention_tid": tid, "message_id": msg_id,
+                      "ai_drafted": bool(ai_draft)}))
+
+
 def cmd_daemon(idle_timeout: int = 50) -> None:
     """Long-running poller that processes approval callbacks for any pending draft.
 
@@ -800,16 +900,53 @@ def _process_update(env: dict, u: dict) -> None:
             _save_pending({})
         return
 
-    # Reply to a pending draft = edit
+    # Reply to a pending draft/mention message
     reply_to = (msg.get("reply_to_message") or {}).get("message_id")
     if reply_to:
         rec = _resolve_pending(reply_to)
         if rec and msg.get("text"):
             new_text = msg["text"]
-            _edit_msg_status(env, reply_to, "✏️ Düzeltildi",
-                             suffix=f"\n_yeni metin:_\n```\n{new_text}\n```")
-            _queue_and_notify(env, rec["draft"],
-                              {"action": "edit", "edited_text": new_text})
+            d = rec.get("draft", {})
+            # Strategy revision note: append to artifact, don't queue anything.
+            if d.get("kind") == "strategy":
+                try:
+                    _append_strategy_note(d.get("strategy_id", ""), new_text)
+                    _edit_msg_status(env, reply_to, "💬 Revize notu kaydedildi",
+                                     suffix=f"\nnot: {new_text[:200]}")
+                except Exception as e:
+                    sys.stderr.write(f"[daemon] strategy note error: {e}\n")
+                return
+            # Weekly plan revision note
+            if d.get("kind") == "weekly":
+                try:
+                    _append_weekly_note(d.get("week_id", ""), new_text)
+                    _edit_msg_status(env, reply_to, "💬 Haftalık plan revize notu kaydedildi",
+                                     suffix=f"\nnot: {new_text[:200]}")
+                except Exception as e:
+                    sys.stderr.write(f"[daemon] weekly note error: {e}\n")
+                return
+            # Incoming-reply OR engagement-proposal flow: user typed the reply
+            # text we should post (target_url + author present in both kinds).
+            if d.get("kind") in ("incoming-reply", "engagement-proposal"):
+                tweet_text = new_text
+                queue_item = {
+                    "id": f"reply-to-{d.get('tweet_id')}",
+                    "kind": "reply",
+                    "to": d.get("target_url"),
+                    "text": tweet_text,
+                    "context": f"manual reply to {d.get('author')}",
+                }
+                try:
+                    _edit_msg_status(env, reply_to, "💬 Cevap atılacak",
+                                     suffix=f"\n_metin:_\n{tweet_text[:300]}")
+                except Exception:
+                    pass
+                _queue_and_notify(env, queue_item, {"action": "approve"})
+            else:
+                # Standard draft-edit flow
+                _edit_msg_status(env, reply_to, "✏️ Düzeltildi",
+                                 suffix=f"\n_yeni metin:_\n```\n{new_text}\n```")
+                _queue_and_notify(env, d, {"action": "edit", "edited_text": new_text})
         return
 
     cb = u.get("callback_query")
@@ -829,11 +966,30 @@ def _process_update(env: dict, u: dict) -> None:
             pass
         return
 
+    # Decision logger — every callback is a learning signal
+    try:
+        _log_decision(action, rec.get("draft", {}))
+    except Exception as e:
+        sys.stderr.write(f"[daemon] decision log fail: {e}\n")
+
     action_tr = {
         "approve": "✅ Onaylandı",
         "skip": "⏭ Geçildi",
         "regen": "🔁 Yeni görsel üretiliyor…",
         "noimage": "📝 Görselsiz atılacak",
+        "replywrite": "💬 Cevap modu — bu mesaja reply yaz",
+        "likemention": "💛 Like atılıyor",
+        "mskip": "⏭ Atlandı",
+        "aireply": "✨ AI taslağı atılacak",
+        "stratgo": "✅ Strateji onaylandı",
+        "stratrev": "💬 Strateji revize — reply ile not yaz",
+        "stratskip": "⏭ Strateji geçildi",
+        "weekgo": "✅ Haftalık plan onaylandı",
+        "weekrev": "💬 Plan revize — reply ile not yaz",
+        "weekskip": "⏭ Haftalık plan geçildi",
+        "trendtweet": "📝 Trend → draft hazırlanıyor",
+        "trendreply": "💬 Trend reply modu — bu mesaja reply yaz",
+        "trendskip": "⏭ Trend geçildi",
     }.get(action, action)
     # Best-effort ack — query may be expired ("query is too old"); don't lose the draft over it.
     try:
@@ -884,14 +1040,431 @@ def _process_update(env: dict, u: dict) -> None:
     except Exception:
         pass
 
+    d_in = rec.get("draft", {})
+
+    # Incoming-reply card actions
+    if action == "aireply":
+        ai_text = d_in.get("ai_draft", "").strip()
+        if not ai_text:
+            try:
+                _api(env, "sendMessage", {
+                    "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+                    "text": "🔴 AI taslağı boş — manuel yaz veya like at.",
+                    "reply_to_message_id": cb_msg_id,
+                })
+            except Exception:
+                pass
+            _register_pending(cb_msg_id, d_in)
+            return
+        try:
+            _edit_msg_status(env, cb_msg_id, "✨ AI taslağı atılacak",
+                             suffix=f"\n_metin:_\n{ai_text[:300]}")
+        except Exception:
+            pass
+        reply_item = {
+            "id": f"aireply-to-{d_in.get('tweet_id')}",
+            "kind": "reply",
+            "to": d_in.get("target_url"),
+            "text": ai_text,
+            "context": f"AI draft reply to {d_in.get('author')}",
+        }
+        _queue_and_notify(env, reply_item, {"action": "approve"})
+        return
+
+    if action == "replywrite":
+        # User must now reply to message — re-register so reply_to handler can fire
+        _register_pending(cb_msg_id, d_in)
+        return
+    if action == "likemention":
+        like_item = {
+            "id": f"like-{d_in.get('tweet_id')}",
+            "kind": "like",
+            "to": d_in.get("target_url"),
+            "text": "",
+            "context": f"like to {d_in.get('author')}",
+        }
+        _queue_and_notify(env, like_item, {"action": "approve"})
+        return
+    if action == "mskip":
+        return  # already removed from pending
+
+    # Strategy card callbacks (Faz A daily_strategist) — flip artifact status,
+    # optionally compile into a draft skeleton for the normal pipeline.
+    if action in ("stratgo", "stratskip"):
+        strategy_id = parts[1] if len(parts) > 1 else d_in.get("strategy_id", "")
+        try:
+            _handle_strategy_decision(env, strategy_id, action, cb_msg_id)
+        except Exception as e:
+            sys.stderr.write(f"[daemon] strategy decision error: {e}\n")
+        return
+    if action == "stratrev":
+        # Keep the strategy in pending so the reply_to handler can capture the user's revision note.
+        _register_pending(cb_msg_id, d_in)
+        return
+
+    # Weekly plan callbacks (Faz A weekly_review) — compile 7 strategy artifacts on approve.
+    if action in ("weekgo", "weekskip"):
+        week_id = parts[1] if len(parts) > 1 else d_in.get("week_id", "")
+        try:
+            _handle_weekly_decision(env, week_id, action, cb_msg_id)
+        except Exception as e:
+            sys.stderr.write(f"[daemon] weekly decision error: {e}\n")
+        return
+    if action == "weekrev":
+        _register_pending(cb_msg_id, d_in)
+        return
+
+    # Trend listener callbacks
+    if action == "trendtweet":
+        # Compile trend selection into a draft skeleton and run through cmd_draft pipeline.
+        sel = d_in.get("selection", {})
+        if not sel:
+            _api(env, "sendMessage", {
+                "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+                "text": "⚠️ Trend kaybı — selection bulunamadı.",
+            })
+            return
+        try:
+            _handle_trend_tweet(env, sel, d_in.get("id", ""))
+        except Exception as e:
+            sys.stderr.write(f"[daemon] trend tweet error: {e}\n")
+        return
+    if action == "trendreply":
+        # User must reply to the message with their reply text. Re-register pending
+        # but as engagement-proposal so the reply_to handler treats it as a reply.
+        sel = d_in.get("selection", {})
+        url = sel.get("url", "")
+        if "x.com" in url or "twitter.com" in url:
+            tweet_id = url.rstrip("/").split("/")[-1] if "/status/" in url else None
+            if tweet_id:
+                _register_pending(cb_msg_id, {
+                    "id": d_in.get("id"),
+                    "kind": "engagement-proposal",
+                    "tweet_id": tweet_id,
+                    "target_url": url,
+                    "author": "trend",
+                })
+                return
+        # Fallback: just re-register the trend
+        _register_pending(cb_msg_id, d_in)
+        return
+    if action == "trendskip":
+        return  # already removed from pending
+
     if action == "approve":
-        _queue_and_notify(env, rec["draft"], {"action": "approve"})
+        _queue_and_notify(env, d_in, {"action": "approve"})
     elif action == "noimage":
-        d = dict(rec["draft"])
+        d = dict(d_in)
         d.pop("image_path", None)
         d.pop("image_content", None)
         _queue_and_notify(env, d, {"action": "approve"})
     # skip = nothing to queue
+
+
+_STRATEGY_DIR = _DATA / "state" / "strategy"
+
+
+def _load_strategy(strategy_id: str) -> tuple[Path, dict] | tuple[None, None]:
+    if not strategy_id:
+        return None, None
+    p = _STRATEGY_DIR / f"{strategy_id}.json"
+    if not p.exists():
+        return None, None
+    try:
+        return p, json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None, None
+
+
+def _save_strategy(path: Path, artifact: dict) -> None:
+    path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2))
+
+
+def _append_strategy_note(strategy_id: str, note: str) -> None:
+    path, artifact = _load_strategy(strategy_id)
+    if not path:
+        return
+    notes = artifact.setdefault("revision_notes", [])
+    notes.append({"at": int(time.time()), "note": note})
+    artifact["approval_status"] = "revision_requested"
+    _save_strategy(path, artifact)
+
+
+def _strategy_to_draft(strategy_id: str, artifact: dict) -> dict | None:
+    """Compile strategy artifact recommendation into a draft skeleton ready for cmd_draft."""
+    rec = artifact.get("recommendation") or {}
+    if not rec or rec.get("_error"):
+        return None
+    hook = rec.get("hook", "").strip()
+    body = rec.get("body_outline", "").strip()
+    reply_bait = rec.get("reply_bait", "").strip()
+    if body and body != "same as hook":
+        text = f"{hook}\n\n{body}\n\n{reply_bait}".strip()
+    else:
+        text = f"{hook}\n\n{reply_bait}".strip() if reply_bait else hook
+    image = rec.get("image") or {}
+    draft = {
+        "id": f"strat-{strategy_id}",
+        "kind": "tweet",
+        "to": None,
+        "text": text,
+        "context": rec.get("reasoning", ""),
+        "pillar": rec.get("pillar"),
+        "format": rec.get("format"),
+        "post_time_tr": rec.get("post_time_tr"),
+        "reply_bait": reply_bait,
+        "source": "daily_strategist",
+        "strategy_id": strategy_id,
+    }
+    if image.get("needed"):
+        draft["image_content"] = image.get("concept", "")
+        draft["image_title"] = (rec.get("pillar") or "cdpilot")[:40]
+    if rec.get("url_in_reply"):
+        draft["followup_text"] = rec["url_in_reply"]
+    return draft
+
+
+def _handle_strategy_decision(env: dict, strategy_id: str, action: str, cb_msg_id: int) -> None:
+    path, artifact = _load_strategy(strategy_id)
+    if not path:
+        _api(env, "sendMessage", {
+            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+            "text": f"⚠️ Strateji bulunamadı: {strategy_id}",
+        })
+        return
+
+    if action == "stratskip":
+        artifact["approval_status"] = "skipped"
+        artifact["decided_at"] = int(time.time())
+        _save_strategy(path, artifact)
+        return
+
+    # stratgo — approve + compile to draft skeleton
+    artifact["approval_status"] = "approved"
+    artifact["decided_at"] = int(time.time())
+    _save_strategy(path, artifact)
+
+    draft = _strategy_to_draft(strategy_id, artifact)
+    if not draft:
+        _api(env, "sendMessage", {
+            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+            "text": f"⚠️ Strateji {strategy_id} taslağa derlenemedi (recommendation eksik).",
+        })
+        return
+
+    drafts_dir = _DATA / "drafts"
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+    draft_path = drafts_dir / f"{draft['id']}.json"
+    draft_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2))
+
+    # Send the draft through the normal cmd_draft pipeline so user can approve/regen image.
+    try:
+        cmd_draft(str(draft_path))
+    except Exception as e:
+        _api(env, "sendMessage", {
+            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+            "text": f"🔴 Strateji taslağı gönderilemedi: {str(e)[:200]}",
+        })
+
+
+_DECISIONS_DIR = _DATA / "audit"
+
+
+def _log_decision(action: str, draft: dict) -> None:
+    """Append every user decision to audit/decisions-YYYY-MM-DD.jsonl.
+
+    Powers the decision_learner: builds handle/pillar/hour approval patterns,
+    then adaptive thresholds in engagement_scanner. Without this, the system
+    can't learn from user behavior.
+    """
+    if not draft:
+        return
+    _DECISIONS_DIR.mkdir(parents=True, exist_ok=True)
+    today = time.strftime("%Y-%m-%d")
+    out = _DECISIONS_DIR / f"decisions-{today}.jsonl"
+
+    # Approval semantics — group by intent so learner can compute approval_rate
+    approve_actions = {"approve", "aireply", "likemention", "stratgo", "weekgo",
+                       "trendtweet", "noimage"}
+    skip_actions = {"skip", "mskip", "stratskip", "weekskip", "trendskip"}
+    revise_actions = {"regen", "stratrev", "weekrev", "replywrite", "trendreply"}
+    decision = ("approve" if action in approve_actions
+                else "skip" if action in skip_actions
+                else "revise" if action in revise_actions
+                else "other")
+
+    entry = {
+        "ts": int(time.time()),
+        "hour": time.strftime("%H"),
+        "action": action,
+        "decision": decision,
+        "draft_id": draft.get("id"),
+        "kind": draft.get("kind"),
+        "pillar": draft.get("pillar"),
+        "handle": draft.get("author") or draft.get("handle"),
+        "source": draft.get("source"),
+        "tweet_id": draft.get("tweet_id"),
+        "ai_drafted": draft.get("ai_drafted", False),
+    }
+    with open(out, "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+_WEEKLY_DIR = _DATA / "state" / "weekly"
+
+
+def _load_weekly(week_id: str) -> tuple[Path, dict] | tuple[None, None]:
+    if not week_id:
+        return None, None
+    p = _WEEKLY_DIR / f"{week_id}.json"
+    if not p.exists():
+        return None, None
+    try:
+        return p, json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None, None
+
+
+def _save_weekly(path: Path, artifact: dict) -> None:
+    path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2))
+
+
+def _append_weekly_note(week_id: str, note: str) -> None:
+    path, artifact = _load_weekly(week_id)
+    if not path:
+        return
+    notes = artifact.setdefault("revision_notes", [])
+    notes.append({"at": int(time.time()), "note": note})
+    artifact["approval_status"] = "revision_requested"
+    _save_weekly(path, artifact)
+
+
+def _weekly_to_strategy_artifact(day_plan: dict, week_id: str) -> dict:
+    """Convert one weekly_plan entry to a daily strategy artifact (pre-approved).
+
+    The daily_strategist won't re-call Claude when an artifact exists (unless
+    CDPILOT_STRATEGIST_FORCE=1). Instead it'll pick this up and send the card.
+    """
+    return {
+        "id": day_plan.get("date"),
+        "generated_at": int(time.time()),
+        "source": "weekly_review",
+        "week_id": week_id,
+        "context": {"derived_from_weekly": True},
+        "recommendation": {
+            "pillar": day_plan.get("pillar"),
+            "format": day_plan.get("format"),
+            "post_time_tr": day_plan.get("post_time_tr"),
+            "hook": day_plan.get("hook_seed", ""),
+            "body_outline": "same as hook",
+            "reply_bait": "",  # daily strategist or user fills this
+            "image": {"needed": day_plan.get("format") == "image",
+                      "concept": "Field Notebook style: " + (day_plan.get("pillar", "") or "")},
+            "url_in_reply": None,
+            "reasoning": day_plan.get("reasoning", ""),
+        },
+        "approval_status": "weekly_preapproved",
+    }
+
+
+def _handle_weekly_decision(env: dict, week_id: str, action: str, cb_msg_id: int) -> None:
+    path, artifact = _load_weekly(week_id)
+    if not path:
+        _api(env, "sendMessage", {
+            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+            "text": f"⚠️ Haftalık plan bulunamadı: {week_id}",
+        })
+        return
+
+    if action == "weekskip":
+        artifact["approval_status"] = "skipped"
+        artifact["decided_at"] = int(time.time())
+        _save_weekly(path, artifact)
+        return
+
+    # weekgo — approve + write 7 strategy artifacts for next week's daily slots
+    plan = artifact.get("plan", {})
+    days = plan.get("next_week_plan", []) if isinstance(plan, dict) else []
+    if not days:
+        _api(env, "sendMessage", {
+            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+            "text": f"⚠️ Haftalık plan boş: {week_id} — derleme atlandı.",
+        })
+        return
+
+    strategy_dir = _DATA / "state" / "strategy"
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for d in days:
+        date_str = d.get("date")
+        if not date_str:
+            continue
+        target = strategy_dir / f"{date_str}.json"
+        # Don't overwrite if user already approved a strategy for that day
+        if target.exists():
+            existing = json.loads(target.read_text())
+            if existing.get("approval_status") in ("approved", "awaiting_telegram"):
+                continue
+        target.write_text(json.dumps(
+            _weekly_to_strategy_artifact(d, week_id), ensure_ascii=False, indent=2))
+        written += 1
+
+    artifact["approval_status"] = "approved"
+    artifact["decided_at"] = int(time.time())
+    artifact["compiled_strategies"] = written
+    _save_weekly(path, artifact)
+
+    try:
+        _api(env, "sendMessage", {
+            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+            "text": f"✅ Haftalık plan onaylandı. {written}/7 strateji günlük olarak hazırlandı.\n"
+                    f"Her sabah 08:30'da o günün kartı Telegram'a düşecek.",
+        })
+    except Exception:
+        pass
+
+
+def _handle_trend_tweet(env: dict, sel: dict, source_id: str) -> None:
+    """Compile a trend selection into a draft skeleton and push through cmd_draft."""
+    angle = sel.get("angle", "").strip()
+    title = sel.get("title", "").strip()
+    url = sel.get("url", "")
+    if not angle:
+        _api(env, "sendMessage", {
+            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+            "text": "⚠️ Trend angle boş — draft üretilemedi.",
+        })
+        return
+
+    # Body: just the angle. Reply-bait & URL handling left to user/strategist polish.
+    body = angle
+    draft = {
+        "id": f"trend-{source_id}",
+        "kind": "tweet",
+        "to": None,
+        "text": body,
+        "context": f"trend listener seed — {sel.get('source', '?')}: {title[:120]}",
+        "pillar": sel.get("pillar"),
+        "format": sel.get("format_hint"),
+        "source": "trend_listener",
+        "source_url": url,
+    }
+    if url and not url.startswith("https://x.com"):
+        # External link → goes to followup reply per URL-in-reply experiment
+        draft["followup_text"] = url
+
+    drafts_dir = _DATA / "drafts"
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+    draft_path = drafts_dir / f"{draft['id']}.json"
+    draft_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2))
+
+    try:
+        cmd_draft(str(draft_path))
+    except Exception as e:
+        _api(env, "sendMessage", {
+            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
+            "text": f"🔴 Trend taslağı gönderilemedi: {str(e)[:200]}",
+        })
 
 
 def _queue_and_notify(env: dict, draft: dict, decision: dict) -> None:
@@ -930,6 +1503,8 @@ def main() -> None:
     s_poll.add_argument("--timeout", type=int, default=1)
     s_daemon = sub.add_parser("daemon", help="long-running approval-loop daemon")
     s_daemon.add_argument("--idle-timeout", type=int, default=50)
+    s_inc = sub.add_parser("incoming-reply", help="post incoming-reply decision card")
+    s_inc.add_argument("json_path", help="path to inbox/<id>.json")
     args = p.parse_args()
     if args.cmd == "setup":
         cmd_setup()
@@ -945,6 +1520,8 @@ def main() -> None:
         cmd_poll(args.timeout)
     elif args.cmd == "daemon":
         cmd_daemon(args.idle_timeout)
+    elif args.cmd == "incoming-reply":
+        cmd_incoming_reply(args.json_path)
 
 
 if __name__ == "__main__":

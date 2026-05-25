@@ -18,6 +18,10 @@ import sys
 import time
 from pathlib import Path
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).parent))
+import _twikit_patch  # noqa: F401
 from twikit import Client  # type: ignore
 
 DATA = Path(os.environ.get("CDPILOT_XBOT_DATA", str(Path.home() / "cdpilot-twitter-data")))
@@ -104,10 +108,22 @@ async def _scrape(since_hours: int) -> int:
             "is_quote": getattr(tw, "is_quote_status", False),
             "status": "new",
         }
-        (INBOX_DIR / f"{tid}.json").write_text(json.dumps(item, ensure_ascii=False, indent=2))
+        inbox_file = INBOX_DIR / f"{tid}.json"
+        inbox_file.write_text(json.dumps(item, ensure_ascii=False, indent=2))
         seen.add(tid)
         new_count += 1
         _log(f"new mention {tid} from @{author}: {text[:80]}")
+        # Push to Telegram as decision card (only for actual replies to us, not random mentions)
+        if item["is_reply_to_us"]:
+            try:
+                import subprocess
+                bridge = Path(__file__).parent / "telegram_bridge.py"
+                subprocess.run(
+                    [sys.executable, str(bridge), "incoming-reply", str(inbox_file)],
+                    timeout=15, check=False,
+                )
+            except Exception as e:
+                _log(f"telegram notify failed for {tid}: {e}")
 
     _save_seen(seen)
     _log(f"scan complete — {new_count} new mentions")

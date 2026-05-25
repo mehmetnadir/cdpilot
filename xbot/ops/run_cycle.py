@@ -83,17 +83,29 @@ def main() -> None:
     # Always: DM inbox poll (Faz 0: max 5 drafts/slot, taslak modu)
     results.append(_run([str(OPS / "dm_handler.py")], "dm_handler"))
 
-    # Morning: discovery + follow proposals + (Tue) grok provocation
+    # Midday: Search-to-Respond — find niche questions on X to reply to
+    if slot == "midday":
+        results.append(_run([str(OPS / "search_respond.py")], "search_respond"))
+
+    # Morning: discovery + follow proposals + (Tue) grok provocation + daily strategy
     if slot == "morning":
         results.append(_run([str(OPS / "discovery_scan.py"), "--limit", "10"], "discovery_scan"))
         results.append(_run([str(OPS / "follow_manager.py")], "follow_manager"))
         # Grok provocation — weekly, Tuesday morning
         if datetime.now().weekday() == 1:  # Tuesday
             results.append(_run([str(OPS / "grok_provocation.py"), "propose"], "grok_provocation"))
+        # Daily strategist — Faz A #1. Produces today's recommendation card.
+        # Runs after discovery so trend candidates are fresh.
+        results.append(_run([str(OPS / "daily_strategist.py")], "daily_strategist"))
+        # Trend listener — Faz A #3. Picks top 3 niche-relevant trends from discovery feed.
+        results.append(_run([str(OPS / "trend_listener.py")], "trend_listener_morning"))
 
-    # Evening: engagement scan (Tier 1/2 + mutual → like/reply candidates → Telegram)
+    # Evening: engagement scan + second trend listener pass
     if slot == "evening":
         results.append(_run([str(OPS / "engagement_scanner.py"), "--propose-top=3"], "engagement_scanner"))
+        # Run discovery_scan first so trend listener has fresh feed (morning's may be 8h stale)
+        results.append(_run([str(OPS / "discovery_scan.py"), "--limit", "8"], "discovery_scan_evening"))
+        results.append(_run([str(OPS / "trend_listener.py")], "trend_listener_evening"))
 
     # Night: analytics + engagement scan-only (no proposals, just scoring for record)
     if slot == "night":
@@ -101,6 +113,12 @@ def main() -> None:
         results.append(_run([str(OPS / "engagement_scanner.py")], "engagement_scanner_scan"))
         # Crisis check — if engagement drops 60% vs 7-day baseline, freeze posting
         results.append(_run([str(OPS / "crisis_check.py")], "crisis_check"))
+        # Decision learner — Faz B #1. Computes profile.json from decisions audit.
+        # Adaptive thresholds picked up by next cycle's engagement_scanner.
+        results.append(_run([str(OPS / "decision_learner.py")], "decision_learner"))
+        # Weekly review — Sunday night only. Produces 7-day backlog card.
+        if datetime.now().weekday() == 6:  # Sunday
+            results.append(_run([str(OPS / "weekly_review.py")], "weekly_review"))
 
     print(f"\n== {slot} complete ==")
     print(json.dumps({"slot": slot, "results": results}, ensure_ascii=False, indent=2))

@@ -198,5 +198,410 @@ def test_engagement_topic_re_matches_keywords():
         assert TOPIC_RE.search(kw), f"{kw} should match"
 
 
+# ── daily_strategist ──
+def test_strategist_infer_pillar():
+    sys.modules.pop("daily_strategist", None)
+    import daily_strategist as ds  # type: ignore
+    assert ds._infer_pillar("tip-001-xyz") == "llm-tips"
+    assert ds._infer_pillar("gem-001-rebrowser") == "gem-repos"
+    assert ds._infer_pillar("bts-007") == "behind-the-scenes"
+    assert ds._infer_pillar("smoke-test") == "behind-the-scenes"
+    assert ds._infer_pillar("teaser-conductor-1") == "teaser"
+    assert ds._infer_pillar("conductor-tease-2") == "teaser"
+    assert ds._infer_pillar("fz0-1") == "cdpilot"
+
+
+def test_strategist_pillar_balance_targets():
+    sys.modules.pop("daily_strategist", None)
+    import daily_strategist as ds  # type: ignore
+    posted = [
+        {"pillar": "cdpilot"}, {"pillar": "cdpilot"}, {"pillar": "cdpilot"},
+        {"pillar": "llm-tips"},
+        {"pillar": "gem-repos"},
+    ]
+    b = ds._pillar_balance(posted)
+    assert b["cdpilot"]["count"] == 3
+    assert b["llm-tips"]["count"] == 1
+    # behind-the-scenes/teaser should show negative delta (underrepresented)
+    assert b["behind-the-scenes"]["delta"] < 0
+    assert b["teaser"]["delta"] < 0
+
+
+def test_strategist_build_context_runs(monkeypatch, tmp_path):
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    sys.modules.pop("daily_strategist", None)
+    import daily_strategist as ds  # type: ignore
+    # Force module-level paths to honor the monkeypatched env.
+    ds.DATA = tmp_path
+    ds.ANALYTICS = tmp_path / "analytics"
+    ds.POSTED = tmp_path / "posted"
+    ds.DRAFTS = tmp_path / "drafts"
+    ds.DISCOVERIES = tmp_path / "discoveries"
+    ds.STATE = tmp_path / "state"
+    ctx = ds.build_context()
+    assert "today" in ctx and "weekday_tr" in ctx
+    assert "weekly_track" in ctx
+    assert "pillar_balance_7d" in ctx
+    assert set(ctx["pillar_balance_7d"].keys()) == set(ds.PILLAR_KEYS)
+    assert ctx["drafts_pending"] == 0
+
+
+def test_strategist_render_card_contains_key_fields():
+    sys.modules.pop("daily_strategist", None)
+    import daily_strategist as ds  # type: ignore
+    rec = {
+        "pillar": "llm-tips", "format": "single", "post_time_tr": "17:23",
+        "hook": "raw CDP > playwright for nested frames",
+        "body_outline": "same as hook",
+        "reply_bait": "which framework abstracts too much for your use case?",
+        "image": {"needed": True, "concept": "Field Notebook style: CDP snippet"},
+        "url_in_reply": None,
+        "reasoning": "llm-tips underrepresented 7d. 17:23 in static peak. image boost.",
+    }
+    ctx = {
+        "today": "2026-05-22", "weekday_tr": "Cuma",
+        "weekly_track": "Comparisons & Benchmarks",
+        "pillar_balance_7d": {"llm-tips": {"delta": -0.25}, "cdpilot": {"delta": 0.1},
+                              "gem-repos": {"delta": -0.05}, "behind-the-scenes": {"delta": -0.05},
+                              "teaser": {"delta": -0.05}},
+        "kpi_last_3d": {"followers": 1, "total_views": 2},
+        "drafts_pending": 0,
+        "active_experiments": {},
+    }
+    card = ds._render_card_text(rec, ctx)
+    assert "llm-tips" in card
+    assert "17:23" in card
+    assert "Field Notebook" in card
+    assert "Soru ile bitiş" in card
+
+
+def test_strategist_compile_strategy_to_draft():
+    # _strategy_to_draft lives in telegram_bridge — verify compile works
+    sys.modules.pop("telegram_bridge", None)
+    import telegram_bridge as tb  # type: ignore
+    artifact = {
+        "id": "2026-05-22",
+        "recommendation": {
+            "pillar": "gem-repos",
+            "format": "single",
+            "post_time_tr": "18:14",
+            "hook": "rebrowser-patches: the puppeteer-extra-stealth replacement nobody talks about",
+            "body_outline": "same as hook",
+            "reply_bait": "what's your current stealth stack?",
+            "image": {"needed": False, "concept": ""},
+            "url_in_reply": "https://github.com/rebrowser/rebrowser-patches",
+            "reasoning": "gem-repos underrepresented. niche audience overlap.",
+        },
+    }
+    draft = tb._strategy_to_draft("2026-05-22", artifact)
+    assert draft is not None
+    assert draft["id"] == "strat-2026-05-22"
+    assert draft["pillar"] == "gem-repos"
+    assert draft["followup_text"] == "https://github.com/rebrowser/rebrowser-patches"
+    assert "rebrowser-patches" in draft["text"]
+    assert "what's your current stealth stack?" in draft["text"]
+    assert "image_content" not in draft  # image.needed = False
+
+
+def test_strategist_compile_returns_none_on_error():
+    sys.modules.pop("telegram_bridge", None)
+    import telegram_bridge as tb  # type: ignore
+    assert tb._strategy_to_draft("x", {"recommendation": {"_error": "timeout"}}) is None
+    assert tb._strategy_to_draft("x", {}) is None
+
+
+# ── weekly_review ──
+def test_weekly_review_next_week_dates_are_seven_days_from_monday():
+    sys.modules.pop("weekly_review", None)
+    import weekly_review as wr  # type: ignore
+    dates = wr._next_week_dates()
+    assert len(dates) == 7
+    assert dates[0]["weekday_en"] == "Mon"
+    assert dates[-1]["weekday_en"] == "Sun"
+
+
+def test_weekly_review_infer_format_image_vs_thread_vs_single():
+    sys.modules.pop("weekly_review", None)
+    import weekly_review as wr  # type: ignore
+    assert wr._infer_format({"image_path": "x.png"}) == "image"
+    assert wr._infer_format({"image_content": "yo"}) == "image"
+    long_thread = {"text": "a" * 250}
+    assert wr._infer_format(long_thread) == "thread"
+    assert wr._infer_format({"text": "short tweet"}) == "single"
+    assert wr._infer_format({"kind": "quote", "text": "x"}) == "quote"
+
+
+def test_weekly_to_strategy_artifact_shape():
+    sys.modules.pop("telegram_bridge", None)
+    import telegram_bridge as tb  # type: ignore
+    day_plan = {
+        "date": "2026-06-01",
+        "weekday": "Mon",
+        "track": "Foundations",
+        "pillar": "cdpilot",
+        "format": "image",
+        "post_time_tr": "17:23",
+        "hook_seed": "raw CDP > playwright nested frame traversal benchmark",
+        "reasoning": "Mon Foundations track + image winners last week",
+    }
+    artifact = tb._weekly_to_strategy_artifact(day_plan, "2026-W23")
+    assert artifact["id"] == "2026-06-01"
+    assert artifact["source"] == "weekly_review"
+    assert artifact["approval_status"] == "weekly_preapproved"
+    rec = artifact["recommendation"]
+    assert rec["pillar"] == "cdpilot"
+    assert rec["post_time_tr"] == "17:23"
+    assert rec["image"]["needed"] is True  # format=image
+    # Non-image day → image.needed False
+    day_plan["format"] = "single"
+    art2 = tb._weekly_to_strategy_artifact(day_plan, "2026-W23")
+    assert art2["recommendation"]["image"]["needed"] is False
+
+
+# ── trend_listener ──
+def test_trend_listener_build_context_empty_safe(monkeypatch, tmp_path):
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    sys.modules.pop("trend_listener", None)
+    import trend_listener as tl  # type: ignore
+    tl.DATA = tmp_path
+    tl.DISCOVERIES = tmp_path / "discoveries"
+    tl.POSTED = tmp_path / "posted"
+    ctx = tl.build_context()
+    assert "sources" in ctx and "today" in ctx
+
+
+def test_trend_listener_filters_seen_urls(monkeypatch, tmp_path):
+    import time as _time
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    (tmp_path / "discoveries").mkdir()
+    (tmp_path / "posted").mkdir()
+    (tmp_path / "discoveries" / "2026-05-25.json").write_text(json.dumps({
+        "hn": [
+            {"title": "Article A", "url": "https://example.com/a", "score": 100},
+            {"title": "Article B", "url": "https://example.com/b", "score": 50},
+        ],
+    }))
+    (tmp_path / "posted" / "old.json").write_text(json.dumps({
+        "id": "old", "posted_at": int(_time.time()) - 100,
+        "followup_text": "https://example.com/a",
+    }))
+    sys.modules.pop("trend_listener", None)
+    import trend_listener as tl  # type: ignore
+    tl.DATA = tmp_path
+    tl.DISCOVERIES = tmp_path / "discoveries"
+    tl.POSTED = tmp_path / "posted"
+    ctx = tl.build_context()
+    hn = ctx["sources"].get("hn", [])
+    urls = {it["url"] for it in hn}
+    assert "https://example.com/a" not in urls  # already posted, filtered
+    assert "https://example.com/b" in urls
+
+
+def test_trend_listener_render_card_contains_action_label():
+    sys.modules.pop("trend_listener", None)
+    import trend_listener as tl  # type: ignore
+    sel = {
+        "source": "hn",
+        "title": "Browser quirk discovered",
+        "url": "https://news.ycombinator.com/item?id=1",
+        "why_now": "trending in our niche today",
+        "suggested_action": "tweet",
+        "angle": "this is the raw CDP perspective on it",
+        "format_hint": "single",
+        "pillar": "cdpilot",
+        "risk_flag": None,
+    }
+    card = tl._render_card(sel, 1, 3)
+    assert "Hacker News" in card
+    assert "Tweet at" in card
+    assert "raw CDP perspective" in card
+    assert "cdpilot" in card
+
+
+def test_trend_listener_render_card_shows_risk_warning():
+    sys.modules.pop("trend_listener", None)
+    import trend_listener as tl  # type: ignore
+    sel = {
+        "source": "x_search", "title": "x", "url": "https://x.com/u/status/1",
+        "why_now": "?", "suggested_action": "reply", "angle": "test",
+        "format_hint": "single", "pillar": "cdpilot", "risk_flag": "controversial",
+    }
+    card = tl._render_card(sel, 1, 1)
+    assert "Risk: controversial" in card
+
+
+# ── search_respond ──
+def test_search_respond_question_regex():
+    sys.modules.pop("search_respond", None)
+    import search_respond as sr  # type: ignore
+    assert sr._is_question("does cdpilot handle iframes?")
+    assert sr._is_question("how do you bypass cloudflare")
+    assert sr._is_question("any idea why playwright stealth breaks?")
+    assert sr._is_question("anyone know if puppeteer detects this")
+    assert not sr._is_question("just shipped a new release")
+    assert not sr._is_question("here is my benchmark result")
+
+
+def test_search_respond_scoring_recent_high_followers_wins():
+    sys.modules.pop("search_respond", None)
+    import search_respond as sr  # type: ignore
+    fresh_big = {"hours_old": 2, "author_followers": 40000, "replies": 1}
+    stale_small = {"hours_old": 30, "author_followers": 1100, "replies": 50}
+    assert sr._score(fresh_big) > sr._score(stale_small)
+
+
+def test_search_respond_dedupe_by_tweet_id():
+    sys.modules.pop("search_respond", None)
+    import search_respond as sr  # type: ignore
+    items = [
+        {"tweet_id": "1", "text": "a"},
+        {"tweet_id": "2", "text": "b"},
+        {"tweet_id": "1", "text": "a dup"},
+    ]
+    out = sr._dedupe(items)
+    assert len(out) == 2
+    assert {i["tweet_id"] for i in out} == {"1", "2"}
+
+
+# ── engagement_scanner auto-execute ──
+def test_engagement_scanner_caps_loaded():
+    sys.modules.pop("engagement_scanner", None)
+    import engagement_scanner as es  # type: ignore
+    assert es.LIKE_PER_DAY >= 15  # yoğun mod (yarısı bile auto-eligible)
+    assert es.REPLY_PER_DAY >= 8
+    assert es.AUTO_LIKE_THRESHOLD == 6
+    assert es.AUTO_REPLY_THRESHOLD == 7
+
+
+def test_engagement_scanner_auto_queue_like_creates_kind_like(monkeypatch, tmp_path):
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    sys.modules.pop("engagement_scanner", None)
+    import engagement_scanner as es  # type: ignore
+    es.DATA = tmp_path
+    es.QUEUE_DIR = tmp_path / "queue"
+    es.QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    c = {"tweet_id": "999", "url": "https://x.com/x/status/999",
+         "handle": "x", "text": "yo", "score": 6, "hours_old": 1.0}
+    path = es._auto_queue_like(c)
+    assert path.exists()
+    item = json.loads(path.read_text())
+    assert item["kind"] == "like"
+    assert item["to"] == c["url"]
+    assert item["source"] == "engagement_scanner_auto"
+    assert item["scheduled_time"] > item["approved_at"]
+
+
+def test_engagement_scanner_auto_queue_reply_includes_draft(monkeypatch, tmp_path):
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    sys.modules.pop("engagement_scanner", None)
+    import engagement_scanner as es  # type: ignore
+    es.DATA = tmp_path
+    es.QUEUE_DIR = tmp_path / "queue"
+    es.QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    c = {"tweet_id": "1234", "url": "https://x.com/x/status/1234",
+         "handle": "addyosmani", "text": "captcha is weird", "score": 8, "hours_old": 2.0}
+    path = es._auto_queue_reply(c, "yeah — raw CDP avoids the page-loaded race here. specific captcha vendor?")
+    item = json.loads(path.read_text())
+    assert item["kind"] == "reply"
+    assert "raw CDP" in item["text"]
+    assert item["ai_drafted"] is True
+    assert item["scheduled_time"] - item["approved_at"] >= 300  # ≥ 5min human gap
+
+
+# ── decision_learner ──
+def test_decision_learner_empty_audit_returns_safe_profile(monkeypatch, tmp_path):
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    sys.modules.pop("decision_learner", None)
+    import decision_learner as dl  # type: ignore
+    dl.DATA = tmp_path
+    dl.AUDIT_DIR = tmp_path / "audit"
+    dl.STATE = tmp_path / "state"
+    dl.PROFILE_PATH = tmp_path / "state" / "profile.json"
+    prof = dl.run()
+    assert prof["total_decisions"] == 0
+    assert prof["handle_stats"] == {}
+    assert "Karar verisi yok" in prof["summary_tr"]
+
+
+def test_decision_learner_trust_classification(monkeypatch, tmp_path):
+    import time as _time
+    from datetime import datetime as _dt
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    now = int(_time.time())
+
+    # @addyosmani: 5/5 approves → high trust
+    # @swyx: 0/5 approves → veto
+    # @vercel: 3/5 approves → medium
+    rows = []
+    for _ in range(5):
+        rows.append({"ts": now, "decision": "approve", "handle": "addyosmani"})
+        rows.append({"ts": now, "decision": "skip", "handle": "swyx"})
+    rows += [{"ts": now, "decision": "approve", "handle": "vercel"}] * 3
+    rows += [{"ts": now, "decision": "skip", "handle": "vercel"}] * 2
+
+    with open(audit / f"decisions-{_dt.now().strftime('%Y-%m-%d')}.jsonl", "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+    sys.modules.pop("decision_learner", None)
+    import decision_learner as dl  # type: ignore
+    dl.DATA = tmp_path
+    dl.AUDIT_DIR = audit
+    dl.STATE = tmp_path / "state"
+    dl.PROFILE_PATH = tmp_path / "state" / "profile.json"
+    prof = dl.run()
+    assert prof["handle_stats"]["addyosmani"]["trust"] == "high"
+    assert prof["handle_stats"]["swyx"]["trust"] == "veto"
+    assert prof["handle_stats"]["vercel"]["trust"] == "medium"
+
+
+def test_decision_learner_adaptive_bonus(monkeypatch, tmp_path):
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "profile.json").write_text(json.dumps({
+        "handle_stats": {
+            "addyosmani": {"trust": "high", "n": 10},
+            "swyx": {"trust": "veto", "n": 8},
+            "vercel": {"trust": "medium", "n": 6},
+            "unknown": {"trust": "insufficient_data", "n": 1},
+        },
+        "pillar_weight_deltas": {"llm-tips": 0.10, "teaser": -0.15},
+    }))
+    sys.modules.pop("decision_learner", None)
+    import decision_learner as dl  # type: ignore
+    dl.PROFILE_PATH = tmp_path / "state" / "profile.json"
+    assert dl.adaptive_score_bonus("addyosmani") == 3
+    assert dl.adaptive_score_bonus("swyx") == -99  # veto
+    assert dl.adaptive_score_bonus("vercel") == 1
+    assert dl.adaptive_score_bonus("unknown") == 0
+    # Pillar bonus stacks
+    assert dl.adaptive_score_bonus("addyosmani", "llm-tips") == 4
+    assert dl.adaptive_score_bonus("vercel", "teaser") == 0  # 1 + (-1) = 0
+
+
+def test_telegram_bridge_log_decision_creates_audit(monkeypatch, tmp_path):
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    sys.modules.pop("telegram_bridge", None)
+    import telegram_bridge as tb  # type: ignore
+    tb._DATA = tmp_path
+    tb._DECISIONS_DIR = tmp_path / "audit"
+    draft = {"id": "fz0-1", "kind": "tweet", "pillar": "cdpilot",
+             "author": "addyosmani", "ai_drafted": True}
+    tb._log_decision("approve", draft)
+    tb._log_decision("skip", draft)
+    audit_files = list((tmp_path / "audit").glob("decisions-*.jsonl"))
+    assert len(audit_files) == 1
+    lines = audit_files[0].read_text().strip().splitlines()
+    assert len(lines) == 2
+    e0 = json.loads(lines[0])
+    assert e0["decision"] == "approve"
+    assert e0["handle"] == "addyosmani"
+    assert e0["pillar"] == "cdpilot"
+    e1 = json.loads(lines[1])
+    assert e1["decision"] == "skip"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
