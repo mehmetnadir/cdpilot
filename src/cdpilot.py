@@ -2098,6 +2098,12 @@ def cmd_launch():
             'InterestFeedContentSuggestions', 'CalculateNativeWinOcclusion',
             'PasswordManagerOnboarding', 'AutofillServerCommunication',
         ]),
+        # Anti-bot leak fix (2026-05-31): Chrome's blink runtime exposes an
+        # "automation controlled" flag when --remote-debugging-port is set;
+        # Patchright/nodriver disable this. Even though navigator.webdriver
+        # already reads false on vanilla Brave/Chrome, deeper detectors
+        # (Cloudflare/Datadome behavioral) probe the blink flag directly.
+        '--disable-blink-features=AutomationControlled',
         # ─── Chromium performance flags ───
         '--disable-background-networking',
         '--disable-background-timer-throttling',
