@@ -370,6 +370,18 @@ function showHelp() {
   AI AGENT
     mcp                Start MCP server (stdin/stdout JSON-RPC)
 
+  WATCH (continuous screencast for AI video understanding)
+    watch start <url>  Begin JPEG screencast at N fps to a disk ring buffer
+                       (default 10fps, 5min retention, 100MB cap). Background
+                       daemon — command returns immediately.
+    watch query --at MM:SS --window 5s
+                       Return JSON list of frame paths around a video time.
+    watch query --last 5s | --since-last
+                       Recent frames or everything new since the last query.
+    watch status       Daemon state, frame count, disk usage.
+    watch stop         Stop daemon + clean up frames (--keep-frames to retain).
+    watch ask "<q>"    Tiny NL parser: extracts time window from a question.
+
   More: https://github.com/mehmetnadir/cdpilot#commands
 `);
 }

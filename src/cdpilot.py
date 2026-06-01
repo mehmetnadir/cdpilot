@@ -9607,6 +9607,30 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element expected to be hidden"}}, "required": ["selector"]}},
             {"name": "browser_screenshot_diff", "description": "Compare two screenshot PNG files byte-by-byte. Returns MATCH if files are identical or DIFF with file sizes if different. Use this for visual regression testing — take a baseline screenshot, perform actions, take another screenshot, then compare.",
              "inputSchema": {"type": "object", "properties": {"path1": {"type": "string", "description": "Absolute path to the first (baseline) screenshot PNG"}, "path2": {"type": "string", "description": "Absolute path to the second (current) screenshot PNG"}}, "required": ["path1", "path2"]}},
+            {"name": "browser_watch_start", "description": "Begin a continuous JPEG screencast of the active page to disk. CDP's Page.startScreencast streams frames at 10-30fps so the model can actually SEE animation, mouse cursors, and short visual events that single screenshots miss. Spawns a background daemon that writes JPEGs into a per-project ring buffer (default 5 min retention, 100MB cap). Use this to capture video playback, animated demos, or any time-based UI for later multimodal analysis.",
+             "inputSchema": {"type": "object", "properties": {
+                 "url": {"type": "string", "description": "URL or file:// path to load before recording. Pass '-' or omit to attach to the currently-loaded page."},
+                 "fps": {"type": "integer", "description": "Frames per second (1-30). Higher = more detail but bigger ring buffer.", "default": 10},
+                 "quality": {"type": "integer", "description": "JPEG quality 1-100.", "default": 70},
+                 "max_width": {"type": "integer", "description": "Maximum frame width in pixels (shrinks proportionally).", "default": 1280},
+                 "retention_s": {"type": "integer", "description": "Seconds to keep frames before eviction.", "default": 300},
+                 "disk_cap_mb": {"type": "integer", "description": "Maximum total frame size in MB before oldest-first eviction.", "default": 100},
+                 "seek": {"type": "string", "description": "Optional MM:SS or seconds to seek the page's first <video> element to."}
+             }}},
+            {"name": "browser_watch_stop", "description": "Stop the background screencast daemon and (by default) delete the captured frames. Use after you've finished querying so you don't leak disk. Pass keep_frames=true to keep the ring buffer for later inspection.",
+             "inputSchema": {"type": "object", "properties": {
+                 "keep_frames": {"type": "boolean", "description": "Keep the captured frames on disk instead of deleting them.", "default": False}
+             }}},
+            {"name": "browser_watch_query", "description": "Return the file paths of JPEG frames captured around a target time window. Frames live on local disk so you can read them and feed them to a multimodal API (vision call) to actually understand what happened. Choose ONE of: at_window (centered on a video time), last (relative to the newest frame), since_last (everything new since the previous query). Returns at most `max` frames (default 16) — when more frames fall in the window we downsample, preferring high-motion moments when Pillow is available.",
+             "inputSchema": {"type": "object", "properties": {
+                 "at": {"type": "string", "description": "Video time to center on, MM:SS or seconds (e.g. '1:23'). Measured from screencast start."},
+                 "window": {"type": "string", "description": "Width of the window around `at`, e.g. '5s', '500ms'.", "default": "5s"},
+                 "last": {"type": "string", "description": "Return frames from the last N seconds (e.g. '5s'). Relative to the newest frame on disk."},
+                 "since_last": {"type": "boolean", "description": "Return only frames newer than the previous watch_query call."},
+                 "max": {"type": "integer", "description": "Maximum number of frame paths to return (downsampled if window has more).", "default": 16}
+             }}},
+            {"name": "browser_watch_status", "description": "Report the current screencast daemon state: running flag, frame count, total disk usage, oldest/newest timestamps. Use before browser_watch_query to confirm frames are actually being captured.",
+             "inputSchema": {"type": "object", "properties": {}}},
         ]
 
     def _handle_request(self, request):
@@ -9677,6 +9701,10 @@ class MCPServer:
             "browser_assert_visible": lambda a: ["assert-visible", a.get("selector", "")],
             "browser_assert_hidden": lambda a: ["assert-hidden", a.get("selector", "")],
             "browser_screenshot_diff": lambda a: ["screenshot-diff", a.get("path1", ""), a.get("path2", "")],
+            "browser_watch_start": lambda a: ["watch", "start"] + ([a["url"]] if a.get("url") else []) + ([f"--fps={a['fps']}"] if a.get("fps") else []) + ([f"--quality={a['quality']}"] if a.get("quality") else []) + ([f"--max-width={a['max_width']}"] if a.get("max_width") else []) + ([f"--retention={a['retention_s']}"] if a.get("retention_s") else []) + ([f"--disk-cap={a['disk_cap_mb']}"] if a.get("disk_cap_mb") else []) + ([f"--seek={a['seek']}"] if a.get("seek") else []),
+            "browser_watch_stop": lambda a: ["watch", "stop"] + (["--keep-frames"] if a.get("keep_frames") else []),
+            "browser_watch_query": lambda a: ["watch", "query"] + ([f"--at={a['at']}"] if a.get("at") else []) + ([f"--window={a['window']}"] if a.get("window") else []) + ([f"--last={a['last']}"] if a.get("last") else []) + (["--since-last"] if a.get("since_last") else []) + ([f"--max={a['max']}"] if a.get("max") else []),
+            "browser_watch_status": lambda a: ["watch", "status"],
         }
         if tool_name not in tool_map:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}}
@@ -10409,6 +10437,822 @@ def _dispatch_blog_cmd(args):
 # ─── End Blog Publish Namespace ───────────────────────────────────────────────
 
 
+# ─── cdpilot watch — continuous screencast for AI video understanding ─────────
+#
+# Why this exists: still screenshots taken at command-rate intervals (~1s)
+# cannot capture animation, mouse cursors, scroll dynamics, or short visual
+# events ("kedi sola mı sağa mı koştu?"). CDP's built-in Page.startScreencast
+# streams JPEG frames at 10-30fps directly from the renderer. We tee the
+# stream onto a disk ring buffer so AI orchestrators (Claude, etc.) can query
+# any time window after the fact and get real frames to feed into a
+# multimodal API. Two-process design: a long-lived daemon owns the WS and
+# writes frames; foreground `query/status/stop` commands only read disk.
+
+WATCH_DEFAULT_FPS = 10
+WATCH_DEFAULT_QUALITY = 70
+WATCH_DEFAULT_MAX_WIDTH = 1280
+WATCH_DEFAULT_RETENTION_S = 300     # 5 minutes
+WATCH_DEFAULT_DISK_CAP_MB = 100
+WATCH_DAEMON_FLAG = '--_watch-daemon'  # hidden — used only for re-entrant fork
+
+
+def _watch_dir():
+    """Return per-project watch directory (state + frames + index)."""
+    pid = PROJECT_ID or _get_project_id()
+    return os.path.join(CDPILOT_HOME, 'projects', pid, 'watch')
+
+
+def _watch_frames_dir():
+    return os.path.join(_watch_dir(), 'frames')
+
+
+def _watch_state_path():
+    return os.path.join(_watch_dir(), 'state.json')
+
+
+def _watch_index_path():
+    return os.path.join(_watch_dir(), 'index.jsonl')
+
+
+def _watch_log_path():
+    return os.path.join(_watch_dir(), 'daemon.log')
+
+
+def _watch_load_state():
+    try:
+        with open(_watch_state_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _watch_save_state(state):
+    os.makedirs(_watch_dir(), exist_ok=True)
+    tmp = _watch_state_path() + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, _watch_state_path())
+
+
+def _watch_clear_state():
+    for p in (_watch_state_path(), _watch_index_path()):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _watch_pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _watch_parse_timecode(spec):
+    """Parse '1:23', '83', '1:23.5' into seconds (float). Returns None on failure."""
+    if spec is None:
+        return None
+    s = str(spec).strip()
+    if not s:
+        return None
+    try:
+        if ':' in s:
+            mm, ss = s.split(':', 1)
+            return float(mm) * 60 + float(ss)
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _watch_parse_window(spec):
+    """Parse '5s', '2.5', '500ms' into seconds (float). Returns 5.0 on failure."""
+    if spec is None:
+        return 5.0
+    s = str(spec).strip().lower()
+    if not s:
+        return 5.0
+    try:
+        if s.endswith('ms'):
+            return float(s[:-2]) / 1000.0
+        if s.endswith('s'):
+            return float(s[:-1])
+        return float(s)
+    except ValueError:
+        return 5.0
+
+
+def _watch_evict(retention_s, disk_cap_bytes):
+    """Drop frames older than retention OR over disk cap (oldest-first).
+
+    Returns (removed_count, bytes_freed).
+    """
+    fdir = _watch_frames_dir()
+    if not os.path.isdir(fdir):
+        return 0, 0
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - int(retention_s * 1000)
+
+    files = []
+    for name in os.listdir(fdir):
+        if not name.endswith('.jpg'):
+            continue
+        try:
+            ts_ms = int(name[:-4])
+        except ValueError:
+            continue
+        path = os.path.join(fdir, name)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        files.append((ts_ms, path, size))
+    files.sort()  # oldest first
+
+    removed = 0
+    freed = 0
+    # Age-based eviction
+    keep = []
+    for ts_ms, path, size in files:
+        if ts_ms < cutoff_ms:
+            try:
+                os.remove(path)
+                removed += 1
+                freed += size
+            except OSError:
+                pass
+        else:
+            keep.append((ts_ms, path, size))
+
+    # Disk-cap eviction (drop oldest until under cap)
+    total = sum(s for _, _, s in keep)
+    while keep and total > disk_cap_bytes:
+        ts_ms, path, size = keep.pop(0)
+        try:
+            os.remove(path)
+            removed += 1
+            freed += size
+            total -= size
+        except OSError:
+            pass
+
+    return removed, freed
+
+
+def _watch_list_frames():
+    """Scan the ring buffer dir, return sorted list of (ts_ms, path)."""
+    fdir = _watch_frames_dir()
+    out = []
+    if not os.path.isdir(fdir):
+        return out
+    for name in os.listdir(fdir):
+        if not name.endswith('.jpg'):
+            continue
+        try:
+            ts_ms = int(name[:-4])
+        except ValueError:
+            continue
+        out.append((ts_ms, os.path.join(fdir, name)))
+    out.sort()
+    return out
+
+
+def _watch_frame_diff(a_path, b_path):
+    """Mean absolute pixel difference (0.0..1.0). Returns None if PIL missing.
+
+    Graceful degradation: if PIL/Pillow is not installed we return None and
+    callers fall back to uniform frame picking.
+    """
+    try:
+        from PIL import Image, ImageChops, ImageStat  # type: ignore
+    except ImportError:
+        return None
+    try:
+        with Image.open(a_path) as a_img, Image.open(b_path) as b_img:
+            a_g = a_img.convert('L').resize((160, 90))
+            b_g = b_img.convert('L').resize((160, 90))
+            diff = ImageChops.difference(a_g, b_g)
+            stat = ImageStat.Stat(diff)
+            return float(stat.mean[0]) / 255.0
+    except Exception:
+        return None
+
+
+# ─── watch daemon (the actual screencast consumer) ───
+
+async def _watch_daemon_run(url, fps, quality, max_width, retention_s,
+                            disk_cap_bytes, seek_s):
+    """Long-lived process: open WS, subscribe to screencastFrame, write JPEGs.
+
+    Runs until SIGTERM / parent kill. Each frame:
+      1. base64-decode payload
+      2. write to frames/<unix_ms>.jpg
+      3. ACK with Page.screencastFrameAck (required, else stream stalls)
+      4. periodically evict (every ~2s)
+    """
+    import websockets
+
+    fdir = _watch_frames_dir()
+    os.makedirs(fdir, exist_ok=True)
+
+    # Launch browser if needed
+    if not cdp_get("/json/version"):
+        cmd_launch()
+
+    ws_url, _ = get_page_ws()
+
+    # Navigate first (so the page exists before we start screencasting).
+    # If url is empty we just attach to whatever is currently loaded.
+    if url:
+        try:
+            await navigate_collect(ws_url, url, glow=False)
+        except Exception as e:
+            sys.stderr.write(f"watch: navigate failed: {e}\n")
+
+    # Try to coax a <video> element into autoplay + (optional) seek.
+    # Best-effort — silent if the page has no video.
+    autoplay_js = (
+        "(()=>{const v=document.querySelector('video');"
+        "if(!v) return {ok:false,reason:'no-video'};"
+        "try{v.muted=true;v.playsInline=true;"
+        + (f"v.currentTime={float(seek_s)};" if seek_s is not None else "")
+        + "const p=v.play();if(p&&p.catch)p.catch(()=>{});"
+        "return {ok:true,duration:v.duration||0,currentTime:v.currentTime};}"
+        "catch(e){return {ok:false,reason:String(e)};}})()"
+    )
+    try:
+        await cdp_send(ws_url, [(81, "Runtime.evaluate", {
+            "expression": autoplay_js, "returnByValue": True,
+        })])
+    except Exception:
+        pass
+
+    # everyNthFrame: CDP samples at ~60fps native; nth=6 → ~10fps.
+    every_nth = max(1, int(round(60 / max(1, fps))))
+
+    # We bypass the pooled cdp_send for the screencast loop because we need
+    # to consume *unsolicited* event frames (Page.screencastFrame) for the
+    # entire daemon lifetime. The pool model assumes request/response.
+    async with websockets.connect(ws_url, max_size=100 * 1024 * 1024) as ws:
+        await ws.send(json.dumps({"id": 1, "method": "Page.enable", "params": {}}))
+        await ws.send(json.dumps({
+            "id": 2, "method": "Page.startScreencast",
+            "params": {
+                "format": "jpeg",
+                "quality": int(quality),
+                "maxWidth": int(max_width),
+                "everyNthFrame": every_nth,
+            },
+        }))
+
+        last_evict = time.time()
+        frame_count = 0
+        # Update state file with confirmed start so `status` shows "running"
+        st = _watch_load_state() or {}
+        st['screencast_started_at_ms'] = int(time.time() * 1000)
+        _watch_save_state(st)
+
+        while True:
+            try:
+                resp = await asyncio.wait_for(ws.recv(), timeout=5)
+            except asyncio.TimeoutError:
+                # Periodic eviction even if no frames arrive (e.g. page paused)
+                if time.time() - last_evict > 2.0:
+                    _watch_evict(retention_s, disk_cap_bytes)
+                    last_evict = time.time()
+                continue
+            try:
+                data = json.loads(resp)
+            except ValueError:
+                continue
+            if data.get("method") != "Page.screencastFrame":
+                continue
+            params = data.get("params", {})
+            session_id = params.get("sessionId")
+            b64 = params.get("data", "")
+            ts_ms = int(time.time() * 1000)
+
+            try:
+                raw = base64.b64decode(b64)
+            except Exception:
+                raw = b""
+            if raw:
+                fpath = os.path.join(fdir, f"{ts_ms}.jpg")
+                try:
+                    with open(fpath, 'wb') as f:
+                        f.write(raw)
+                    # Append to index (best-effort; missing entries are fine,
+                    # query falls back to scanning the dir directly)
+                    try:
+                        with open(_watch_index_path(), 'a') as idx:
+                            idx.write(json.dumps({
+                                "ts_ms": ts_ms,
+                                "filename": f"{ts_ms}.jpg",
+                                "size": len(raw),
+                            }) + "\n")
+                    except OSError:
+                        pass
+                    frame_count += 1
+                except OSError as e:
+                    sys.stderr.write(f"watch: write failed: {e}\n")
+
+            # ACK is REQUIRED — CDP stops sending frames until acknowledged.
+            try:
+                await ws.send(json.dumps({
+                    "id": 1000 + (frame_count % 10000),
+                    "method": "Page.screencastFrameAck",
+                    "params": {"sessionId": session_id},
+                }))
+            except Exception:
+                break
+
+            # Periodic eviction (every ~2s)
+            if time.time() - last_evict > 2.0:
+                _watch_evict(retention_s, disk_cap_bytes)
+                last_evict = time.time()
+
+
+def _cmd_watch_daemon_entry():
+    """Internal: re-entrant entry point when called with --_watch-daemon flag.
+
+    Reads parameters from state file, runs the async screencast loop forever.
+    Logs go to daemon.log so the foreground process can stay clean.
+    """
+    state = _watch_load_state() or {}
+    url = state.get('url') or ''
+    fps = int(state.get('fps') or WATCH_DEFAULT_FPS)
+    quality = int(state.get('quality') or WATCH_DEFAULT_QUALITY)
+    max_width = int(state.get('max_width') or WATCH_DEFAULT_MAX_WIDTH)
+    retention_s = float(state.get('retention_s') or WATCH_DEFAULT_RETENTION_S)
+    disk_cap_bytes = int(state.get('disk_cap_bytes') or WATCH_DEFAULT_DISK_CAP_MB * 1024 * 1024)
+    seek_s = state.get('seek_s')
+
+    state['pid'] = os.getpid()
+    state['daemon_started_at_ms'] = int(time.time() * 1000)
+    _watch_save_state(state)
+
+    try:
+        asyncio.run(_watch_daemon_run(
+            url, fps, quality, max_width, retention_s, disk_cap_bytes, seek_s
+        ))
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        try:
+            with open(_watch_log_path(), 'a') as f:
+                f.write(f"[{datetime.datetime.utcnow().isoformat()}] daemon crash: {e}\n")
+        except OSError:
+            pass
+
+
+def cmd_watch_start(*args):
+    """Start screencast capture in a background daemon.
+
+    cdpilot watch start <url|file://path|->  [--fps=10] [--quality=70]
+                                              [--max-width=1280]
+                                              [--retention=300]
+                                              [--disk-cap=100]
+                                              [--seek=1:23]
+
+    - URL may be omitted to attach to the currently-loaded page.
+    - `-` as URL also means "attach, don't navigate".
+    - Idempotent: if a daemon for this project is already running it is
+      stopped first (we never want two screencasts on the same target).
+    """
+    # Stop any prior daemon — two screencasts on one target would race.
+    prev = _watch_load_state()
+    if prev and _watch_pid_alive(prev.get('pid')):
+        try:
+            os.kill(int(prev['pid']), 15)
+        except OSError:
+            pass
+        # brief wait so the WS releases
+        for _ in range(20):
+            if not _watch_pid_alive(prev.get('pid')):
+                break
+            time.sleep(0.05)
+
+    # Wipe ring buffer + index from any prior run (same project, different video)
+    fdir = _watch_frames_dir()
+    if os.path.isdir(fdir):
+        for name in os.listdir(fdir):
+            if name.endswith('.jpg'):
+                try:
+                    os.remove(os.path.join(fdir, name))
+                except OSError:
+                    pass
+    try:
+        os.remove(_watch_index_path())
+    except OSError:
+        pass
+
+    # Parse args
+    url = ''
+    fps = WATCH_DEFAULT_FPS
+    quality = WATCH_DEFAULT_QUALITY
+    max_width = WATCH_DEFAULT_MAX_WIDTH
+    retention_s = WATCH_DEFAULT_RETENTION_S
+    disk_cap_mb = WATCH_DEFAULT_DISK_CAP_MB
+    seek_s = None
+
+    positional = []
+    for a in args:
+        if a.startswith('--fps='):
+            try:
+                fps = max(1, min(30, int(a.split('=', 1)[1])))
+            except ValueError:
+                pass
+        elif a.startswith('--quality='):
+            try:
+                quality = max(1, min(100, int(a.split('=', 1)[1])))
+            except ValueError:
+                pass
+        elif a.startswith('--max-width='):
+            try:
+                max_width = max(160, min(3840, int(a.split('=', 1)[1])))
+            except ValueError:
+                pass
+        elif a.startswith('--retention='):
+            try:
+                retention_s = max(5, int(a.split('=', 1)[1]))
+            except ValueError:
+                pass
+        elif a.startswith('--disk-cap='):
+            try:
+                disk_cap_mb = max(1, int(a.split('=', 1)[1]))
+            except ValueError:
+                pass
+        elif a.startswith('--seek='):
+            seek_s = _watch_parse_timecode(a.split('=', 1)[1])
+        elif not a.startswith('--'):
+            positional.append(a)
+
+    if positional:
+        url = positional[0]
+        if url == '-':
+            url = ''
+
+    os.makedirs(_watch_frames_dir(), exist_ok=True)
+    state = {
+        'url': url,
+        'fps': fps,
+        'quality': quality,
+        'max_width': max_width,
+        'retention_s': retention_s,
+        'disk_cap_bytes': disk_cap_mb * 1024 * 1024,
+        'seek_s': seek_s,
+        'started_at_ms': int(time.time() * 1000),
+        'project_id': PROJECT_ID,
+        'pid': None,
+    }
+    _watch_save_state(state)
+
+    # Fork the daemon. Use the same python + this script + the hidden flag.
+    script = os.path.abspath(__file__)
+    log_f = None
+    try:
+        log_f = open(_watch_log_path(), 'a')
+    except OSError:
+        log_f = subprocess.DEVNULL
+
+    env = os.environ.copy()
+    env['CDPILOT_PROJECT_ID'] = PROJECT_ID or _get_project_id()
+    # The daemon must use the same CDP port (same project's browser)
+    env['CDP_PORT'] = str(CDP_PORT)
+
+    proc = subprocess.Popen(
+        [sys.executable, script, WATCH_DAEMON_FLAG],
+        stdout=log_f, stderr=log_f,
+        env=env,
+        start_new_session=True,  # detach from this terminal's process group
+    )
+    state['pid'] = proc.pid
+    _watch_save_state(state)
+
+    # Wait briefly for the daemon to confirm screencast start
+    confirmed = False
+    for _ in range(40):  # up to ~2s
+        time.sleep(0.05)
+        st = _watch_load_state() or {}
+        if st.get('screencast_started_at_ms'):
+            confirmed = True
+            break
+        if not _watch_pid_alive(proc.pid):
+            break
+
+    out = {
+        'ok': confirmed or _watch_pid_alive(proc.pid),
+        'pid': proc.pid,
+        'url': url or '(attach)',
+        'fps': fps,
+        'quality': quality,
+        'max_width': max_width,
+        'retention_s': retention_s,
+        'disk_cap_mb': disk_cap_mb,
+        'frames_dir': _watch_frames_dir(),
+        'state_path': _watch_state_path(),
+    }
+    print(json.dumps(out, indent=2))
+    if not out['ok']:
+        sys.exit(1)
+
+
+def cmd_watch_stop(*args):
+    """Stop the watch daemon and optionally cleanup frames."""
+    keep_frames = '--keep-frames' in args
+    state = _watch_load_state()
+    if not state:
+        print(json.dumps({'ok': True, 'message': 'no active watch session'}))
+        return
+
+    pid = state.get('pid')
+    killed = False
+    if pid and _watch_pid_alive(pid):
+        try:
+            os.kill(int(pid), 15)
+            killed = True
+        except OSError:
+            pass
+        for _ in range(40):
+            if not _watch_pid_alive(pid):
+                break
+            time.sleep(0.05)
+        if _watch_pid_alive(pid):
+            try:
+                os.kill(int(pid), 9)
+            except OSError:
+                pass
+
+    removed = 0
+    if not keep_frames:
+        fdir = _watch_frames_dir()
+        if os.path.isdir(fdir):
+            for name in os.listdir(fdir):
+                if name.endswith('.jpg'):
+                    try:
+                        os.remove(os.path.join(fdir, name))
+                        removed += 1
+                    except OSError:
+                        pass
+        try:
+            os.remove(_watch_index_path())
+        except OSError:
+            pass
+
+    _watch_clear_state()
+    print(json.dumps({
+        'ok': True,
+        'killed': killed,
+        'pid': pid,
+        'frames_removed': removed,
+        'kept_frames': keep_frames,
+    }, indent=2))
+
+
+def cmd_watch_status(*args):
+    """Report daemon state, frame count, disk usage."""
+    state = _watch_load_state()
+    frames = _watch_list_frames()
+    total_size = sum(os.path.getsize(p) for _, p in frames if os.path.exists(p)) if frames else 0
+
+    out = {
+        'running': bool(state and _watch_pid_alive(state.get('pid'))),
+        'frames': len(frames),
+        'disk_bytes': total_size,
+        'disk_mb': round(total_size / (1024 * 1024), 2),
+        'oldest_ts_ms': frames[0][0] if frames else None,
+        'newest_ts_ms': frames[-1][0] if frames else None,
+    }
+    if state:
+        out['pid'] = state.get('pid')
+        out['url'] = state.get('url') or '(attach)'
+        out['fps'] = state.get('fps')
+        out['started_at_ms'] = state.get('started_at_ms')
+        out['screencast_started_at_ms'] = state.get('screencast_started_at_ms')
+        out['retention_s'] = state.get('retention_s')
+        out['disk_cap_mb'] = (state.get('disk_cap_bytes') or 0) // (1024 * 1024)
+    print(json.dumps(out, indent=2))
+
+
+def _watch_last_query_path():
+    return os.path.join(_watch_dir(), 'last-query.json')
+
+
+def cmd_watch_query(*args):
+    """Return frame paths inside a time window as JSON.
+
+    cdpilot watch query --at <mm:ss|sec> --window <Ns>  [--max=16]
+    cdpilot watch query --since-last [--max=16]
+    cdpilot watch query --last <Ns> [--max=16]    (relative to newest frame)
+
+    Time mapping: --at is interpreted as VIDEO time, measured from the moment
+    the screencast started (state['screencast_started_at_ms']). This matches
+    user intuition for "what happened at 0:35" because we begin capturing
+    right after autoplay.
+    """
+    state = _watch_load_state()
+    if not state:
+        print(json.dumps({'frames': [], 'count': 0, 'error': 'no watch session'}))
+        return
+
+    max_frames = 16
+    at_s = None
+    window_s = 5.0
+    since_last = False
+    last_window = None
+
+    args_list = list(args)
+    i = 0
+    while i < len(args_list):
+        a = args_list[i]
+        if a == '--at' and i + 1 < len(args_list):
+            at_s = _watch_parse_timecode(args_list[i + 1])
+            i += 2
+        elif a.startswith('--at='):
+            at_s = _watch_parse_timecode(a.split('=', 1)[1])
+            i += 1
+        elif a == '--window' and i + 1 < len(args_list):
+            window_s = _watch_parse_window(args_list[i + 1])
+            i += 2
+        elif a.startswith('--window='):
+            window_s = _watch_parse_window(a.split('=', 1)[1])
+            i += 1
+        elif a == '--max' and i + 1 < len(args_list):
+            try:
+                max_frames = max(1, min(64, int(args_list[i + 1])))
+            except ValueError:
+                pass
+            i += 2
+        elif a.startswith('--max='):
+            try:
+                max_frames = max(1, min(64, int(a.split('=', 1)[1])))
+            except ValueError:
+                pass
+            i += 1
+        elif a == '--since-last':
+            since_last = True
+            i += 1
+        elif a == '--last' and i + 1 < len(args_list):
+            last_window = _watch_parse_window(args_list[i + 1])
+            i += 2
+        elif a.startswith('--last='):
+            last_window = _watch_parse_window(a.split('=', 1)[1])
+            i += 1
+        else:
+            i += 1
+
+    frames = _watch_list_frames()
+    if not frames:
+        print(json.dumps({'frames': [], 'count': 0, 'duration_s': 0}))
+        return
+
+    sc_start_ms = state.get('screencast_started_at_ms') or state.get('started_at_ms') or frames[0][0]
+    selected = []
+
+    if since_last:
+        last_q = 0
+        try:
+            with open(_watch_last_query_path()) as f:
+                last_q = int(json.load(f).get('ts_ms') or 0)
+        except (OSError, ValueError):
+            last_q = 0
+        selected = [(ts, p) for ts, p in frames if ts > last_q]
+    elif last_window is not None:
+        newest_ts = frames[-1][0]
+        lo_ms = newest_ts - int(last_window * 1000)
+        selected = [(ts, p) for ts, p in frames if ts >= lo_ms]
+    elif at_s is not None:
+        # Map video time to wall-clock ms
+        center_ms = sc_start_ms + int(at_s * 1000)
+        half_ms = int((window_s / 2.0) * 1000)
+        lo_ms = center_ms - half_ms
+        hi_ms = center_ms + half_ms
+        selected = [(ts, p) for ts, p in frames if lo_ms <= ts <= hi_ms]
+    else:
+        # Default: the latest <window_s> seconds
+        newest_ts = frames[-1][0]
+        lo_ms = newest_ts - int(window_s * 1000)
+        selected = [(ts, p) for ts, p in frames if ts >= lo_ms]
+
+    # Downsample to max_frames (uniform pick, keep first + last)
+    if len(selected) > max_frames:
+        # Try motion-aware picking when PIL is available
+        motion_scores = []
+        for j in range(1, len(selected)):
+            d = _watch_frame_diff(selected[j - 1][1], selected[j][1])
+            motion_scores.append(d if d is not None else 0.0)
+        if motion_scores and any(s is not None for s in motion_scores):
+            # Pick frames around the highest-motion peaks
+            indices = sorted(range(len(motion_scores)),
+                             key=lambda k: motion_scores[k], reverse=True)
+            pick_idx = sorted(set([0, len(selected) - 1] + indices[:max_frames - 2]))
+            pick_idx = pick_idx[:max_frames]
+            selected = [selected[k] for k in pick_idx]
+        else:
+            # Uniform downsample
+            step = len(selected) / max_frames
+            picks = [int(j * step) for j in range(max_frames)]
+            picks[-1] = len(selected) - 1
+            selected = [selected[k] for k in picks]
+
+    if selected:
+        try:
+            with open(_watch_last_query_path(), 'w') as f:
+                json.dump({'ts_ms': selected[-1][0]}, f)
+        except OSError:
+            pass
+
+    duration_s = (selected[-1][0] - selected[0][0]) / 1000.0 if len(selected) >= 2 else 0.0
+    out = {
+        'frames': [p for _, p in selected],
+        'timestamps_ms': [t for t, _ in selected],
+        'count': len(selected),
+        'duration_s': round(duration_s, 3),
+        'window_s': window_s,
+        'at_s': at_s,
+        'screencast_started_at_ms': sc_start_ms,
+    }
+    print(json.dumps(out, indent=2))
+
+
+def cmd_watch_ask(*args):
+    """Tiny natural-language wrapper around `watch query`.
+
+    cdpilot watch ask "0:35'te kedi sola mı sağa mı koştu?"
+    cdpilot watch ask "son 5 saniyede ne oldu"
+
+    We don't actually do LLM inference here — this command just parses a
+    time window out of the question and emits the same JSON shape as
+    `watch query` so the orchestrator (Claude) can pick up the frames and
+    feed them to a multimodal API itself.
+    """
+    if not args:
+        print(json.dumps({'error': 'question required'}))
+        sys.exit(1)
+    question = ' '.join(args)
+    q_lower = question.lower()
+
+    # Find mm:ss or m:ss anywhere in the string
+    m = _re.search(r'(\d+):(\d{1,2})(?:\.\d+)?', question)
+    at_s = None
+    if m:
+        at_s = float(m.group(1)) * 60 + float(m.group(2))
+
+    # "son N saniye(de)" / "last N seconds"
+    last_match = _re.search(r'(?:son|last)\s+(\d+(?:\.\d+)?)\s*(?:saniye|sec|seconds?|s\b)', q_lower)
+    last_window = float(last_match.group(1)) if last_match else None
+
+    forward = []
+    if at_s is not None:
+        forward = ['--at', f'{int(at_s // 60)}:{at_s % 60:.2f}'.rstrip('0').rstrip('.'),
+                   '--window', '5s']
+    elif last_window is not None:
+        forward = ['--last', f'{last_window}s']
+    else:
+        forward = ['--last', '5s']
+
+    forward += ['--max', '8']
+    cmd_watch_query(*forward)
+
+
+def _dispatch_watch_cmd(args):
+    """Parse `cdpilot watch <sub> ...` and dispatch. Sync wrapper."""
+    sub = args[0] if args else ''
+    rest = args[1:]
+    if not sub or sub in ('--help', '-h', 'help'):
+        print("Usage: cdpilot watch <subcommand> [options]", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Subcommands:", file=sys.stderr)
+        print("  start [url|-] [--fps=N] [--quality=N] [--max-width=N]", file=sys.stderr)
+        print("                 [--retention=SEC] [--disk-cap=MB] [--seek=MM:SS]", file=sys.stderr)
+        print("  stop [--keep-frames]", file=sys.stderr)
+        print("  query --at MM:SS --window 5s [--max=16]", file=sys.stderr)
+        print("  query --since-last [--max=16]", file=sys.stderr)
+        print("  query --last 5s [--max=16]", file=sys.stderr)
+        print("  status", file=sys.stderr)
+        print("  ask \"<natural-language question>\"", file=sys.stderr)
+        sys.exit(0)
+    if sub == 'start':
+        cmd_watch_start(*rest)
+    elif sub == 'stop':
+        cmd_watch_stop(*rest)
+    elif sub == 'query':
+        cmd_watch_query(*rest)
+    elif sub == 'status':
+        cmd_watch_status(*rest)
+    elif sub == 'ask':
+        cmd_watch_ask(*rest)
+    else:
+        print(f"Unknown watch subcommand: {sub}. Run: cdpilot watch --help", file=sys.stderr)
+        sys.exit(1)
+
+
+# ─── End cdpilot watch namespace ──────────────────────────────────────────────
+
+
 # ─── CLI ───
 
 if __name__ == "__main__":
@@ -10426,6 +11270,13 @@ if __name__ == "__main__":
         cmd = 'version'
     elif cmd in ('--help', '-h'):
         print(__doc__)
+        sys.exit(0)
+
+    # Hidden re-entrant entry for the watch daemon. `cdpilot watch start`
+    # forks this process with the flag so the screencast consumer runs in
+    # the background while the foreground process returns immediately.
+    if cmd == WATCH_DAEMON_FLAG:
+        _cmd_watch_daemon_entry()
         sys.exit(0)
 
     sync_cmds = {
@@ -10458,6 +11309,7 @@ if __name__ == "__main__":
         'test': lambda: cmd_test_dispatch(args),
         'trace': lambda: cmd_trace_dispatch(args),
         'blog': lambda: _dispatch_blog_cmd(args),
+        'watch': lambda: _dispatch_watch_cmd(args),
     }
 
     if cmd == "serve":
