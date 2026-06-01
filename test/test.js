@@ -125,11 +125,14 @@ function extractRawTripleString(src, varName) {
 }
 
 test('STEALTH_JS constant is defined', () => {
-  assert(PY_CONTENT.includes('STEALTH_JS = r"""'), 'Should define STEALTH_JS');
+  // Three-tier split: the full body lives in STEALTH_JS_FULL; STEALTH_JS is a
+  // backward-compat alias. Both must be present.
+  assert(PY_CONTENT.includes('STEALTH_JS_FULL = r"""'), 'Should define STEALTH_JS_FULL');
+  assert(/STEALTH_JS = STEALTH_JS_FULL/.test(PY_CONTENT), 'STEALTH_JS must alias STEALTH_JS_FULL');
 });
 
 test('STEALTH_JS is syntactically valid JavaScript', () => {
-  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_FULL');
   assert(js, 'STEALTH_JS body should be extractable');
   const vm = require('vm');
   // new Script validates syntax without executing
@@ -137,13 +140,13 @@ test('STEALTH_JS is syntactically valid JavaScript', () => {
 });
 
 test('STEALTH_JS is idempotent (guards with __cdpilot_stealth flag)', () => {
-  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_FULL');
   assert(js.includes('__cdpilot_stealth'), 'Should guard against double-injection');
   assert(js.includes('if (window.__cdpilot_stealth) return'), 'Should early-return on repeat');
 });
 
 test('STEALTH_JS patches the documented fingerprint surfaces', () => {
-  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_FULL');
   assert(js.includes("'webdriver'") || js.includes('"webdriver"'), 'Should patch navigator.webdriver');
   assert(js.includes('chrome.runtime') || js.includes("chrome.runtime"), 'Should patch chrome.runtime');
   assert(js.includes("'plugins'") || js.includes('"plugins"'), 'Should patch navigator.plugins');
@@ -153,13 +156,13 @@ test('STEALTH_JS patches the documented fingerprint surfaces', () => {
 });
 
 test('STEALTH_JS only patches webdriver when value is actually true (smart no-op)', () => {
-  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_FULL');
   assert(/wdValue\s*===\s*true/.test(js),
     'webdriver patch must be conditional on actual value being true — patching a benign Chrome creates a worse fingerprint');
 });
 
 test('STEALTH_JS plugins inherit from PluginArray.prototype (instanceof check)', () => {
-  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_FULL');
   assert(js.includes('PluginArray.prototype') || js.includes('PluginArrayProto'),
     'plugins must inherit from PluginArray.prototype, not vanilla Array');
   assert(js.includes('Plugin.prototype') || js.includes('PluginProto'),
@@ -167,7 +170,7 @@ test('STEALTH_JS plugins inherit from PluginArray.prototype (instanceof check)',
 });
 
 test('STEALTH_JS patches Worker constructor for worker-context webdriver', () => {
-  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_FULL');
   assert(/window\.Worker/.test(js), 'Should wrap window.Worker');
   assert(/createObjectURL/.test(js), 'Should use blob URL to inject patch');
   assert(/__cdpilot_worker_patched/.test(js), 'Should guard against double-patching Worker');
@@ -176,7 +179,7 @@ test('STEALTH_JS patches Worker constructor for worker-context webdriver', () =>
 });
 
 test('STEALTH_JS does NOT weaken web security primitives', () => {
-  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS');
+  const js = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_FULL');
   // Fail-fast on common anti-patterns that would be a security regression.
   assert(!js.includes('eval('), 'Must not use eval()');
   assert(!js.includes('document.domain'), 'Must not relax same-origin via document.domain');
@@ -314,12 +317,13 @@ test('MCP: browser_captcha_solve tool registered', () => {
     'browser_captcha_solve should map to the captcha-solve CLI command in tool_map');
 });
 
-test('navigate_collect gates stealth injection behind get_stealth_config', () => {
-  // STEALTH_JS must be registered on the SAME WS as Page.navigate so the
-  // session-bound script survives until loadEventFired. Therefore the gate
-  // lives in navigate_collect, not _control_start.
-  const m = PY_CONTENT.match(/async def navigate_collect[\s\S]*?stealth_active = get_stealth_config\(\)[\s\S]*?if stealth_active:[\s\S]*?addScriptToEvaluateOnNewDocument[\s\S]*?STEALTH_JS/);
-  assert(m, 'navigate_collect should read get_stealth_config() and conditionally register STEALTH_JS via addScriptToEvaluateOnNewDocument');
+test('navigate_collect gates stealth injection behind the active tier', () => {
+  // The fingerprint script must be registered on the SAME WS as Page.navigate
+  // so the session-bound script survives until loadEventFired. With the
+  // three-tier model the gate selects via stealth_js_for_tier(get_mode_config())
+  // and only injects when a (non-regular) source is returned.
+  const m = PY_CONTENT.match(/async def navigate_collect[\s\S]*?stealth_source = stealth_js_for_tier\(get_mode_config\(\)\)[\s\S]*?if stealth_source:[\s\S]*?addScriptToEvaluateOnNewDocument[\s\S]*?stealth_source/);
+  assert(m, 'navigate_collect should select the tier source via stealth_js_for_tier(get_mode_config()) and conditionally register it via addScriptToEvaluateOnNewDocument');
 });
 
 test('navigate_collect registers stealth BEFORE Page.navigate', () => {
@@ -671,16 +675,17 @@ test('adaptive config + hostname memory defined', () => {
     "Adaptive must persist a stealth_hosts list");
 });
 
-test('cmd_go: adaptive auto-enables stealth for known host before navigate', () => {
-  // Invariant: when adaptive is ON and the URL's host is in the learned list,
-  // cmd_go must set CDPILOT_STEALTH=1 BEFORE navigate_collect runs (otherwise
-  // the stealth script wouldn't be registered in time).
-  // v0.5.1: Fix 1 isolation block sits between CDPILOT_STEALTH and navigate_collect,
-  // so we verify the two invariants separately.
-  const hasHostCheck = /async def cmd_go[\s\S]*?_adaptive_host_requires_stealth\(url\)[\s\S]{0,600}?CDPILOT_STEALTH/.test(PY_CONTENT);
+test('cmd_go: adaptive auto-enables tier for known host before navigate', () => {
+  // Invariant: when adaptive is ON and the URL's host has a learned tier (or is
+  // in the legacy stealth_hosts list), cmd_go must set CDPILOT_MODE BEFORE
+  // navigate_collect runs so the right fingerprint script is registered in time.
+  // The Fix 1 isolation block sits between the CDPILOT_MODE set and
+  // navigate_collect, so we verify the invariants separately.
+  const hasTierStart = /async def cmd_go[\s\S]*?_adaptive_host_tier\(url\)[\s\S]{0,600}?CDPILOT_MODE/.test(PY_CONTENT);
+  const hasLegacyStart = /async def cmd_go[\s\S]*?_adaptive_host_requires_stealth\(url\)[\s\S]{0,900}?CDPILOT_MODE/.test(PY_CONTENT);
   const hasNavCollect = /async def cmd_go[\s\S]*?navigate_collect\(active_ws,\s*url\)/.test(PY_CONTENT);
-  assert(hasHostCheck && hasNavCollect,
-    "cmd_go must check _adaptive_host_requires_stealth and set CDPILOT_STEALTH=1 BEFORE navigate_collect");
+  assert(hasTierStart && hasLegacyStart && hasNavCollect,
+    "cmd_go must check the learned tier (and legacy stealth_hosts) and set CDPILOT_MODE BEFORE navigate_collect");
 });
 
 test('cmd_go: CAPTCHA detection → remember host + retry once with stealth', () => {
@@ -2330,6 +2335,91 @@ test('v0.9 watch: CLI smoke — `watch query` without a session returns empty + 
   const out = run('watch query --at 0:01 --window 1s');
   assert(/"frames":\s*\[\]/.test(out), 'query must emit empty frames list');
   assert(/no watch session/.test(out), 'query must surface "no watch session" hint');
+});
+
+// ── Three-tier stealth mode (regular | stealth | undetected) ──
+
+test('mode: cmd_mode defined + dispatched', () => {
+  assert(/def cmd_mode\(/.test(PY_CONTENT), 'cmd_mode must be defined');
+  assert(/'mode':\s*lambda:\s*cmd_mode\(/.test(PY_CONTENT),
+    'mode must be wired into the sync_cmds dispatch table');
+});
+
+test('mode: regular tier injects no fingerprint patch', () => {
+  // stealth_js_for_tier('regular') must return None so navigate injects nothing.
+  assert(/def stealth_js_for_tier\(tier\):/.test(PY_CONTENT),
+    'stealth_js_for_tier resolver must exist');
+  const re = /def stealth_js_for_tier\(tier\):[\s\S]*?\n\n\ndef /;
+  const m = PY_CONTENT.match(re);
+  assert(m, 'should extract stealth_js_for_tier body');
+  assert(/return None/.test(m[0]), "regular tier must fall through to return None");
+  // navigate_collect must only inject when a source is returned (truthy).
+  assert(/stealth_source = stealth_js_for_tier\(get_mode_config\(\)\)/.test(PY_CONTENT),
+    'navigate_collect must select the stealth source via tier');
+  assert(/if stealth_source:/.test(PY_CONTENT),
+    'navigate_collect must guard injection on a truthy source (regular = no inject)');
+});
+
+test('mode: stealth tier uses STEALTH_JS_LIGHT (no plugin array)', () => {
+  assert(/STEALTH_JS_LIGHT = r"""/.test(PY_CONTENT), 'STEALTH_JS_LIGHT must be defined');
+  const re = /def stealth_js_for_tier\(tier\):[\s\S]*?\n\n\ndef /;
+  const body = PY_CONTENT.match(re)[0];
+  assert(/if tier == 'stealth':\s*\n\s*return STEALTH_JS_LIGHT/.test(body),
+    "stealth tier must resolve to STEALTH_JS_LIGHT");
+});
+
+test('mode: undetected tier uses STEALTH_JS_FULL', () => {
+  assert(/STEALTH_JS_FULL = r"""/.test(PY_CONTENT), 'STEALTH_JS_FULL must be defined');
+  const re = /def stealth_js_for_tier\(tier\):[\s\S]*?\n\n\ndef /;
+  const body = PY_CONTENT.match(re)[0];
+  assert(/if tier == 'undetected':\s*\n\s*return STEALTH_JS_FULL/.test(body),
+    "undetected tier must resolve to STEALTH_JS_FULL");
+  // STEALTH_JS legacy alias must point at the FULL body.
+  assert(/STEALTH_JS = STEALTH_JS_FULL/.test(PY_CONTENT),
+    'STEALTH_JS must alias STEALTH_JS_FULL for backward compatibility');
+});
+
+test('mode: STEALTH_JS_LIGHT excludes plugin spoofing', () => {
+  const light = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_LIGHT');
+  assert(light, 'STEALTH_JS_LIGHT body should be extractable');
+  // Light tier is the SAFE subset — bench proved the synthetic plugin array
+  // is itself a leak (bot.sannysoft.com garbage filenames).
+  assert(!/PluginArray/.test(light), 'LIGHT must NOT spoof navigator.plugins (bench leak)');
+  assert(!/makePlugin/.test(light), 'LIGHT must NOT build fake Plugin objects');
+  assert(!/internal-pdf-viewer/.test(light), 'LIGHT must NOT inject fake PDF plugin filenames');
+  assert(!/37445/.test(light), 'LIGHT must NOT override WebGL vendor');
+  // But it MUST keep the safe subset.
+  assert(/'webdriver'/.test(light), 'LIGHT must still patch navigator.webdriver');
+  assert(/chrome\.runtime/.test(light), 'LIGHT must still patch chrome.runtime');
+  assert(/permissions\.query/.test(light), 'LIGHT must still reconcile permissions.query');
+  // Light must be syntactically valid JS.
+  const vm = require('vm');
+  assert.doesNotThrow(() => new vm.Script(light), 'STEALTH_JS_LIGHT should parse as valid JS');
+  // The FULL body, by contrast, MUST still spoof plugins.
+  const full = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_FULL');
+  assert(/PluginArray/.test(full), 'FULL tier must keep the plugin spoof');
+});
+
+test('mode: backwards-compat — stealth on maps to undetected', () => {
+  // get_mode_config must treat the legacy stealth toggle as undetected when
+  // no explicit mode is set, and cmd_stealth must bridge to set_mode_config.
+  assert(/return 'undetected' if get_stealth_config\(\) else DEFAULT_MODE_TIER/.test(PY_CONTENT),
+    'get_mode_config must map legacy stealth-on to undetected');
+  assert(/set_mode_config\('undetected' if enabled else 'regular'\)/.test(PY_CONTENT),
+    'cmd_stealth must keep mode.json coherent (on->undetected, off->regular)');
+});
+
+test('MCP: browser_mode tool registered', () => {
+  assert(/"name":\s*"browser_mode"/.test(PY_CONTENT),
+    'browser_mode must be registered in _register_tools');
+  assert(/"browser_mode":\s*lambda a:\s*\["mode"\]/.test(PY_CONTENT),
+    'browser_mode must be routed in the MCP tool_map');
+  // Enum must list all three tiers.
+  const re = /"name":\s*"browser_mode"[\s\S]*?"enum":\s*\[([^\]]*)\]/;
+  const m = PY_CONTENT.match(re);
+  assert(m, 'browser_mode must declare a tier enum');
+  assert(/regular/.test(m[1]) && /stealth/.test(m[1]) && /undetected/.test(m[1]),
+    'browser_mode enum must list regular, stealth, undetected');
 });
 
 // ── Summary ──

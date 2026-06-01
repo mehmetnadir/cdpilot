@@ -236,7 +236,80 @@ window.__cdpilot_waitFor = function(selector, timeout) {
 #   - Idempotent: guarded by window.__cdpilot_stealth flag.
 #   - Fails silently per-patch; one failure cannot break the page.
 #   - Opt-in via `cdpilot stealth on`. Default OFF for backward compatibility.
-STEALTH_JS = r"""
+#
+# THREE-TIER MODEL (crawl4ai-style regular -> stealth -> undetected):
+#   - regular     : NO fingerprint patch injected at all. Cleanest, fastest,
+#                   relies only on --disable-blink-features=AutomationControlled
+#                   set at launch. Lowest entropy -> fewest leaks. Default tier.
+#   - stealth     : STEALTH_JS_LIGHT - webdriver + chrome.runtime + permissions
+#                   reconcile ONLY. Deliberately OMITS the plugin-array spoof,
+#                   which Stealth Bench V1 proved is itself a leak source
+#                   (bot.sannysoft.com surfaced garbage plugin filenames like
+#                   "rCJMteXy" from the synthetic PluginArray). Light tier is a
+#                   strict subset of FULL.
+#   - undetected  : STEALTH_JS_FULL - the full body (light subset + plugins +
+#                   Worker patch + WebGL vendor + hardwareConcurrency). Highest
+#                   plausibility on naive checks but highest entropy; pair with
+#                   behavioral entropy/humanize for the hardest targets.
+#
+# STEALTH_JS retains the FULL body for backward compatibility - every existing
+# reference (`cdpilot stealth on`, adaptive escalation) maps to undetected.
+
+# Light tier: the SAFE subset. webdriver + chrome.runtime + permissions only.
+# No plugin spoofing (bench leak), no WebGL vendor override, no Worker wrap.
+STEALTH_JS_LIGHT = r"""
+(function() {
+  'use strict';
+  if (window.__cdpilot_stealth) return;
+  try { Object.defineProperty(window, '__cdpilot_stealth', {value: true, writable: false, configurable: false}); } catch(e) {}
+
+  // 1) navigator.webdriver - only patch if it's actually `true`.
+  try {
+    var wdValue;
+    try { wdValue = navigator.webdriver; } catch (_) {}
+    if (wdValue === true) {
+      Object.defineProperty(Navigator.prototype, 'webdriver', {
+        get: function() { return false; },
+        configurable: true
+      });
+    }
+  } catch (e) {}
+
+  // 2) window.chrome - real Chrome exposes chrome.runtime even without extensions
+  try {
+    if (!window.chrome) {
+      window.chrome = {};
+    }
+    if (!window.chrome.runtime) {
+      window.chrome.runtime = {
+        OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {},
+        PlatformNackArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}
+      };
+    }
+    if (typeof window.chrome.app === 'undefined') {
+      window.chrome.app = { isInstalled: false, InstallState: {}, RunningState: {} };
+    }
+  } catch (e) {}
+
+  // 3) Permissions.query - reconcile with Notification.permission (classic tell)
+  try {
+    if (navigator.permissions && navigator.permissions.query) {
+      var origQuery = navigator.permissions.query.bind(navigator.permissions);
+      navigator.permissions.query = function(p) {
+        if (p && p.name === 'notifications') {
+          return Promise.resolve({ state: Notification.permission, onchange: null });
+        }
+        return origQuery(p);
+      };
+    }
+  } catch (e) {}
+})();
+"""
+
+# Full tier (a.k.a. "undetected"): the complete body. Light subset + plugin
+# array + Worker patch + WebGL vendor + hardwareConcurrency. STEALTH_JS is kept
+# as an alias of FULL so every legacy reference still resolves.
+STEALTH_JS_FULL = r"""
 (function() {
   'use strict';
   if (window.__cdpilot_stealth) return;
@@ -404,6 +477,11 @@ STEALTH_JS = r"""
 })();
 """
 
+# Backward-compat alias: STEALTH_JS == the FULL (undetected) body. Every legacy
+# reference (`cdpilot stealth on`, adaptive escalation, navigate inject) keeps
+# resolving to the full patch set, exactly as before the three-tier split.
+STEALTH_JS = STEALTH_JS_FULL
+
 # ─── CAPTCHA Detection ────────────────────────────────────────────────────────
 # Read-only DOM probe. Detects common CAPTCHA/challenge providers post-navigation.
 # Returns JSON string: {"detected": bool, "types": [...], "details": [...]}
@@ -479,6 +557,7 @@ CAPTCHA_DETECT_JS = r"""
 PROXY_CONFIG_FILE = os.path.join(PROFILE_DIR, 'proxy.json')
 HEADLESS_CONFIG_FILE = os.path.join(PROFILE_DIR, 'headless.json')
 STEALTH_CONFIG_FILE = os.path.join(PROFILE_DIR, 'stealth.json')
+MODE_CONFIG_FILE = os.path.join(PROFILE_DIR, 'mode.json')
 BLOCK_CONFIG_FILE = os.path.join(PROFILE_DIR, 'block.json')
 CAPTCHA_PROVIDERS_FILE = os.path.join(CDPILOT_HOME, 'captcha-providers.json')
 CAPTCHA_AUTO_FILE = os.path.join(PROFILE_DIR, 'captcha-auto.json')
@@ -1413,11 +1492,16 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
         # as long as this connection lives — which is exactly the window we
         # need (until Page.loadEventFired below). Stealth must run before
         # any page script inspects navigator; addScript guarantees that.
-        stealth_active = get_stealth_config()
-        if stealth_active:
+        #
+        # Three-tier selection: regular -> inject nothing, stealth -> LIGHT,
+        # undetected -> FULL. get_mode_config() folds in the legacy stealth
+        # toggle and the CDPILOT_STEALTH env var (set during adaptive
+        # escalation) so existing behavior is preserved.
+        stealth_source = stealth_js_for_tier(get_mode_config())
+        if stealth_source:
             await ws.send(json.dumps({
                 "id": 50, "method": "Page.addScriptToEvaluateOnNewDocument",
-                "params": {"source": STEALTH_JS}
+                "params": {"source": stealth_source}
             }))
 
         # Apply request blocking BEFORE navigate, on this same WS session.
@@ -1967,6 +2051,105 @@ def get_headless_config():
     return False
 
 
+# ─── Three-tier stealth mode (crawl4ai-style escalation) ──────────────────────
+# Tiers, weakest fingerprint footprint -> strongest spoof:
+#   regular    -> inject NOTHING (cleanest, default)
+#   stealth    -> STEALTH_JS_LIGHT (webdriver/chrome.runtime/permissions only)
+#   undetected -> STEALTH_JS_FULL  (light + plugins + WebGL + Worker)
+MODE_TIERS = ('regular', 'stealth', 'undetected')
+DEFAULT_MODE_TIER = 'regular'
+
+
+def get_mode_config():
+    """Return the active stealth tier as a string in MODE_TIERS.
+
+    Resolution order: CDPILOT_MODE env -> mode.json -> legacy stealth on/off
+    -> DEFAULT_MODE_TIER. Legacy `cdpilot stealth on` (no mode.json present)
+    maps to 'undetected' so the old binary toggle still produces the full
+    patch set; `stealth off` (or absent) keeps 'regular'.
+    """
+    env = os.environ.get('CDPILOT_MODE', '').strip().lower()
+    if env in MODE_TIERS:
+        return env
+    if os.path.exists(MODE_CONFIG_FILE):
+        try:
+            with open(MODE_CONFIG_FILE) as f:
+                tier = json.load(f).get('tier', DEFAULT_MODE_TIER)
+            if tier in MODE_TIERS:
+                return tier
+        except (OSError, ValueError):
+            pass
+    # Backwards-compat: no explicit mode set — honor the legacy stealth toggle.
+    # stealth on -> undetected (full), stealth off -> regular (clean).
+    return 'undetected' if get_stealth_config() else DEFAULT_MODE_TIER
+
+
+def set_mode_config(tier):
+    """Persist the active tier to mode.json. Returns the normalized tier."""
+    tier = (tier or '').strip().lower()
+    if tier not in MODE_TIERS:
+        raise ValueError(f"invalid tier: {tier!r}")
+    _atomic_write_json(MODE_CONFIG_FILE, {'tier': tier})
+    return tier
+
+
+def stealth_js_for_tier(tier):
+    """Return the fingerprint patch JS for a tier, or None for 'regular'.
+
+    regular    -> None (inject nothing)
+    stealth    -> STEALTH_JS_LIGHT
+    undetected -> STEALTH_JS_FULL
+    """
+    if tier == 'stealth':
+        return STEALTH_JS_LIGHT
+    if tier == 'undetected':
+        return STEALTH_JS_FULL
+    return None
+
+
+def cmd_mode(tier=None):
+    """Get or set the three-tier stealth mode (regular | stealth | undetected).
+
+    Usage:
+      cdpilot mode                 # show current tier + what it injects
+      cdpilot mode regular         # no fingerprint patch (cleanest, fastest)
+      cdpilot mode stealth         # light patch: webdriver/chrome.runtime/perms
+      cdpilot mode undetected      # full patch: + plugins + WebGL + Worker
+
+    Default: regular. Stealth Bench V1 found that the full patch set ALONE
+    lowered scores (-6.3p) because the synthetic plugin array leaks, while
+    light host-learning gained (+6.3p). The 'stealth' tier omits plugin
+    spoofing for this reason. Escalate to 'undetected' only for hard targets.
+    Effect applies on the NEXT navigation. Env override: CDPILOT_MODE=<tier>.
+    """
+    if tier is None or tier.strip().lower() in ('', 'status'):
+        current = get_mode_config()
+        patch = {
+            'regular': 'none (no fingerprint patch — cleanest)',
+            'stealth': 'STEALTH_JS_LIGHT (webdriver, chrome.runtime, permissions)',
+            'undetected': 'STEALTH_JS_FULL (light + plugins + WebGL + Worker)',
+        }[current]
+        print(f'Mode: {current}')
+        print(f'  Injects: {patch}')
+        return
+    t = tier.strip().lower()
+    if t not in MODE_TIERS:
+        print(f"Invalid tier: {tier}. Use one of: {', '.join(MODE_TIERS)}.", file=sys.stderr)
+        sys.exit(1)
+    set_mode_config(t)
+    # Keep the legacy stealth toggle coherent so `stealth status` and any code
+    # still reading get_stealth_config() agree with the tier:
+    #   regular   -> stealth off
+    #   stealth   -> stealth on  (a patch IS injected, just the light one)
+    #   undetected-> stealth on
+    try:
+        _atomic_write_json(STEALTH_CONFIG_FILE, {'stealth': t != 'regular'})
+    except Exception:
+        pass
+    print(f'Mode: {t}')
+    print('Effect applies on next navigation (`cdpilot go <url>`).')
+
+
 def get_stealth_config():
     """Return whether stealth fingerprint patches are enabled.
 
@@ -2202,12 +2385,20 @@ async def cmd_go(url):
     adaptive_stealth = False
     is_known_hostile = _adaptive_host_requires_stealth(url)
 
-    # Adaptive mode: if this hostname is in the learned stealth-required list,
-    # temporarily enable stealth for the navigation that's about to happen.
-    if is_known_hostile and not get_stealth_config():
-        os.environ['CDPILOT_STEALTH'] = '1'
+    # Adaptive mode (tier-aware): if we learned a tier for this host, start the
+    # navigation at that tier via CDPILOT_MODE. Falls back to the legacy
+    # stealth_hosts list (-> 'stealth' tier) for hosts learned before tiers
+    # existed. CDPILOT_MODE takes precedence in get_mode_config().
+    learned_tier = _adaptive_host_tier(url)
+    if learned_tier and learned_tier != 'regular' and get_mode_config() == 'regular':
+        os.environ['CDPILOT_MODE'] = learned_tier
         adaptive_stealth = True
-        sys.stderr.write(f"🛡️  Adaptive: enabling stealth for known-hostile host\n")
+        sys.stderr.write(f"🛡️  Adaptive: starting at learned tier '{learned_tier}' for known-hostile host\n")
+    elif is_known_hostile and get_mode_config() == 'regular':
+        # Legacy stealth_hosts entry with no tier learned yet — start at light.
+        os.environ['CDPILOT_MODE'] = 'stealth'
+        adaptive_stealth = True
+        sys.stderr.write(f"🛡️  Adaptive: enabling stealth tier for known-hostile host\n")
 
     # Fix 1: Per-task context isolation (opt-in via CDPILOT_ADAPTIVE_FRESH_CONTEXT=1) — spawn a fresh BrowserContext when
     # adaptive is on and we know this host is hostile. Prevents cross-task
@@ -2252,20 +2443,26 @@ async def cmd_go(url):
                 types = ",".join(info.get("types", [])) or "unknown"
                 sys.stderr.write(f"⚠️  CAPTCHA tespit edildi ({types}). Çözüm için: cdpilot captcha-wait\n")
 
-                # Adaptive escalation: remember this host so the next visit
-                # starts in stealth. Re-nav is gated to once-per-call.
+                # Adaptive escalation (tier-aware): bump the host one tier up
+                # (regular -> stealth -> undetected), remember it, and re-nav
+                # once at the new tier. Re-nav is gated to once-per-call.
                 if cfg['enabled']:
+                    current_tier = get_mode_config()
+                    next_tier = _escalate_tier(current_tier)
                     if expected_host:
                         _adaptive_remember_host(expected_host)
-                        sys.stderr.write(f"🛡️  Adaptive: remembered {expected_host} as stealth-required\n")
+                        _adaptive_remember_host_tier(expected_host, next_tier)
+                        sys.stderr.write(f"🛡️  Adaptive: remembered {expected_host} at tier '{next_tier}'\n")
                         captcha_types = info.get('types', [])
                         _adaptive_remember_host_entropy(expected_host, captcha_types)
                         needs_entropy = any(CAPTCHA_ENTROPY_REQUIRED.get(t, True) for t in captcha_types)
                         if needs_entropy:
                             sys.stderr.write(f"🧬 Adaptive: per-host entropy enabled for {expected_host} ({','.join(captcha_types)})\n")
-                    if not adaptive_stealth and not get_stealth_config():
-                        sys.stderr.write("🛡️  Adaptive: retrying once with stealth on...\n")
-                        os.environ['CDPILOT_STEALTH'] = '1'
+                    # Only retry if escalation actually changes the tier (not
+                    # already at the undetected ceiling for this navigation).
+                    if next_tier != current_tier:
+                        sys.stderr.write(f"🛡️  Adaptive: retrying once at tier '{next_tier}'...\n")
+                        os.environ['CDPILOT_MODE'] = next_tier
                         # Fix 3: Idempotent re-nav — skip if already on target.
                         current_host = await _adaptive_current_host(active_ws)
                         norm = lambda h: h[4:] if h.startswith("www.") else h
@@ -2273,12 +2470,12 @@ async def cmd_go(url):
                             sys.stderr.write("🛡️  Adaptive: already on target host, skip re-nav\n")
                         else:
                             await navigate_collect(active_ws, url)
-                        # Re-probe after stealth re-nav
+                        # Re-probe after escalated re-nav
                         info2 = await _detect_captcha(active_ws)
                         if info2.get("detected"):
-                            sys.stderr.write("⚠️  Adaptive: CAPTCHA still present after stealth retry. Manual solve needed.\n")
+                            sys.stderr.write(f"⚠️  Adaptive: CAPTCHA still present after '{next_tier}' retry. Manual solve needed.\n")
                         else:
-                            sys.stderr.write("✅ Adaptive: CAPTCHA cleared with stealth.\n")
+                            sys.stderr.write(f"✅ Adaptive: CAPTCHA cleared at tier '{next_tier}'.\n")
                 # Captcha solver auto-mode: if provider configured + auto on, attempt solve
                 try:
                     await _captcha_auto_solve_if_enabled(active_ws, info, url)
@@ -4884,6 +5081,14 @@ def cmd_stealth(state=None):
     os.makedirs(os.path.dirname(STEALTH_CONFIG_FILE), exist_ok=True)
     with open(STEALTH_CONFIG_FILE, 'w') as f:
         json.dump({'stealth': enabled}, f)
+    # Backward-compat bridge to the three-tier model: keep mode.json coherent
+    # with the legacy toggle so `stealth on` -> 'undetected' (full patch) and
+    # `stealth off` -> 'regular'. Without this, an existing mode.json would
+    # silently override the toggle (get_mode_config reads mode.json first).
+    try:
+        set_mode_config('undetected' if enabled else 'regular')
+    except Exception:
+        pass
     print(f'Stealth: {"on" if enabled else "off"}')
     print('Effect applies on next navigation (`cdpilot go <url>`).')
 
@@ -5142,18 +5347,25 @@ async def _assert_host(ws_url, expected_host):
 
 
 def get_adaptive_config():
-    """Return {'enabled': bool, 'stealth_hosts': [hostname,...]}."""
+    """Return adaptive config with all learned-state keys carried through.
+
+    Keys: enabled, stealth_hosts, entropy_hosts, host_tiers. The latter two
+    MUST be preserved here because callers write the whole dict back via
+    _atomic_write_json — dropping a key would silently erase learned state.
+    """
     if not os.path.exists(ADAPTIVE_CONFIG_FILE):
-        return {'enabled': False, 'stealth_hosts': []}
+        return {'enabled': False, 'stealth_hosts': [], 'entropy_hosts': {}, 'host_tiers': {}}
     try:
         with open(ADAPTIVE_CONFIG_FILE) as f:
             data = json.load(f)
         return {
             'enabled': bool(data.get('enabled', False)),
             'stealth_hosts': list(data.get('stealth_hosts', [])),
+            'entropy_hosts': dict(data.get('entropy_hosts', {})),
+            'host_tiers': dict(data.get('host_tiers', {})),
         }
     except (OSError, ValueError):
-        return {'enabled': False, 'stealth_hosts': []}
+        return {'enabled': False, 'stealth_hosts': [], 'entropy_hosts': {}, 'host_tiers': {}}
 
 
 def _adaptive_remember_host(hostname):
@@ -5163,6 +5375,48 @@ def _adaptive_remember_host(hostname):
         return
     cfg['stealth_hosts'].append(hostname)
     _atomic_write_json(ADAPTIVE_CONFIG_FILE, cfg)
+
+
+def _escalate_tier(tier):
+    """Return the next-stronger tier. undetected is the ceiling."""
+    try:
+        i = MODE_TIERS.index(tier)
+    except ValueError:
+        i = 0
+    return MODE_TIERS[min(i + 1, len(MODE_TIERS) - 1)]
+
+
+def _adaptive_remember_host_tier(hostname, tier):
+    """Record the tier a host needs in adaptive.json under 'host_tiers'.
+
+    Monotonic: only ever ratchets UP (regular -> stealth -> undetected),
+    never down — mirrors the never-auto-demote policy of the stealth_hosts
+    list so a single false-negative CAPTCHA detection can't downgrade a host.
+    """
+    if tier not in MODE_TIERS:
+        return
+    cfg = get_adaptive_config()
+    host_tiers = cfg.get('host_tiers', {})
+    prev = host_tiers.get(hostname)
+    if prev in MODE_TIERS and MODE_TIERS.index(prev) >= MODE_TIERS.index(tier):
+        return  # already at or above this tier, skip write
+    host_tiers[hostname] = tier
+    cfg['host_tiers'] = host_tiers
+    _atomic_write_json(ADAPTIVE_CONFIG_FILE, cfg)
+
+
+def _adaptive_host_tier(url):
+    """Return the learned tier for a URL's host, or None if none/disabled."""
+    cfg = get_adaptive_config()
+    if not cfg.get('enabled'):
+        return None
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or '').lower()
+    except Exception:
+        return None
+    tier = cfg.get('host_tiers', {}).get(host)
+    return tier if tier in MODE_TIERS else None
 
 
 def _adaptive_host_requires_stealth(url):
@@ -10143,6 +10397,8 @@ class MCPServer:
              }}},
             {"name": "browser_watch_status", "description": "Report the current screencast daemon state: running flag, frame count, total disk usage, oldest/newest timestamps. Use before browser_watch_query to confirm frames are actually being captured.",
              "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "browser_mode", "description": "Get or set the three-tier stealth mode (crawl4ai-style escalation). Tiers from lightest to heaviest fingerprint footprint: 'regular' injects NO anti-fingerprint patch (cleanest, fastest, fewest leaks — the default and best for most sites); 'stealth' injects a light patch (navigator.webdriver, chrome.runtime, permissions only — deliberately omits plugin spoofing which leaks); 'undetected' injects the full patch (light + plugin array + WebGL vendor + Worker patch — highest plausibility on naive checks but highest entropy). Omit 'tier' to read the current mode. Effect applies on the next navigation. Escalate to 'undetected' only for hard anti-bot targets.",
+             "inputSchema": {"type": "object", "properties": {"tier": {"type": "string", "enum": ["regular", "stealth", "undetected"], "description": "Tier to set. Omit to get the current tier."}}}},
         ]
 
     def _handle_request(self, request):
@@ -10218,6 +10474,7 @@ class MCPServer:
             "browser_watch_stop": lambda a: ["watch", "stop"] + (["--keep-frames"] if a.get("keep_frames") else []),
             "browser_watch_query": lambda a: ["watch", "query"] + ([f"--at={a['at']}"] if a.get("at") else []) + ([f"--window={a['window']}"] if a.get("window") else []) + ([f"--last={a['last']}"] if a.get("last") else []) + (["--since-last"] if a.get("since_last") else []) + ([f"--max={a['max']}"] if a.get("max") else []),
             "browser_watch_status": lambda a: ["watch", "status"],
+            "browser_mode": lambda a: ["mode"] + ([a["tier"]] if a.get("tier") else []),
         }
         if tool_name not in tool_map:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}}
@@ -11801,6 +12058,7 @@ if __name__ == "__main__":
         'proxy': lambda: cmd_proxy(*args),
         'headless': lambda: cmd_headless(args[0] if args else None),
         'stealth': lambda: cmd_stealth(args[0] if args else None),
+        'mode': lambda: cmd_mode(args[0] if args else None),
         'block': lambda: cmd_block(*args),
         'context': lambda: cmd_context(*args),
         'show': lambda: cmd_show(args[0] if args else None),
