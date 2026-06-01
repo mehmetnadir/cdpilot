@@ -2005,6 +2005,143 @@ test('v0.6.2: wipe command registered in async dispatch table', () => {
   assert(/"wipe":\s*lambda/.test(PY_CONTENT), 'wipe must be in async_map');
 });
 
+// ── smart-click / smart-fill / smart-select: disabled, shadow DOM, locale, label heuristics ──
+//
+// These tests are static-analysis only (same style as the STEALTH_JS tests
+// above). They verify that the rendered JS template contains the right
+// guards — the *behavior* of those guards is exercised by the e2e smoke
+// suite and live bench runs, not here.
+
+function extractCmdBody(src, funcName) {
+  // Capture from `async def cmd_X` up to the next top-level `async def ` /
+  // `def ` definition. The next-def regex accepts underscore-prefixed
+  // helpers (`_dismiss_js_template`) and any-case identifier so we don't
+  // accidentally swallow neighbouring functions into the body.
+  const re = new RegExp('async def ' + funcName + '[\\s\\S]*?(?=\\nasync def |\\ndef [A-Za-z_])', 'm');
+  const m = src.match(re);
+  return m ? m[0] : null;
+}
+
+const SMART_CLICK_BODY = extractCmdBody(PY_CONTENT, 'cmd_smart_click');
+const SMART_FILL_BODY = extractCmdBody(PY_CONTENT, 'cmd_smart_fill');
+const SMART_SELECT_BODY = extractCmdBody(PY_CONTENT, 'cmd_smart_select');
+
+test('smart_click: skips disabled buttons', () => {
+  // The disabled check must run inside the candidate-scoring loop, otherwise
+  // a disabled <button>Login</button> still ends up as the top match and we
+  // silently click nothing.
+  assert(SMART_CLICK_BODY, 'cmd_smart_click body must be extractable');
+  assert(/el\.disabled\s*===\s*true/.test(SMART_CLICK_BODY),
+    'smart_click must check el.disabled === true');
+  assert(/aria-disabled['"]\s*\)\s*===\s*['"]true/.test(SMART_CLICK_BODY),
+    'smart_click must check aria-disabled === "true"');
+  assert(/fieldset\[disabled\]/.test(SMART_CLICK_BODY),
+    'smart_click must check fieldset[disabled] ancestor');
+  assert(/disabledCount/.test(SMART_CLICK_BODY),
+    'smart_click must track disabledCount to distinguish "no match" from "all disabled"');
+});
+
+test('smart_click: errors when all matches disabled', () => {
+  // When candidates are empty but disabledCount > 0, the Python side must
+  // emit a specific error so callers can tell a timing bug from a missing
+  // element.
+  assert(/allDisabled/.test(SMART_CLICK_BODY),
+    'smart_click JS must return allDisabled in not-found payload');
+  assert(/no enabled element matches/.test(SMART_CLICK_BODY),
+    'smart_click Python must print "no enabled element matches" error');
+});
+
+test('smart_click: deepQuerySelectorAll traverses shadow root', () => {
+  // Without shadow DOM traversal, Salesforce Lightning / Polymer custom
+  // widgets are invisible to smart-click. The helper must recurse into
+  // every open shadowRoot.
+  assert(/function deepQuerySelectorAll/.test(SMART_CLICK_BODY),
+    'smart_click must define deepQuerySelectorAll');
+  assert(/el\.shadowRoot/.test(SMART_CLICK_BODY),
+    'smart_click traversal must inspect el.shadowRoot');
+  assert(/deepQuerySelectorAll\(document,/.test(SMART_CLICK_BODY),
+    'smart_click must call deepQuerySelectorAll(document, ...) instead of document.querySelectorAll');
+});
+
+test('smart_fill: deepQuerySelectorAll for shadow inputs', () => {
+  // Lightning / Polymer / lit-element form controls expose <input> only
+  // through their shadow root — smart-fill must walk in.
+  assert(SMART_FILL_BODY, 'cmd_smart_fill body must be extractable');
+  assert(/function deepQuerySelectorAll/.test(SMART_FILL_BODY),
+    'smart_fill must define deepQuerySelectorAll');
+  assert(/deepQuerySelectorAll\(document,\s*\n?\s*'input,/.test(SMART_FILL_BODY),
+    'smart_fill must call deepQuerySelectorAll for input/textarea/select');
+});
+
+test('smart_click: Turkish İ matches lowercase i (locale-aware lowercase)', () => {
+  // `'İ'.toLowerCase()` yields `'i̇'` (i + combining dot) in some
+  // engines, which breaks `===` against `'i'`. `toLocaleLowerCase()` is the
+  // ICU-backed path that produces `'i'`.
+  //
+  // The check ignores `tagName.toLowerCase()` (HTML tag names are pure
+  // ASCII — "BUTTON" → "button" is safe under any folding) and string
+  // contents inside `//` line comments.
+  assert(/toLocaleLowerCase\(\)/.test(SMART_CLICK_BODY),
+    'smart_click must use toLocaleLowerCase() (not toLowerCase) for Turkish/German safety');
+  const lines = SMART_CLICK_BODY.split('\n');
+  const offenders = lines.filter(l => {
+    if (/^\s*\/\//.test(l)) return false;             // strip JS line comments
+    if (!/\.toLowerCase\(\)/.test(l)) return false;
+    if (/tagName\.toLowerCase\(\)/.test(l)) return false; // tag names are ASCII
+    return true;
+  });
+  assert.strictEqual(offenders.length, 0,
+    'smart_click must NOT use plain .toLowerCase() on user-visible text — offenders: ' +
+      JSON.stringify(offenders));
+});
+
+test('smart_click: German ß matches (locale-aware lowercase used everywhere)', () => {
+  // The fix is the same as Turkish — locale-aware folding. We assert the
+  // helper exists and is used in both score() and the candidate text walk.
+  assert(/function lc\(s\)/.test(SMART_CLICK_BODY),
+    'smart_click must define lc() locale-aware helper');
+  // lc() must be the one wrapping the search term going in
+  assert(/lc\(\{safe_text\}|search\s*=\s*lc\(/.test(SMART_CLICK_BODY) ||
+    /var search = lc/.test(SMART_CLICK_BODY),
+    'smart_click must apply lc() to the search term');
+});
+
+test('smart_fill: aria-labelledby lookup', () => {
+  // Material UI / Ant Design / Chakra often wire the label via
+  // aria-labelledby instead of <label for>. Without this fallback their
+  // inputs are unreachable.
+  assert(/aria-labelledby/.test(SMART_FILL_BODY),
+    'smart_fill must read aria-labelledby attribute');
+  assert(/getElementById\(id\)/.test(SMART_FILL_BODY),
+    'smart_fill must dereference aria-labelledby IDs via getElementById');
+});
+
+test('smart_fill: nested aria-label closest()', () => {
+  // Floating-label designs wrap the input in a container that carries the
+  // aria-label. `closest('[aria-label]')` finds that container.
+  assert(/closest\(['"]\[aria-label\]['"]\)/.test(SMART_FILL_BODY),
+    'smart_fill must use closest("[aria-label]") for ancestor lookup');
+  // Also: nearby label scan (4 prev siblings) for floating-label widgets
+  assert(/previousElementSibling/.test(SMART_FILL_BODY),
+    'smart_fill must walk previousElementSibling for nearby labels');
+});
+
+// ── Cross-cutting hardening for smart-select ──
+
+test('smart_select: also gets disabled + shadow + locale hardening', () => {
+  // smart-select is the third "smart" command and silently inherits the
+  // same bug surface — calling .value on a disabled <select> is a no-op,
+  // <select>s can live in shadow roots, and option text uses non-Latin
+  // characters all the time (country pickers).
+  assert(SMART_SELECT_BODY, 'cmd_smart_select body must be extractable');
+  assert(/function deepQuerySelectorAll/.test(SMART_SELECT_BODY),
+    'smart_select must define deepQuerySelectorAll');
+  assert(/toLocaleLowerCase\(\)/.test(SMART_SELECT_BODY),
+    'smart_select must use toLocaleLowerCase()');
+  assert(/sel\.disabled\s*===\s*true/.test(SMART_SELECT_BODY),
+    'smart_select must check sel.disabled === true');
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
