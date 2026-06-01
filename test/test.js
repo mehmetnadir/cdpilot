@@ -2142,6 +2142,121 @@ test('smart_select: also gets disabled + shadow + locale hardening', () => {
     'smart_select must check sel.disabled === true');
 });
 
+// ── v0.9: cdpilot watch (continuous screencast for AI video understanding) ──
+
+test('v0.9 watch: cmd_watch_start defined and registered in sync dispatch', () => {
+  assert(PY_CONTENT.includes('def cmd_watch_start('), 'cmd_watch_start must be defined');
+  assert(/'watch':\s*lambda:\s*_dispatch_watch_cmd\(args\)/.test(PY_CONTENT),
+    "'watch' must dispatch via _dispatch_watch_cmd in sync_cmds");
+});
+
+test('v0.9 watch: daemon entry sends Page.startScreencast with correct params', () => {
+  const m = PY_CONTENT.match(/async def _watch_daemon_run[\s\S]{0,8000}?(?=\ndef |\nasync def )/);
+  assert(m, '_watch_daemon_run body must be present');
+  assert(/Page\.startScreencast/.test(m[0]), 'must invoke Page.startScreencast');
+  assert(/"format":\s*"jpeg"/.test(m[0]), 'must request JPEG format');
+  assert(/everyNthFrame/.test(m[0]), 'must set everyNthFrame for fps control');
+  assert(/Page\.screencastFrameAck/.test(m[0]), 'must ACK frames (else CDP stalls)');
+  assert(/maxWidth/.test(m[0]), 'must constrain max frame width');
+  assert(/quality/i.test(m[0]), 'must pass JPEG quality');
+});
+
+test('v0.9 watch: frames written to per-project ring buffer dir as <ts_ms>.jpg', () => {
+  const m = PY_CONTENT.match(/async def _watch_daemon_run[\s\S]{0,8000}?(?=\ndef |\nasync def )/);
+  assert(m, '_watch_daemon_run body required');
+  // <unix_ms>.jpg naming + write to frames dir
+  assert(/\{ts_ms\}\.jpg/.test(m[0]), 'frame filename must be <ts_ms>.jpg');
+  assert(/_watch_frames_dir|frames_dir|fdir/.test(m[0]), 'must write under frames dir');
+  assert(/base64\.b64decode/.test(m[0]), 'must decode the screencast payload');
+  // Ring buffer dir helper points under ~/.cdpilot/projects/<pid>/watch/frames
+  const fdMatch = PY_CONTENT.match(/def _watch_frames_dir[\s\S]{0,300}?(?=\ndef )/);
+  assert(fdMatch, '_watch_frames_dir helper required');
+  assert(/['"]frames['"]/.test(fdMatch[0]), 'ring buffer subdir must be "frames"');
+});
+
+test('v0.9 watch: cmd_watch_query filters by --at/--window and --last/--since-last', () => {
+  const m = PY_CONTENT.match(/def cmd_watch_query[\s\S]{0,8000}?(?=\ndef |\nasync def )/);
+  assert(m, 'cmd_watch_query body required');
+  for (const flag of ["'--at'", "'--at='", "'--window'", "'--last'", "'--since-last'", "'--max'"]) {
+    assert(m[0].includes(flag), `cmd_watch_query must parse ${flag}`);
+  }
+  // Time-window arithmetic: center_ms = sc_start + at*1000, plus/minus half window
+  assert(/center_ms/.test(m[0]) && /half_ms/.test(m[0]),
+    'must compute center+half-window for --at queries');
+});
+
+test('v0.9 watch: ring buffer evicts frames older than retention OR over disk cap', () => {
+  const m = PY_CONTENT.match(/def _watch_evict[\s\S]{0,3000}?(?=\ndef )/);
+  assert(m, '_watch_evict body required');
+  assert(/cutoff_ms/.test(m[0]), 'must compute time-based cutoff');
+  assert(/disk_cap_bytes/.test(m[0]), 'must enforce disk cap');
+  assert(/total\s*>\s*disk_cap_bytes/.test(m[0]),
+    'must evict oldest-first until under disk cap');
+  assert(/os\.remove/.test(m[0]), 'must actually delete evicted files');
+});
+
+test('v0.9 watch: cmd_watch_status returns frame count + disk usage as JSON', () => {
+  const m = PY_CONTENT.match(/def cmd_watch_status[\s\S]{0,2000}?(?=\ndef )/);
+  assert(m, 'cmd_watch_status body required');
+  assert(/['"]running['"]/.test(m[0]), 'status JSON must include "running" flag');
+  assert(/['"]frames['"]/.test(m[0]), 'status JSON must include "frames" count');
+  assert(/disk_bytes|disk_mb/.test(m[0]), 'status JSON must include disk usage');
+  assert(/_watch_pid_alive/.test(m[0]), 'must probe daemon pid for liveness');
+});
+
+test('v0.9 watch: cmd_watch_query emits JSON with frame paths + timestamps + count', () => {
+  const m = PY_CONTENT.match(/def cmd_watch_query[\s\S]{0,8000}?(?=\ndef |\nasync def )/);
+  assert(m, 'cmd_watch_query body required');
+  assert(/['"]frames['"]/.test(m[0]), 'query output must include frames key');
+  assert(/['"]count['"]/.test(m[0]), 'query output must include count key');
+  assert(/['"]timestamps_ms['"]/.test(m[0]), 'query output must include timestamps_ms');
+  assert(/json\.dumps/.test(m[0]), 'query must print JSON');
+});
+
+test('v0.9 watch: daemon is forked via subprocess.Popen with hidden flag (no blocking)', () => {
+  const m = PY_CONTENT.match(/def cmd_watch_start[\s\S]{0,6000}?(?=\ndef )/);
+  assert(m, 'cmd_watch_start body required');
+  assert(/subprocess\.Popen/.test(m[0]),
+    'cmd_watch_start must Popen a daemon (foreground returns immediately)');
+  assert(/WATCH_DAEMON_FLAG/.test(m[0]), 'must use the hidden --_watch-daemon flag');
+  assert(/start_new_session=True/.test(m[0]),
+    'daemon must detach from controlling terminal');
+  // And the re-entrant flag must be handled at __main__ before sync_cmds
+  assert(PY_CONTENT.includes("WATCH_DAEMON_FLAG = '--_watch-daemon'"),
+    'WATCH_DAEMON_FLAG constant must exist');
+  assert(/if cmd == WATCH_DAEMON_FLAG/.test(PY_CONTENT),
+    '__main__ must short-circuit into daemon mode on the hidden flag');
+});
+
+test('v0.9 watch: MCP server exposes browser_watch_* tools', () => {
+  for (const tool of [
+    '"browser_watch_start"',
+    '"browser_watch_stop"',
+    '"browser_watch_query"',
+    '"browser_watch_status"',
+  ]) {
+    assert(PY_CONTENT.includes(tool), `MCP tools list must contain ${tool}`);
+  }
+  // Tool router maps must be present
+  assert(/"browser_watch_start":\s*lambda a:/.test(PY_CONTENT),
+    'tool_map must route browser_watch_start to the CLI');
+  assert(/"browser_watch_query":\s*lambda a:/.test(PY_CONTENT),
+    'tool_map must route browser_watch_query to the CLI');
+});
+
+test('v0.9 watch: CLI smoke — `watch status` works with no active session', () => {
+  const out = run('watch status');
+  // Should emit valid JSON with running:false (no daemon = no error)
+  assert(/"running":\s*false/.test(out), `status must report not-running, got: ${out}`);
+  assert(/"frames":\s*0/.test(out), 'status frames count must be 0 when empty');
+});
+
+test('v0.9 watch: CLI smoke — `watch query` without a session returns empty + error key', () => {
+  const out = run('watch query --at 0:01 --window 1s');
+  assert(/"frames":\s*\[\]/.test(out), 'query must emit empty frames list');
+  assert(/no watch session/.test(out), 'query must surface "no watch session" hint');
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
