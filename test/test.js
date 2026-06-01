@@ -239,6 +239,81 @@ test('captcha commands are in NO_CONTROL_CMDS (no glow interference)', () => {
   assert(m[1].includes("'captcha-wait'"), 'captcha-wait should bypass control wrapper');
 });
 
+// ── captcha-solve (Amazon classic + provider abstraction) ──
+
+test('captcha-solve: cmd_captcha_solve defined + dispatched', () => {
+  assert(/async def cmd_captcha_solve\(provider=None\)/.test(PY_CONTENT),
+    'Should define async cmd_captcha_solve(provider=None)');
+  assert(/'captcha-solve':\s*lambda:\s*cmd_captcha_solve/.test(PY_CONTENT),
+    "Should register 'captcha-solve' in async_map dispatch");
+});
+
+test('captcha-solve: amazon detection via #captchacharacters', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'CAPTCHA_DETECT_JS');
+  assert(js, 'CAPTCHA_DETECT_JS should be extractable');
+  assert(js.includes('#captchacharacters'), 'Detection JS should look for #captchacharacters input');
+  assert(js.includes('amazon-classic'), "Detection JS should tag 'amazon-classic'");
+  assert(/opfcaptcha|images-na\.ssl-images-amazon\.com/.test(js),
+    'Detection JS should match Amazon captcha image src patterns');
+  assert(/async def _detect_amazon_captcha/.test(PY_CONTENT),
+    'Should define _detect_amazon_captcha helper');
+});
+
+test('captcha-solve: graceful when amazoncaptcha not installed', () => {
+  assert(/from amazoncaptcha import AmazonCaptcha/.test(PY_CONTENT),
+    'Should lazily import amazoncaptcha (optional dependency)');
+  const solver = PY_CONTENT.match(/def _solve_amazon_local[\s\S]*?return None\n/);
+  assert(solver, '_solve_amazon_local should exist');
+  assert(/except ImportError:\s*\n\s*return None/.test(solver[0]),
+    '_solve_amazon_local must return None on ImportError (no hard dependency)');
+  assert(/amazoncaptcha not installed\. Run: pip install amazoncaptcha/.test(PY_CONTENT),
+    'cmd_captcha_solve should print an install hint when the lib is missing');
+});
+
+test('captcha-solve: capsolver BYOK reads CAPSOLVER_API_KEY env', () => {
+  assert(/os\.environ\.get\('CAPSOLVER_API_KEY'\)/.test(PY_CONTENT),
+    'BYOK solver should read CAPSOLVER_API_KEY from environment');
+  assert(/os\.environ\.get\('TWOCAPTCHA_API_KEY'\)/.test(PY_CONTENT),
+    'BYOK solver should read TWOCAPTCHA_API_KEY from environment');
+  const byok = PY_CONTENT.match(/async def _solve_image_byok[\s\S]*?return \{'error': 'no_byok_key'\}/);
+  assert(byok, '_solve_image_byok should exist');
+  assert(/_captcha_urlopen_async/.test(byok[0]),
+    'BYOK solver must use the stdlib urllib wrapper (no new HTTP dependency)');
+  assert(!/\bimport requests\b/.test(byok[0]), 'BYOK solver must not import requests');
+});
+
+// ── profile warm (reCAPTCHA v3 score aging) ──
+
+test('profile warm: cmd_profile_warm defined', () => {
+  assert(/async def cmd_profile_warm\(minutes=None, sites=None\)/.test(PY_CONTENT),
+    'Should define async cmd_profile_warm(minutes=None, sites=None)');
+  assert(/'profile':\s*lambda:\s*cmd_profile_dispatch\(args\)/.test(PY_CONTENT),
+    "Should register top-level 'profile' command routing to cmd_profile_dispatch");
+  assert(/if sub == 'warm':/.test(PY_CONTENT),
+    "cmd_profile_dispatch should handle the 'warm' subcommand");
+});
+
+test('profile warm: visits safe site list + aging delays', () => {
+  const m = PY_CONTENT.match(/WARM_SAFE_SITES\s*=\s*\[([\s\S]*?)\]/);
+  assert(m, 'WARM_SAFE_SITES list should be defined');
+  assert(/wikipedia/.test(m[1]), 'Safe list should include wikipedia');
+  assert(/github\.com/.test(m[1]), 'Safe list should include github');
+  assert(/stackoverflow\.com/.test(m[1]), 'Safe list should include stackoverflow');
+  const fn = PY_CONTENT.match(/async def cmd_profile_warm[\s\S]*?budget_minutes/);
+  assert(fn, 'cmd_profile_warm body should be extractable');
+  assert(/_humanize_scroll/.test(fn[0]), 'Should reuse _humanize_scroll for engagement');
+  assert(/navigate_collect/.test(fn[0]), 'Should visit sites via navigate_collect (open session)');
+  assert(/asyncio\.sleep\(/.test(fn[0]), 'Should apply randomized aging delays between visits');
+  assert(/Warming profile: visited/.test(fn[0]), 'Should report progress to stderr');
+});
+
+test('MCP: browser_captcha_solve tool registered', () => {
+  assert(/"name":\s*"browser_captcha_solve"/.test(PY_CONTENT),
+    'browser_captcha_solve should be registered in _register_tools()');
+  assert(/"browser_captcha_solve":\s*lambda a:\s*\["captcha-solve"\]/.test(PY_CONTENT),
+    'browser_captcha_solve should map to the captcha-solve CLI command in tool_map');
+});
+
 test('navigate_collect gates stealth injection behind get_stealth_config', () => {
   // STEALTH_JS must be registered on the SAME WS as Page.navigate so the
   // session-bound script survives until loadEventFired. Therefore the gate

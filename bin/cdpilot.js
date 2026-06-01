@@ -350,6 +350,11 @@ function showHelp() {
     stealth [on|off]   Toggle anti-fingerprint patches (opt-in)
     captcha-check      Detect CAPTCHA on active page (JSON output)
     captcha-wait [s]   Pause until user solves CAPTCHA (default 300s)
+    captcha-solve [--provider P]
+                       Solve Amazon classic image CAPTCHA (opt-in). amazon-local
+                       (optional amazoncaptcha lib) or BYOK capsolver/2captcha.
+    profile warm [--minutes N]
+                       Age cookies/history on safe sites to boost reCAPTCHA v3 score.
     adaptive [on|off]  Auto-escalate to stealth on hosts that show CAPTCHA.
                        Remembers per-host. Use 'adaptive forget <host>' to reset.
     cookies save <file> [<dom>]

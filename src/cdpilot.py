@@ -461,6 +461,14 @@ CAPTCHA_DETECT_JS = r"""
       add('geetest', 'GeeTest');
     }
 
+    // Amazon classic image CAPTCHA ("Type the characters you see in this image")
+    // Solvable locally with the optional amazoncaptcha library (image OCR).
+    var amzInput = document.querySelector('#captchacharacters');
+    var amzImg = document.querySelector('img[src*="opfcaptcha"], img[src*="captcha"][src*="images-na.ssl-images-amazon.com"], form[action*="/errors/validateCaptcha"] img');
+    if (amzInput && amzImg) {
+      add('amazon-classic', 'Amazon', { img_src: amzImg.src, input_id: amzInput.id || 'captchacharacters' });
+    }
+
     return JSON.stringify(result);
   } catch (e) {
     return JSON.stringify({ detected: false, error: String(e) });
@@ -6095,6 +6103,355 @@ async def cmd_captcha_dispatch(args: list) -> None:
         sys.exit(1)
 
 
+# ─── Amazon classic image CAPTCHA (local OCR + BYOK image solvers) ────────
+# amazon.com rate-limit page: "Enter the characters you see below". The image
+# is a 6-char distorted glyph string at a fixed URL pattern. The optional
+# `amazoncaptcha` PyPI lib (pure-Python + Pillow, MIT) OCRs it offline with
+# ~90% accuracy. It is NOT a mandatory dependency — imported lazily.
+# BYOK fallback: CapSolver / 2Captcha image-to-text endpoints (HTTP only).
+
+
+async def _detect_amazon_captcha(ws_url: str) -> dict:
+    """Return {'detected': bool, 'img_src': str, 'input_id': str} for Amazon classic CAPTCHA.
+
+    Probes the active page for the #captchacharacters input + captcha image.
+    Never raises.
+    """
+    info = await _detect_captcha(ws_url)
+    if not info.get('detected'):
+        return {'detected': False}
+    for d in info.get('details', []):
+        if d.get('type') == 'amazon-classic':
+            return {
+                'detected': True,
+                'img_src': d.get('img_src', ''),
+                'input_id': d.get('input_id', 'captchacharacters'),
+            }
+    return {'detected': False}
+
+
+async def _fetch_image_bytes(ws_url: str, img_src: str) -> bytes | None:
+    """Download the captcha image bytes. Uses urllib (image URLs are public CDN)."""
+    if not img_src:
+        return None
+    try:
+        return await _captcha_urlopen_async(img_src, timeout=15)
+    except Exception:
+        return None
+
+
+def _solve_amazon_local(img_bytes: bytes) -> str | None:
+    """OCR Amazon classic CAPTCHA with the OPTIONAL amazoncaptcha library.
+
+    Returns the solved string, or None if the library is unavailable or fails.
+    Raises ImportError-as-signal via returning None; caller prints install hint.
+    """
+    try:
+        from amazoncaptcha import AmazonCaptcha  # optional dependency
+    except ImportError:
+        return None
+    try:
+        import io as _io
+        cap = AmazonCaptcha(_io.BytesIO(img_bytes))
+        solution = cap.solve()
+        if solution and solution.lower() != 'not solved':
+            return solution
+    except Exception:
+        return None
+    return None
+
+
+async def _solve_image_byok(img_bytes: bytes) -> dict:
+    """Solve an image CAPTCHA via a BYOK provider (CapSolver / 2Captcha).
+
+    Reads CAPSOLVER_API_KEY then TWOCAPTCHA_API_KEY from the environment.
+    Only stdlib HTTP — no new dependency. Returns {'token': text} or {'error': ...}.
+    """
+    import base64 as _b64
+    b64 = _b64.b64encode(img_bytes).decode('ascii')
+
+    capsolver_key = os.environ.get('CAPSOLVER_API_KEY')
+    if capsolver_key:
+        try:
+            payload = json.dumps({
+                'clientKey': capsolver_key,
+                'task': {'type': 'ImageToTextTask', 'body': b64},
+            }).encode()
+            raw = await _captcha_urlopen_async(
+                'https://api.capsolver.com/createTask', data=payload,
+                headers={'Content-Type': 'application/json'}, timeout=60,
+            )
+            r = json.loads(raw)
+            if r.get('errorId', 0) == 0:
+                text = (r.get('solution') or {}).get('text', '')
+                if text:
+                    return {'token': text, 'provider': 'capsolver'}
+            return {'error': f"capsolver: {r.get('errorDescription', r)}"}
+        except Exception as e:
+            return {'error': f'capsolver: {e}'}
+
+    twocaptcha_key = os.environ.get('TWOCAPTCHA_API_KEY')
+    if twocaptcha_key:
+        import urllib.parse as _uparse
+        try:
+            body = _uparse.urlencode({
+                'key': twocaptcha_key, 'method': 'base64',
+                'body': b64, 'json': '1',
+            }).encode()
+            raw = await _captcha_urlopen_async('https://2captcha.com/in.php', data=body, timeout=30)
+            resp = json.loads(raw)
+            if resp.get('status') != 1:
+                return {'error': f"2captcha submit: {resp.get('request', resp)}"}
+            task_id = resp['request']
+            poll = f"https://2captcha.com/res.php?key={twocaptcha_key}&action=get&id={task_id}&json=1"
+            deadline = time.time() + CAPTCHA_SOLVE_TIMEOUT
+            while time.time() < deadline:
+                await asyncio.sleep(5)
+                r2 = json.loads(await _captcha_urlopen_async(poll, timeout=15))
+                if r2.get('status') == 1:
+                    return {'token': r2['request'], 'provider': '2captcha'}
+                if r2.get('request') != 'CAPCHA_NOT_READY':
+                    return {'error': f"2captcha: {r2.get('request')}"}
+            return {'error': '2captcha timeout'}
+        except Exception as e:
+            return {'error': f'2captcha: {e}'}
+
+    return {'error': 'no_byok_key'}
+
+
+async def _fill_amazon_solution(ws_url: str, input_id: str, solution: str) -> bool:
+    """Type the solution into the Amazon CAPTCHA input and submit. Returns True on success."""
+    safe_id = json.dumps(input_id)
+    safe_val = json.dumps(solution)
+    js = f"""
+    (function() {{
+      try {{
+        var el = document.getElementById({safe_id}) || document.querySelector('#captchacharacters');
+        if (!el) return false;
+        var setter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, 'value').set;
+        setter.call(el, {safe_val});
+        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+        var form = el.form || el.closest('form');
+        if (form) {{ form.submit(); return true; }}
+        var btn = document.querySelector('button[type=submit], input[type=submit]');
+        if (btn) {{ btn.click(); return true; }}
+        return true;
+      }} catch(e) {{ return false; }}
+    }})()
+    """
+    try:
+        r = await cdp_send(ws_url, [(1, 'Runtime.evaluate', {
+            'expression': js, 'returnByValue': True,
+        })], timeout=5)
+        return bool(r.get(1, {}).get('result', {}).get('value', False))
+    except Exception:
+        return False
+
+
+async def cmd_captcha_solve(provider=None):
+    """Solve the CAPTCHA on the current page (opt-in).
+
+    Providers:
+      amazon-local (default) — OCR Amazon classic image CAPTCHA with the optional
+                               `amazoncaptcha` lib (pip install amazoncaptcha).
+      capsolver / 2captcha   — BYOK image-to-text via CAPSOLVER_API_KEY /
+                               TWOCAPTCHA_API_KEY env vars (stdlib HTTP only).
+
+    Detects Amazon classic CAPTCHA (#captchacharacters + captcha image), solves,
+    fills the input and submits. Prints JSON; exit 0 = solved, 3 = no captcha,
+    1 = error / unsolvable.
+    """
+    provider = (provider or 'amazon-local').lower()
+    ws, _ = get_page_ws()
+
+    amz = await _detect_amazon_captcha(ws)
+    if not amz.get('detected'):
+        # Not an Amazon classic captcha — report what (if anything) was found.
+        info = await _detect_captcha(ws)
+        print(json.dumps({
+            'solved': False, 'status': 'no_amazon_captcha',
+            'detected_types': info.get('types', []),
+        }, ensure_ascii=False))
+        sys.exit(3 if not info.get('detected') else 1)
+
+    img_src = amz.get('img_src', '')
+    input_id = amz.get('input_id', 'captchacharacters')
+    img_bytes = await _fetch_image_bytes(ws, img_src)
+    if not img_bytes:
+        print(json.dumps({'solved': False, 'error': 'image_fetch_failed', 'img_src': img_src}, ensure_ascii=False))
+        sys.exit(1)
+
+    solution = None
+    used_provider = None
+
+    if provider in ('amazon-local', 'amazon', 'local'):
+        solution = _solve_amazon_local(img_bytes)
+        used_provider = 'amazon-local'
+        if solution is None:
+            # Distinguish "lib missing" from "lib failed".
+            try:
+                import amazoncaptcha  # noqa: F401
+                print(json.dumps({
+                    'solved': False, 'status': 'ocr_failed',
+                    'provider': 'amazon-local',
+                    'hint': 'OCR returned no result; retry or use --provider capsolver',
+                }, ensure_ascii=False))
+            except ImportError:
+                print(json.dumps({
+                    'solved': False, 'status': 'amazoncaptcha_not_installed',
+                    'hint': 'amazoncaptcha not installed. Run: pip install amazoncaptcha (optional)',
+                }, ensure_ascii=False))
+            sys.exit(1)
+    elif provider in ('capsolver', '2captcha', 'twocaptcha'):
+        res = await _solve_image_byok(img_bytes)
+        if 'error' in res:
+            if res['error'] == 'no_byok_key':
+                print(json.dumps({
+                    'solved': False, 'status': 'no_byok_key',
+                    'hint': 'Set CAPSOLVER_API_KEY or TWOCAPTCHA_API_KEY in the environment',
+                }, ensure_ascii=False))
+            else:
+                print(json.dumps({'solved': False, 'error': res['error']}, ensure_ascii=False))
+            sys.exit(1)
+        solution = res.get('token')
+        used_provider = res.get('provider', provider)
+    else:
+        print(json.dumps({'solved': False, 'error': f'unknown_provider:{provider}'}, ensure_ascii=False))
+        sys.exit(1)
+
+    if not solution:
+        print(json.dumps({'solved': False, 'error': 'empty_solution', 'provider': used_provider}, ensure_ascii=False))
+        sys.exit(1)
+
+    filled = await _fill_amazon_solution(ws, input_id, solution)
+    print(json.dumps({
+        'solved': True, 'solution': solution, 'provider': used_provider,
+        'submitted': filled,
+    }, ensure_ascii=False))
+    sys.exit(0)
+
+
+# ─── Profile warm-up (reCAPTCHA v3 score aging) ──────────────────────────
+# New browser profiles get a -0.5 reCAPTCHA v3 trust penalty. Browsing a few
+# popular, safe sites ages the cookie jar / history so the profile reads as
+# "established", lifting the v3 score. Opt-in, uses the already-open session.
+
+WARM_SAFE_SITES = [
+    'https://en.wikipedia.org/wiki/Web_browser',
+    'https://github.com/',
+    'https://stackoverflow.com/',
+    'https://news.ycombinator.com/',
+    'https://www.bbc.com/news',
+    'https://www.reddit.com/',
+    'https://duckduckgo.com/',
+    'https://www.wikipedia.org/',
+]
+
+
+async def cmd_profile_warm(minutes=None, sites=None):
+    """Warm up the current profile by browsing safe popular sites (opt-in).
+
+    Ages cookies/history to boost reCAPTCHA v3 score. Uses the already-open
+    browser session (does not launch). Default ~2 minutes over a hardcoded
+    safe site list with randomized dwell + light scrolling between visits.
+
+    Args:
+      minutes: budget in minutes (default 2, max 30). String from CLI.
+      sites:   optional comma-separated override list of URLs.
+    """
+    import random as _r
+    try:
+        budget_min = float(minutes) if minutes else 2.0
+    except (ValueError, TypeError):
+        budget_min = 2.0
+    budget_min = max(0.5, min(budget_min, 30.0))
+
+    site_list = WARM_SAFE_SITES
+    if sites:
+        if isinstance(sites, str):
+            site_list = [s.strip() for s in sites.split(',') if s.strip()]
+        else:
+            site_list = list(sites)
+    if not site_list:
+        site_list = WARM_SAFE_SITES
+
+    if not cdp_get("/json/version"):
+        print(json.dumps({'error': 'no_browser', 'hint': 'Run: cdpilot launch'}, ensure_ascii=False))
+        sys.exit(1)
+
+    ws, _ = get_page_ws()
+    deadline = time.time() + budget_min * 60.0
+    rnd = _r.Random()
+    visited = 0
+    total = len(site_list)
+
+    for idx, url in enumerate(site_list, 1):
+        if time.time() >= deadline:
+            break
+        try:
+            await navigate_collect(ws, url)
+            visited += 1
+            sys.stderr.write(f"🔥 Warming profile: visited {visited}/{total} sites... ({url})\n")
+            sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"🔥 Warm: skip {url} ({str(e)[:60]})\n")
+            continue
+
+        # Light scroll to look engaged (reuses humanized scroll).
+        try:
+            await _humanize_scroll(ws, rnd.randint(400, 1200))
+        except Exception:
+            pass
+
+        # Random aging delay 5-15s, but never overrun the budget.
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(rnd.uniform(5, 15), max(0.1, remaining)))
+
+    print(json.dumps({
+        'warmed': True, 'visited': visited, 'sites': total,
+        'budget_minutes': budget_min,
+    }, ensure_ascii=False))
+
+
+async def cmd_profile_dispatch(args: list) -> None:
+    """Top-level dispatcher for 'cdpilot profile <subcommand> [args...]'.
+
+    Subcommands:
+      warm [--minutes N] [--sites url1,url2]   Warm up profile (reCAPTCHA v3 aging).
+    """
+    if not args:
+        print(
+            "Usage: cdpilot profile <subcommand>\n"
+            "  warm [--minutes N] [--sites url1,url2,...]   Age cookies/history to boost reCAPTCHA v3 score",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    sub = args[0].lower()
+    rest = args[1:]
+
+    def _get_flag(flag):
+        for i, a in enumerate(rest):
+            if a == flag and i + 1 < len(rest):
+                return rest[i + 1]
+            if a.startswith(flag + '='):
+                return a.split('=', 1)[1]
+        return None
+
+    if sub == 'warm':
+        await cmd_profile_warm(
+            minutes=_get_flag('--minutes') or _get_flag('-m'),
+            sites=_get_flag('--sites'),
+        )
+    else:
+        print(f"Unknown profile subcommand: {sub}", file=sys.stderr)
+        sys.exit(1)
+
+
 # ─── End Captcha Solver Plugin ───────────────────────────────────────────
 
 
@@ -9730,6 +10087,8 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"text": {"type": "string", "description": "Visible text of the element to click (e.g. 'Login', 'Submit Order', 'Learn more')"}}, "required": ["text"]}},
             {"name": "browser_dismiss", "description": "Find and click the strongest 'dismiss / continue without account' button on the page. Built-in pattern library covers English + Turkish dismissive phrases ('Stay signed out', 'No thanks', 'Skip', 'Continue without', etc.) and explicitly excludes destructive lookalikes (Delete account, Sign out, Subscribe). Designed for LLM chat sites that gate queries behind a sign-up modal. Pass 'aggressive' or an integer N (max 10) to handle chained modals.",
              "inputSchema": {"type": "object", "properties": {"repeat": {"type": "string", "description": "Optional. Number of dismiss attempts (1-10) or 'aggressive' (up to 5 chained). Default: 1.", "default": "1"}}}},
+            {"name": "browser_captcha_solve", "description": "Solve the CAPTCHA on the current page (opt-in). Detects and solves Amazon classic image CAPTCHA (the \"Type the characters you see\" rate-limit page) by OCRing the image, filling the input, and submitting. Default provider 'amazon-local' uses the optional amazoncaptcha library (pip install amazoncaptcha) for offline OCR. BYOK providers 'capsolver' / '2captcha' use image-to-text APIs via CAPSOLVER_API_KEY / TWOCAPTCHA_API_KEY env vars. Returns JSON with solved status. For token-based CAPTCHAs (reCAPTCHA, hCaptcha, Turnstile) use the captcha config/auto CLI instead.",
+             "inputSchema": {"type": "object", "properties": {"provider": {"type": "string", "enum": ["amazon-local", "capsolver", "2captcha"], "description": "Solver provider. Default: amazon-local (offline OCR via optional amazoncaptcha lib).", "default": "amazon-local"}}}},
             {"name": "browser_smart_fill", "description": "Fill an input by its label or placeholder text — no CSS selector needed. Finds input by associated label, placeholder, aria-label, name, or id. React-compatible value setting. Use when you know WHAT field to fill but not the exact selector.",
              "inputSchema": {"type": "object", "properties": {"label": {"type": "string", "description": "Label or placeholder text of the input (e.g. 'Email', 'Password', 'Search')"}, "value": {"type": "string", "description": "Value to fill in the input"}}, "required": ["label", "value"]}},
             {"name": "browser_smart_select", "description": "Select a dropdown option by label and option text — no CSS selector needed. Finds the select element by label/name, then selects the matching option. Use for dropdown interactions without knowing selectors.",
@@ -9840,6 +10199,7 @@ class MCPServer:
             "browser_smart_click": lambda a: ["smart-click", a.get("text", "")],
             "browser_dismiss": lambda a: ["dismiss"] + ([str(a["repeat"])] if a.get("repeat") else []),
             "browser_smart_fill": lambda a: ["smart-fill", a.get("label", ""), a.get("value", "")],
+            "browser_captcha_solve": lambda a: ["captcha-solve"] + ([f"--provider={a['provider']}"] if a.get("provider") else []),
             "browser_smart_select": lambda a: ["smart-select", a.get("label", ""), a.get("option", "")],
             "browser_describe": lambda a: ["describe"],
             "browser_assert": lambda a: ["assert", a.get("selector", "")] + ([a["text"]] if a.get("text") else []),
@@ -11619,6 +11979,12 @@ if __name__ == "__main__":
         'captcha-check': cmd_captcha_check,
         'captcha-wait': lambda: cmd_captcha_wait(args[0] if args else None),
         'captcha': lambda: cmd_captcha_dispatch(args),
+        'captcha-solve': lambda: cmd_captcha_solve(
+            next((a.split('=')[1] for a in args if a.startswith('--provider=')),
+                 args[args.index('--provider') + 1] if '--provider' in args and args.index('--provider') + 1 < len(args)
+                 else (next((a for a in args if not a.startswith('--')), None))),
+        ),
+        'profile': lambda: cmd_profile_dispatch(args),
         'agent': lambda: _dispatch_agent_cmd(args),
     }
 
@@ -11627,6 +11993,7 @@ if __name__ == "__main__":
                        'dialog', 'download', 'throttle', 'permission', 'intercept',
                        'batch', 'screenshot-diff', 'run',
                        'captcha-check', 'captcha-wait', 'captcha',
+                       'profile',
                        'cookies'}  # v0.6.1: cookies auto-config doesn't need browser
     # Clean up idle sessions before running any command
     _cleanup_idle_sessions()
