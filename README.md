@@ -29,7 +29,7 @@ AI agents and developers need browser control that **just works**:
 
 - **Zero config** — `npx cdpilot launch` starts an isolated browser session
 - **Zero dependency** — No Puppeteer, no Playwright, no Selenium. Pure CDP over HTTP
-- **40+ commands** — Navigate, click, type, screenshot, network, console, accessibility, and more
+- **65+ commands** — Navigate, click, type, screenshot, network, console, accessibility, video understanding, and more
 - **AI-agent friendly** — Designed for Claude, GPT, Gemini, and any LLM tool-use workflow
 - **Isolated sessions** — Your personal browser stays untouched. cdpilot runs in its own profile
 - **Visual feedback** — Green glow overlay, cursor visualization, click ripples, and keystroke display keep you informed during automation
@@ -343,6 +343,42 @@ cdpilot dismiss aggressive    # Handle chained modals (cookie banner → signup)
 > lookalikes (Delete account, Sign out, Subscribe) — safe to chain into a
 > query workflow.
 
+### Video Understanding
+
+A single screenshot can't see motion. `cdpilot watch` runs a continuous
+screencast (`Page.startScreencast`) into a ring buffer of JPEG frames, so an
+AI agent can query a time window and actually *watch* what happened —
+animations, mouse cursor movement, scroll, an explosion effect — instead of
+guessing from one still frame.
+
+```bash
+cdpilot watch start <url|file://...>   # Begin screencast, play the video
+cdpilot watch query --at 1:23 --window 5s  # Frames around a timestamp
+cdpilot watch ask "did the menu animate open?"  # Ask about recent frames
+cdpilot watch status          # Show capture state + buffer size
+cdpilot watch stop            # Stop the screencast
+```
+
+Works on both local files (`file://...`) and online video (YouTube, Vimeo,
+Twitter, Facebook, Instagram). Zero dependency — Pillow is optional and only
+used for motion-detection between frames.
+
+> **DRM limitation:** DRM-protected players (Netflix and similar) render as
+> black frames at the CDP layer — cdpilot cannot capture them. Everything
+> non-DRM works.
+
+MCP exposes this as `browser_watch_*` tools for AI agents.
+
+### Video Understanding (commands)
+
+```bash
+cdpilot watch start <url|file://>     # Start screencast, play video
+cdpilot watch query --at 1:23 --window 5s  # Frames around a timestamp
+cdpilot watch ask "did the modal slide in?"  # Ask about recent frames
+cdpilot watch status                   # Capture state + buffer size
+cdpilot watch stop                     # Stop screencast
+```
+
 ### Stealth & CAPTCHA
 
 Zero-dependency anti-fingerprint layer — patches `navigator.webdriver`,
@@ -350,6 +386,10 @@ Zero-dependency anti-fingerprint layer — patches `navigator.webdriver`,
 vendor/renderer, permissions, hardware concurrency, and the `Worker`
 constructor. Injected via `Page.addScriptToEvaluateOnNewDocument` before
 any page script runs. Disabled by default; opt-in.
+
+At launch, cdpilot also passes `--disable-blink-features=AutomationControlled`,
+which closes the Blink runtime flag that Cloudflare and DataDome probe to detect
+an automated browser.
 
 ```bash
 cdpilot stealth on            # enable fingerprint patches (opt-in)
@@ -601,7 +641,7 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 
 ### Shipped
 
-- [x] 60+ CLI commands (navigate, click, fill, screenshot, PDF, console, network...)
+- [x] 65+ CLI commands (navigate, click, fill, screenshot, PDF, console, network, video understanding...)
 - [x] MCP server for AI agent integration (Claude Code, Cursor, etc.)
 - [x] **10 built-in test assertions** — assert, assert-url, assert-title, assert-count, assert-value, assert-attr, assert-visible/hidden, wait-for, check (batch), screenshot-diff
 - [x] **Accessibility tree snapshot** (`a11y-snapshot`) — structured data with @ref references, 500x fewer tokens than screenshots
@@ -625,14 +665,15 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] Pre-flight wizard (auto-installs dependencies on first run)
 - [x] Persistent MCP glow (stays on during entire AI session, like Claude's orange glow)
 - [x] DevExtension system (native JS injection without browser store)
-- [x] **Smart commands** — `smart-click`, `smart-fill`, `smart-select` — interact by visible text, no CSS selectors needed, no LLM required
+- [x] **Smart commands** — `smart-click`, `smart-fill`, `smart-select` — interact by visible text, no CSS selectors needed, no LLM required. Now with a disabled-element guard (no more false "clicked" on disabled buttons), Shadow DOM traversal (Lightning, Polymer, lit-element widgets), locale-aware text matching (Turkish İ/i, German ß), and floating-label support for `smart-fill` (Material / Ant / Chakra via `aria-labelledby` and `closest` label resolution)
+- [x] **Video understanding** (`watch`) — continuous screencast into a ring buffer so an AI agent can query a time window and see motion (animation, cursor, scroll), not just one still frame. Local `file://` and online video (YouTube/Vimeo/Twitter/etc.); DRM players (Netflix) excluded
 - [x] **Data extraction** (`extract`) — structured DOM data in text, JSON, or list format
 - [x] **Page observation** (`observe`) — list all interactive elements with available actions
 - [x] **Script runner** (`run`) — execute `.cdp` script files with pass/fail reporting
 
 ### Coming Soon
 
-- [ ] **iframe & Shadow DOM** support — interact with elements inside iframes and shadow roots
+- [ ] **iframe** support — interact with elements inside iframes (Shadow DOM traversal already shipped in smart commands)
 - [ ] **Session recording & replay** — record browser sessions and replay them deterministically
 - [ ] **Stealth mode** *(Pro)* — human-like mouse/typing, anti-fingerprint, CAPTCHA solving
 - [ ] **cdpilot Cloud** — hosted browser sessions API, REST + WebSocket MCP endpoint

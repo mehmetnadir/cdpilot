@@ -2,6 +2,29 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [0.9.0-dev] - unreleased
+
+### Added
+- **`cdpilot watch`** — video understanding via continuous screencast. `Page.startScreencast` streams JPEG frames into a ring buffer so an AI agent can query a time window and observe motion (animation, mouse cursor, scroll, transitions) that a single screenshot cannot capture.
+  - `watch start <url|file://...>` — begin screencast and play the video
+  - `watch query --at <mm:ss> --window <Ns>` — frames around a timestamp
+  - `watch ask "<question>"` — ask about recently captured frames
+  - `watch status` / `watch stop`
+  - Works on local files (`file://`) and online video (YouTube, Vimeo, Twitter, Facebook, Instagram)
+  - Zero dependency; Pillow is optional and only used for motion-detection between frames
+  - Exposed to AI agents as `browser_watch_*` MCP tools
+- **`--disable-blink-features=AutomationControlled`** launch flag — closes the Blink runtime flag that Cloudflare and DataDome probe to detect an automated browser.
+
+### Changed
+- **smart-click / smart-fill / smart-select** hardening:
+  - Disabled-element guard — no longer reports a successful "click" on a disabled button (real bug fix).
+  - Shadow DOM traversal — finds elements inside Lightning, Polymer, and lit-element web components.
+  - Locale-aware text matching — correct case folding for Turkish (İ/i) and German (ß).
+  - `smart-fill` floating-label support — resolves Material / Ant / Chakra labels via `aria-labelledby` and `closest` label lookup.
+
+### Known limitation
+- `watch` cannot capture DRM-protected players (Netflix and similar) — they render as black frames at the CDP layer.
+
 ## [0.8.0] - 2026-05-20
 
 ### Bench
