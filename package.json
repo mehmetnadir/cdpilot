@@ -1,7 +1,7 @@
 {
   "name": "cdpilot",
   "version": "0.8.0",
-  "description": "Zero-dependency browser automation CLI. Raw CDP, 60+ commands, stealth + adaptive escalation, CAPTCHA solvers, proxy pools, TLS probe, MCP server. No Puppeteer/Playwright/Selenium.",
+  "description": "Zero-dependency browser automation CLI. Raw CDP, 65+ commands, video understanding, stealth + escalation, CAPTCHA solvers, proxy pools, TLS probe, MCP server. No Puppeteer/Playwright/Selenium.",
   "bin": {
     "cdpilot": "./bin/cdpilot.js",
     "bctl": "./bin/cdpilot.js"
@@ -42,7 +42,10 @@
     "adaptive-escalation",
     "proxy-rotation",
     "tls-fingerprint",
-    "cookie-management"
+    "cookie-management",
+    "video-understanding",
+    "screencast",
+    "shadow-dom"
   ],
   "author": "Mehmet Nadir",
   "license": "MIT",
