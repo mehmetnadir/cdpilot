@@ -347,7 +347,12 @@ function showHelp() {
     (Address a context's tab in subsequent commands via CDPILOT_TARGET=<tgt-id>)
 
   STEALTH & CAPTCHA
-    stealth [on|off]   Toggle anti-fingerprint patches (opt-in)
+    mode [regular|stealth|undetected]
+                       Three-tier stealth (crawl4ai-style). regular = no patch
+                       (cleanest, default); stealth = light patch (webdriver/
+                       chrome.runtime/permissions); undetected = full patch
+                       (+ plugins + WebGL + Worker). Adaptive auto-escalates.
+    stealth [on|off]   Legacy binary toggle (on -> undetected tier)
     captcha-check      Detect CAPTCHA on active page (JSON output)
     captcha-wait [s]   Pause until user solves CAPTCHA (default 300s)
     captcha-solve [--provider P]
