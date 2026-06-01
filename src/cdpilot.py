@@ -6995,16 +6995,44 @@ async def cmd_smart_click(text):
         cdpilot smart-click "Learn more"
     """
     ws_url, _ = get_page_ws()
+    # Locale-aware lowercase so Turkish/German chars round-trip safely.
+    # `toLocaleLowerCase()` (no arg) honors the browser's BCP-47 locale, which
+    # matches what the user sees in the DOM. Python's str.lower() handles
+    # ASCII fine for the *search* term that we marshal across; the in-page
+    # comparison uses the same locale-aware function on both sides.
     safe_text = json.dumps(text.lower())
     js = f"""
     (function() {{
-      var search = {safe_text};
+      // Walk into shadow roots so Salesforce Lightning / Polymer / any custom
+      // element with attachShadow({{mode:'open'}}) becomes searchable.
+      // Closed shadow roots are inaccessible by design — nothing we can do
+      // about those without a DevTools-only API.
+      function deepQuerySelectorAll(root, selector) {{
+        var found = Array.from(root.querySelectorAll(selector));
+        Array.from(root.querySelectorAll('*')).forEach(function(el) {{
+          if (el.shadowRoot) {{
+            found = found.concat(deepQuerySelectorAll(el.shadowRoot, selector));
+          }}
+        }});
+        return found;
+      }}
+
+      function lc(s) {{
+        // Locale-aware lowercase — `toLowerCase()` mishandles Turkish (İ → i̇
+        // combining sequence in some engines) and stays case-sensitive on
+        // ß in older runtimes. `toLocaleLowerCase()` matches the user's
+        // expected mental model: "İletişim" → "iletişim".
+        return (s == null ? '' : (s + '')).toLocaleLowerCase();
+      }}
+
+      var search = lc({safe_text}).trim();
       var candidates = [];
+      var disabledCount = 0;
 
       // Score: exact > startsWith > includes > partial
       function score(str) {{
         if (!str) return 0;
-        var s = str.toLowerCase().trim();
+        var s = lc(str).trim();
         if (s === search) return 100;
         if (s.startsWith(search)) return 80;
         if (s.includes(search)) return 60;
@@ -7015,13 +7043,13 @@ async def cmd_smart_click(text):
         return 0;
       }}
 
-      var els = document.querySelectorAll(
+      var els = deepQuerySelectorAll(document,
         'a, button, input[type=submit], input[type=button], ' +
         '[role=button], [role=link], [role=tab], [role=menuitem], ' +
         'summary, label, [onclick], [tabindex]'
       );
 
-      Array.from(els).forEach(function(el) {{
+      els.forEach(function(el) {{
         var rect = el.getBoundingClientRect();
         if (rect.width === 0 && rect.height === 0) return;
         var style = window.getComputedStyle(el);
@@ -7040,10 +7068,23 @@ async def cmd_smart_click(text):
         var bestMatch = '';
         texts.forEach(function(t) {{
           var s = score(t);
-          if (s > bestScore) {{ bestScore = s; bestMatch = t.trim().substring(0, 60); }}
+          if (s > bestScore) {{ bestScore = s; bestMatch = (t + '').trim().substring(0, 60); }}
         }});
 
         if (bestScore > 0) {{
+          // Reject elements that look clickable but won't fire — `<button
+          // disabled>`, `[aria-disabled=true]`, or a disabled ancestor
+          // (fieldset[disabled] propagates to children). Without this the
+          // command reports "Clicked" but nothing happens — silent fail.
+          var isDisabled = (
+            el.disabled === true ||
+            el.getAttribute('aria-disabled') === 'true' ||
+            (typeof el.closest === 'function' && el.closest('fieldset[disabled], [aria-disabled="true"]') !== null)
+          );
+          if (isDisabled) {{
+            disabledCount++;
+            return;
+          }}
           candidates.push({{
             el: el,
             score: bestScore,
@@ -7055,7 +7096,13 @@ async def cmd_smart_click(text):
         }}
       }});
 
-      if (candidates.length === 0) return JSON.stringify({{found: false}});
+      if (candidates.length === 0) {{
+        return JSON.stringify({{
+          found: false,
+          allDisabled: disabledCount > 0,
+          disabledCount: disabledCount
+        }});
+      }}
 
       candidates.sort(function(a, b) {{ return b.score - a.score; }});
       var best = candidates[0];
@@ -7084,7 +7131,14 @@ async def cmd_smart_click(text):
         return
 
     if not data.get("found"):
-        print(f'No element found matching: "{text}"', file=sys.stderr)
+        if data.get("allDisabled"):
+            # Distinguish "no match" from "match exists but disabled" — the
+            # latter is almost always a timing bug in the caller (form
+            # validation hasn't unlocked the submit button yet).
+            print(f'Error: no enabled element matches "{text}" '
+                  f'({data.get("disabledCount", 0)} disabled match(es) skipped)', file=sys.stderr)
+        else:
+            print(f'No element found matching: "{text}"', file=sys.stderr)
         sys.exit(1)
 
     await _vfx_ripple(ws_url, data["x"], data["y"])
@@ -7293,7 +7347,9 @@ async def cmd_dismiss(repeat=None):
 async def cmd_smart_fill(text, value):
     """Fill input by label/placeholder text — no CSS selector needed.
 
-    Finds input by: associated label, placeholder, aria-label, name, id match.
+    Finds input by: associated label, placeholder, aria-label, name, id match,
+    aria-labelledby, closest [aria-label], and nearby (4-prev) labels for
+    floating-label designs (Material UI, Ant Design, Chakra).
 
     Usage:
         cdpilot smart-fill "Email" "test@example.com"
@@ -7305,43 +7361,96 @@ async def cmd_smart_fill(text, value):
     safe_value = json.dumps(value)
     js = f"""
     (function() {{
-      var search = {safe_text};
+      // Shadow DOM traversal — same helper as smart-click. Custom-element
+      // form controls (e.g. <sf-input> in Salesforce Lightning) only
+      // expose their <input> via shadow root.
+      function deepQuerySelectorAll(root, selector) {{
+        var found = Array.from(root.querySelectorAll(selector));
+        Array.from(root.querySelectorAll('*')).forEach(function(el) {{
+          if (el.shadowRoot) {{
+            found = found.concat(deepQuerySelectorAll(el.shadowRoot, selector));
+          }}
+        }});
+        return found;
+      }}
+
+      function lc(s) {{
+        return (s == null ? '' : (s + '')).toLocaleLowerCase();
+      }}
+
+      var search = lc({safe_text}).trim();
       var value = {safe_value};
       var candidates = [];
 
       function score(str) {{
         if (!str) return 0;
-        var s = str.toLowerCase().trim();
+        var s = lc(str).trim();
         if (s === search) return 100;
         if (s.startsWith(search)) return 80;
         if (s.includes(search)) return 60;
         return 0;
       }}
 
-      var inputs = document.querySelectorAll('input, textarea, select, [contenteditable=true]');
-      Array.from(inputs).forEach(function(el) {{
+      var inputs = deepQuerySelectorAll(document,
+        'input, textarea, select, [contenteditable=true]');
+      inputs.forEach(function(el) {{
         var rect = el.getBoundingClientRect();
         if (rect.width === 0 && rect.height === 0) return;
 
         var scores = [];
-        // Check placeholder
+        // 1. placeholder
         scores.push(score(el.getAttribute('placeholder') || ''));
-        // Check aria-label
+        // 2. aria-label
         scores.push(score(el.getAttribute('aria-label') || ''));
-        // Check name/id
+        // 3. name / id
         scores.push(score(el.name || ''));
         scores.push(score(el.id || ''));
-        // Check associated label
+        // 4. label[for=id] (classic)
         if (el.id) {{
           var label = document.querySelector('label[for="' + el.id + '"]');
           if (label) scores.push(score(label.textContent || ''));
         }}
-        // Check parent label
+        // 5. parent <label>
         var parentLabel = el.closest('label');
         if (parentLabel) scores.push(score(parentLabel.textContent || ''));
-        // Check preceding text node/label
+        // 6. immediately-preceding sibling (legacy fallback)
         var prev = el.previousElementSibling;
         if (prev) scores.push(score(prev.textContent || ''));
+
+        // 7. aria-labelledby — the input points at one or more IDs whose
+        //    textContent forms the accessible name. ARIA spec says space-
+        //    separated tokens, in order.
+        var labelledby = el.getAttribute('aria-labelledby');
+        if (labelledby) {{
+          labelledby.split(/\\s+/).forEach(function(id) {{
+            if (!id) return;
+            var ref = document.getElementById(id);
+            if (ref) scores.push(score(ref.textContent || ''));
+          }});
+        }}
+        // 8. closest ancestor with [aria-label] — Material UI / Chakra wrap
+        //    the input in a labelled container instead of using <label>.
+        if (typeof el.closest === 'function') {{
+          var aria = el.closest('[aria-label]');
+          if (aria && aria !== el) scores.push(score(aria.getAttribute('aria-label') || ''));
+        }}
+        // 9. nearby label — walk up to 4 previous siblings looking for a
+        //    <label> or label-like element. Floating-label designs render
+        //    the label as a separate sibling at the parent level.
+        var node = el;
+        for (var depth = 0; depth < 2 && node && node.parentElement; depth++) {{
+          var sib = node.previousElementSibling;
+          for (var i = 0; i < 4 && sib; i++) {{
+            if (sib.tagName === 'LABEL' ||
+                sib.matches && (sib.matches('label, [class*="label" i], [class*="Label"]'))) {{
+              var t = (sib.textContent || '').trim();
+              if (t && t.length < 80) scores.push(score(t));
+              break;
+            }}
+            sib = sib.previousElementSibling;
+          }}
+          node = node.parentElement;
+        }}
 
         var bestScore = Math.max.apply(null, scores);
         if (bestScore > 0) {{
@@ -7406,13 +7515,38 @@ async def cmd_smart_select(text, option_text):
     safe_option = json.dumps(option_text.lower())
     js = f"""
     (function() {{
-      var search = {safe_text};
-      var optSearch = {safe_option};
-      var selects = document.querySelectorAll('select');
+      // Shadow DOM + locale-aware comparison — same conventions as smart-click
+      // / smart-fill so all three commands behave consistently on Lightning,
+      // Polymer, and Turkish/German content.
+      function deepQuerySelectorAll(root, selector) {{
+        var found = Array.from(root.querySelectorAll(selector));
+        Array.from(root.querySelectorAll('*')).forEach(function(el) {{
+          if (el.shadowRoot) {{
+            found = found.concat(deepQuerySelectorAll(el.shadowRoot, selector));
+          }}
+        }});
+        return found;
+      }}
+
+      function lc(s) {{
+        return (s == null ? '' : (s + '')).toLocaleLowerCase();
+      }}
+
+      var search = lc({safe_text}).trim();
+      var optSearch = lc({safe_option}).trim();
+      var selects = deepQuerySelectorAll(document, 'select');
       var best = null;
       var bestScore = 0;
+      var disabledCount = 0;
 
-      Array.from(selects).forEach(function(sel) {{
+      selects.forEach(function(sel) {{
+        // Skip disabled selects — same rationale as smart-click: silently
+        // setting .value on a disabled <select> is a no-op and confusing.
+        var isDisabled = (
+          sel.disabled === true ||
+          sel.getAttribute('aria-disabled') === 'true' ||
+          (typeof sel.closest === 'function' && sel.closest('fieldset[disabled], [aria-disabled="true"]') !== null)
+        );
         var texts = [
           sel.getAttribute('aria-label') || '',
           sel.name || '', sel.id || ''
@@ -7424,21 +7558,30 @@ async def cmd_smart_select(text, option_text):
         var parent = sel.closest('label');
         if (parent) texts.push(parent.textContent || '');
 
+        var matched = false;
         texts.forEach(function(t) {{
-          var s = t.toLowerCase().trim();
+          var s = lc(t).trim();
           var sc = s === search ? 100 : s.includes(search) ? 60 : 0;
-          if (sc > bestScore) {{ bestScore = sc; best = sel; }}
+          if (sc > 0) matched = true;
+          if (sc > bestScore && !isDisabled) {{ bestScore = sc; best = sel; }}
         }});
+        if (matched && isDisabled) disabledCount++;
       }});
 
-      if (!best) return JSON.stringify({{found: false}});
+      if (!best) {{
+        return JSON.stringify({{
+          found: false,
+          allDisabled: disabledCount > 0,
+          disabledCount: disabledCount
+        }});
+      }}
 
       // Find matching option
       var options = Array.from(best.options);
       var match = options.find(function(o) {{
-        return o.text.toLowerCase().trim() === optSearch;
+        return lc(o.text).trim() === optSearch;
       }}) || options.find(function(o) {{
-        return o.text.toLowerCase().includes(optSearch);
+        return lc(o.text).includes(optSearch);
       }});
 
       if (!match) return JSON.stringify({{found: true, optionFound: false, available: options.map(function(o) {{ return o.text; }}).slice(0, 10)}});
@@ -7457,7 +7600,11 @@ async def cmd_smart_select(text, option_text):
         return
 
     if not data.get("found"):
-        print(f'No select found matching: "{text}"', file=sys.stderr)
+        if data.get("allDisabled"):
+            print(f'Error: no enabled select matches "{text}" '
+                  f'({data.get("disabledCount", 0)} disabled match(es) skipped)', file=sys.stderr)
+        else:
+            print(f'No select found matching: "{text}"', file=sys.stderr)
         sys.exit(1)
     if not data.get("optionFound"):
         print(f'Option "{option_text}" not found. Available: {", ".join(data.get("available", []))}', file=sys.stderr)
