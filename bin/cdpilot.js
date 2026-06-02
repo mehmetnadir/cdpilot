@@ -358,6 +358,11 @@ function showHelp() {
     captcha-solve [--provider P]
                        Solve Amazon classic image CAPTCHA (opt-in). amazon-local
                        (optional amazoncaptcha lib) or BYOK capsolver/2captcha.
+    friction           Detect highest anti-bot rung (none/rate_limited/
+                       soft_captcha/login_wall/otp_sms/hard_block) + policy.
+                       rate_limit auto-backoff in 'go'; login/OTP/block = human
+                       handoff (no autonomous bypass). Env: CDPILOT_FRICTION_BACKOFF,
+                       CDPILOT_FRICTION_MAX_RETRY.
     profile warm [--minutes N]
                        Age cookies/history on safe sites to boost reCAPTCHA v3 score.
     adaptive [on|off]  Auto-escalate to stealth on hosts that show CAPTCHA.
