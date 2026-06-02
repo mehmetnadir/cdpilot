@@ -358,6 +358,11 @@ function showHelp() {
     captcha-solve [--provider P]
                        Solve Amazon classic image CAPTCHA (opt-in). amazon-local
                        (optional amazoncaptcha lib) or BYOK capsolver/2captcha.
+                       Auto-routes PerimeterX 'Press & Hold' to press-hold.
+    press-hold [selector]
+                       Solve a PerimeterX/HUMAN 'Press & Hold' challenge with a
+                       humanized press->hold(jitter)->release gesture (no token,
+                       no provider). Auto-finds #px-captcha if no selector given.
     friction           Detect highest anti-bot rung (none/rate_limited/
                        soft_captcha/login_wall/otp_sms/hard_block) + policy.
                        rate_limit auto-backoff in 'go'; login/OTP/block = human

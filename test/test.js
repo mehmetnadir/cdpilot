@@ -285,6 +285,106 @@ test('captcha-solve: capsolver BYOK reads CAPSOLVER_API_KEY env', () => {
   assert(!/\bimport requests\b/.test(byok[0]), 'BYOK solver must not import requests');
 });
 
+// ── PerimeterX / HUMAN "Press & Hold" solver ──
+
+test('press-hold: _solve_press_and_hold defined + cmd_press_hold dispatched', () => {
+  assert(/async def _solve_press_and_hold\(ws_url, target_sel=None\)/.test(PY_CONTENT),
+    'Should define async _solve_press_and_hold(ws_url, target_sel=None)');
+  assert(/async def cmd_press_hold\(selector=None\)/.test(PY_CONTENT),
+    'Should define async cmd_press_hold(selector=None)');
+  assert(/'press-hold':\s*lambda:\s*cmd_press_hold/.test(PY_CONTENT),
+    "Should register 'press-hold' in async_map dispatch");
+});
+
+test('press-hold: uses Input.dispatchMouseEvent mousePressed->mouseMoved(jitter)->mouseReleased sequence', () => {
+  const m = PY_CONTENT.match(/async def _press_hold_gesture\(ws_url, x, y, hold_ms\)[\s\S]*?return jitters/);
+  assert(m, '_press_hold_gesture should exist');
+  const body = m[0];
+  const iPress = body.indexOf('"type": "mousePressed"');
+  const iMove = body.indexOf('"type": "mouseMoved"');
+  const iRelease = body.indexOf('"type": "mouseReleased"');
+  assert(iPress >= 0, 'gesture must dispatch mousePressed');
+  assert(iMove >= 0, 'gesture must dispatch mouseMoved (the hold tremor)');
+  assert(iRelease >= 0, 'gesture must dispatch mouseReleased');
+  assert(iPress < iMove && iMove < iRelease,
+    'order must be mousePressed -> mouseMoved -> mouseReleased');
+  assert(/Input\.dispatchMouseEvent/.test(body),
+    'must use CDP Input.dispatchMouseEvent (zero new deps)');
+});
+
+test('press-hold: hold duration is gaussian-randomized (not fixed)', () => {
+  const m = PY_CONTENT.match(/def _press_hold_duration_ms\(\)[\s\S]*?return [^\n]+/);
+  assert(m, '_press_hold_duration_ms should exist');
+  assert(/_gauss\(4000,\s*\d+,\s*3000,\s*7000\)/.test(m[0]),
+    'hold duration must be _gauss(mu=4000, sigma, lo=3000, hi=7000) — randomized + clamped');
+  assert(/hold_ms = _press_hold_duration_ms\(\)/.test(PY_CONTENT),
+    '_solve_press_and_hold must draw a fresh randomized hold per attempt');
+});
+
+test('press-hold: micro-jitter during hold (1-2px mouseMoved with button held)', () => {
+  const m = PY_CONTENT.match(/async def _press_hold_gesture\(ws_url, x, y, hold_ms\)[\s\S]*?return jitters/);
+  assert(m, '_press_hold_gesture should exist');
+  const body = m[0];
+  assert(/r\.randint\(-2, 2\)/.test(body),
+    'jitter must be +/-2px (randint(-2, 2)) around the press point');
+  const moveBlock = body.slice(body.indexOf('"type": "mouseMoved"'));
+  assert(/"button":\s*"left"/.test(moveBlock) && /"buttons":\s*1/.test(moveBlock),
+    'hold-phase mouseMoved must keep the left button held (button:left, buttons:1)');
+  const pressBlock = body.slice(body.indexOf('"type": "mousePressed"'),
+                               body.indexOf('"type": "mouseMoved"'));
+  assert(/"buttons":\s*1/.test(pressBlock), 'mousePressed must set buttons:1 (held)');
+  const relBlock = body.slice(body.indexOf('"type": "mouseReleased"'));
+  assert(/"buttons":\s*0/.test(relBlock), 'mouseReleased must clear buttons (buttons:0)');
+});
+
+test('press-hold: reuses existing humanizer (no reimplemented mouse path) + jitter cadence', () => {
+  const m = PY_CONTENT.match(/async def _press_hold_gesture\(ws_url, x, y, hold_ms\)[\s\S]*?return jitters/);
+  assert(m, '_press_hold_gesture should exist');
+  const body = m[0];
+  assert(/await _humanize_mouse_move\(ws_url, x, y\)/.test(body),
+    'must reuse the existing _humanize_mouse_move Bezier path (not reimplement)');
+  assert(/r\.uniform\(0\.10, 0\.20\)/.test(body),
+    'micro-jitter cadence must be ~100-200ms (uniform(0.10, 0.20))');
+});
+
+test('press-hold: cmd_captcha_solve routes perimeterx -> press_and_hold', () => {
+  const m = PY_CONTENT.match(/async def cmd_captcha_solve\(provider=None\)[\s\S]*?amz = await _detect_amazon_captcha/);
+  assert(m, 'cmd_captcha_solve prologue should exist');
+  const head = m[0];
+  assert(/'perimeterx' in \(pre\.get\('types'\) or \[\]\)/.test(head),
+    'cmd_captcha_solve must check for a perimeterx type');
+  assert(/await _solve_press_and_hold\(ws\)/.test(head),
+    'cmd_captcha_solve must route perimeterx to _solve_press_and_hold');
+  const iRoute = head.indexOf('_solve_press_and_hold');
+  const iAmz = head.indexOf('_detect_amazon_captcha');
+  assert(iRoute >= 0 && iRoute < iAmz,
+    'perimeterx routing must run before the Amazon/BYOK provider path');
+});
+
+test('press-hold: target finder (px hooks + TR/EN text) + retry + result schema', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'PRESS_HOLD_FIND_JS');
+  assert(js, 'PRESS_HOLD_FIND_JS should be extractable');
+  assert(js.includes('#px-captcha') && js.includes('px-captcha'),
+    'finder must look for #px-captcha / [class*="px-captcha"]');
+  assert(/press and hold|press & hold/.test(js) && /bas[ıi]l[ıi] tut/.test(js),
+    'finder must match press-and-hold text in English + Turkish');
+  const solver = PY_CONTENT.match(/async def _solve_press_and_hold[\s\S]*?"error": "still_present_after_retry"\}/);
+  assert(solver, '_solve_press_and_hold should exist with retry');
+  assert(/max_attempts = 2/.test(solver[0]), 'solver must allow a 2nd attempt on failure');
+  assert(/"method": "press_and_hold"/.test(solver[0]), 'result must report method press_and_hold');
+  assert(/"hold_ms"/.test(solver[0]) && /"attempts"/.test(solver[0]),
+    'result must include hold_ms and attempts');
+  assert(/info = await _detect_captcha\(ws_url\)/.test(solver[0]),
+    'solver must verify with _detect_captcha after the gesture');
+});
+
+test('MCP: browser_press_hold tool + handler registered', () => {
+  assert(/\{"name":\s*"browser_press_hold"/.test(PY_CONTENT),
+    'browser_press_hold MCP tool should be declared');
+  assert(/"browser_press_hold":\s*lambda a:\s*\["press-hold"\]/.test(PY_CONTENT),
+    'browser_press_hold MCP handler should map to the press-hold CLI command');
+});
+
 // ── profile warm (reCAPTCHA v3 score aging) ──
 
 test('profile warm: cmd_profile_warm defined', () => {
