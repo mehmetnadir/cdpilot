@@ -2422,6 +2422,107 @@ test('MCP: browser_mode tool registered', () => {
     'browser_mode enum must list regular, stealth, undetected');
 });
 
+// ── LIGHT tier self-containment regression guard ──
+// Context: STEALTH_JS_FULL was split into a LIGHT subset (06a32f2). A split can
+// silently leave a symbol behind — LIGHT calling a helper (makePlugin,
+// spoofParam, PluginArrayProto, OrigWorker, …) that is ONLY declared inside
+// FULL. Such a dangling reference throws ReferenceError on every page load when
+// LIGHT is injected via Page.addScriptToEvaluateOnNewDocument, killing the JS
+// context (the "stealth tier = 0 steps" failure mode). These tests prove LIGHT
+// is a hermetic IIFE: it parses, runs, and references no FULL-only symbol.
+
+test('mode: STEALTH_JS_LIGHT is a self-contained IIFE (no FULL-only refs)', () => {
+  const light = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_LIGHT');
+  const full = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_FULL');
+  assert(light && full, 'both LIGHT and FULL bodies must be extractable');
+
+  // Wrapped in a single IIFE — the whole body is one (function(){...})() form.
+  assert(/^\s*\(function\s*\(\)\s*\{/.test(light), 'LIGHT must open with an IIFE');
+  assert(/\}\)\(\);\s*$/.test(light.trim() + '\n'.repeat(0)) || /\}\)\(\);\s*$/.test(light.trimEnd()),
+    'LIGHT must close the IIFE with })();');
+
+  // Helpers/vars that exist ONLY in FULL — LIGHT must reference NONE of them.
+  // (If the split leaked one of these into LIGHT, it would throw at runtime.)
+  const fullOnlySymbols = [
+    'makeMime', 'makePlugin', 'spoofParam', 'PluginArrayProto', 'PluginProto',
+    'MimeTypeProto', 'pluginNames', 'workerPatch', 'WrappedWorker', 'OrigWorker',
+    'gp1', 'gp2', '__cdpilot_worker_patched',
+  ];
+  for (const sym of fullOnlySymbols) {
+    // Sanity: the symbol really is a FULL concept.
+    assert(full.includes(sym), `precondition: ${sym} should exist in FULL`);
+    assert(!light.includes(sym),
+      `LIGHT must NOT reference FULL-only symbol "${sym}" — dangling ref = ReferenceError on every page (0-step bench failure)`);
+  }
+});
+
+test('mode: stealth tier injection doesn\'t reference undefined symbols', () => {
+  const light = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_LIGHT');
+  const vm = require('vm');
+
+  // Collect every locally-declared identifier (var/function/catch params) so we
+  // can assert LIGHT never calls a helper it didn't define itself.
+  const declaredVars = [...light.matchAll(/\bvar\s+([A-Za-z_$][\w$]*)/g)].map(m => m[1]);
+  const declaredFns = [...light.matchAll(/\bfunction\s+([A-Za-z_$][\w$]*)/g)].map(m => m[1]);
+  const declared = new Set([...declaredVars, ...declaredFns]);
+  // LIGHT defines wdValue + origQuery as locals today; assert that holds.
+  assert(declared.has('wdValue'), 'LIGHT should declare wdValue locally');
+  assert(declared.has('origQuery'), 'LIGHT should declare origQuery locally');
+
+  // Execute LIGHT in a minimal sandbox that emulates the bits of `window`/global
+  // a real page exposes BEFORE any stealth runs. If LIGHT touched an
+  // undefined FULL-only helper, this run would throw — the test would fail.
+  const sandbox = {};
+  const win = {
+    chrome: undefined,
+    PluginArray: function () {}, Plugin: function () {}, MimeType: function () {},
+    WebGLRenderingContext: function () {}, WebGL2RenderingContext: function () {},
+    Worker: function () {},
+  };
+  win.WebGLRenderingContext.prototype = { getParameter() { return null; } };
+  win.WebGL2RenderingContext.prototype = { getParameter() { return null; } };
+  sandbox.window = win;
+  sandbox.Navigator = function () {};
+  // Real Chrome exposes navigator.webdriver on Navigator.prototype (not as an
+  // own prop). LIGHT redefines the prototype getter, so mirror that shape here.
+  sandbox.Navigator.prototype = {};
+  Object.defineProperty(sandbox.Navigator.prototype, 'webdriver', { get() { return true; }, configurable: true });
+  sandbox.navigator = Object.create(sandbox.Navigator.prototype);
+  sandbox.navigator.permissions = { query: () => Promise.resolve({ state: 'granted' }) };
+  sandbox.Notification = { permission: 'default' };
+  sandbox.Promise = Promise;
+  sandbox.Object = Object;
+  vm.createContext(sandbox);
+  assert.doesNotThrow(
+    () => new vm.Script(light).runInContext(sandbox, { timeout: 1000 }),
+    'STEALTH_JS_LIGHT must execute without ReferenceError/throw — a dangling FULL-only ref would surface here',
+  );
+  // Post-condition: the webdriver mask actually applied (proves the IIFE ran to
+  // completion, not just parsed). Vanilla `true` -> patched to `false`.
+  assert.strictEqual(sandbox.navigator.webdriver, false,
+    'LIGHT should have masked navigator.webdriver to false after running');
+});
+
+test('mode: LIGHT is a strict subset of FULL (regression guard for the split)', () => {
+  const light = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_LIGHT');
+  const full = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_FULL');
+  // The three LIGHT patches (webdriver / chrome.runtime / permissions) are the
+  // SAFE subset and must each also appear in FULL — LIGHT can never gain a
+  // surface FULL lacks, or "subset" is a lie and tier escalation is incoherent.
+  assert(light.includes("'webdriver'") && full.includes("'webdriver'"),
+    'webdriver patch must exist in both tiers');
+  assert(light.includes('window.chrome.runtime') && full.includes('window.chrome.runtime'),
+    'chrome.runtime patch must exist in both tiers');
+  assert(light.includes('navigator.permissions.query') && full.includes('navigator.permissions.query'),
+    'permissions.query patch must exist in both tiers');
+  // FULL must be strictly larger (it carries the extra surfaces).
+  assert(full.length > light.length, 'FULL must be a superset of LIGHT (larger body)');
+  // Shared idempotency guard — both gate on the same flag so a page that ran
+  // one tier won\'t double-run the other.
+  assert(light.includes('__cdpilot_stealth') && full.includes('__cdpilot_stealth'),
+    'both tiers must share the __cdpilot_stealth idempotency guard');
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
