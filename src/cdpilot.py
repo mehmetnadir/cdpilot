@@ -3139,6 +3139,188 @@ async def _humanize_click(ws_url, x, y):
     await asyncio.sleep(r.uniform(0.08, 0.20))
 
 
+# ─── PerimeterX / HUMAN "Press & Hold" solver ───────────────────────────────
+# PerimeterX (HUMAN Security) gates content behind a button the user must press
+# AND HOLD for several seconds. The detector measures the mouse-hold *behaviour*
+# (press duration, micro-tremor during the hold, release timing) to tell a human
+# hand from a bot — it is NOT a token challenge, so there is nothing to fetch or
+# inject. The only way through is to emit a real, human-shaped press->hold->release
+# gesture. We reuse the existing humanized mouse path + Input.dispatchMouseEvent
+# (zero new deps, pure CDP) and add the natural hand-tremor PerimeterX looks for.
+
+# JS that locates the press-and-hold target and returns its viewport centre.
+# Tries the canonical #px-captcha / [class*="px-captcha"] hooks first, then any
+# element whose visible text matches "press & hold" / "press and hold" / the
+# Turkish "basili tut". Returns JSON: {found, cx, cy, w, h, how} or {found:false}.
+PRESS_HOLD_FIND_JS = r"""
+(function(userSel) {
+  try {
+    function centre(el, how) {
+      if (!el) return null;
+      try { el.scrollIntoView({behavior: 'instant', block: 'center'}); } catch (e) {}
+      var r = el.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) return null;
+      return JSON.stringify({
+        found: true,
+        cx: Math.round(r.left + r.width / 2),
+        cy: Math.round(r.top + r.height / 2),
+        w: Math.round(r.width), h: Math.round(r.height), how: how
+      });
+    }
+    if (userSel) {
+      var u = document.querySelector(userSel);
+      var cu = centre(u, 'user-selector');
+      if (cu) return cu;
+    }
+    // Canonical PerimeterX hooks.
+    var px = document.querySelector('#px-captcha, [class*="px-captcha"]');
+    if (px) {
+      // The visible hold target is often an inner button/div; prefer a child
+      // with real size, else the container itself.
+      var inner = px.querySelector('div[role="button"], button, [tabindex], div');
+      var ci = centre(inner, 'px-inner');
+      if (ci) return ci;
+      var cc = centre(px, 'px-container');
+      if (cc) return cc;
+    }
+    // Text-based fallback: any small interactive element saying press & hold.
+    var needles = ['press & hold', 'press and hold', 'press &amp; hold',
+                   'basili tut', 'basılı tut', 'press hold'];
+    var cands = document.querySelectorAll(
+      'button, [role="button"], div, span, a, p');
+    for (var i = 0; i < cands.length; i++) {
+      var el = cands[i];
+      var t = (el.textContent || '').toLowerCase().trim();
+      if (!t || t.length > 60) continue;
+      for (var j = 0; j < needles.length; j++) {
+        if (t.indexOf(needles[j]) >= 0) {
+          var ct = centre(el, 'text-match');
+          if (ct) return ct;
+        }
+      }
+    }
+    return JSON.stringify({ found: false });
+  } catch (e) {
+    return JSON.stringify({ found: false, error: String(e) });
+  }
+})
+"""
+
+
+def _press_hold_duration_ms():
+    """Gaussian-randomized hold duration in ms. mu~4000, clamped 3000..7000.
+
+    PerimeterX rejects a fixed duration (machine-like). We draw from a Gaussian
+    so each attempt looks individually human, then clamp to the band the widget
+    actually accepts.
+    """
+    return int(_gauss(4000, 900, 3000, 7000))
+
+
+async def _press_hold_gesture(ws_url, x, y, hold_ms):
+    """Emit one real press->hold(jitter)->release gesture at (x, y) over CDP.
+
+    1. Bezier-humanized mouse move to the target (reuses _humanize_mouse_move).
+    2. Input.dispatchMouseEvent mousePressed (button:left) at the target.
+    3. Hold loop: every 100-200ms emit a mouseMoved with +/-1-2px jitter WHILE the
+       left button stays pressed -- this is the natural hand-tremor PerimeterX
+       inspects. Total loop time == hold_ms.
+    4. Input.dispatchMouseEvent mouseReleased.
+    Returns the number of micro-jitter moves dispatched during the hold.
+    """
+    import random as _r
+    r = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
+    # Land the cursor on the target with a human path + small final offset.
+    await _humanize_mouse_move(ws_url, x, y)
+    await asyncio.sleep(r.uniform(0.05, 0.18))
+    # Press and hold the left button at the target.
+    await cdp_send(ws_url, [(981, "Input.dispatchMouseEvent", {
+        "type": "mousePressed", "x": x, "y": y,
+        "button": "left", "buttons": 1, "clickCount": 1})])
+    jitters = 0
+    elapsed = 0.0
+    cur_x, cur_y = x, y
+    hold_s = hold_ms / 1000.0
+    while elapsed < hold_s:
+        step = r.uniform(0.10, 0.20)
+        # Don't overshoot the requested hold window.
+        if elapsed + step > hold_s:
+            step = max(0.0, hold_s - elapsed)
+        await asyncio.sleep(step)
+        elapsed += step
+        if elapsed >= hold_s:
+            break
+        # +/-1-2px tremor around the press point, button still held (buttons:1).
+        cur_x = x + r.randint(-2, 2)
+        cur_y = y + r.randint(-2, 2)
+        await cdp_send(ws_url, [(982, "Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": cur_x, "y": cur_y,
+            "button": "left", "buttons": 1, "modifiers": 0})])
+        jitters += 1
+    # Release at (near) the press point.
+    await cdp_send(ws_url, [(983, "Input.dispatchMouseEvent", {
+        "type": "mouseReleased", "x": cur_x, "y": cur_y,
+        "button": "left", "buttons": 0, "clickCount": 1})])
+    return jitters
+
+
+async def _solve_press_and_hold(ws_url, target_sel=None):
+    """Solve a PerimeterX/HUMAN "Press & Hold" challenge with a humanized gesture.
+
+    Finds the hold target (#px-captcha / [class*="px-captcha"] / press-and-hold
+    text, or an explicit target_sel), then performs press->hold(with micro-tremor)
+    ->release. Verifies via _detect_captcha; retries once with a different hold
+    duration if the challenge is still present.
+
+    Returns: {"solved": bool, "method": "press_and_hold", "hold_ms": N,
+              "attempts": N, ...}. Never raises.
+    """
+    last_hold = 0
+    attempts = 0
+    max_attempts = 2
+    for attempts in range(1, max_attempts + 1):
+        # (Re)locate the target each attempt -- the widget may re-render.
+        try:
+            find_expr = f"({PRESS_HOLD_FIND_JS})({json.dumps(target_sel) if target_sel else 'null'})"
+            res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {
+                "expression": find_expr, "returnByValue": True})], timeout=8)
+            raw = res.get(1, {}).get("result", {}).get("value")
+            loc = json.loads(raw) if raw else {"found": False}
+        except Exception as e:
+            return {"solved": False, "method": "press_and_hold",
+                    "hold_ms": last_hold, "attempts": attempts,
+                    "error": f"locate_failed:{str(e)[:80]}"}
+        if not loc.get("found"):
+            return {"solved": False, "method": "press_and_hold",
+                    "hold_ms": last_hold, "attempts": attempts,
+                    "error": "target_not_found"}
+
+        hold_ms = _press_hold_duration_ms()
+        last_hold = hold_ms
+        try:
+            jitters = await _press_hold_gesture(
+                ws_url, int(loc["cx"]), int(loc["cy"]), hold_ms)
+        except Exception as e:
+            return {"solved": False, "method": "press_and_hold",
+                    "hold_ms": hold_ms, "attempts": attempts,
+                    "error": f"gesture_failed:{str(e)[:80]}"}
+
+        # Settle, then check whether the challenge cleared.
+        import random as _r
+        await asyncio.sleep((_r.Random().uniform(500, 1500)) / 1000.0)
+        info = await _detect_captcha(ws_url)
+        still_px = 'perimeterx' in (info.get('types') or [])
+        if not still_px:
+            return {"solved": True, "method": "press_and_hold",
+                    "hold_ms": hold_ms, "attempts": attempts,
+                    "jitter_moves": jitters}
+        # else: loop and try once more with a fresh (re-drawn) hold duration.
+
+    return {"solved": False, "method": "press_and_hold",
+            "hold_ms": last_hold, "attempts": attempts,
+            "error": "still_present_after_retry"}
+
+
 async def _humanize_type(ws_url, text):
     """Type text with Gaussian inter-key and dwell delays via CDP key events."""
     import random as _r
@@ -6793,6 +6975,28 @@ async def _fill_amazon_solution(ws_url: str, input_id: str, solution: str) -> bo
         return False
 
 
+async def cmd_press_hold(selector=None):
+    """Solve a PerimeterX/HUMAN "Press & Hold" challenge (standalone, opt-in).
+
+    Performs a humanized press->hold(with micro-tremor)->release gesture on the
+    hold target. If no selector is given, auto-locates the px-captcha widget
+    (#px-captcha / [class*="px-captcha"] / "press & hold" text). Prints JSON;
+    exit 0 = solved, 1 = not solved / target not found.
+
+    Usage:
+      cdpilot press-hold              # auto-find the px-captcha target
+      cdpilot press-hold "#px-captcha button"
+    """
+    if not cdp_get("/json/version"):
+        print(json.dumps({'solved': False, 'error': 'no_browser',
+                          'hint': 'Run: cdpilot launch'}, ensure_ascii=False))
+        sys.exit(1)
+    ws, _ = get_page_ws()
+    res = await _solve_press_and_hold(ws, target_sel=selector)
+    print(json.dumps(res, ensure_ascii=False))
+    sys.exit(0 if res.get('solved') else 1)
+
+
 async def cmd_captcha_solve(provider=None):
     """Solve the CAPTCHA on the current page (opt-in).
 
@@ -6808,6 +7012,16 @@ async def cmd_captcha_solve(provider=None):
     """
     provider = (provider or 'amazon-local').lower()
     ws, _ = get_page_ws()
+
+    # PerimeterX / HUMAN "Press & Hold" is a behavioural (not token) challenge:
+    # there is no provider to call, the only solution is a real humanized
+    # press->hold->release gesture. Route it automatically whenever detected,
+    # regardless of the requested provider, before the Amazon/BYOK path.
+    pre = await _detect_captcha(ws)
+    if 'perimeterx' in (pre.get('types') or []):
+        res = await _solve_press_and_hold(ws)
+        print(json.dumps(res, ensure_ascii=False))
+        sys.exit(0 if res.get('solved') else 1)
 
     amz = await _detect_amazon_captcha(ws)
     if not amz.get('detected'):
@@ -10632,6 +10846,7 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"repeat": {"type": "string", "description": "Optional. Number of dismiss attempts (1-10) or 'aggressive' (up to 5 chained). Default: 1.", "default": "1"}}}},
             {"name": "browser_captcha_solve", "description": "Solve the CAPTCHA on the current page (opt-in). Detects and solves Amazon classic image CAPTCHA (the \"Type the characters you see\" rate-limit page) by OCRing the image, filling the input, and submitting. Default provider 'amazon-local' uses the optional amazoncaptcha library (pip install amazoncaptcha) for offline OCR. BYOK providers 'capsolver' / '2captcha' use image-to-text APIs via CAPSOLVER_API_KEY / TWOCAPTCHA_API_KEY env vars. Returns JSON with solved status. For token-based CAPTCHAs (reCAPTCHA, hCaptcha, Turnstile) use the captcha config/auto CLI instead.",
              "inputSchema": {"type": "object", "properties": {"provider": {"type": "string", "enum": ["amazon-local", "capsolver", "2captcha"], "description": "Solver provider. Default: amazon-local (offline OCR via optional amazoncaptcha lib).", "default": "amazon-local"}}}},
+            {"name": "browser_press_hold", "description": "Solve a PerimeterX/HUMAN \"Press & Hold\" challenge on the current page (opt-in). PerimeterX is a BEHAVIOURAL challenge -- the user must press AND HOLD a button for several seconds while the detector measures hold duration, natural hand-tremor, and release timing. It is NOT token-based, so there is no provider to call: the only solution is a real humanized press->hold->release gesture, which this tool emits via CDP Input events (Gaussian-randomized ~3-7s hold with +/-1-2px micro-jitter while the button is held). Auto-locates the #px-captcha widget (or pass an explicit selector). Returns JSON with solved status, hold_ms, and attempts. Use this when browser_friction/captcha-check reports a 'perimeterx' type.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "Optional CSS selector for the hold target. If omitted, auto-finds the px-captcha button."}}}},
             {"name": "browser_friction", "description": "Detect the highest anti-bot 'friction' rung on the current page and return the recommended response policy as JSON. Real sites stack defenses incrementally (rate-limit -> CAPTCHA -> login-wall -> SMS/OTP -> hard-block); this reports which rung is currently active. Levels (low->high): none, rate_limited, soft_captcha, login_wall, otp_sms, hard_block. Bilingual (English + Turkish) DOM heuristics. Read-only — never bypasses anything. login_wall/otp_sms/hard_block are flagged for HUMAN handoff (not autonomously solved) for safety/ethics; rate_limited recommends exponential backoff; soft_captcha defers to the captcha tools. Use this for diagnosis before deciding how to proceed on a gated site.",
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_smart_fill", "description": "Fill an input by its label or placeholder text — no CSS selector needed. Finds input by associated label, placeholder, aria-label, name, or id. React-compatible value setting. Use when you know WHAT field to fill but not the exact selector.",
@@ -10747,6 +10962,7 @@ class MCPServer:
             "browser_dismiss": lambda a: ["dismiss"] + ([str(a["repeat"])] if a.get("repeat") else []),
             "browser_smart_fill": lambda a: ["smart-fill", a.get("label", ""), a.get("value", "")],
             "browser_captcha_solve": lambda a: ["captcha-solve"] + ([f"--provider={a['provider']}"] if a.get("provider") else []),
+            "browser_press_hold": lambda a: ["press-hold"] + ([a["selector"]] if a.get("selector") else []),
             "browser_friction": lambda a: ["friction"],
             "browser_smart_select": lambda a: ["smart-select", a.get("label", ""), a.get("option", "")],
             "browser_describe": lambda a: ["describe"],
@@ -12536,6 +12752,8 @@ if __name__ == "__main__":
                  else (next((a for a in args if not a.startswith('--')), None))),
         ),
         'profile': lambda: cmd_profile_dispatch(args),
+        'press-hold': lambda: cmd_press_hold(
+            next((a for a in args if not a.startswith('--')), None)),
         'agent': lambda: _dispatch_agent_cmd(args),
     }
 
