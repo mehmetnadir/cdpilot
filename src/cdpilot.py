@@ -554,6 +554,123 @@ CAPTCHA_DETECT_JS = r"""
 })()
 """
 
+# ─── Progressive-Resilience Escalation Ladder ───
+# Real sites stack defenses incrementally (sahibinden.com pattern: random
+# captcha -> rate-limit -> login-wall -> SMS/OTP). CAPTCHA_DETECT_JS only sees
+# the captcha rung. FRICTION_DETECT_JS detects the OTHER friction rungs purely
+# from the DOM (read-only) and reports the HIGHEST one present. Bilingual
+# (Turkish + English) keyword heuristics — TR sites are first-class.
+#
+# Ladder (low -> high):
+#   none          normal page
+#   rate_limited  HTTP 429 markers, "too many requests" / "çok fazla istek"
+#   soft_captcha  (handled by CAPTCHA_DETECT_JS, merged in _detect_friction)
+#   login_wall    login form gating the real content (sign in / giriş yap)
+#   otp_sms       verification-code / OTP / SMS input
+#   hard_block    access denied / banned / 403 forbidden, no content
+FRICTION_DETECT_JS = r"""
+(function() {
+  try {
+    var out = { level: 'none', signals: [], detail: '' };
+    var bodyText = (document.body ? (document.body.innerText || '') : '').toLowerCase();
+    var titleText = (document.title || '').toLowerCase();
+    var hay = titleText + ' \n ' + bodyText;
+    var sample = hay.slice(0, 6000);
+    var hasAny = function(words) {
+      for (var i = 0; i < words.length; i++) {
+        if (sample.indexOf(words[i]) >= 0) return words[i];
+      }
+      return null;
+    };
+
+    // ── hard_block (highest) ──
+    var blockWords = [
+      'access denied', 'access to this page has been denied', 'you have been blocked',
+      'permanently banned', 'ip has been banned', '403 forbidden', 'forbidden',
+      'erişim engellendi', 'erişiminiz engellendi', 'engellendiniz', 'yasaklandı',
+      'reddedildi', 'banlandı'
+    ];
+    var blockHit = hasAny(blockWords);
+    // Only treat as a hard block when the page has almost no real content
+    // (block pages are typically tiny). Avoids false positives on articles
+    // that merely mention these words.
+    var thinPage = bodyText.replace(/\s+/g, ' ').trim().length < 600;
+
+    // ── otp_sms ──
+    var otpWords = [
+      'verification code', 'one-time code', 'one time password', 'otp',
+      'sms code', 'code sent to your phone', 'enter the code',
+      'doğrulama kodu', 'onay kodu', 'tek kullanımlık', 'telefonunuza gönderilen',
+      'sms ile gönderilen', 'sms doğrulama', 'kodu girin'
+    ];
+    var otpInput = document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="otp" i], ' +
+      'input[name*="code" i][maxlength], input[name*="sms" i], input[name*="verification" i], ' +
+      'input[id*="verification" i], input[name*="dogrulama" i], input[id*="dogrulama" i]'
+    );
+    var otpWordHit = hasAny(otpWords);
+
+    // ── login_wall ──
+    var pwInput = document.querySelector('input[type="password"]');
+    var loginForm = document.querySelector(
+      'form[action*="login" i], form[action*="signin" i], form[action*="giris" i], form[id*="login" i]'
+    );
+    var loginWords = [
+      'sign in', 'log in', 'login to continue', 'please sign in', 'you must be logged in',
+      'create an account to continue', 'sign in to continue',
+      'giriş yap', 'oturum aç', 'giriş yapın', 'üye girişi', 'devam etmek için giriş',
+      'giriş yapmalısınız', 'lütfen giriş yapın', 'hesabınıza giriş'
+    ];
+    var loginWordHit = hasAny(loginWords);
+
+    // ── rate_limited ──
+    var rateWords = [
+      'too many requests', 'rate limit', 'rate limited', 'slow down',
+      'you are being rate limited', 'request limit', 'try again later',
+      'çok fazla istek', 'çok sık istek', 'lütfen yavaşlayın', 'yavaşlayın',
+      'istek sınırı', 'çok hızlı', 'daha sonra tekrar deneyin', 'güvenlik doğrulaması'
+    ];
+    var rateWordHit = hasAny(rateWords);
+    // 429 surfaced into DOM (some sites print the status), or retry-after hint
+    var rate429 = /\b429\b/.test(sample) && (sample.indexOf('request') >= 0 || sample.indexOf('istek') >= 0 || rateWordHit);
+    var retryAfter = /retry[\s-]?after/.test(sample);
+
+    // Decide highest rung present.
+    if (blockHit && thinPage) {
+      out.level = 'hard_block';
+      out.signals.push('keyword:' + blockHit);
+      out.detail = 'Access denied / banned page with no real content.';
+    } else if (otpWordHit || otpInput) {
+      out.level = 'otp_sms';
+      if (otpWordHit) out.signals.push('keyword:' + otpWordHit);
+      if (otpInput) out.signals.push('input:otp');
+      out.detail = 'SMS/OTP verification prompt detected.';
+    } else if ((pwInput || loginForm) && loginWordHit) {
+      out.level = 'login_wall';
+      out.signals.push('keyword:' + loginWordHit);
+      if (pwInput) out.signals.push('input:password');
+      if (loginForm) out.signals.push('form:login');
+      out.detail = 'Login wall gating the page content.';
+    } else if (loginWordHit && loginForm) {
+      out.level = 'login_wall';
+      out.signals.push('keyword:' + loginWordHit);
+      out.signals.push('form:login');
+      out.detail = 'Login wall gating the page content.';
+    } else if (rateWordHit || rate429 || retryAfter) {
+      out.level = 'rate_limited';
+      if (rateWordHit) out.signals.push('keyword:' + rateWordHit);
+      if (rate429) out.signals.push('status:429');
+      if (retryAfter) out.signals.push('hint:retry-after');
+      out.detail = 'Rate-limit signal detected on page.';
+    }
+
+    return JSON.stringify(out);
+  } catch (e) {
+    return JSON.stringify({ level: 'none', signals: [], detail: '', error: String(e) });
+  }
+})()
+"""
+
 PROXY_CONFIG_FILE = os.path.join(PROFILE_DIR, 'proxy.json')
 HEADLESS_CONFIG_FILE = os.path.join(PROFILE_DIR, 'headless.json')
 STEALTH_CONFIG_FILE = os.path.join(PROFILE_DIR, 'stealth.json')
@@ -2433,6 +2550,44 @@ async def cmd_go(url):
             await _assert_host(active_ws, expected_host)
         except NavigationDrift:
             raise
+        except Exception:
+            pass
+
+        # Progressive-resilience friction probe (non-captcha rungs).
+        # rate_limited -> exponential backoff + re-nav (bounded). login/otp/hard
+        # -> stderr handoff warning only (NO autonomous bypass — ethics line).
+        # The captcha rung is left to the dedicated probe below.
+        try:
+            fr = await _detect_friction(active_ws)
+            fr_level = fr.get('level', 'none')
+            if fr_level == 'rate_limited' and _friction_backoff_enabled():
+                attempt = 0
+                while fr_level == 'rate_limited' and attempt < _friction_max_retry():
+                    wait_s = _friction_backoff_seconds(attempt)
+                    sys.stderr.write(
+                        f"⏳ Rate-limit tespit edildi ({','.join(fr.get('signals', [])) or '?'}); "
+                        f"{wait_s}s backoff, retry {attempt + 1}/{_friction_max_retry()}...\n")
+                    if expected_host:
+                        _adaptive_remember_host(expected_host)
+                    await asyncio.sleep(wait_s)
+                    await navigate_collect(active_ws, url)
+                    fr = await _detect_friction(active_ws)
+                    fr_level = fr.get('level', 'none')
+                    attempt += 1
+                if fr_level == 'rate_limited':
+                    sys.stderr.write("⚠️  Rate-limit backoff sonrası hâlâ sınırlı. Daha sonra deneyin.\n")
+                else:
+                    sys.stderr.write("✅ Rate-limit temizlendi.\n")
+            elif fr_level in ('login_wall', 'otp_sms', 'hard_block'):
+                act = _friction_action(fr_level)
+                payload = {'action': act['action'], 'url': url, 'level': fr_level,
+                           'signals': fr.get('signals', [])}
+                if act.get('backoff_suggested'):
+                    payload['backoff_suggested'] = True
+                # Human handoff: warn + emit JSON line, but DO NOT block the
+                # navigation (caller may still want the partial content).
+                sys.stderr.write(f"{act['message']}\n")
+                sys.stderr.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
@@ -5547,6 +5702,140 @@ async def _detect_captcha(ws_url):
             return {"detected": False, "error": "parse_failed"}
     except Exception as e:
         return {"detected": False, "error": str(e)[:120]}
+
+
+# ─── Progressive-Resilience Escalation Ladder ───
+# Friction levels ordered low -> high. soft_captcha is detected by the existing
+# _detect_captcha (9 provider types); the other rungs come from
+# FRICTION_DETECT_JS. _detect_friction merges both and reports the highest.
+FRICTION_LEVELS = (
+    'none', 'rate_limited', 'soft_captcha', 'login_wall', 'otp_sms', 'hard_block',
+)
+
+
+def _friction_backoff_enabled():
+    """Whether cmd_go should auto-backoff on rate_limited. Default on."""
+    return os.environ.get('CDPILOT_FRICTION_BACKOFF', 'on').lower() not in ('off', '0', 'false', 'no')
+
+
+def _friction_max_retry():
+    """Max rate-limit backoff retries in cmd_go. Default 2, clamped 0..5."""
+    try:
+        n = int(os.environ.get('CDPILOT_FRICTION_MAX_RETRY', '2'))
+    except (ValueError, TypeError):
+        n = 2
+    return max(0, min(n, 5))
+
+
+def _friction_backoff_seconds(attempt):
+    """Exponential backoff with jitter: 2^attempt seconds, capped at 60s.
+
+    attempt is 0-based (first retry -> 2s base). Adds up to 25% jitter so
+    concurrent workers don't synchronize their retries.
+    """
+    import random as _r
+    base = min(2 ** (attempt + 1), 60)
+    jitter = _r.uniform(0, base * 0.25)
+    return round(min(base + jitter, 60), 2)
+
+
+def _friction_action(level):
+    """Map a friction level to the response policy cmd_go should apply.
+
+    ETHICS/SAFETY: login_wall, otp_sms and hard_block are NEVER bypassed
+    autonomously — they hand off to the human. Only rate_limited is auto-handled
+    (backoff + retry); soft_captcha defers to the existing captcha flow.
+
+    Returns a dict: {action, level, autonomous: bool, message}.
+    """
+    if level == 'rate_limited':
+        return {
+            'action': 'backoff', 'level': level, 'autonomous': True,
+            'message': 'Rate limited — exponential backoff then retry.',
+        }
+    if level == 'soft_captcha':
+        return {
+            'action': 'captcha', 'level': level, 'autonomous': True,
+            'message': 'CAPTCHA — defer to detect/wait/solver flow.',
+        }
+    if level == 'login_wall':
+        return {
+            'action': 'human_login_required', 'level': level, 'autonomous': False,
+            'message': '🔐 Login gerekli — kullanıcı girişi bekleniyor (otomatik giriş YOK).',
+        }
+    if level == 'otp_sms':
+        return {
+            'action': 'human_otp_required', 'level': level, 'autonomous': False,
+            'message': '📱 SMS/OTP doğrulama gerekli — kullanıcı çözmeli (otomatik çözüm YOK).',
+        }
+    if level == 'hard_block':
+        return {
+            'action': 'hard_blocked', 'level': level, 'autonomous': False,
+            'message': '🚫 Sert engelleme — geri çekil ve bekle.', 'backoff_suggested': True,
+        }
+    return {'action': 'proceed', 'level': 'none', 'autonomous': True, 'message': 'No friction.'}
+
+
+async def _detect_friction(ws_url):
+    """Detect the highest anti-bot friction rung on the active page.
+
+    Runs FRICTION_DETECT_JS (rate-limit / login-wall / OTP / hard-block) and
+    merges in the existing _detect_captcha result (soft_captcha). Returns the
+    HIGHEST rung present per FRICTION_LEVELS ordering.
+
+    Returns: {"level": str, "signals": [...], "detail": str, "captcha"?: {...}}
+    Never raises — failures degrade to {"level": "none", ...}.
+    """
+    friction = {"level": "none", "signals": [], "detail": ""}
+    try:
+        r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {
+            "expression": FRICTION_DETECT_JS,
+            "returnByValue": True,
+        })], timeout=5)
+        raw = r.get(1, {}).get("result", {}).get("value")
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and parsed.get("level") in FRICTION_LEVELS:
+                    friction = parsed
+            except (ValueError, TypeError):
+                pass
+    except Exception as e:
+        friction = {"level": "none", "signals": [], "detail": "", "error": str(e)[:120]}
+
+    # Merge soft_captcha from the dedicated captcha detector.
+    try:
+        cap = await _detect_captcha(ws_url)
+    except Exception:
+        cap = {"detected": False}
+    if cap.get("detected"):
+        cap_level = 'soft_captcha'
+        # Keep whichever rung is higher in the ladder.
+        cur_idx = FRICTION_LEVELS.index(friction.get('level', 'none')) if friction.get('level') in FRICTION_LEVELS else 0
+        cap_idx = FRICTION_LEVELS.index(cap_level)
+        if cap_idx > cur_idx:
+            sigs = list(friction.get('signals', []))
+            sigs.append('captcha:' + (",".join(cap.get('types', [])) or 'unknown'))
+            friction = {
+                'level': cap_level, 'signals': sigs,
+                'detail': 'CAPTCHA challenge present (' + (",".join(cap.get('types', [])) or 'unknown') + ').',
+            }
+        friction['captcha'] = {'types': cap.get('types', []), 'detected': True}
+    return friction
+
+
+async def cmd_friction():
+    """One-shot friction-level diagnostic on the active page. Prints JSON.
+
+    Reports the highest escalation rung (none/rate_limited/soft_captcha/
+    login_wall/otp_sms/hard_block) plus the recommended response policy.
+    Read-only — never attempts to bypass anything.
+    """
+    ws, _ = get_page_ws()
+    info = await _detect_friction(ws)
+    action = _friction_action(info.get('level', 'none'))
+    info['recommended'] = action
+    print(json.dumps(info, ensure_ascii=False))
 
 
 async def cmd_captcha_check():
@@ -10343,6 +10632,8 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"repeat": {"type": "string", "description": "Optional. Number of dismiss attempts (1-10) or 'aggressive' (up to 5 chained). Default: 1.", "default": "1"}}}},
             {"name": "browser_captcha_solve", "description": "Solve the CAPTCHA on the current page (opt-in). Detects and solves Amazon classic image CAPTCHA (the \"Type the characters you see\" rate-limit page) by OCRing the image, filling the input, and submitting. Default provider 'amazon-local' uses the optional amazoncaptcha library (pip install amazoncaptcha) for offline OCR. BYOK providers 'capsolver' / '2captcha' use image-to-text APIs via CAPSOLVER_API_KEY / TWOCAPTCHA_API_KEY env vars. Returns JSON with solved status. For token-based CAPTCHAs (reCAPTCHA, hCaptcha, Turnstile) use the captcha config/auto CLI instead.",
              "inputSchema": {"type": "object", "properties": {"provider": {"type": "string", "enum": ["amazon-local", "capsolver", "2captcha"], "description": "Solver provider. Default: amazon-local (offline OCR via optional amazoncaptcha lib).", "default": "amazon-local"}}}},
+            {"name": "browser_friction", "description": "Detect the highest anti-bot 'friction' rung on the current page and return the recommended response policy as JSON. Real sites stack defenses incrementally (rate-limit -> CAPTCHA -> login-wall -> SMS/OTP -> hard-block); this reports which rung is currently active. Levels (low->high): none, rate_limited, soft_captcha, login_wall, otp_sms, hard_block. Bilingual (English + Turkish) DOM heuristics. Read-only — never bypasses anything. login_wall/otp_sms/hard_block are flagged for HUMAN handoff (not autonomously solved) for safety/ethics; rate_limited recommends exponential backoff; soft_captcha defers to the captcha tools. Use this for diagnosis before deciding how to proceed on a gated site.",
+             "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_smart_fill", "description": "Fill an input by its label or placeholder text — no CSS selector needed. Finds input by associated label, placeholder, aria-label, name, or id. React-compatible value setting. Use when you know WHAT field to fill but not the exact selector.",
              "inputSchema": {"type": "object", "properties": {"label": {"type": "string", "description": "Label or placeholder text of the input (e.g. 'Email', 'Password', 'Search')"}, "value": {"type": "string", "description": "Value to fill in the input"}}, "required": ["label", "value"]}},
             {"name": "browser_smart_select", "description": "Select a dropdown option by label and option text — no CSS selector needed. Finds the select element by label/name, then selects the matching option. Use for dropdown interactions without knowing selectors.",
@@ -10456,6 +10747,7 @@ class MCPServer:
             "browser_dismiss": lambda a: ["dismiss"] + ([str(a["repeat"])] if a.get("repeat") else []),
             "browser_smart_fill": lambda a: ["smart-fill", a.get("label", ""), a.get("value", "")],
             "browser_captcha_solve": lambda a: ["captcha-solve"] + ([f"--provider={a['provider']}"] if a.get("provider") else []),
+            "browser_friction": lambda a: ["friction"],
             "browser_smart_select": lambda a: ["smart-select", a.get("label", ""), a.get("option", "")],
             "browser_describe": lambda a: ["describe"],
             "browser_assert": lambda a: ["assert", a.get("selector", "")] + ([a["text"]] if a.get("text") else []),
@@ -12237,6 +12529,7 @@ if __name__ == "__main__":
         'captcha-check': cmd_captcha_check,
         'captcha-wait': lambda: cmd_captcha_wait(args[0] if args else None),
         'captcha': lambda: cmd_captcha_dispatch(args),
+        'friction': cmd_friction,
         'captcha-solve': lambda: cmd_captcha_solve(
             next((a.split('=')[1] for a in args if a.startswith('--provider=')),
                  args[args.index('--provider') + 1] if '--provider' in args and args.index('--provider') + 1 < len(args)
@@ -12250,7 +12543,7 @@ if __name__ == "__main__":
     NO_CONTROL_CMDS = {'glow', 'stop', 'tabs', 'close', 'close-tab', 'new-tab',
                        'dialog', 'download', 'throttle', 'permission', 'intercept',
                        'batch', 'screenshot-diff', 'run',
-                       'captcha-check', 'captcha-wait', 'captcha',
+                       'captcha-check', 'captcha-wait', 'captcha', 'friction',
                        'profile',
                        'cookies'}  # v0.6.1: cookies auto-config doesn't need browser
     # Clean up idle sessions before running any command
