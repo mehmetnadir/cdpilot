@@ -317,6 +317,131 @@ test('MCP: browser_captcha_solve tool registered', () => {
     'browser_captcha_solve should map to the captcha-solve CLI command in tool_map');
 });
 
+// ── Progressive-resilience escalation ladder (friction) ──
+
+test('friction: FRICTION_DETECT_JS constant defined + valid JS', () => {
+  assert(PY_CONTENT.includes('FRICTION_DETECT_JS = r"""'), 'Should define FRICTION_DETECT_JS');
+  const js = extractRawTripleString(PY_CONTENT, 'FRICTION_DETECT_JS');
+  assert(js, 'FRICTION_DETECT_JS body should be extractable');
+  const vm = require('vm');
+  assert.doesNotThrow(() => new vm.Script(js), 'FRICTION_DETECT_JS should parse as valid JS');
+});
+
+test('friction: FRICTION_DETECT_JS is read-only (no mutation/network/storage)', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'FRICTION_DETECT_JS');
+  assert(!/\.innerHTML\s*=/.test(js), 'Must not write innerHTML');
+  assert(!/\.appendChild\(/.test(js), 'Must not append DOM nodes');
+  assert(!/fetch\(|XMLHttpRequest|navigator\.sendBeacon/.test(js), 'Must not make network calls');
+  assert(!/localStorage|sessionStorage|document\.cookie/.test(js), 'Must not touch storage/cookies');
+});
+
+test('friction: _detect_friction defined + cmd_friction dispatched', () => {
+  assert(/async def _detect_friction\(ws_url\)/.test(PY_CONTENT),
+    'Should define async _detect_friction(ws_url)');
+  assert(/async def cmd_friction\(\)/.test(PY_CONTENT),
+    'Should define async cmd_friction()');
+  assert(/'friction':\s*cmd_friction/.test(PY_CONTENT),
+    "Should register 'friction' in async_map dispatch");
+});
+
+test('friction: 6-level ladder ordered low->high', () => {
+  const m = PY_CONTENT.match(/FRICTION_LEVELS\s*=\s*\(([\s\S]*?)\)/);
+  assert(m, 'FRICTION_LEVELS tuple should exist');
+  const body = m[1];
+  ['none', 'rate_limited', 'soft_captcha', 'login_wall', 'otp_sms', 'hard_block'].forEach((lvl) => {
+    assert(body.includes(`'${lvl}'`), `FRICTION_LEVELS should include ${lvl}`);
+  });
+  // Ordering: none before hard_block in the source tuple.
+  assert(body.indexOf("'none'") < body.indexOf("'rate_limited'"), 'none before rate_limited');
+  assert(body.indexOf("'rate_limited'") < body.indexOf("'hard_block'"), 'rate_limited before hard_block');
+});
+
+test('friction: rate_limited keyword detection (TR + EN)', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'FRICTION_DETECT_JS');
+  assert(js.includes('too many requests'), 'Should detect EN rate-limit phrase');
+  assert(js.includes('çok fazla istek'), 'Should detect TR rate-limit phrase');
+  assert(/rate_limited/.test(js), "Should classify as 'rate_limited'");
+  assert(/\\b429\\b/.test(js) || js.includes('429'), 'Should consider HTTP 429 marker');
+});
+
+test('friction: login_wall detection (login form + gate keyword)', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'FRICTION_DETECT_JS');
+  assert(js.includes('giriş yap'), 'Should detect TR login phrase');
+  assert(js.includes('sign in') || js.includes('log in'), 'Should detect EN login phrase');
+  assert(/input\[type="password"\]/.test(js), 'Should look for a password input');
+  assert(/login_wall/.test(js), "Should classify as 'login_wall'");
+});
+
+test('friction: otp_sms detection (verification code input/keyword)', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'FRICTION_DETECT_JS');
+  assert(js.includes('doğrulama kodu'), 'Should detect TR OTP phrase');
+  assert(js.includes('verification code'), 'Should detect EN OTP phrase');
+  assert(/one-time-code/.test(js), 'Should look for one-time-code autocomplete input');
+  assert(/otp_sms/.test(js), "Should classify as 'otp_sms'");
+});
+
+test('friction: hard_block detection (403/access denied)', () => {
+  const js = extractRawTripleString(PY_CONTENT, 'FRICTION_DETECT_JS');
+  assert(js.includes('access denied'), 'Should detect EN block phrase');
+  assert(js.includes('erişim engellendi'), 'Should detect TR block phrase');
+  assert(js.includes('403') || js.includes('forbidden'), 'Should detect 403/forbidden');
+  assert(/hard_block/.test(js), "Should classify as 'hard_block'");
+});
+
+test('friction: _friction_action returns backoff for rate_limited', () => {
+  const m = PY_CONTENT.match(/def _friction_action\(level\):[\s\S]*?return \{'action': 'proceed'/);
+  assert(m, '_friction_action body should be extractable');
+  const body = m[0];
+  assert(/level == 'rate_limited'[\s\S]*?'action': 'backoff'/.test(body),
+    'rate_limited should map to backoff action');
+  assert(/'autonomous': True/.test(body), 'backoff should be autonomous');
+});
+
+test('friction: login/otp/hard map to human handoff (NO autonomous bypass)', () => {
+  const m = PY_CONTENT.match(/def _friction_action\(level\):[\s\S]*?return \{'action': 'proceed'/);
+  assert(m, '_friction_action body should be extractable');
+  const body = m[0];
+  assert(/'action': 'human_login_required'[\s\S]*?'autonomous': False/.test(body),
+    'login_wall must be human_login_required + autonomous False');
+  assert(/'action': 'human_otp_required'[\s\S]*?'autonomous': False/.test(body),
+    'otp_sms must be human_otp_required + autonomous False');
+  assert(/'action': 'hard_blocked'[\s\S]*?'autonomous': False/.test(body),
+    'hard_block must be hard_blocked + autonomous False');
+  // Ethics guard: no auto-fill of password/OTP anywhere in friction handling.
+  assert(!/human_login_required[\s\S]{0,200}smart-fill/.test(PY_CONTENT),
+    'login handoff must not auto-fill credentials');
+});
+
+test('friction: cmd_go integrates friction probe with bounded backoff', () => {
+  const m = PY_CONTENT.match(/async def cmd_go\(url\):[\s\S]*?Post-navigation CAPTCHA probe/);
+  assert(m, 'cmd_go body up to captcha probe should be extractable');
+  const body = m[0];
+  assert(/_detect_friction\(active_ws\)/.test(body), 'cmd_go should call _detect_friction');
+  assert(/_friction_max_retry\(\)/.test(body), 'cmd_go backoff loop should be bounded by _friction_max_retry');
+  assert(/asyncio\.sleep\(wait_s\)/.test(body), 'cmd_go should sleep for the backoff window');
+  assert(/_friction_action\(fr_level\)/.test(body), 'cmd_go should resolve a friction action for handoff rungs');
+});
+
+test('friction: env knobs honored (CDPILOT_FRICTION_BACKOFF / MAX_RETRY)', () => {
+  assert(/CDPILOT_FRICTION_BACKOFF/.test(PY_CONTENT), 'Should read CDPILOT_FRICTION_BACKOFF');
+  assert(/CDPILOT_FRICTION_MAX_RETRY/.test(PY_CONTENT), 'Should read CDPILOT_FRICTION_MAX_RETRY');
+  // Backoff is capped at 60s.
+  assert(/min\(2 \*\* \(attempt \+ 1\), 60\)/.test(PY_CONTENT), 'Backoff should cap at 60s');
+});
+
+test('friction: in NO_CONTROL_CMDS (no glow interference)', () => {
+  const m = PY_CONTENT.match(/NO_CONTROL_CMDS\s*=\s*\{([\s\S]*?)\}/);
+  assert(m, 'NO_CONTROL_CMDS should exist');
+  assert(m[1].includes("'friction'"), 'friction should bypass control wrapper');
+});
+
+test('MCP: browser_friction tool registered + mapped', () => {
+  assert(/"name":\s*"browser_friction"/.test(PY_CONTENT),
+    'browser_friction should be registered in _register_tools()');
+  assert(/"browser_friction":\s*lambda a:\s*\["friction"\]/.test(PY_CONTENT),
+    'browser_friction should map to the friction CLI command in tool_map');
+});
+
 test('navigate_collect gates stealth injection behind the active tier', () => {
   // The fingerprint script must be registered on the SAME WS as Page.navigate
   // so the session-bound script survives until loadEventFired. With the
