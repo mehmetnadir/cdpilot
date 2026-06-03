@@ -29,7 +29,7 @@ AI agents and developers need browser control that **just works**:
 
 - **Zero config** — `npx cdpilot launch` starts an isolated browser session
 - **Zero dependency** — No Puppeteer, no Playwright, no Selenium. Pure CDP over HTTP
-- **65+ commands** — Navigate, click, type, screenshot, network, console, accessibility, video understanding, and more
+- **70+ commands** — Navigate, click, type, screenshot, network, console, accessibility, video understanding, progressive anti-bot resilience, and more
 - **AI-agent friendly** — Designed for Claude, GPT, Gemini, and any LLM tool-use workflow
 - **Isolated sessions** — Your personal browser stays untouched. cdpilot runs in its own profile
 - **Visual feedback** — Green glow overlay, cursor visualization, click ripples, and keystroke display keep you informed during automation
@@ -391,6 +391,26 @@ At launch, cdpilot also passes `--disable-blink-features=AutomationControlled`,
 which closes the Blink runtime flag that Cloudflare and DataDome probe to detect
 an automated browser.
 
+#### Three-tier stealth mode
+
+`cdpilot mode` is the recommended entry point — one switch that sets how much
+fingerprint surface cdpilot touches, lightest to heaviest:
+
+```bash
+cdpilot mode             # show current tier + what it injects
+cdpilot mode regular     # no fingerprint patch — cleanest, fastest (default)
+cdpilot mode stealth     # light patch: webdriver / chrome.runtime / permissions
+cdpilot mode undetected  # full patch: + plugin array + WebGL + Worker
+```
+
+`regular` is the default because Stealth Bench V1 found the full patch set
+*alone* lowered scores — a synthetic plugin array is itself a tell. The
+`stealth` tier deliberately omits plugin spoofing; escalate to `undetected`
+only for hard targets. The adaptive layer learns the right tier per host and
+escalates on CAPTCHA. Effect applies on the next navigation. Env override:
+`CDPILOT_MODE=<tier>`. The legacy `stealth on/off` toggle still works and stays
+coherent with the tier:
+
 ```bash
 cdpilot stealth on            # enable fingerprint patches (opt-in)
 cdpilot stealth off           # disable (default)
@@ -413,6 +433,47 @@ cdpilot adaptive clear        # Drop the stealth host memory entirely
 > runs in the open lane by default, detects CAPTCHA after each navigation, and
 > when it sees one — adds the host to a persistent list, retries once with
 > stealth on. Never auto-demotes. Conservative by design.
+
+### Friction Ladder (progressive anti-bot detection)
+
+Real sites don't just throw a CAPTCHA — they stack defenses incrementally.
+`cdpilot friction` reports which rung is currently active so an agent can react
+appropriately instead of guessing. Six levels, lowest to highest:
+
+```
+none → rate_limited → soft_captcha → login_wall → otp_sms → hard_block
+```
+
+```bash
+cdpilot friction              # JSON: current rung + recommended response policy
+```
+
+Bilingual (English + Turkish) DOM heuristics. The detection is **read-only — it
+never bypasses anything.** The response policy is deliberately conservative:
+
+- `rate_limited` → automatic exponential backoff + retry
+- `soft_captcha` → defer to the captcha tools
+- `login_wall` / `otp_sms` / `hard_block` → flagged for **human handoff, not
+  autonomously solved**
+
+That last line is an ethics boundary, not a missing feature: cdpilot will not
+attempt to defeat a login, an OTP/SMS gate, or an outright block on its own.
+MCP exposes this as `browser_friction`.
+
+### Press-and-Hold (PerimeterX / HUMAN behavioral challenge)
+
+PerimeterX's "Press & Hold" is a *behavioral* challenge, not a token — there's
+no provider to call. The only solution is a real press → hold → release
+gesture, which cdpilot emits via the CDP Input domain: a Gaussian-randomized
+~3–7s hold with ±1–2px micro-jitter while the button is held.
+
+```bash
+cdpilot press-hold                       # auto-find the px-captcha target
+cdpilot press-hold "#px-captcha button"  # explicit selector
+```
+
+`captcha-solve` auto-routes here when it detects a `perimeterx` challenge.
+MCP exposes this as `browser_press_hold`.
 
 ### Captcha Solver Plugins (v0.6+)
 
@@ -449,6 +510,33 @@ after each navigation. Without auto-on, detection still works but solving is man
 
 > **Expected bench improvement (v0.6):** reCaptcha 2/6 → 5+/6, hCaptcha 2/3 → 3/3
 
+#### Image CAPTCHA + profile warming
+
+`captcha-solve` handles the image-based rate-limit CAPTCHAs that the token
+solvers above don't cover:
+
+```bash
+cdpilot captcha-solve                       # auto-detect + route (incl. press-hold)
+cdpilot captcha-solve --provider amazon-local  # offline OCR (default)
+cdpilot captcha-solve --provider capsolver   # BYOK image-to-text
+cdpilot captcha-solve --provider 2captcha    # BYOK image-to-text
+```
+
+- **Amazon classic image CAPTCHA** (the "Type the characters you see" page) is
+  OCR'd offline via the **optional** `amazoncaptcha` library
+  (`pip install amazoncaptcha` — pure-Python + Pillow, MIT). Not installed = the
+  command reports it and exits cleanly; no hard dependency added.
+- **BYOK providers** (`capsolver`, `2captcha`) use their image-to-text APIs via
+  `CAPSOLVER_API_KEY` / `TWOCAPTCHA_API_KEY`.
+
+```bash
+cdpilot profile warm          # age the profile for reCAPTCHA v3 score
+```
+
+`profile warm` browses a set of low-risk sites to build cookie/history age,
+which nudges reCAPTCHA v3's behavioral score upward over time. Slow by
+design — run it ahead of a session, not inline.
+
 Verified against public bot-detection panels:
 - **bot.sannysoft.com:** 24/24 PASS (WebDriver, Chrome obj, Plugins as PluginArray, WebGL, PHANTOM_*, HEADCHR_*, SELENIUM_DRIVER)
 - **bot.incolumitas.com** intoli: 6/6 OK — new-tests: 6/7 OK (one FAIL = pure CDP presence, cannot be JS-patched)
@@ -470,6 +558,24 @@ until cdpilot health >/dev/null; do cdpilot launch; sleep 2; done
 
 Surfaces today's Brave crash count from `~/Library/Logs/DiagnosticReports/`
 on macOS — spot degradation before your automation silently stalls.
+
+### Scaling & Workstation Use
+
+```bash
+CDPILOT_POOL_SIZE=4 cdpilot launch   # 4 separate browser processes
+CDPILOT_OFFSCREEN=1 cdpilot launch   # headed, but no window on your screen
+```
+
+- **Multi-instance pool** (`CDPILOT_POOL_SIZE=N`) starts N independent browser
+  processes and dispatches work to the least-loaded one, for `N × per-instance`
+  parallelism. Default is `1` — single instance, no change for existing users.
+- **Off-screen mode** (`CDPILOT_OFFSCREEN=1`) keeps the browser headed (real
+  rendering, no headless fingerprint) but positions the window where it can't
+  steal focus — meant for automating on a workstation you're also using.
+- **Docker + Xvfb harness** (`cdpilot-bench/docker/`) runs headed-in-Xvfb so
+  bench/automation runs never pop a window on the host display. CI-ready. Note
+  that software rendering (no GPU) lowers anti-bot scores versus native — it's
+  an isolated environment for reproducibility, not the headline configuration.
 
 ## Use with AI Agents
 
@@ -516,6 +622,9 @@ print(result.stdout)
 | `CHROME_BIN` | Auto-detect | Browser binary path |
 | `CDPILOT_PROFILE` | `~/.cdpilot/profile` | Isolated browser profile |
 | `BROWSER_SESSION` | Auto | Session identifier |
+| `CDPILOT_MODE` | `regular` | Stealth tier override (`regular`/`stealth`/`undetected`) |
+| `CDPILOT_OFFSCREEN` | `0` | Headed but render off-screen — no window steals focus |
+| `CDPILOT_POOL_SIZE` | `1` | N separate browser processes, least-loaded dispatch |
 
 ## How It Works
 
@@ -641,7 +750,7 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 
 ### Shipped
 
-- [x] 65+ CLI commands (navigate, click, fill, screenshot, PDF, console, network, video understanding...)
+- [x] 70+ CLI commands (navigate, click, fill, screenshot, PDF, console, network, video understanding, friction ladder...)
 - [x] MCP server for AI agent integration (Claude Code, Cursor, etc.)
 - [x] **10 built-in test assertions** — assert, assert-url, assert-title, assert-count, assert-value, assert-attr, assert-visible/hidden, wait-for, check (batch), screenshot-diff
 - [x] **Accessibility tree snapshot** (`a11y-snapshot`) — structured data with @ref references, 500x fewer tokens than screenshots
@@ -667,6 +776,11 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] DevExtension system (native JS injection without browser store)
 - [x] **Smart commands** — `smart-click`, `smart-fill`, `smart-select` — interact by visible text, no CSS selectors needed, no LLM required. Now with a disabled-element guard (no more false "clicked" on disabled buttons), Shadow DOM traversal (Lightning, Polymer, lit-element widgets), locale-aware text matching (Turkish İ/i, German ß), and floating-label support for `smart-fill` (Material / Ant / Chakra via `aria-labelledby` and `closest` label resolution)
 - [x] **Video understanding** (`watch`) — continuous screencast into a ring buffer so an AI agent can query a time window and see motion (animation, cursor, scroll), not just one still frame. Local `file://` and online video (YouTube/Vimeo/Twitter/etc.); DRM players (Netflix) excluded
+- [x] **Friction ladder** (`friction`) — 6-level progressive anti-bot detection (none → rate_limited → soft_captcha → login_wall → otp_sms → hard_block), bilingual EN+TR, read-only; rate-limit auto-backoff, login/OTP/hard-block flagged for human handoff (no autonomous bypass)
+- [x] **Three-tier stealth mode** (`mode regular|stealth|undetected`) — single switch over fingerprint surface, with per-host adaptive tier learning
+- [x] **Press-and-hold solver** (`press-hold`) — humanized press → hold → release gesture (Gaussian 3–7s + micro-jitter) for PerimeterX/HUMAN behavioral challenges; `captcha-solve` auto-routes here
+- [x] **Image CAPTCHA + profile warming** — offline Amazon image OCR (optional `amazoncaptcha` lib) + BYOK image-to-text (capsolver/2captcha); `profile warm` ages the profile for reCAPTCHA v3 score
+- [x] **Multi-instance pool + off-screen mode** (`CDPILOT_POOL_SIZE`, `CDPILOT_OFFSCREEN`) — N parallel browser processes; headed rendering without stealing window focus
 - [x] **Data extraction** (`extract`) — structured DOM data in text, JSON, or list format
 - [x] **Page observation** (`observe`) — list all interactive elements with available actions
 - [x] **Script runner** (`run`) — execute `.cdp` script files with pass/fail reporting
