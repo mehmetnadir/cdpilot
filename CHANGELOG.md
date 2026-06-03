@@ -14,6 +14,14 @@ All notable changes to cdpilot will be documented in this file.
   - Zero dependency; Pillow is optional and only used for motion-detection between frames
   - Exposed to AI agents as `browser_watch_*` MCP tools
 - **`--disable-blink-features=AutomationControlled`** launch flag — closes the Blink runtime flag that Cloudflare and DataDome probe to detect an automated browser.
+- **`cdpilot friction`** — progressive anti-bot resilience probe. Real sites stack defenses incrementally; `friction` reports the highest active rung and the recommended response policy as JSON. Six levels (low→high): `none`, `rate_limited`, `soft_captcha`, `login_wall`, `otp_sms`, `hard_block`. Bilingual (English + Turkish) DOM heuristics. **Read-only — never bypasses anything.** Policy: `rate_limited` → automatic exponential backoff + retry (in `cmd_go`); `soft_captcha` → defer to captcha tools; `login_wall` / `otp_sms` / `hard_block` → flagged for HUMAN handoff, never autonomously solved (deliberate ethics boundary). MCP: `browser_friction`.
+- **`cdpilot mode [regular|stealth|undetected]`** — three-tier stealth mode, a single switch over how much fingerprint surface is patched. `regular` (default) injects nothing — cleanest and fastest; `stealth` injects a light patch (webdriver / chrome.runtime / permissions, deliberately omitting plugin spoofing which leaks); `undetected` injects the full patch (+ plugin array + WebGL + Worker). Default is `regular` because Stealth Bench V1 found the full patch set *alone* lowered scores. The adaptive layer learns the right tier per host and escalates on CAPTCHA. Effect applies on the next navigation; env override `CDPILOT_MODE`. Legacy `stealth on/off` stays coherent with the tier. MCP: `browser_mode`.
+- **`cdpilot press-hold [<selector>]`** — PerimeterX/HUMAN "Press & Hold" behavioral challenge solver. It is not token-based, so there is no provider to call; the only solution is a real press → hold → release gesture, emitted via CDP Input events: a Gaussian-randomized ~3–7s hold with ±1–2px micro-jitter while held. Auto-locates the `#px-captcha` widget or takes an explicit selector. `captcha-solve` auto-routes here when it detects a `perimeterx` challenge. MCP: `browser_press_hold`.
+- **`cdpilot captcha-solve [--provider amazon-local|capsolver|2captcha]`** — image-based CAPTCHA solver, complementing the token solvers. Amazon classic image CAPTCHA ("Type the characters you see" rate-limit page) is OCR'd offline via the **optional** `amazoncaptcha` library (pure-Python + Pillow, MIT) — not installed = clean report, no hard dependency. BYOK providers `capsolver` / `2captcha` use image-to-text APIs via `CAPSOLVER_API_KEY` / `TWOCAPTCHA_API_KEY`. Auto-detects and routes (including to `press-hold` for PerimeterX). MCP: `browser_captcha_solve`.
+- **`cdpilot profile warm`** — ages the browser profile by browsing low-risk sites to build cookie/history age, which nudges reCAPTCHA v3's behavioral score upward over time. Slow by design — run ahead of a session, not inline.
+- **Multi-instance pool** (`CDPILOT_POOL_SIZE=N`) — launches N independent browser processes and dispatches work to the least-loaded one, for `N × per-instance` parallelism. Default `1` (single instance, no change for existing users).
+- **Off-screen mode** (`CDPILOT_OFFSCREEN=1`) — keeps the browser headed (real rendering, no headless fingerprint) but positions the window where it can't steal focus. For automating on a workstation in active use.
+- **Docker + Xvfb harness** (`cdpilot-bench/docker/`) — headed-in-Xvfb so bench/automation runs never pop a window on the host display; CI-ready. Software rendering (no GPU) lowers anti-bot scores versus native — an isolated reproducibility environment, not the headline configuration.
 
 ### Changed
 - **smart-click / smart-fill / smart-select** hardening:
@@ -21,6 +29,11 @@ All notable changes to cdpilot will be documented in this file.
   - Shadow DOM traversal — finds elements inside Lightning, Polymer, and lit-element web components.
   - Locale-aware text matching — correct case folding for Turkish (İ/i) and German (ß).
   - `smart-fill` floating-label support — resolves Material / Ant / Chakra labels via `aria-labelledby` and `closest` label lookup.
+
+### Bench (in progress)
+- Native (Apple M1, GPU): **45 / 80 (≈56%)** at $0.00 (driven by free Gemini). This is a **single run** and verification was interrupted — treat as provisional, not a confirmed rate. Journey across sprints: 12 → 19 → 35 → 45 (Sprint 2 adapter fix +20, Sprint 3 captcha + regular-as-default +10).
+- Docker (Xvfb, software render): 30 / 80 — a separate, GPU-less isolated CI environment, not comparable to the native run and not a headline number.
+- For context (not apples-to-apples): commercial hosted services score higher (browserbase 73, anchor 65) but run premium LLM controllers at roughly $150–300/mo; cdpilot's bench runs at $0.
 
 ### Known limitation
 - `watch` cannot capture DRM-protected players (Netflix and similar) — they render as black frames at the CDP layer.
