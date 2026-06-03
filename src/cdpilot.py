@@ -2320,6 +2320,31 @@ def _sanitize_profile_state(profile_dir):
 
 # ─── Commands ───
 
+def _minimize_browser_window():
+    """Minimize the browser window via CDP (Browser.setWindowBounds).
+
+    Reliable on macOS where negative --window-position is clamped back on
+    screen. Uses cdpilot's own async cdp_send over the browser-level WS —
+    no new dependency. Best-effort: any failure is swallowed by the caller.
+    """
+    ver = cdp_get('/json/version') or {}
+    ws_url = ver.get('webSocketDebuggerUrl')
+    if not ws_url:
+        return
+
+    async def _do():
+        r = await cdp_send(ws_url, [(1, "Browser.getWindowForTarget", {})])
+        win_id = ((r.get(1) or {}).get("result") or {}).get("windowId")
+        if win_id is None:
+            win_id = 1
+        await cdp_send(ws_url, [(2, "Browser.setWindowBounds", {
+            "windowId": win_id,
+            "bounds": {"windowState": "minimized"},
+        })])
+
+    asyncio.run(_do())
+
+
 def cmd_launch():
     """Launch the browser with CDP enabled (isolated session — does not touch existing browser)."""
     global CHROME_BIN, CDP_PORT, CDP_BASE
@@ -2442,6 +2467,17 @@ def cmd_launch():
         '--new-window', 'about:blank',
     ]
 
+    # Off-screen window placement (opt-in). Keeps the browser HEADED (anti-bot
+    # detection still sees a real window / GPU) but parks it far off the visible
+    # desktop so it never steals focus or pops in front of the user — ideal for
+    # long bench runs on a workstation. CDPILOT_OFFSCREEN=1 or a custom
+    # CDPILOT_WINDOW_POSITION="x,y". No effect on headless.
+    _win_pos = os.environ.get('CDPILOT_WINDOW_POSITION', '')
+    if not _win_pos and os.environ.get('CDPILOT_OFFSCREEN') in ('1', 'true', 'yes', 'on'):
+        _win_pos = '-3000,-3000'
+    if _win_pos:
+        chrome_args.append(f'--window-position={_win_pos}')
+
     # Dev extensions
     dev_exts = get_dev_extensions()
     valid_exts = [p for p in dev_exts if os.path.isdir(p)]
@@ -2468,6 +2504,16 @@ def cmd_launch():
         if cdp_get('/json/version'):
             if PROJECT_ID:
                 _register_project(PROJECT_ID, CDP_PORT, PROFILE_DIR, pid=proc.pid)
+            # Off-screen / minimized placement (opt-in). Keeps the browser
+            # HEADED (anti-bot still sees a real GPU-backed window) but parks it
+            # out of the way so long bench runs never steal focus or pop in
+            # front of the user. macOS clamps negative --window-position, so we
+            # also minimize via CDP (Browser.setWindowBounds) which is reliable.
+            if os.environ.get('CDPILOT_OFFSCREEN') in ('1', 'true', 'yes', 'on'):
+                try:
+                    _minimize_browser_window()
+                except Exception:
+                    pass
             proj_label = f' [{PROJECT_ID}]' if PROJECT_ID else ''
             print(f'CDP ready! (port {CDP_PORT}){proj_label}')
             return
