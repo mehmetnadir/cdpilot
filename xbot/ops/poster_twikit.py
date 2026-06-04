@@ -67,6 +67,35 @@ def _telegram_notify(text: str) -> None:
         _log(f"telegram notify failed: {e}")
 
 
+def _tr_summary(text: str) -> str:
+    """Produce a 1-sentence Turkish summary of an (English) tweet.
+
+    Uses the local ``claude`` CLI (subscription auth on srv21). On any failure
+    — CLI missing, timeout, empty output — falls back to the first 100 chars of
+    the raw tweet text. Never raises; always returns a non-empty string when the
+    input is non-empty.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    fallback = text[:100] + ("…" if len(text) > 100 else "")
+    import shutil
+    import subprocess
+    if not shutil.which("claude"):
+        return fallback
+    prompt = ("Bu tweet'i 1 cümle Türkçe özetle, sadece özeti yaz: " + text)
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", prompt],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except Exception as e:
+        _log(f"tr_summary claude call failed: {e}")
+        return fallback
+    out = (proc.stdout or "").strip()
+    return out if out else fallback
+
+
 def _tweet_id_from_to(to: str | None) -> str | None:
     """Extract tweet id from a reply target URL like https://x.com/user/status/12345."""
     if not to:
@@ -282,7 +311,17 @@ async def main_async() -> None:
                     f"\n  ↳ followup: {item.get('followup_tweet_url')}"
                     if item.get("followup_tweet_url") else ""
                 )
-                _telegram_notify(f"🟢 `{item['id']}` atıldı\n{item['tweet_url']}{fu_suffix}")
+                # Post-notify: link + Turkish summary (claude CLI, fallback raw)
+                kind_label = {
+                    "tweet": "Tweet atıldı",
+                    "reply": "Cevap atıldı",
+                    "quote": "Alıntı atıldı",
+                }.get(item.get("kind", "tweet"), "Tweet atıldı")
+                summary = _tr_summary(item.get("text", ""))
+                summary_line = f"\n\n📝 TR özet: {summary}" if summary else ""
+                _telegram_notify(
+                    f"✅ {kind_label}\n{item['tweet_url']}{summary_line}{fu_suffix}"
+                )
             else:
                 err = result.get("err", "unknown")
                 item["status"] = "failed"

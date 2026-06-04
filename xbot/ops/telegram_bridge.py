@@ -565,6 +565,29 @@ def _queue_draft(d: dict, decision: dict, idx: int) -> Path:
     return p
 
 
+def auto_post_enabled() -> bool:
+    """True when AUTO_POST mode is active (no approval card; direct queue).
+
+    Controlled by ``CDPILOT_AUTO_POST`` env. Defaults to ``on`` — the user opted
+    into unattended posting; set ``off`` to restore the legacy approval flow.
+    Accepted truthy values: on/1/true/yes (case-insensitive). Anything else = off.
+    """
+    val = os.environ.get("CDPILOT_AUTO_POST", "on").strip().lower()
+    return val in ("on", "1", "true", "yes")
+
+
+def auto_queue_draft(draft: dict, idx: int = 0) -> Path:
+    """AUTO_POST: write a draft straight to the queue as ``pending`` — no card.
+
+    Reuses :func:`_queue_draft` so the humanizer hot-zone ``scheduled_time``
+    (peak windows + jitter + quiet-hours guard) is preserved exactly; the only
+    difference from the approval flow is that no Telegram approval card is sent
+    and no user click is required. The poster picks it up at ``scheduled_time``
+    and sends the post-notify (link + TR summary) after a successful post.
+    """
+    return _queue_draft(draft, {"action": "approve"}, idx)
+
+
 def cmd_batch_seq(json_path: str) -> None:
     """Sequential batch helper: send N drafts one-by-one, wait for each decision.
 
