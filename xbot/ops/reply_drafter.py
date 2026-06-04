@@ -28,7 +28,10 @@ import sys
 import time
 from pathlib import Path
 
-DATA = Path(os.environ.get("CDPILOT_XBOT_DATA", str(Path.home() / "cdpilot-twitter-data")))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _paths import bot_home  # noqa: E402
+
+DATA = bot_home()
 LOG_FILE = DATA / "logs" / "reply-drafter.log"
 
 CLAUDE_BIN = os.environ.get("CDPILOT_CLAUDE_BIN", "claude")

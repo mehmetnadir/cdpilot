@@ -42,7 +42,10 @@ from twikit import Client  # type: ignore
 sys.path.insert(0, str(Path(__file__).parent))
 from _sanitize import sanitize, render_flags  # type: ignore
 
-DATA = Path(os.environ.get("CDPILOT_XBOT_DATA", str(Path.home() / "cdpilot-twitter-data")))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _paths import bot_home  # noqa: E402
+
+DATA = bot_home()
 STATE_FILE = DATA / "state" / "dm-seen.json"
 LOG_FILE = DATA / "logs" / "dm.log"
 COOKIES = Path(os.environ.get(

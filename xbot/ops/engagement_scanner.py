@@ -47,7 +47,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from _sanitize import sanitize, wrap_external, render_flags  # type: ignore
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA = Path(os.environ.get("CDPILOT_XBOT_DATA", str(Path.home() / "cdpilot-twitter-data")))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _paths import bot_home  # noqa: E402
+
+DATA = bot_home()
 OUT_DIR = DATA / "engagement"
 LOG_FILE = DATA / "logs" / "engagement.log"
 COOKIES = Path(os.environ.get(

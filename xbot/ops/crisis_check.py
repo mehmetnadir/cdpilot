@@ -27,7 +27,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-DATA = Path(os.environ.get("CDPILOT_XBOT_DATA", str(Path.home() / "cdpilot-twitter-data")))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _paths import bot_home  # noqa: E402
+
+DATA = bot_home()
 ANALYTICS = DATA / "analytics"
 FREEZE_FLAG = DATA / "state" / "crisis-freeze.flag"
 LOG_FILE = DATA / "logs" / "crisis.log"

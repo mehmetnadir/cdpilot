@@ -22,11 +22,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _phase0_lib import open_tab, page_eval, _http  # type: ignore
+from _paths import bot_home  # type: ignore
 
-QUEUE_DIR = Path.home() / "cdpilot-twitter-data" / "queue"
-POSTED_DIR = Path.home() / "cdpilot-twitter-data" / "posted"
-FAILED_DIR = Path.home() / "cdpilot-twitter-data" / "failed"
-LOG_FILE = Path.home() / "cdpilot-twitter-data" / "logs" / "poster.log"
+DATA = bot_home()
+QUEUE_DIR = DATA / "queue"
+POSTED_DIR = DATA / "posted"
+FAILED_DIR = DATA / "failed"
+LOG_FILE = DATA / "logs" / "poster.log"
 TELEGRAM_BRIDGE = Path(__file__).parent / "telegram_bridge.py"
 
 

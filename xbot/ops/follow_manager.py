@@ -34,7 +34,10 @@ import _twikit_patch  # noqa: F401
 from twikit import Client  # type: ignore
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA = Path(os.environ.get("CDPILOT_XBOT_DATA", str(Path.home() / "cdpilot-twitter-data")))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _paths import bot_home  # noqa: E402
+
+DATA = bot_home()
 TIER_FILE = ROOT / "tier1.json"
 STATE_FILE = DATA / "state" / "follow-state.json"
 QUEUE_DIR = DATA / "queue"

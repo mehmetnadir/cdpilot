@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Failed item'ı pending'e revert + scheduled_time +5dk yap."""
 import json
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-QFILE = "/opt/cdpilot-twitter-bot/queue/2026-05-19.json"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _paths import bot_home  # noqa: E402
+
+QFILE = str(bot_home() / "queue" / "2026-05-19.json")
 
 with open(QFILE) as f:
     d = json.load(f)

@@ -3,12 +3,16 @@
 Day 1 morning routine — manuel ilk run.
 3 günlük rolling queue üretir: 2026-05-19, 2026-05-20, 2026-05-21.
 """
-import json, os, uuid, random
+import json, os, sys, uuid, random
 from datetime import date, datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _paths import bot_home  # noqa: E402
 
 random.seed(20260519)
 
-DATA_DIR = os.path.expanduser('~/cdpilot-twitter-data')
+DATA_DIR = str(bot_home())
 QUEUE_DIR = os.path.join(DATA_DIR, 'queue')
 os.makedirs(QUEUE_DIR, exist_ok=True)
 

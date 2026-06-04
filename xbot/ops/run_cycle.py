@@ -30,7 +30,10 @@ from datetime import datetime
 from pathlib import Path
 
 OPS = Path(__file__).parent
-VENV_PY = Path.home() / "cdpilot-twitter-data" / "twikit-venv" / "bin" / "python"
+sys.path.insert(0, str(OPS.resolve()))
+from _paths import bot_home  # noqa: E402
+
+VENV_PY = bot_home() / "twikit-venv" / "bin" / "python"
 
 
 def _run(args: list, label: str) -> dict:

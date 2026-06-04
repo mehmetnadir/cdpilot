@@ -28,7 +28,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-_DATA = Path(os.environ.get("CDPILOT_XBOT_DATA", str(Path.home() / "cdpilot-twitter-data")))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _paths import bot_home  # noqa: E402
+
+_DATA = bot_home()
 ENV_PATH = Path(os.environ.get("CDPILOT_TELEGRAM_ENV", str(_DATA / "telegram.env")))
 STATE_PATH = _DATA / "telegram-state.json"
 PENDING_PATH = _DATA / "telegram-pending.json"
@@ -397,13 +400,16 @@ def cmd_draft(json_path: str) -> None:
     if image_path and Path(image_path).exists():
         remote_root = os.environ.get(
             "CDPILOT_IMAGE_RSYNC_ROOT", "srv21:/opt/cdpilot-twitter-bot/images/")
+        # Remote images dir (no host prefix) — where the srv21 daemon reads from.
+        remote_images_dir = os.environ.get(
+            "CDPILOT_IMAGE_REMOTE_DIR", "/opt/cdpilot-twitter-bot/images")
         if remote_root and os.environ.get("CDPILOT_IMAGE_RSYNC_DISABLE") != "1":
             try:
                 import subprocess
                 subprocess.run(["rsync", "-a", str(image_path), remote_root],
                                check=False, timeout=20, capture_output=True)
-                # Translate path: srv21 sees it at /opt/cdpilot-twitter-bot/images/<name>
-                d["image_path"] = f"/opt/cdpilot-twitter-bot/images/{Path(image_path).name}"
+                # Translate path so srv21 daemon resolves the mirrored image.
+                d["image_path"] = f"{remote_images_dir}/{Path(image_path).name}"
             except Exception as e:
                 sys.stderr.write(f"image rsync to srv21 failed: {e}\n")
 

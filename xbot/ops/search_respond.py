@@ -37,7 +37,10 @@ _sys.path.insert(0, str(_Path(__file__).parent))
 import _twikit_patch  # noqa: F401
 from twikit import Client  # type: ignore
 
-DATA = Path(os.environ.get("CDPILOT_XBOT_DATA", str(Path.home() / "cdpilot-twitter-data")))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _paths import bot_home  # noqa: E402
+
+DATA = bot_home()
 XBOT = Path(__file__).resolve().parent.parent
 STATE = DATA / "state"
 SEARCH_DIR = STATE / "search"
