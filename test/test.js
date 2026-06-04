@@ -2748,6 +2748,121 @@ test('mode: LIGHT is a strict subset of FULL (regression guard for the split)', 
     'both tiers must share the __cdpilot_stealth idempotency guard');
 });
 
+// ── Smart browser close (owned-tab tracking + Browser.close) ──
+
+test('close: cmd_close defined and dispatched with --force/--keep flags', () => {
+  assert(/async def cmd_close\(force_browser=False, keep_browser=False\)/.test(PY_CONTENT),
+    'cmd_close must accept force_browser/keep_browser params');
+  // Dispatcher wires `close` -> cmd_close with flag parsing.
+  const m = PY_CONTENT.match(/"close":\s*lambda:\s*cmd_close\(([\s\S]*?)\),/);
+  assert(m, 'close must be registered in async_map as a cmd_close call');
+  assert(/force_browser="--force" in args/.test(m[1]),
+    'close dispatch must parse --force into force_browser');
+  assert(/keep_browser=\("--keep" in args/.test(m[1]),
+    'close dispatch must parse --keep into keep_browser');
+});
+
+test('close: tracks owned tab on go / new-tab / session-window / smart-click', () => {
+  // go marks the resolved page target as owned.
+  assert(/ws, page = get_page_ws\(\)\s*\n\s*#[\s\S]*?_mark_owned_tab\(page\.get\("id"\)\)/.test(PY_CONTENT),
+    'cmd_go must mark its page target as owned');
+  // new-tab marks the freshly opened target.
+  const newTab = PY_CONTENT.match(/data = cdp_get\(f'\/json\/new\?[\s\S]*?_mark_owned_tab\(data\.get\("id"\)\)/);
+  assert(newTab, 'cmd_new_tab must mark the new target as owned');
+  // The session window cdpilot creates is owned.
+  assert(/_save_sessions\(sessions\)\s*\n\s*#[\s\S]*?_mark_owned_tab\(target_id\)/.test(PY_CONTENT),
+    'a freshly created session window must be marked owned');
+  // smart-click marks any tab the click spawned.
+  assert(/_pre_click_targets/.test(PY_CONTENT) &&
+    /if t\.get\("type"\) == "page" and t\.get\("id"\) not in _pre_click_targets:\s*\n\s*_mark_owned_tab/.test(PY_CONTENT),
+    'cmd_smart_click must mark click-spawned tabs as owned');
+});
+
+test('close: closes ONLY owned tabs, leaves user tabs', () => {
+  const body = PY_CONTENT.match(/async def cmd_close\([\s\S]*?\n\nasync def _browser_close_graceful/);
+  // _browser_close_graceful is defined BEFORE cmd_close, so grab cmd_close body explicitly.
+  const m = PY_CONTENT.match(/async def cmd_close\(force_browser=False, keep_browser=False\):([\s\S]*?)\n\n# ─/);
+  const fn = (m && m[1]) || '';
+  assert(fn.includes('owned = _load_owned_tabs()'),
+    'cmd_close must load the owned-tab set');
+  assert(/if tid and tid in owned:/.test(fn),
+    'cmd_close must only close targets present in the owned set');
+  assert(/Target\.closeTarget/.test(fn),
+    'cmd_close must use CDP Target.closeTarget to close owned tabs');
+  // User-tab detection skips internal/blank pages.
+  assert(/user_pages = \[p for p in remaining_pages\s*\n\s*if not _is_chrome_internal_url/.test(fn),
+    'cmd_close must filter user pages excluding chrome-internal/blank tabs');
+});
+
+test('close: when no user tabs remain -> Browser.close (graceful, never kill -9)', () => {
+  const m = PY_CONTENT.match(/async def _browser_close_graceful\(\):([\s\S]*?)\n\nasync def cmd_close/);
+  const fn = (m && m[1]) || '';
+  assert(fn.includes('"Browser.close"') || fn.includes("'Browser.close'"),
+    '_browser_close_graceful must send the CDP Browser.close command first');
+  assert(/_stop_browser_on_port\(CDP_PORT\)/.test(fn),
+    'graceful close must fall back to SIGTERM-based _stop_browser_on_port');
+  // No actual SIGKILL/kill -9 invocation in the graceful path. (A comment may
+  // mention "kill -9" to explain why it's avoided — only flag real calls.)
+  assert(!/signal\.SIGKILL|os\.kill\([^)]*9\)|"-9"|'-9'/.test(fn),
+    'graceful close must NOT invoke kill -9 / SIGKILL');
+  // cmd_close calls graceful close only when user tabs absent or --force.
+  const cm = PY_CONTENT.match(/async def cmd_close\(force_browser=False, keep_browser=False\):([\s\S]*?)\n\n# ─/);
+  const cfn = (cm && cm[1]) || '';
+  assert(/if user_pages and not force_browser:[\s\S]*?Browser left open/.test(cfn),
+    'cmd_close must leave the browser open when user tabs remain (unless --force)');
+  assert(/await _browser_close_graceful\(\)/.test(cfn),
+    'cmd_close must invoke graceful browser close when empty/forced');
+});
+
+test('close: --keep never quits the browser; legacy cmd_stop preserved', () => {
+  const cm = PY_CONTENT.match(/async def cmd_close\(force_browser=False, keep_browser=False\):([\s\S]*?)\n\n# ─/);
+  const cfn = (cm && cm[1]) || '';
+  assert(/if keep_browser:[\s\S]*?return/.test(cfn),
+    'cmd_close must short-circuit and never quit when keep_browser is set');
+  // Legacy full-kill stop is untouched and still registered.
+  assert(/'stop':\s*cmd_stop,/.test(PY_CONTENT),
+    'legacy `stop` must still map to the full-kill cmd_stop');
+  assert(/def cmd_stop\(\):/.test(PY_CONTENT),
+    'cmd_stop (legacy kill-all behavior) must still exist');
+  // `stop --smart` aliases the smart close without removing legacy stop.
+  assert(/if cmd == "stop" and "--smart" in args:[\s\S]*?cmd_close\(/.test(PY_CONTENT),
+    '`stop --smart` must alias the smart close');
+});
+
+test('close: MCP browser_close exposes force/keep_browser + maps to flags', () => {
+  const m = PY_CONTENT.match(/"name": "browser_close"[\s\S]*?inputSchema[\s\S]*?\}\}/);
+  assert(m, 'browser_close tool must be registered');
+  assert(/"force"/.test(m[0]) && /"keep_browser"/.test(m[0]),
+    'browser_close schema must expose force + keep_browser');
+  assert(/"browser_close": lambda a: \["close"\][\s\S]*?--force[\s\S]*?--keep/.test(PY_CONTENT),
+    'browser_close must map force/keep_browser to CLI --force/--keep');
+});
+
+test('close: owned-tab tracking persists to a per-profile JSON file', () => {
+  assert(/OWNED_TABS_FILE = os\.path\.join\(PROFILE_DIR, 'owned-tabs\.json'\)/.test(PY_CONTENT),
+    'owned tabs must be stored in a per-project profile file');
+  assert(/def _load_owned_tabs\(\):/.test(PY_CONTENT) && /def _save_owned_tabs\(/.test(PY_CONTENT)
+    && /def _mark_owned_tab\(/.test(PY_CONTENT),
+    'owned-tab load/save/mark helpers must exist');
+  // After consuming the set, cmd_close clears tracking.
+  const cm = PY_CONTENT.match(/async def cmd_close\(force_browser=False, keep_browser=False\):([\s\S]*?)\n\n# ─/);
+  const cfn = (cm && cm[1]) || '';
+  assert(/_save_owned_tabs\(set\(\)\)/.test(cfn),
+    'cmd_close must clear the owned-tab set after closing');
+});
+
+test('close: CLI smoke — `close` with no browser is a graceful no-op', () => {
+  const out = run('close');
+  assert(/No browser running\./.test(out),
+    '`close` must report no browser running instead of crashing');
+});
+
+test('close: CLI smoke — `stop --smart` with no browser is a graceful no-op', () => {
+  const out = run('stop --smart');
+  assert(/No browser running\./.test(out),
+    '`stop --smart` must report no browser running instead of crashing');
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);

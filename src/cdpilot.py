@@ -684,6 +684,10 @@ ADAPTIVE_CONFIG_FILE = os.path.join(PROFILE_DIR, 'adaptive.json')
 ENTROPY_CONFIG_FILE = os.path.join(PROFILE_DIR, 'entropy.json')
 DOWNLOAD_CONFIG_FILE = os.path.join(PROFILE_DIR, 'download-config.json')
 SESSION_FILE = os.path.join(PROFILE_DIR, 'sessions.json')
+# Tabs that cdpilot itself opened (via go / new-tab / smart-click). The smart
+# `close` command only touches these — user tabs opened manually in the same
+# isolated profile are left alone.
+OWNED_TABS_FILE = os.path.join(PROFILE_DIR, 'owned-tabs.json')
 COOKIES_DIR = os.path.join(CDPILOT_HOME, 'cookies')
 COOKIES_AUTO_CONFIG_FILE = os.path.join(PROFILE_DIR, 'cookies-auto.json')
 CF_CLEARANCE_COOKIES = frozenset({'cf_clearance', '__cf_bm', '_cfuvid'})
@@ -1234,6 +1238,9 @@ def _create_session_window():
             "last_used": time.time(),
         }
         _save_sessions(sessions)
+        # Freshly created by cdpilot -> owned. (The reuse branch above does not
+        # mark, since that tab may have been opened by the user.)
+        _mark_owned_tab(target_id)
 
     return target_id
 
@@ -2537,6 +2544,9 @@ async def cmd_go(url):
         cmd_launch()
 
     ws, page = get_page_ws()
+    # Mark this tab as cdpilot-owned so a later `close` knows it can shut it.
+    if isinstance(page, dict):
+        _mark_owned_tab(page.get("id"))
 
     try:
         from urllib.parse import urlparse
@@ -4467,10 +4477,158 @@ async def cmd_debug(url=None):
     print(f"Debug complete: {url}")
 
 
-async def cmd_close():
-    ws, page = get_page_ws()
-    r = await cdp_send(ws, [(1, "Page.close", {})])
-    print("Tab closed")
+# ─── Owned-Tab Tracking ───
+# cdpilot records every target_id it opens so that `close` can distinguish its
+# own tabs from tabs the user opened manually in the same isolated profile.
+# Stored as a JSON list in the project profile dir; survives across CLI
+# invocations (each `go`/`new-tab` is a separate process).
+
+def _load_owned_tabs():
+    """Return the set of target_ids cdpilot opened in this project profile."""
+    try:
+        with open(OWNED_TABS_FILE) as f:
+            data = json.load(f)
+            return set(data.get("owned", []))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+
+
+def _save_owned_tabs(owned):
+    """Persist the owned target_id set."""
+    try:
+        os.makedirs(os.path.dirname(OWNED_TABS_FILE), exist_ok=True)
+        with open(OWNED_TABS_FILE, "w") as f:
+            json.dump({"owned": sorted(owned)}, f)
+    except OSError:
+        pass
+
+
+def _mark_owned_tab(target_id):
+    """Record a target_id as cdpilot-owned. No-op on falsy input."""
+    if not target_id:
+        return
+    owned = _load_owned_tabs()
+    if target_id not in owned:
+        owned.add(target_id)
+        _save_owned_tabs(owned)
+
+
+def _is_chrome_internal_url(url):
+    """True for blank/new-tab/internal pages that don't count as 'real' tabs."""
+    if not url:
+        return True
+    u = url.strip().lower()
+    return (u in ("about:blank", "about:newtab", "")
+            or u.startswith("chrome://")
+            or u.startswith("edge://")
+            or u.startswith("chrome-extension://")
+            or u.startswith("devtools://")
+            or u.startswith("brave://")
+            or u.startswith("vivaldi://"))
+
+
+async def _browser_close_graceful():
+    """Ask the browser to shut down gracefully via the CDP Browser.close
+    command (cleanest cross-platform path — flushes state, no orphaned procs).
+    Returns True if the command was acknowledged. Falls back to a SIGTERM-based
+    process stop (never kill -9) when the WebSocket path fails."""
+    try:
+        browser_ws = await _get_browser_ws()
+        if browser_ws:
+            await cdp_send(browser_ws, [(1, "Browser.close", {})], timeout=5)
+            return True
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    # Fallback: graceful OS-level termination (SIGTERM on POSIX, taskkill on
+    # Windows). kill -9 is intentionally NOT used here — last resort only.
+    return _stop_browser_on_port(CDP_PORT)
+
+
+async def cmd_close(force_browser=False, keep_browser=False):
+    """Smart close: shut down cdpilot's own tabs, then close the whole browser
+    if no user tabs remain.
+
+    Behavior:
+      1. Close every cdpilot-owned tab (CDP Target.closeTarget).
+      2. Inspect the remaining page targets:
+         - 0 real tabs left (only about:blank / chrome:// / new-tab) ->
+           close the browser application gracefully (Browser.close, SIGTERM
+           fallback — never kill -9).
+         - one or more user tabs remain -> leave the browser open; only the
+           owned tabs were closed.
+
+    Flags:
+      keep_browser  — never close the browser, only the owned tabs.
+      force_browser — close the browser even if user tabs remain.
+    """
+    if not cdp_get("/json/version"):
+        print("No browser running.")
+        return
+
+    tabs = get_tabs()
+    pages = [t for t in tabs if t.get("type") == "page"]
+    owned = _load_owned_tabs()
+
+    # Make sure the current session window counts as owned even if it predates
+    # tracking (legacy session created before this feature shipped).
+    session_target = _get_session_window_target_id()
+    if session_target:
+        owned.add(session_target)
+
+    browser_ws = await _get_browser_ws()
+    closed = 0
+    for p in pages:
+        tid = p.get("id")
+        if tid and tid in owned:
+            try:
+                await cdp_send(browser_ws, [(1, "Target.closeTarget",
+                                             {"targetId": tid})], timeout=5)
+                closed += 1
+            except Exception:
+                pass
+
+    # Owned set is consumed — clear tracking + the CWD session window pointer so
+    # a later command starts clean.
+    _save_owned_tabs(set())
+    if session_target:
+        sessions = _load_sessions()
+        sid = _get_session_id()
+        sessions.pop(sid, None)
+        _save_sessions(sessions)
+    cdp_cache_invalidate()
+
+    print(f"Closed {closed} cdpilot tab(s).")
+
+    # Re-read remaining targets after closing owned tabs.
+    remaining = get_tabs()
+    remaining_pages = [t for t in remaining if t.get("type") == "page"]
+    user_pages = [p for p in remaining_pages
+                  if not _is_chrome_internal_url(p.get("url"))]
+
+    if keep_browser:
+        if user_pages:
+            print(f"Browser left open ({len(user_pages)} user tab(s)).")
+        else:
+            print("Browser left open (--keep).")
+        return
+
+    if user_pages and not force_browser:
+        print(f"Browser left open — {len(user_pages)} user tab(s) still present.")
+        return
+
+    # No user tabs remain (or --force) -> close the browser gracefully.
+    if await _browser_close_graceful():
+        print(f"Browser closed gracefully (port {CDP_PORT}).")
+        if PROJECT_ID:
+            registry = _load_registry()
+            if PROJECT_ID in registry:
+                registry[PROJECT_ID]["status"] = "stopped"
+                registry[PROJECT_ID]["pid"] = None
+                _save_registry(registry)
+    else:
+        print("Browser close failed.", file=sys.stderr)
 
 
 def cmd_session():
@@ -4894,6 +5052,7 @@ async def cmd_new_tab(url='about:blank'):
     data = cdp_get(f'/json/new?{urllib.parse.quote(url, safe=safe_chars)}')
     cdp_cache_invalidate()
     if data:
+        _mark_owned_tab(data.get("id"))
         print(f'New tab opened: {data.get("url", url)}')
         print(f'  ID: {data.get("id", "?")}')
     else:
@@ -8155,6 +8314,10 @@ async def cmd_smart_click(text):
         cdpilot smart-click "Learn more"
     """
     ws_url, _ = get_page_ws()
+    # Snapshot page targets before the click so a new tab opened by the click
+    # (target=_blank, window.open) can be marked cdpilot-owned afterwards.
+    _pre_click_targets = {t.get("id") for t in (cdp_get("/json") or [])
+                          if t.get("type") == "page"}
     # Locale-aware lowercase so Turkish/German chars round-trip safely.
     # `toLocaleLowerCase()` (no arg) honors the browser's BCP-47 locale, which
     # matches what the user sees in the DOM. Python's str.lower() handles
@@ -8302,6 +8465,15 @@ async def cmd_smart_click(text):
         sys.exit(1)
 
     await _vfx_ripple(ws_url, data["x"], data["y"])
+    # A click can spawn a new tab (target=_blank). Diff the target list and mark
+    # any newcomer as cdpilot-owned so `close` will clean it up later.
+    try:
+        cdp_cache_invalidate()
+        for t in (cdp_get("/json", no_cache=True) or []):
+            if t.get("type") == "page" and t.get("id") not in _pre_click_targets:
+                _mark_owned_tab(t.get("id"))
+    except Exception:
+        pass
     print(f'Clicked: {data["tag"].upper()} "{data["text"]}" (score:{data["score"]})')
     if data.get("alternatives"):
         print(f'  Also found: {", ".join(data["alternatives"])}')
@@ -10880,8 +11052,8 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the input element"}, "value": {"type": "string", "description": "Value to set in the input field"}}, "required": ["selector", "value"]}},
             {"name": "browser_launch", "description": "Launch an isolated browser instance with Chrome DevTools Protocol enabled. Uses existing Brave/Chrome/Chromium installation — no browser download needed. Creates an isolated profile directory so your personal browser data is never touched.",
              "inputSchema": {"type": "object", "properties": {}}},
-            {"name": "browser_close", "description": "Close the currently active browser tab. Use this to clean up after automation tasks or to close unwanted popups/tabs that were opened during navigation.",
-             "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "browser_close", "description": "Smart close: shut down every tab cdpilot opened during this automation, then close the whole browser application gracefully ONLY if no user-opened tabs remain. If the user has their own tabs open in the same browser, those are left untouched and the browser stays open. Use this to clean up after automation. Set force=true to close the browser even when user tabs remain; set keep_browser=true to only close cdpilot's tabs and never quit the browser.",
+             "inputSchema": {"type": "object", "properties": {"force": {"type": "boolean", "description": "Close the browser application even if user-opened tabs remain.", "default": False}, "keep_browser": {"type": "boolean", "description": "Only close cdpilot's own tabs; never quit the browser.", "default": False}}}},
             {"name": "browser_extract", "description": "Extract structured data from elements matching a CSS selector. No LLM needed — pure DOM extraction. Returns text (default), JSON (with tag, text, attrs, href, src), specific attributes, or clean list. Use for scraping tables, lists, links, form values. Limit: 100 elements for JSON, 200 for text.",
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector to match elements (e.g. 'table tr', '.product', 'a')"}, "format": {"type": "string", "enum": ["text", "json", "list"], "description": "Output format: 'text' (one per line), 'json' (full structure with attrs), 'list' (numbered)", "default": "text"}}, "required": ["selector"]}},
             {"name": "browser_observe", "description": "List all interactive elements on the current page with their available actions (CLICK, FILL, NAVIGATE, TOGGLE, SELECT, SUBMIT, UPLOAD). Like Stagehand observe() but deterministic — no LLM needed. Shows what you CAN DO on the page. Use this to understand page structure before acting.",
@@ -11001,7 +11173,7 @@ class MCPServer:
             "browser_a11y": lambda a: ["a11y"] + ([a["mode"]] if a.get("mode") and a["mode"] != "full" else []),
             "browser_fill": lambda a: ["fill", a.get("selector", ""), a.get("value", "")],
             "browser_launch": lambda a: ["launch"],
-            "browser_close": lambda a: ["close"],
+            "browser_close": lambda a: ["close"] + (["--force"] if a.get("force") else []) + (["--keep"] if a.get("keep_browser") else []),
             "browser_extract": lambda a: ["extract", a.get("selector", "")] + ([f"--{a['format']}"] if a.get("format") and a["format"] != "text" else []),
             "browser_observe": lambda a: ["observe"],
             "browser_smart_click": lambda a: ["smart-click", a.get("text", "")],
@@ -12674,6 +12846,15 @@ if __name__ == "__main__":
         cmd_switch_tab(args[0])
         sys.exit(0)
 
+    # `stop --smart` aliases the smart close (owned tabs + browser-if-empty).
+    # Bare `stop` keeps its legacy full-kill behavior for backward compatibility.
+    if cmd == "stop" and "--smart" in args:
+        asyncio.run(cmd_close(
+            force_browser="--force" in args,
+            keep_browser=("--keep" in args or "--keep-browser" in args),
+        ))
+        sys.exit(0)
+
     if cmd in sync_cmds:
         sync_cmds[cmd]()
         sys.exit(0)
@@ -12734,7 +12915,10 @@ if __name__ == "__main__":
         "emulate": lambda: (require_args(1, "emulate <device>"), None)[1] if not args else cmd_emulate(args[0]),
         "glow": lambda: cmd_glow(args[0] if args else "on"),
         "debug": lambda: cmd_debug(args[0] if args else None),
-        "close": cmd_close,
+        "close": lambda: cmd_close(
+            force_browser="--force" in args,
+            keep_browser=("--keep" in args or "--keep-browser" in args),
+        ),
         'new-tab': lambda: cmd_new_tab(args[0] if args else 'about:blank'),
         'close-tab': lambda: cmd_close_tab(args[0] if args else None),
         'pdf': lambda: cmd_pdf(args[0] if args else None),

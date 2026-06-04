@@ -296,7 +296,9 @@ function showHelp() {
     setup              Auto-detect browser, create isolated profile
     launch             Start browser with CDP enabled
     status             Check browser connection
-    stop               Stop browser
+    stop [--smart]     Stop browser (--smart = close owned tabs, quit if empty)
+    close [--force|--keep]  Smart close: close cdpilot's tabs; quit browser only
+                       if no user tabs remain (--force quits anyway, --keep never quits)
 
   NAVIGATION
     go <url>           Navigate to URL
