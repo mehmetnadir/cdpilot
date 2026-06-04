@@ -435,6 +435,21 @@ def _send_to_telegram(card_text: str, strategy_id: str) -> dict:
     return result
 
 
+def _auto_queue(strategy_id: str, artifact: dict) -> dict:
+    """AUTO_POST: compile the strategy recommendation into a draft and queue it
+    directly (no approval card). Hot-zone scheduled_time is preserved via the
+    shared telegram_bridge queue logic.
+    """
+    sys.path.insert(0, str(Path(__file__).parent))
+    import telegram_bridge as tb  # type: ignore
+
+    draft = tb._strategy_to_draft(strategy_id, artifact)
+    if not draft:
+        return {"_error": "no_draft"}
+    qp = tb.auto_queue_draft(draft)
+    return {"queued": True, "queue_path": str(qp), "draft_id": draft["id"]}
+
+
 def run(send: bool = True) -> dict:
     today_str = datetime.now().strftime("%Y-%m-%d")
     STRATEGY_DIR.mkdir(parents=True, exist_ok=True)
@@ -445,6 +460,19 @@ def run(send: bool = True) -> dict:
         # Weekly-preapproved artifact: send the card now (no Claude call), so user
         # still gets daily approval prompt for the pre-planned hook.
         if isinstance(existing, dict) and existing.get("approval_status") == "weekly_preapproved":
+            sys.path.insert(0, str(Path(__file__).parent))
+            import telegram_bridge as tb  # type: ignore
+            if tb.auto_post_enabled():
+                aq = _auto_queue(today_str, existing)
+                if aq.get("_error"):
+                    _log(f"weekly auto-queue failed: {aq['_error']}")
+                    return {"status": "weekly_autoqueue_fail", "path": str(out_path),
+                            "error": aq["_error"]}
+                existing["approval_status"] = "auto_queued"
+                existing["queued_at"] = int(time.time())
+                out_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2))
+                _log(f"auto-queued weekly-derived strategy for {today_str}")
+                return {"status": "weekly_auto_queued", "path": str(out_path), **aq}
             try:
                 rec = existing.get("recommendation", {})
                 ctx = build_context()
@@ -503,6 +531,20 @@ def run(send: bool = True) -> dict:
         return {"status": "error", "path": str(out_path), "error": rec["_error"]}
 
     if send:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import telegram_bridge as tb  # type: ignore
+        if tb.auto_post_enabled():
+            aq = _auto_queue(today_str, artifact)
+            if aq.get("_error"):
+                _log(f"auto-queue failed: {aq['_error']}")
+                return {"status": "autoqueue_fail", "path": str(out_path),
+                        "error": aq["_error"], "recommendation": rec}
+            artifact["approval_status"] = "auto_queued"
+            artifact["queued_at"] = int(time.time())
+            out_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2))
+            _log(f"auto-queued strategy for {today_str} → {aq.get('queue_path')}")
+            return {"status": "auto_queued", "path": str(out_path),
+                    "recommendation": rec, **aq}
         try:
             card = _render_card_text(rec, context)
             tg_result = _send_to_telegram(card, today_str)

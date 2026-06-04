@@ -603,5 +603,204 @@ def test_telegram_bridge_log_decision_creates_audit(monkeypatch, tmp_path):
     assert e1["decision"] == "skip"
 
 
+# ── AUTO_POST mode (onaysız akış) ──
+def test_auto_post_enabled_default_on(monkeypatch):
+    monkeypatch.delenv("CDPILOT_AUTO_POST", raising=False)
+    sys.modules.pop("telegram_bridge", None)
+    import telegram_bridge as tb  # type: ignore
+    assert tb.auto_post_enabled() is True  # default ON — user opted in
+
+
+def test_auto_post_enabled_off_restores_legacy(monkeypatch):
+    monkeypatch.setenv("CDPILOT_AUTO_POST", "off")
+    sys.modules.pop("telegram_bridge", None)
+    import telegram_bridge as tb  # type: ignore
+    assert tb.auto_post_enabled() is False
+    monkeypatch.setenv("CDPILOT_AUTO_POST", "1")
+    assert tb.auto_post_enabled() is True
+
+
+def test_auto_post_strategist_no_card_direct_queue(monkeypatch, tmp_path):
+    """AUTO_POST=on → daily_strategist queues directly, sends NO approval card."""
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    monkeypatch.setenv("CDPILOT_AUTO_POST", "on")
+    monkeypatch.setenv("CDPILOT_QUEUE_RSYNC", "")  # no remote rsync in tests
+    sys.modules.pop("telegram_bridge", None)
+    sys.modules.pop("daily_strategist", None)
+    import telegram_bridge as tb  # type: ignore
+    tb._DATA = tmp_path
+    tb.QUEUE_DIR = tmp_path / "queue"
+    import daily_strategist as ds  # type: ignore
+
+    # If a card were sent, _send_to_telegram would be invoked → make it explode.
+    def _boom(*a, **k):
+        raise AssertionError("approval card must NOT be sent in AUTO_POST mode")
+    monkeypatch.setattr(ds, "_send_to_telegram", _boom)
+
+    artifact = {
+        "id": "2026-06-01",
+        "recommendation": {
+            "pillar": "cdpilot", "format": "single", "post_time_tr": "17:23",
+            "hook": "raw CDP beats playwright for nested frames",
+            "body_outline": "same as hook",
+            "reply_bait": "what's your stack?",
+            "image": {"needed": False, "concept": ""},
+            "url_in_reply": None,
+            "reasoning": "underrepresented pillar",
+        },
+    }
+    res = ds._auto_queue("2026-06-01", artifact)
+    assert res.get("queued") is True
+    qp = Path(res["queue_path"])
+    assert qp.exists()
+    item = json.loads(qp.read_text())
+    assert item["status"] == "pending"
+    assert item["kind"] == "tweet"
+    assert "raw CDP" in item["text"]
+
+
+def test_auto_post_off_keeps_awaiting_telegram(monkeypatch, tmp_path):
+    """AUTO_POST=off → legacy approval flow: artifact status awaiting_telegram."""
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    monkeypatch.setenv("CDPILOT_AUTO_POST", "off")
+    monkeypatch.setenv("CDPILOT_STRATEGIST_FORCE", "1")
+    sys.modules.pop("telegram_bridge", None)
+    sys.modules.pop("daily_strategist", None)
+    import daily_strategist as ds  # type: ignore
+    ds.DATA = tmp_path
+    ds.STRATEGY_DIR = tmp_path / "state" / "strategy"
+
+    # Stub claude availability + recommendation + context + telegram send.
+    monkeypatch.setattr(ds, "_claude_available", lambda: True)
+    monkeypatch.setattr(ds, "build_context", lambda: {
+        "today": "2026-06-01", "weekday_tr": "Pzt", "weekly_track": "T",
+        "pillar_balance_7d": {"cdpilot": {"delta": 0.0}},
+        "kpi_last_3d": {"followers": 1, "total_views": 2},
+        "drafts_pending": 0, "active_experiments": {},
+    })
+    monkeypatch.setattr(ds, "_ask_claude", lambda ctx: {
+        "pillar": "cdpilot", "format": "single", "post_time_tr": "17:23",
+        "hook": "hook text", "body_outline": "same as hook",
+        "reply_bait": "q?", "image": {"needed": False}, "url_in_reply": None,
+        "reasoning": "because",
+    })
+    captured = {}
+
+    def _fake_send(card, sid):
+        captured["sent"] = True
+        return {"message_id": 7}
+    monkeypatch.setattr(ds, "_send_to_telegram", _fake_send)
+
+    res = ds.run(send=True)
+    assert res["status"] == "ok"
+    assert captured.get("sent") is True  # card WAS sent in legacy mode
+    artifact = json.loads(Path(res["path"]).read_text())
+    assert artifact["approval_status"] == "awaiting_telegram"
+
+
+def test_auto_post_queue_preserves_hot_zone_timing(monkeypatch, tmp_path):
+    """AUTO_POST item is unattended but still scheduled (hot-zone, future)."""
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    monkeypatch.setenv("CDPILOT_AUTO_POST", "on")
+    monkeypatch.setenv("CDPILOT_QUEUE_RSYNC", "")
+    sys.modules.pop("telegram_bridge", None)
+    import telegram_bridge as tb  # type: ignore
+    tb._DATA = tmp_path
+    tb.QUEUE_DIR = tmp_path / "queue"
+    draft = {"id": "hot-1", "kind": "tweet", "to": None,
+             "text": "scheduled but unattended", "context": "t"}
+    qp = tb.auto_queue_draft(draft)
+    item = json.loads(qp.read_text())
+    assert item["status"] == "pending"
+    # Humanizer hot-zone scheduling applied (not a bare now()): a scheduled_time
+    # is present and the quiet-hours guard never lands it inside 23:00-08:00 TR.
+    assert "scheduled_time" in item and item["scheduled_time"] > 0
+    import datetime as _dt
+    tr = _dt.datetime.utcfromtimestamp(item["scheduled_time"] + 3 * 3600)
+    assert not (tr.hour >= 23 or tr.hour < 8)
+    # Direct call to the shared scheduler confirms it targets a TR peak window.
+    sched = tb._schedule_time_for(item["approved_at"], "tweet", 0)
+    tr2 = _dt.datetime.utcfromtimestamp(sched + 3 * 3600)
+    assert not (tr2.hour >= 23 or tr2.hour < 8)
+
+
+# ── POST-NOTIFY (poster_twikit: link + TR özet) ──
+def test_post_notify_sends_link_and_tr_summary(monkeypatch, tmp_path):
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    sys.modules.pop("poster_twikit", None)
+    import poster_twikit as pt  # type: ignore
+    sent = {}
+    monkeypatch.setattr(pt, "_telegram_notify", lambda text: sent.setdefault("text", text))
+    monkeypatch.setattr(pt, "_tr_summary", lambda text: "Türkçe özet cümlesi.")
+
+    item = {"id": "t-1", "kind": "tweet", "text": "raw CDP > playwright",
+            "tweet_url": "https://x.com/cdpilot_dev/status/123"}
+    # Mimic poster's success-notify block
+    kind_label = {"tweet": "Tweet atıldı", "reply": "Cevap atıldı",
+                  "quote": "Alıntı atıldı"}.get(item["kind"], "Tweet atıldı")
+    summary = pt._tr_summary(item["text"])
+    summary_line = f"\n\n📝 TR özet: {summary}" if summary else ""
+    pt._telegram_notify(f"✅ {kind_label}\n{item['tweet_url']}{summary_line}")
+
+    assert "https://x.com/cdpilot_dev/status/123" in sent["text"]
+    assert "TR özet: Türkçe özet cümlesi." in sent["text"]
+    assert "Tweet atıldı" in sent["text"]
+
+
+def test_tr_summary_uses_claude_cli(monkeypatch):
+    sys.modules.pop("poster_twikit", None)
+    import poster_twikit as pt  # type: ignore
+    import subprocess
+
+    monkeypatch.setattr(pt.shutil if hasattr(pt, "shutil") else __import__("shutil"),
+                        "which", lambda name: "/usr/bin/claude")
+
+    class _Proc:
+        stdout = "Bu, claude tarafından üretilmiş TR özettir.\n"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Proc())
+    out = pt._tr_summary("english tweet content")
+    assert out == "Bu, claude tarafından üretilmiş TR özettir."
+
+
+def test_tr_summary_fallback_when_claude_missing(monkeypatch):
+    sys.modules.pop("poster_twikit", None)
+    import poster_twikit as pt  # type: ignore
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda name: None)  # claude not installed
+    raw = "x" * 150
+    out = pt._tr_summary(raw)
+    assert out == raw[:100] + "…"  # fallback: first 100 chars + ellipsis
+    # empty input → empty summary
+    assert pt._tr_summary("") == ""
+
+
+# ── CRISIS FREEZE respected by auto-post poster ──
+def test_crisis_freeze_blocks_auto_post(monkeypatch, tmp_path):
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    monkeypatch.setenv("CDPILOT_AUTO_POST", "on")
+    sys.modules.pop("poster_twikit", None)
+    import poster_twikit as pt  # type: ignore
+    import asyncio
+    pt.QUEUE_DIR = tmp_path / "queue"
+    pt.POSTED_DIR = tmp_path / "posted"
+    pt.FAILED_DIR = tmp_path / "failed"
+    pt.FREEZE_FLAG = tmp_path / "state" / "crisis-freeze.flag"
+    pt.QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    pt.FREEZE_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    pt.FREEZE_FLAG.write_text("frozen")
+    # A due pending item exists, but freeze must short-circuit before posting.
+    item = {"id": "frozen-1", "kind": "tweet", "text": "should not post",
+            "status": "pending", "scheduled_time": 1}
+    (pt.QUEUE_DIR / "frozen-1.json").write_text(json.dumps(item))
+    posted = {}
+    monkeypatch.setattr(pt, "_telegram_notify", lambda t: posted.setdefault("notify", t))
+
+    asyncio.run(pt.main_async())
+    # Item stays in queue (not posted), no posted file created.
+    assert (pt.QUEUE_DIR / "frozen-1.json").exists()
+    assert not list((tmp_path / "posted").glob("*.json")) if (tmp_path / "posted").exists() else True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

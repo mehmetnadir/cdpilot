@@ -172,9 +172,33 @@ def _ai_draft(incoming: str, author: str) -> str | None:
         return None
 
 
+def _auto_queue_reply(c: dict, ai_draft: str, idx: int) -> dict:
+    """AUTO_POST: queue an AI-drafted reply directly (no approval card)."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    import telegram_bridge as tb  # type: ignore
+
+    draft = {
+        "id": f"search-reply-{c['tweet_id']}",
+        "kind": "reply",
+        "to": c["url"],
+        "text": ai_draft,
+        "context": f"AI reply to @{c['author']} (search_respond)",
+        "source": "search_respond",
+    }
+    qp = tb.auto_queue_draft(draft, idx=idx)
+    return {"queued": True, "queue_path": str(qp), "draft_id": draft["id"]}
+
+
 def _send_card(c: dict, ai_draft: str | None, idx: int, total: int) -> dict:
     sys.path.insert(0, str(Path(__file__).parent))
     import telegram_bridge as tb  # type: ignore
+
+    if tb.auto_post_enabled():
+        # Auto-post the AI reply when we have one; with no draft there is nothing
+        # to post unattended (manual reply needs a human), so skip silently.
+        if ai_draft and ai_draft.strip():
+            return _auto_queue_reply(c, ai_draft.strip(), idx)
+        return {"status": "auto_skip_no_draft", "tweet_id": c.get("tweet_id")}
 
     env = tb._load_env()
     if not env.get("TELEGRAM_CHAT_ID"):

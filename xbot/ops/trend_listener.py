@@ -231,9 +231,50 @@ def _render_card(sel: dict, idx: int, total: int) -> str:
     )
 
 
+def _trend_to_draft(sel: dict, trend_id: str, idx: int) -> dict | None:
+    """Compile a trend selection into a tweet draft (auto-post path).
+
+    Mirrors telegram_bridge._handle_trend_tweet's skeleton: angle is the body,
+    external (non-x.com) URL goes to a followup reply.
+    """
+    angle = (sel.get("angle") or "").strip()
+    if not angle:
+        return None
+    url = sel.get("url", "")
+    draft = {
+        "id": f"trend-{trend_id}-{idx}",
+        "kind": "tweet",
+        "to": None,
+        "text": angle,
+        "context": f"trend listener seed — {sel.get('source', '?')}: {(sel.get('title') or '')[:120]}",
+        "pillar": sel.get("pillar"),
+        "format": sel.get("format_hint"),
+        "source": "trend_listener",
+        "source_url": url,
+    }
+    if url and not url.startswith("https://x.com"):
+        draft["followup_text"] = url
+    return draft
+
+
+def _auto_queue_card(sel: dict, idx: int, trend_id: str) -> dict:
+    """AUTO_POST: queue the trend tweet directly (no approval card)."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    import telegram_bridge as tb  # type: ignore
+
+    draft = _trend_to_draft(sel, trend_id, idx)
+    if not draft:
+        return {"_error": "no_angle"}
+    qp = tb.auto_queue_draft(draft, idx=idx)
+    return {"queued": True, "queue_path": str(qp), "draft_id": draft["id"]}
+
+
 def _send_card(sel: dict, idx: int, total: int, trend_id: str) -> dict:
     sys.path.insert(0, str(Path(__file__).parent))
     import telegram_bridge as tb  # type: ignore
+
+    if tb.auto_post_enabled():
+        return _auto_queue_card(sel, idx, trend_id)
 
     env = tb._load_env()
     if not env.get("TELEGRAM_CHAT_ID"):
