@@ -37,13 +37,15 @@
 ## Aktif Çalışma
 | Durum | Alan | Açıklama |
 |-------|------|----------|
-| ✅ | v0.8.0 | Core CLI (50+ komut), MCP, DevExtension, Stealth, CAPTCHA, Adaptive, Context Pool, Proxy, TLS probe |
-| ✅ | Site | cdpilot.ndr.ist canlı (63 komut docs) |
-| ✅ | GitHub & npm | v0.5.0 hazırlandı; npm publish onay bekliyor |
-| 🔄 | cdpilot Cloud | Hosted browser sessions API (roadmap) |
+| ✅ | v0.8.0 npm | OIDC trusted publisher ile yayında (npm provenance) |
+| ✅ | v0.9 yetenekler | friction ladder, press-hold solver, video watch, 3-tier mode, captcha-solve, multi-instance pool, offscreen, smart-close — 70+ komut, 330 test |
+| ✅ | Bench | native 45/80 (single run) + Docker 30/80 (reproducible). 12→45 journey, $0 |
+| ✅ | Site | cdpilot.ndr.ist güncel (v0.9 özellikler yansıdı) |
+| ✅ | Twitter bot | @cdpilot_dev canlı + otomatik-post (TR özet bildirimi), srv21 |
+| ⏳ | Faz 5 yayın | Twitter thread onaylı — thread-poster (8 tweet zinciri) + VPN bekliyor |
 | ⏳ | v0.9 tls-proxy | Optional local TLS-MITM (curl-impersonate semantics) |
 
-Son Güncelleme: 2026-05-21
+Son Güncelleme: 2026-06-08
 
 <!-- gitnexus:start -->
 ## GitNexus — Code Intelligence
