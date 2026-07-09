@@ -69,11 +69,20 @@ function findBrowser() {
 // ── Python Detection ──
 
 function findPython() {
-  for (const cmd of ['python3', 'python']) {
+  // cdpilot.py uses PEP 604 unions (dict | None) → requires Python 3.10+.
+  // Prefer version-specific + Homebrew interpreters so a stale default python3
+  // (e.g. macOS 3.9) is skipped instead of selected and crashing at runtime.
+  const candidates = [
+    process.env.CDPILOT_PYTHON,
+    'python3.13', 'python3.12', 'python3.11', 'python3.10',
+    '/opt/homebrew/bin/python3', '/usr/local/bin/python3',
+    'python3', 'python',
+  ].filter(Boolean);
+  for (const cmd of candidates) {
     try {
       const ver = execSync(`${cmd} --version 2>&1`, { stdio: 'pipe' }).toString().trim();
       const match = ver.match(/(\d+)\.(\d+)/);
-      if (match && parseInt(match[1]) >= 3 && parseInt(match[2]) >= 8) {
+      if (match && (parseInt(match[1]) > 3 || (parseInt(match[1]) === 3 && parseInt(match[2]) >= 10))) {
         return cmd;
       }
     } catch {}
@@ -458,7 +467,7 @@ function runInternalTestRunner(testFile, traceDir, traceMode, grepPattern) {
   const results = { passed: 0, failed: 0, skipped: 0, tests: [] };
   const cdpPort = process.env.CDP_PORT || '9222';
   const SCRIPT = path.join(__dirname, '..', 'src', 'cdpilot.py');
-  const python = 'python3';
+  const python = findPython() || 'python3';
   let stepIdx = 0;
 
   const makeT = () => {
