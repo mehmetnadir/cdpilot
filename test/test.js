@@ -40,12 +40,12 @@ console.log('\n  cdpilot tests\n');
 
 test('--version prints version', () => {
   const out = run('--version');
-  assert(out.includes('0.8.0'), 'Should print version');
+  assert(out.includes(require('../package.json').version), 'Should print version');
 });
 
 test('-v prints version', () => {
   const out = run('-v');
-  assert(out.includes('0.8.0'), 'Should print version');
+  assert(out.includes(require('../package.json').version), 'Should print version');
 });
 
 test('help shows usage', () => {

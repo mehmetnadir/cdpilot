@@ -2,9 +2,13 @@
 
 All notable changes to cdpilot will be documented in this file.
 
-## [0.9.0-dev] - unreleased
+## [0.9.0] - 2026-08-23
+
+### Changed
+- **Python 3.10+ is now required** (the core uses PEP 604 union types). `findPython` now tries version-specific interpreters (`python3.13`…`python3.10`) and Homebrew paths before generic `python3`; the CI matrix was updated to match.
 
 ### Added
+- **`cdpilot setup` detects the Python `websockets` module** and fails early with an install hint — thanks @lross2k (#12, #13). The check imports `websockets` via the same interpreter cdpilot selects, so a pip/interpreter mismatch can't fool it.
 - **`cdpilot watch`** — video understanding via continuous screencast. `Page.startScreencast` streams JPEG frames into a ring buffer so an AI agent can query a time window and observe motion (animation, mouse cursor, scroll, transitions) that a single screenshot cannot capture.
   - `watch start <url|file://...>` — begin screencast and play the video
   - `watch query --at <mm:ss> --window <Ns>` — frames around a timestamp
