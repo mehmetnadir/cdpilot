@@ -277,9 +277,11 @@ async def _post_thread(client: Client, item: dict, queue_path: Path) -> dict:
             reply_to = posted_ids[-1] if posted_ids else None
             tw = await client.create_tweet(text=texts[i], reply_to=reply_to)
         except Exception as e:
-            _persist_progress(str(e))
-            _log(f"🧵 thread {item.get('id')} broke at {i + 1}/{len(texts)}: {e}")
-            return {"ok": False, "partial": True, "err": str(e),
+            tb = traceback.format_exc()
+            _persist_progress(repr(e))
+            item["traceback"] = tb
+            _log(f"🧵 thread {item.get('id')} broke at {i + 1}/{len(texts)}: {e!r}\n{tb}")
+            return {"ok": False, "partial": True, "err": repr(e),
                     "posted": len(posted_ids), "total": len(texts)}
         posted_ids.append(str(tw.id))
         _persist_progress()
