@@ -93,16 +93,16 @@ function findPython() {
 // ── Python websockets Detection ──
 
 function findWebsockets() {
-  for (const cmd of ['pip3', 'pip']) {
-    try {
-      const ver = execSync(`${cmd} show websockets 2>&1`, { stdio: 'pipe' }).toString().trim();
-      const match = ver.match(/Name: websockets/);
-      if (match) {
-        return cmd;
-      }
-    } catch {}
+  // Import via the interpreter cdpilot actually selects — pip metadata can
+  // point at a different Python than findPython() resolves.
+  const python = findPython();
+  if (!python) return null;
+  try {
+    const out = execSync(`${python} -c "import websockets; print(getattr(websockets, '__version__', 'installed'))"`, { stdio: 'pipe' }).toString().trim();
+    return out || 'installed';
+  } catch {
+    return null;
   }
-  return null;
 }
 
 // ── Setup Command ──
@@ -127,7 +127,7 @@ function runSetup() {
   }
 
   if (!findPython()) {
-    console.log('\n  ❌ Python 3.8+ not found.');
+    console.log('\n  ❌ Python 3.10+ not found.');
     console.log('  Install: https://www.python.org/downloads/\n');
     process.exit(1);
   }
@@ -178,7 +178,7 @@ function preflight() {
     const ver = execSync(`${python} --version 2>&1`, { stdio: 'pipe' }).toString().trim();
     console.log(`  ✓ ${ver}`);
   } else {
-    console.log('  ✗ Python 3.8+ not found');
+    console.log('  ✗ Python 3.10+ not found');
     console.log('    → Install: https://www.python.org/downloads/\n');
     process.exit(1);
   }
