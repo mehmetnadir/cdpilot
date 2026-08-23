@@ -548,6 +548,12 @@ def _queue_draft(d: dict, decision: dict, idx: int) -> Path:
         item["followup_text"] = d["followup_text"]
     if d.get("image_path"):
         item["image_path"] = d["image_path"]
+    if d.get("texts"):  # kind=thread — ordered tweet chain
+        item["texts"] = d["texts"]
+    if d.get("target_created_ts"):  # reply staleness gate input (poster-side)
+        item["target_created_ts"] = d["target_created_ts"]
+    if d.get("source"):
+        item["source"] = d["source"]
     p = QUEUE_DIR / f"{d['id']}.json"
     p.write_text(json.dumps(item, ensure_ascii=False, indent=2))
 
@@ -782,10 +788,6 @@ def cmd_incoming_reply(json_path: str) -> None:
     sys.path.insert(0, str(Path(__file__).parent))
     from _sanitize import sanitize, render_flags  # type: ignore
 
-    env = _load_env()
-    if not env.get("TELEGRAM_CHAT_ID"):
-        sys.exit("TELEGRAM_CHAT_ID not set — run: telegram_bridge.py setup")
-
     m = json.loads(Path(json_path).read_text())
     tid = m.get("tweet_id")
     author = m.get("author", "@?")
@@ -809,6 +811,32 @@ def cmd_incoming_reply(json_path: str) -> None:
         except Exception as e:
             sys.stderr.write(f"reply_drafter failed for {tid}: {e}\n")
             ai_draft = ""
+
+    # ── AUTO_POST: queue the AI draft directly — no approval card. Poster-side
+    # guardrails (daily cap, 48h staleness via target_created_ts, quiet hours,
+    # crisis freeze) gate the actual send. No draft → nothing to post
+    # unattended (manual reply needs a human), skip silently.
+    if auto_post_enabled():
+        if not ai_draft.strip():
+            print(json.dumps({"mention_tid": tid, "auto_post": "skip_no_draft"}))
+            return
+        auto_draft = {
+            "id": f"aireply-to-{tid}",
+            "kind": "reply",
+            "to": url,
+            "text": ai_draft.strip(),
+            "context": f"AI draft reply to {author} (auto-post, no card)",
+            "source": "mention_auto",
+            "target_created_ts": m.get("created_at"),
+        }
+        qp = auto_queue_draft(auto_draft)
+        print(json.dumps({"mention_tid": tid, "auto_post": "queued",
+                          "queue_path": str(qp), "ai_drafted": True}))
+        return
+
+    env = _load_env()
+    if not env.get("TELEGRAM_CHAT_ID"):
+        sys.exit("TELEGRAM_CHAT_ID not set — run: telegram_bridge.py setup")
 
     flags_str = render_flags(san["flags"])
     body = (

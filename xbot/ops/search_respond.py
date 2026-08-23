@@ -184,6 +184,8 @@ def _auto_queue_reply(c: dict, ai_draft: str, idx: int) -> dict:
         "text": ai_draft,
         "context": f"AI reply to @{c['author']} (search_respond)",
         "source": "search_respond",
+        # Poster-side staleness gate input (48h) — target tweet's own timestamp
+        "target_created_ts": int(c.get("created_ts") or 0) or None,
     }
     qp = tb.auto_queue_draft(draft, idx=idx)
     return {"queued": True, "queue_path": str(qp), "draft_id": draft["id"]}

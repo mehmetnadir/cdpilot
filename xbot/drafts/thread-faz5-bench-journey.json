@@ -1,0 +1,17 @@
+{
+  "id": "thread-faz5-bench-journey",
+  "kind": "thread",
+  "source": "faz5-bench-journey",
+  "context": "Faz 5 launch thread — 12→45 bench journey. Approved draft: cdpilot-bench/.claude/docs/twitter-thread.md (verbatim). DRAFT ONLY — not in a live queue dir; queue via telegram_bridge.auto_queue_draft / batch flow when VPN + go signal ready. Hook visual (12→45 journey table, dark bg) can be attached by adding image_path before queueing.",
+  "texts": [
+    "built a stealth browser automation CLI. then ran it through my own anti-bot benchmark.\n\nthe benchmark said the stealth layer was making it worse 🧵",
+    "first config — stealth on, adaptive on, the one i was proudest of — scored 12 out of 80.\n\nturning stealth OFF scored higher. that's not how it was supposed to go.",
+    "the why: my stealth layer faked navigator.plugins with random names like \"rCJMteXy\".\n\nreal chrome has a known plugin set. a randomized garbage array IS the anomaly. caught it on bot.sannysoft. the spoof was the tell.",
+    "fix was to stop being clever. made the regular tier (zero fingerprint patching) the default. doing nothing beat doing something.",
+    "then the bigger gut-punch. the low score wasn't weak anti-bot — it was 3 bugs in my own test harness.\n\ncross-task tab leaks, no reconnect on dropped net, \"target detached\" 96 times. fixed those → +20 points. zero stealth work.",
+    "concurrency lesson while i'm confessing: max 3 parallel was the sweet spot.\n\n5 → 29 timeouts. 10 → full collapse. trying to go faster made it slower.",
+    "journey: 12 → 19 → 35 (verified 39) → 45 out of 80. 3.75x.\n\ncost across every run: $0.00, free gemini 2.5 flash. (45 is a single run, still verifying it — not calling it final.)",
+    "funded vendors score higher (browserbase 73) but on premium LLMs + cloud browser, ~$150-300/mo. this got into the neighborhood for nothing.",
+    "also shipped `cdpilot watch` — stream frames so an AI can actually watch a video, not guess from one shot.\n\nrepo + writeup → cdpilot.ndr.ist"
+  ]
+}

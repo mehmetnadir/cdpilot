@@ -5,17 +5,32 @@
 
 ---
 
-## Yeni pillar karışımı (Hafta 2+)
+## Yeni pillar karışımı (Revize 2026-08-23 — Nadir onayı)
 
 | % | Pillar | Örnek |
 |---|---|---|
-| 35% | **cdpilot ürün** — feature, recipe, bench | "shipped v0.6.1 — per-host cookies safe-list" |
-| 25% | **LLM/AI/vibe-coder ipuçları** | "most agent stacks miss Page.setDownloadBehavior" |
-| 20% | **Az bilinen ama iyi repolar** | rebrowser-patches, twikit, anubis, vd. |
+| 30% | **cdpilot ürün** — feature, recipe, bench | "shipped v0.9.0 — video watch + friction ladder" |
+| 20% | **Claude ile üretim hikâyeleri** (build-in-public) | "needed a flipbook. every library was 200KB+ of jank. built one from scratch with Claude in a day — zero deps, 60fps. here's the approach" |
+| 20% | **LLM/AI/vibe-coder ipuçları** | "most agent stacks miss Page.setDownloadBehavior" |
+| 15% | **Az bilinen ama iyi repolar** | rebrowser-patches, twifork, anubis, vd. |
 | 10% | **Behind-the-scenes** — kararlar, tradeoffs | "why we chose Option C for TLS" |
-| 10% | **Teaser** — gizli proje sızıntıları (Faz 1+) | conductor, kokpit, mastershop, vd. |
+| 5% | **Teaser** — gizli proje sızıntıları (Faz 1+) | conductor, kokpit, mastershop, vd. |
 
 cdpilot artık posts'un yarısı değil. Marka olarak değer üretmek > kendini reklam etmek.
+
+### "Claude ile üretim hikâyeleri" pillar kuralları (2026-08-23)
+
+Kaynak: Nadir'in gerçek projelerinde Claude ile çözülen problemler. Format: problem → neden hazır çözüm yetmedi → yaklaşım → ölçülebilir sonuç.
+
+**Gizlilik gate'i (ZORUNLU):**
+- Proje adı, müşteri adı, domain, gelir rakamı, ekran görüntüsü PAYLAŞILMAZ (cdpilot hariç).
+- Paylaşılan şey PATTERN'dir: "a publishing client's flipbook" değil → "needed a flipbook".
+- Private repo kodu paylaşılmaz; anlatılan yaklaşım genel çizimle (pseudocode OK).
+- Tereddütte: paylaşma, drafts/'a koy, Nadir'e Telegram'dan sor.
+
+**Soru-cevap kuralı:** Bu pillar'ın tweet'lerine gelen "hangi proje / nasıl yaptınız detayı" tarzı reply'lara bot CEVAP VERMEZ — Nadir kendisi cevaplar. Bot sadece teknik-genel sorulara yanıt drafts'lar.
+
+**Ton:** Kişisel deneyim ("I/we built"), somut sayı (KB, fps, gün), asla "AI did everything" hype'ı — Claude bir araç olarak geçer, hikâyenin kahramanı problem çözümüdür. Reply-bait kuralı bu pillar'da da geçerli.
 
 ---
 
