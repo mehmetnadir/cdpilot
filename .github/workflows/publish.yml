@@ -22,8 +22,10 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install Python runtime deps
-        run: pip install websockets
+        run: python -m pip install websockets
       - name: Run tests
         run: npm test
+        env:
+          CDPILOT_PYTHON: python
       - name: Publish to npm (OIDC)
         run: npm publish --access public --provenance

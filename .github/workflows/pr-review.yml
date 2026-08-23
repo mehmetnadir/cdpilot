@@ -19,16 +19,15 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python runtime deps
-        run: pip install websockets
-
-      - name: Install websockets
-        run: pip install websockets
+        run: python -m pip install websockets
 
       - name: Syntax check
         run: python3 -m py_compile src/cdpilot.py
 
       - name: Run tests
         run: node test/test.js
+        env:
+          CDPILOT_PYTHON: python
 
   lint:
     runs-on: ubuntu-latest
