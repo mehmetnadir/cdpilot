@@ -59,9 +59,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install Python runtime deps
-        run: pip install websockets
+        run: python -m pip install websockets
       - name: Run npm tests
         run: npm test
+        env:
+          CDPILOT_PYTHON: python
       - name: Compile Python
         run: python -m py_compile src/cdpilot.py
       - name: Python version check
