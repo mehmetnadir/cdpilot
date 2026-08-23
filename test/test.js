@@ -77,6 +77,11 @@ test('setup detects python', () => {
   assert(out.includes('Python:'), 'Should show Python detection');
 });
 
+test('setup detects python websockets', () => {
+  const out = run('setup');
+  assert(out.includes('websockets:'), 'Should show Python\'s websockets detection');
+});
+
 // ── File structure ──
 
 test('cdpilot.py exists', () => {
