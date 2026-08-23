@@ -101,6 +101,12 @@ def _patch_user_class():
             legacy = data.get("legacy", {}) if isinstance(data, dict) else {}
             for k, default in _OPTIONAL_LEGACY_FIELDS.items():
                 legacy.setdefault(k, default)
+            # 2026-08: v1.1 endpoints (follow_user et al.) return location as a
+            # plain string; User.__init__ expects {"location": {"location": ...}}.
+            if isinstance(data.get("location"), str):
+                data["location"] = {"location": data["location"]}
+            if isinstance(legacy.get("location"), dict):
+                legacy["location"] = legacy["location"].get("location", "")
         except Exception:
             pass
         return orig_init(self, client, data)

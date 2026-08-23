@@ -49,6 +49,15 @@ COOKIES = Path(os.environ.get(
 
 FAZ = os.environ.get("CDPILOT_FAZ", "0")
 DAILY_CAP = {"0": 2, "0.5": 3, "1": 5, "2": 8}.get(FAZ, 2)
+# Follow-back: anyone following us gets followed back (mutuals carry the
+# bidirectional +15 reply boost in the 2026 For You ranker).
+FOLLOWBACK_CAP = int(os.environ.get("CDPILOT_FOLLOWBACK_DAILY_CAP", "10"))
+
+
+def _auto_post_enabled() -> bool:
+    """Mirror of poster_twikit._auto_post_enabled — keep semantics in sync."""
+    val = os.environ.get("CDPILOT_AUTO_POST", "on").strip().lower()
+    return val in ("on", "1", "true", "yes")
 
 
 def _log(msg: str) -> None:
@@ -97,11 +106,73 @@ def _telegram_draft(handle: str, topic: str) -> None:
         _log(f"telegram draft exception @{handle}: {e}")
 
 
+def _queue_follow(handle: str, topic: str) -> None:
+    """AUTO_POST path: drop a kind=follow item straight into the queue —
+    the poster executes it; no Telegram approval round-trip."""
+    QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    now = int(time.time())
+    item = {
+        "id": f"follow-{handle}-{_today()}",
+        "kind": "follow",
+        "to": handle,
+        "context": f"tier follow ({topic})",
+        "source": "follow_manager",
+        "status": "pending",
+        "created_at": now,
+        "approved_at": now,
+        "scheduled_time": now,
+    }
+    (QUEUE_DIR / f"{item['id']}.json").write_text(
+        json.dumps(item, ensure_ascii=False, indent=1))
+
+
+async def _follow_back(client: Client, state: dict, blocklist: set) -> int:
+    """Follow back everyone following us (capped/day). Returns follows done."""
+    today = _today()
+    fb_days = state.setdefault("followback_days", {})
+    done_today = fb_days.get(today, 0)
+    if done_today >= FOLLOWBACK_CAP:
+        return 0
+    me = await client.get_user_by_screen_name("cdpilot_dev")
+    followers = await client.get_user_followers(me.id, count=100)
+    known = set(state.get("followed", [])) | blocklist
+    import random
+    n = 0
+    for u in followers:
+        if u.screen_name in known:
+            continue
+        if done_today + n >= FOLLOWBACK_CAP:
+            break
+        try:
+            await client.follow_user(u.id)
+            state.setdefault("followed", []).append(u.screen_name)
+            state.setdefault("followed_back", []).append(u.screen_name)
+            n += 1
+            _log(f"follow-back: @{u.screen_name}")
+            await asyncio.sleep(random.uniform(10, 20))
+        except Exception as e:
+            _log(f"follow-back fail @{u.screen_name}: {e!r}")
+    if n:
+        fb_days[today] = done_today + n
+    return n
+
+
 async def main_async() -> None:
     tier = json.loads(TIER_FILE.read_text())
     state = _load_state()
     today = _today()
     proposed_today = state.get("proposed", {}).get(today, [])
+
+    # Follow-back pass runs every cycle, independent of the proposal cap.
+    try:
+        client = Client("en-US")
+        client.load_cookies(str(COOKIES))
+        blocklist = set(tier.get("blocklist", []))
+        fb = await _follow_back(client, state, blocklist)
+        if fb:
+            _save_state(state)
+    except Exception as e:
+        _log(f"follow-back pass error: {e!r}")
 
     if len(proposed_today) >= DAILY_CAP:
         _log(f"daily cap {DAILY_CAP} reached for {today}")
@@ -132,7 +203,11 @@ async def main_async() -> None:
     slots = DAILY_CAP - len(proposed_today)
     picks = candidates[:slots]
     for entry in picks:
-        _telegram_draft(entry["handle"], entry.get("topic", "—"))
+        if _auto_post_enabled():
+            _queue_follow(entry["handle"], entry.get("topic", "—"))
+            _log(f"auto-queued follow @{entry['handle']}")
+        else:
+            _telegram_draft(entry["handle"], entry.get("topic", "—"))
         proposed_today.append(entry["handle"])
 
     state.setdefault("proposed", {})[today] = proposed_today

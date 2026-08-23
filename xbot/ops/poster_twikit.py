@@ -275,7 +275,16 @@ async def _post_thread(client: Client, item: dict, queue_path: Path) -> dict:
                     "posted": len(posted_ids), "total": len(texts)}
         try:
             reply_to = posted_ids[-1] if posted_ids else None
-            tw = await client.create_tweet(text=texts[i], reply_to=reply_to)
+            try:
+                tw = await client.create_tweet(text=texts[i], reply_to=reply_to)
+            except Exception as first:
+                # srv21 egress is flaky: ConnectTimeout('') breaks chains for no
+                # good reason. One backoff retry before declaring partial.
+                if "Timeout" not in type(first).__name__ and "Connect" not in type(first).__name__:
+                    raise
+                _log(f"  🧵 transient {type(first).__name__} at {i + 1}, retrying in 15s")
+                await asyncio.sleep(15)
+                tw = await client.create_tweet(text=texts[i], reply_to=reply_to)
         except Exception as e:
             tb = traceback.format_exc()
             _persist_progress(repr(e))
