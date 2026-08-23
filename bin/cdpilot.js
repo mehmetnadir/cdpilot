@@ -81,6 +81,21 @@ function findPython() {
   return null;
 }
 
+// ── Python websockets Detection ──
+
+function findWebsockets() {
+  for (const cmd of ['pip3', 'pip']) {
+    try {
+      const ver = execSync(`${cmd} show websockets 2>&1`, { stdio: 'pipe' }).toString().trim();
+      const match = ver.match(/Name: websockets/);
+      if (match) {
+        return cmd;
+      }
+    } catch {}
+  }
+  return null;
+}
+
 // ── Setup Command ──
 
 function runSetup() {
@@ -88,11 +103,12 @@ function runSetup() {
   const config = resolveProjectConfig();
 
   console.log('\n  cdpilot setup\n');
-  console.log(`  Browser:  ${browser || '❌ Not found'}`);
-  console.log(`  Profile:  ${config.profileDir}`);
-  console.log(`  CDP Port: ${config.port === '0' ? 'auto' : config.port}`);
-  console.log(`  Project:  ${config.projectId || 'manual mode'}`);
-  console.log(`  Python:   ${findPython() || '❌ Not found'}`);
+  console.log(`  Browser:    ${browser || '❌ Not found'}`);
+  console.log(`  Profile:    ${config.profileDir}`);
+  console.log(`  CDP Port:   ${config.port === '0' ? 'auto' : config.port}`);
+  console.log(`  Project:    ${config.projectId || 'manual mode'}`);
+  console.log(`  Python:     ${findPython() || '❌ Not found'}`);
+  console.log(`  websockets: ${findWebsockets() || '❌ Not found'}`);
 
   if (!browser) {
     console.log('\n  ❌ No compatible browser found.');
@@ -104,6 +120,12 @@ function runSetup() {
   if (!findPython()) {
     console.log('\n  ❌ Python 3.8+ not found.');
     console.log('  Install: https://www.python.org/downloads/\n');
+    process.exit(1);
+  }
+
+  if (!findWebsockets()) {
+    console.log('\n  ❌ Python websockets not found.');
+    console.log('  Install: pip install websockets\n');
     process.exit(1);
   }
 
