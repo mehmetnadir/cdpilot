@@ -18,6 +18,9 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install Python runtime deps
+        run: pip install websockets
+
       - name: Install websockets
         run: pip install websockets
 
