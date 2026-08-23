@@ -7,6 +7,10 @@
 
 ## 1. Ağırlık tablosu (HeavyRanker)
 
+> ⚠️ **SUPERSEDED (2026-08):** Bu tablo 2023 legacy release'den. Gerçek 2026 ağırlıkları
+> için §5'e bak (xai-org/x-algorithm repo'sundan doğrulanmış). Özellikle: reply +27 ve
+> profile click +12 artık GEÇERSİZ.
+
 | Sinyal | Ağırlık | Yorum |
 |---|---|---|
 | **Reply gönderildi** | **+27** | EN GÜÇLÜ sinyal. Reply çekecek format = boost |
@@ -90,4 +94,82 @@ Her draft için (kendin kontrol et):
 
 ---
 
-Son Güncelleme: 2026-05-20
+## 5. 2026-08 güncelleme — Açık kaynak algoritma (xai-org/x-algorithm)
+
+> Kaynak: https://github.com/xai-org/x-algorithm (2026-08-13 açık kaynak, Apache-2.0).
+> Ağırlıklar `home-mixer/params/param.rs`'den doğrudan okundu (2026-08-23 doğrulandı).
+> [TAHMİN] etiketli sayılar üçüncü taraf — repo'da yok, kesin gerçek olarak sunma.
+> Detaylı skill: `~/.claude/skills/x-algorithm-truth/SKILL.md`
+
+### 5.1 Grok/Phoenix ranking — içerik tavanı belirler
+
+- Yeni pipeline: Home Mixer → Thunder (in-network cache) + Phoenix retrieval (two-tower
+  embedding) + SimClusters → Phoenix scorer (her aksiyon için olasılık tahmini) → Grox
+  (yayın anında spam/kalite classifier + text/görsel embedding).
+- **Post metni engagement OLMADAN önce embed edilip kullanıcı ilgi vektörleriyle
+  eşleştiriliyor.** Belirsiz/jenerik metin ("exciting news!") hiçbir cluster'a oturmaz →
+  retrieval'a girmez. Draft'ta TEK net, spesifik iddia + somut terim/sayı zorunlu.
+- İçerik skorun tavanı; erken engagement sadece onaylar [TAHMİN — forkoff.xyz yorumu].
+  Zayıf post'u hızlı beğeni kurtarmaz.
+- Konu tutarlılığı hesap embedding'ini netleştirir; konu dağınıklığı her post'a vergi
+  [TAHMİN]. cdpilot niş'inde kal: browser automation / CDP / AI tooling.
+
+### 5.2 Yeni ağırlıklar — reply > like (repo, kesin)
+
+| Sinyal | 2026 ağırlık | Like'a oran |
+|---|---|---|
+| **Copy-link ile paylaşım** | **+20.0** | **40x** — EN GÜÇLÜ sinyal |
+| **Reply** | **+5.0** | **10x** (eski "27x" GEÇERSİZ) |
+| Quote | +5.0 | 10x |
+| DM ile paylaşım | +5.0 | 10x |
+| Follow (post üzerinden) | +4.0 | 8x |
+| Retweet | +1.0 | 2x |
+| Like | +0.5 | 1x (baz) |
+| Profile click | **0.0** | eski +12 SIFIRLANDI |
+| Mutual'dan reply boost | +15.0 | mutual reply ≈ 4 normal reply |
+| Not interested | −43.2 | |
+| Mute | −58.8 | mute > block cezası! |
+| **Report** | **−234.0** | 1 report ≈ 468 like siler |
+
+- Bookmark ağırlığı param.rs'de YOK — "bookmark 10-12x" iddiaları [TAHMİN].
+- Aynı yazarın ardışık postları ×0.5 decay (taban 0.25) → **min 30 dk aralık kuralı
+  artık repo-kanıtlı**. Out-of-network erişim ×0.75 iskonto.
+- Drafter hedefi: paylaşılabilir + reply çeken içerik. "Kaydet/paylaş değeri var mı?"
+  testi like-optimizasyonundan önemli.
+
+### 5.3 Hız kapıları — ilk 15-30 dakika [TAHMİN]
+
+- 0-5 dk: 3+ etkileşim → ilk boost · 5-15 dk: 10+ → out-of-network yayılım ·
+  15-30 dk: 50+ → viral kaskad (teract.ai; repo'da yok, yönsel olarak makul).
+- Repo kesin gerçek: 48 saatten eski post aday havuzundan DÜŞER. ~6 saatte görünürlük
+  yarılanır [TAHMİN].
+- Bot aksiyonu: post'u peak saatte at + **ilk 60 dk mention/reply'lara cevap hazır ol**
+  (mutual reply +15 boost bunu ödüllendirir). Post at ve kaybol = israf.
+
+### 5.4 Kök tweet'te link cezası — kural sertleşti
+
+- Üçüncü taraf gözlem: kök tweet'te harici link %30-50 erişim kaybı, Premium olmayan
+  hesapta daha ağır [TAHMİN — opentweet.io, teract.ai].
+- Repo gerçeği: `OpenLinkWeight` sadece 0.2 (reply 5.0'ın 1/25'i) — link tıklaması
+  skora neredeyse hiç katkı vermiyor; ayrı bir "link ceza ağırlığı" param.rs'de yok,
+  ceza spam heuristics tarafında.
+- Mevcut kural AYNEN geçerli ve güçlendi: **link HER ZAMAN ilk reply'a.** Hashtag ≤2
+  (fazlası spam classifier tetikler [TAHMİN ~%40 kayıp]).
+
+### 5.5 Original Content Rewards (OCR) — monetizasyon değişti
+
+- Eski ad revenue share **7 Eylül 2026'da bitiyor** (son ödemeler: 14 Ağu, 28 Ağu,
+  11 Eyl). **OCR başvuru: 8 Eylül 2026'dan itibaren**, ödemeler 2 haftada bir.
+- Eşik: **500 verified follower + 500K Home Timeline impression** (ölçüm penceresi
+  doğrulanamadı; Premium şartı muhtemel ama doğrulanamadı).
+- Ödeme birimi: **"qualified impression"** = Premium abonenin Home Timeline'da post'un
+  ≥%50'sini görmesi → For You sıralaması artık doğrudan gelir.
+- Kalifiye içerik: orijinal analiz/rapor, kendi çektiğin görsel/video, özgün yorum.
+  Kopya/agregasyon ve engagement farming HARİÇ. cdpilot bench verileri + build-log
+  içerikleri "genuine analytical commentary" sınıfına girer — strategist bu formatlara
+  ağırlık versin.
+- Kaynak: TechCrunch + Android Headlines (2026-08-08); help.x.com/en/using-x/original-content-rewards (2026-08-23'te 403 verdi, basından doğrulandı).
+
+---
+
+Son Güncelleme: 2026-08-23 (§5 eklendi — xai-org/x-algorithm açık kaynak; §1 legacy işaretlendi)
