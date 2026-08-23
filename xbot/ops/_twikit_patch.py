@@ -131,11 +131,17 @@ def apply() -> None:
     if _PATCHED:
         return
     try:
-        from twikit.x_client_transaction import utils as _utils
-        _utils.handle_x_migration = _cookieless_handle_x_migration
-        # Some callers import the name directly:
-        from twikit.x_client_transaction import transaction as _tx
-        _tx.handle_x_migration = _cookieless_handle_x_migration
+        import twikit as _twikit
+        # 2026-08-23: the migration override is ONLY for the legacy 2.3.3 fork.
+        # On twifork (2.3.5+) it feeds ClientTransaction a landing page whose
+        # ondemand bundle no longer matches -> "Couldn't get KEY_BYTE indices".
+        # twifork handles migration itself; overriding it re-breaks auth.
+        if str(getattr(_twikit, "__version__", "")).startswith("2.3.3"):
+            from twikit.x_client_transaction import utils as _utils
+            _utils.handle_x_migration = _cookieless_handle_x_migration
+            # Some callers import the name directly:
+            from twikit.x_client_transaction import transaction as _tx
+            _tx.handle_x_migration = _cookieless_handle_x_migration
         _patch_user_class()
         _PATCHED = True
     except Exception:
