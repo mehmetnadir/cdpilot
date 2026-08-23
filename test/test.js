@@ -1155,12 +1155,15 @@ test('_quartic_easeout is defined with correct formula', () => {
     "Must define _quartic_easeout(t)");
   assert(/1\.0\s*-\s*\(1\.0\s*-\s*t\)\s*\*\*\s*4/.test(PY_CONTENT),
     "_quartic_easeout must use formula 1-(1-t)^4");
-  // Verify boundary values via Python (inline pure function extract)
-  const { execSync } = require('child_process');
-  const out = execSync(`python3 -c "
+  // Verify boundary values via Python (inline pure function extract).
+  // execFileSync (no shell): cmd.exe mangles multiline -c strings, and
+  // Windows has `python`, not `python3`.
+  const { execFileSync } = require('child_process');
+  const PY_BIN = process.platform === 'win32' ? 'python' : 'python3';
+  const out = execFileSync(PY_BIN, ['-c', `
 def _quartic_easeout(t): return 1.0 - (1.0 - t) ** 4
 print(_quartic_easeout(0), _quartic_easeout(1))
-"`, { encoding: 'utf-8', timeout: 5000 });
+`], { encoding: 'utf-8', timeout: 5000 });
   const [v0, v1] = out.trim().split(' ').map(Number);
   assert(Math.abs(v0 - 0.0) < 0.001, "_quartic_easeout(0) must be 0.0");
   assert(Math.abs(v1 - 1.0) < 0.001, "_quartic_easeout(1) must be 1.0");
@@ -1168,8 +1171,9 @@ print(_quartic_easeout(0), _quartic_easeout(1))
 
 test('_bezier_path returns correct point count', () => {
   // Verify formula via inline Python (stdlib only, no cdpilot.py load needed)
-  const { execSync } = require('child_process');
-  const out = execSync(`python3 -c "
+  const { execFileSync } = require('child_process');
+  const PY_BIN = process.platform === 'win32' ? 'python' : 'python3';
+  const out = execFileSync(PY_BIN, ['-c', `
 import random, os
 os.environ['CDPILOT_ENTROPY_SEED'] = '42'
 _ENTROPY_SEED = '42'
@@ -1187,13 +1191,14 @@ def _bezier_path(start_xy, end_xy, points=15):
     return result
 pts = _bezier_path((0, 0), (100, 100), 10)
 print(len(pts))
-"`, { encoding: 'utf-8', timeout: 5000 });
+`], { encoding: 'utf-8', timeout: 5000 });
   assert.strictEqual(parseInt(out.trim()), 10, "_bezier_path must return exactly N points");
 });
 
 test('_gauss stays within [lo, hi] bounds (1000 samples)', () => {
-  const { execSync } = require('child_process');
-  const out = execSync(`python3 -c "
+  const { execFileSync } = require('child_process');
+  const PY_BIN = process.platform === 'win32' ? 'python' : 'python3';
+  const out = execFileSync(PY_BIN, ['-c', `
 import random
 _ENTROPY_SEED = '42'
 def _gauss(mu, sigma, lo, hi):
@@ -1201,7 +1206,7 @@ def _gauss(mu, sigma, lo, hi):
     return max(lo, min(hi, r.gauss(mu, sigma)))
 failures = [v for i in range(1000) for v in [_gauss(85, 25, 40, 200)] if v < 40 or v > 200]
 print(len(failures))
-"`, { encoding: 'utf-8', timeout: 5000 });
+`], { encoding: 'utf-8', timeout: 5000 });
   assert.strictEqual(parseInt(out.trim()), 0, "_gauss must produce 0 out-of-range samples in 1000 trials");
 });
 

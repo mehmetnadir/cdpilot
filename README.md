@@ -76,7 +76,7 @@ npx cdpilot <command>
 npm i -g cdpilot
 ```
 
-**Requirements:** Node.js 18+ and one of: Brave Browser, Google Chrome, or Chromium.
+**Requirements:** Node.js 18+, Python 3.10+, and one of: Brave Browser, Google Chrome, or Chromium. (The Python `websockets` module is auto-installed by the pre-flight wizard on first launch.)
 
 ### First-time setup
 
