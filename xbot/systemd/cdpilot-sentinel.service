@@ -1,0 +1,12 @@
+[Unit]
+Description=cdpilot xbot sentinel — Twitter operasyonu bekçisi (fs+journal, API'siz)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/cdpilot-twitter-bot
+ExecStart=/usr/bin/python3 /opt/cdpilot-twitter-bot/ops/xbot_sentinel.py
+Environment=CDPILOT_BOT_HOME=/opt/cdpilot-twitter-bot
+Environment=CDPILOT_TELEGRAM_ENV=/opt/cdpilot-twitter-bot/telegram.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cdpilot-sentinel

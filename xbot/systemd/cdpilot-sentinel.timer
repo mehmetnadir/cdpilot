@@ -1,0 +1,10 @@
+[Unit]
+Description=cdpilot sentinel — 30 dakikada bir bot sağlık kontrolü
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
