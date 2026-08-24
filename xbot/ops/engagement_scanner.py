@@ -521,6 +521,7 @@ def _auto_queue_like(c: dict) -> Path:
         "to": c["url"],
         "text": "",
         "context": f"auto-like (score {c.get('score')}, @{c.get('handle')})",
+        "status": "pending",  # poster only picks pending/partial — omit and it rots
         "approved_at": int(time.time()),
         "scheduled_time": int(time.time()) + 30,  # ~30s delay for humanizer
         "source": "engagement_scanner_auto",
@@ -541,6 +542,7 @@ def _auto_queue_reply(c: dict, draft_text: str) -> Path:
         "to": c["url"],
         "text": draft_text,
         "context": f"auto-reply via ai_draft (score {c.get('score')}, @{c.get('handle')})",
+        "status": "pending",  # poster only picks pending/partial — omit and it rots
         "approved_at": int(time.time()),
         "scheduled_time": int(time.time()) + delay,
         "source": "engagement_scanner_auto",

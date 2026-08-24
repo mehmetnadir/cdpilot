@@ -98,7 +98,7 @@ def _tr_summary(text: str) -> str:
     try:
         proc = subprocess.run(
             ["claude", "-p", prompt],
-            capture_output=True, text=True, timeout=30, check=False,
+            capture_output=True, text=True, timeout=75, check=False,
         )
     except Exception as e:
         _log(f"tr_summary claude call failed: {e}")
