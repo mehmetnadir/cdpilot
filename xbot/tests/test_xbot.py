@@ -133,14 +133,17 @@ def test_tweet_id_invalid_returns_none():
 
 # ── crisis_check: aggregate + freeze flag round-trip ──
 def test_crisis_aggregate_sums_tweet_metrics(monkeypatch):
+    """Schema must match what daily_analytics actually writes: "tweet_metrics",
+    with view counts arriving from X as strings (2026-08-25 regression: this test
+    asserted a "tweets" key that no producer ever wrote, so crisis detection read
+    zero metrics every single day and could never trigger)."""
     monkeypatch.setenv("CDPILOT_XBOT_DATA", tempfile.mkdtemp())
     from crisis_check import _aggregate  # type: ignore
     rec = {
         "date": "2026-05-22",
         "followers": 42,
-        "tweets_tracked": 2,
-        "tweets": [
-            {"likes": 5, "replies": 1, "rt": 2, "quotes": 0, "bookmarks": 1, "views": 100},
+        "tweet_metrics": [
+            {"likes": 5, "replies": 1, "rt": 2, "quotes": 0, "bookmarks": 1, "views": "100"},
             {"likes": 3, "replies": 0, "rt": 1, "quotes": 0, "bookmarks": 0, "views": 50},
         ],
     }
@@ -149,6 +152,119 @@ def test_crisis_aggregate_sums_tweet_metrics(monkeypatch):
     assert agg["replies"] == 1
     assert agg["total_engagement"] == 8 + 1 + 3 + 0 + 1
     assert agg["views"] == 150
+    assert agg["tweets_tracked"] == 2
+
+
+def test_crisis_aggregate_accepts_legacy_tweets_key(monkeypatch):
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", tempfile.mkdtemp())
+    from crisis_check import _aggregate  # type: ignore
+    agg = _aggregate({"date": "2026-05-01", "followers": 10,
+                      "tweets": [{"likes": 2, "views": "7"}]})
+    assert agg["likes"] == 2 and agg["views"] == 7
+
+
+def _crisis_with_history(tmp_path, monkeypatch, days):
+    """Write analytics snapshots for the last len(days) dates and run check()."""
+    import importlib
+    from datetime import datetime, timedelta, timezone
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    sys.modules.pop("crisis_check", None)
+    crisis_check = importlib.import_module("crisis_check")  # type: ignore
+    adir = tmp_path / "analytics"
+    adir.mkdir(parents=True, exist_ok=True)
+    today = datetime.now(timezone.utc).date()
+    for offset, snap in enumerate(reversed(days)):
+        d = today - timedelta(days=offset)
+        snap = {"date": d.isoformat(), **snap}
+        (adir / f"{d.isoformat()}.json").write_text(json.dumps(snap))
+    monkeypatch.setattr(crisis_check, "_telegram_send", lambda *a, **k: None)
+    return crisis_check, crisis_check.check()
+
+
+def test_crisis_drop_rules_disarmed_on_thin_baseline(tmp_path, monkeypatch):
+    """Only one prior day carried tweets — a quiet day must not freeze posting."""
+    hist = [{"followers": 40, "tweet_metrics": []} for _ in range(5)]
+    hist[-2] = {"followers": 40, "tweet_metrics": [{"likes": 9, "views": "900"}]}
+    hist[-1] = {"followers": 40, "tweet_metrics": [{"likes": 0, "views": "1"}]}
+    crisis_check, res = _crisis_with_history(tmp_path, monkeypatch, hist)
+    assert res["triggered"] is False
+    assert any("disarmed" in s for s in res["skipped"])
+    assert not crisis_check.FREEZE_FLAG.exists()
+
+
+def test_crisis_single_unfollow_on_small_account_does_not_freeze(tmp_path, monkeypatch):
+    hist = [{"followers": 3, "tweet_metrics": []} for _ in range(4)]
+    hist[-1] = {"followers": 2, "tweet_metrics": []}
+    crisis_check, res = _crisis_with_history(tmp_path, monkeypatch, hist)
+    assert res["triggered"] is False
+    assert any("noise floor" in s for s in res["skipped"])
+    assert not crisis_check.FREEZE_FLAG.exists()
+
+
+def test_crisis_follower_fetch_failure_is_not_a_drop(tmp_path, monkeypatch):
+    """_collect stores followers=None when the profile fetch fails."""
+    hist = [{"followers": 120, "tweet_metrics": []} for _ in range(4)]
+    hist[-1] = {"followers": None, "tweet_metrics": []}
+    crisis_check, res = _crisis_with_history(tmp_path, monkeypatch, hist)
+    assert res["triggered"] is False
+    assert not crisis_check.FREEZE_FLAG.exists()
+
+
+def test_crisis_real_follower_drop_still_triggers(tmp_path, monkeypatch):
+    hist = [{"followers": 120, "tweet_metrics": []} for _ in range(4)]
+    hist[-1] = {"followers": 100, "tweet_metrics": []}
+    crisis_check, res = _crisis_with_history(tmp_path, monkeypatch, hist)
+    assert res["triggered"] is True
+    assert any("follower drop" in r for r in res["reasons"])
+    assert crisis_check.FREEZE_FLAG.exists()
+
+
+def _import_daily_analytics(tmp_path, monkeypatch):
+    """daily_analytics imports twikit at module scope; stub it so the pure
+    formatting path is testable without the bot venv."""
+    import importlib
+    import types
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    fake = types.ModuleType("twikit")
+    fake.Client = object
+    monkeypatch.setitem(sys.modules, "twikit", fake)
+    monkeypatch.setitem(sys.modules, "_twikit_patch", types.ModuleType("_twikit_patch"))
+    sys.modules.pop("daily_analytics", None)
+    return importlib.import_module("daily_analytics")
+
+
+def test_daily_analytics_markdown_survives_string_view_counts(tmp_path, monkeypatch):
+    """2026-08-25 regression (sentinel C6): X returns view_count as a str, so
+    sum() over mixed int/str metrics raised TypeError inside _write_markdown.
+    The JSON snapshot was already on disk by then, so only the daily-log block
+    vanished — two nights in a row, with the cycle reporting a clean run."""
+    da = _import_daily_analytics(tmp_path, monkeypatch)
+    snapshot = {
+        "date": "2026-08-24",
+        "followers": 3,
+        "following": 8,
+        "tweet_metrics": [
+            {"id": "thread-faz5", "views": "31", "likes": 0, "replies": 2, "rt": 0,
+             "text": "t", "url": "https://x.com/cdpilot_dev/status/1"},
+            {"id": "search-reply", "views": 5, "likes": 1, "replies": 0, "rt": 0,
+             "text": "r", "url": None},
+        ],
+    }
+    da._write_markdown(snapshot)
+    body = da.DAILY_LOG.read_text()
+    assert "## 2026-08-24" in body
+    assert "36 views" in body      # 31 (str) + 5 (int)
+    assert "**Tweets tracked:** 2" in body
+
+
+def test_daily_analytics_to_int_handles_x_formats(tmp_path, monkeypatch):
+    da = _import_daily_analytics(tmp_path, monkeypatch)
+    assert da._to_int("31") == 31
+    assert da._to_int("1,234") == 1234
+    assert da._to_int(7) == 7
+    assert da._to_int(None) == 0
+    assert da._to_int("") == 0
+    assert da._to_int("n/a") == 0
 
 
 def test_crisis_clear_removes_flag(monkeypatch, tmp_path):

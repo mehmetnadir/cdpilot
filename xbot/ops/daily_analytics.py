@@ -49,6 +49,29 @@ def _log(msg: str) -> None:
     sys.stderr.write(line)
 
 
+def _to_int(v) -> int:
+    """X metric fields arrive mixed-typed: view_count is a str ('31'), the rest int.
+    Coerce at the source so snapshots are homogeneous for every downstream consumer."""
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        cleaned = v.replace(",", "").replace("\u00a0", "").strip()
+        if cleaned.isdigit():
+            return int(cleaned)
+        if cleaned:
+            _log(f"metric coercion failed: {v!r} -> 0")
+        return 0
+    if v is None:
+        return 0
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        _log(f"metric coercion failed: {v!r} -> 0")
+        return 0
+
+
 async def _collect(days: int) -> dict:
     if not COOKIES_PATH.exists():
         _log(f"cookies missing: {COOKIES_PATH}")
@@ -82,12 +105,12 @@ async def _collect(days: int) -> dict:
             "text": item.get("text", "")[:160],
             "url": item.get("tweet_url"),
             "posted_at": posted_at,
-            "likes": getattr(tw, "favorite_count", 0) or 0,
-            "replies": getattr(tw, "reply_count", 0) or 0,
-            "rt": getattr(tw, "retweet_count", 0) or 0,
-            "quotes": getattr(tw, "quote_count", 0) or 0,
-            "bookmarks": getattr(tw, "bookmark_count", 0) or 0,
-            "views": getattr(tw, "view_count", 0) or 0,
+            "likes": _to_int(getattr(tw, "favorite_count", 0)),
+            "replies": _to_int(getattr(tw, "reply_count", 0)),
+            "rt": _to_int(getattr(tw, "retweet_count", 0)),
+            "quotes": _to_int(getattr(tw, "quote_count", 0)),
+            "bookmarks": _to_int(getattr(tw, "bookmark_count", 0)),
+            "views": _to_int(getattr(tw, "view_count", 0)),
         })
 
     # Follower count
@@ -113,15 +136,15 @@ def _write_markdown(snapshot: dict) -> None:
     date = snapshot["date"]
     DAILY_LOG.parent.mkdir(parents=True, exist_ok=True)
     metrics = snapshot.get("tweet_metrics", [])
-    metrics_sorted = sorted(metrics, key=lambda x: x.get("views", 0), reverse=True)
+    metrics_sorted = sorted(metrics, key=lambda x: _to_int(x.get("views")), reverse=True)
 
     lines = [f"\n## {date}\n"]
     lines.append(f"- **Followers:** {snapshot.get('followers')} (following {snapshot.get('following')})")
     lines.append(f"- **Tweets tracked:** {len(metrics)}")
     if metrics:
-        total_views = sum(m["views"] for m in metrics)
-        total_likes = sum(m["likes"] for m in metrics)
-        total_replies = sum(m["replies"] for m in metrics)
+        total_views = sum(_to_int(m.get("views")) for m in metrics)
+        total_likes = sum(_to_int(m.get("likes")) for m in metrics)
+        total_replies = sum(_to_int(m.get("replies")) for m in metrics)
         lines.append(f"- **Aggregate:** {total_views} views · {total_likes} likes · {total_replies} replies")
         lines.append("\n### Top engagement")
         for m in metrics_sorted[:5]:

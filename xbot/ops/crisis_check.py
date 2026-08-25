@@ -38,6 +38,11 @@ TELEGRAM_BRIDGE = Path(__file__).parent / "telegram_bridge.py"
 
 DROP_THRESHOLD = 0.60  # 60% drop vs baseline triggers
 IMPR_FLOOR = 0.40
+# A freeze blocks ALL posting, so the drop rules stay disarmed until the baseline
+# carries real signal. On a young account an empty history reads as a collapse —
+# and a freeze nobody notices is how posting died for 6 weeks in 2026-08.
+MIN_BASELINE_DAYS = 3      # baseline days that actually tracked tweets
+MIN_FOLLOWERS_FOR_DROP = 25  # below this, ordinary churn is noise, not a shadowban
 
 
 def _log(msg: str) -> None:
@@ -74,15 +79,33 @@ def _load_analytics_history() -> list[dict]:
     return out
 
 
+def _to_int(v) -> int:
+    """Snapshots may carry str metrics (X returns view_count as a string)."""
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, int):
+        return v
+    try:
+        return int(str(v).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0
+
+
 def _aggregate(record: dict) -> dict:
-    """Sum tweet metrics for a day record."""
-    tweets = record.get("tweets") or []
-    likes = sum(t.get("likes", 0) for t in tweets)
-    replies = sum(t.get("replies", 0) for t in tweets)
-    rt = sum(t.get("rt", 0) for t in tweets)
-    quotes = sum(t.get("quotes", 0) for t in tweets)
-    bookmarks = sum(t.get("bookmarks", 0) for t in tweets)
-    views = sum(t.get("views", 0) for t in tweets)
+    """Sum tweet metrics for a day record.
+
+    daily_analytics writes the list under "tweet_metrics"; "tweets" is the legacy
+    key kept for snapshots written before that rename.
+    """
+    tweets = record.get("tweet_metrics")
+    if tweets is None:
+        tweets = record.get("tweets") or []
+    likes = sum(_to_int(t.get("likes")) for t in tweets)
+    replies = sum(_to_int(t.get("replies")) for t in tweets)
+    rt = sum(_to_int(t.get("rt")) for t in tweets)
+    quotes = sum(_to_int(t.get("quotes")) for t in tweets)
+    bookmarks = sum(_to_int(t.get("bookmarks")) for t in tweets)
+    views = sum(_to_int(t.get("views")) for t in tweets)
     return {
         "date": record.get("date"),
         "tweets_tracked": record.get("tweets_tracked", len(tweets)),
@@ -105,10 +128,21 @@ def check() -> dict:
 
     triggered = False
     reasons: list[str] = []
+    skipped: list[str] = []
+
+    # Drop rules need a baseline that actually observed tweets; days where
+    # analytics tracked nothing are absence of data, not absence of engagement.
+    baseline_with_data = [d for d in baseline if d["tweets_tracked"] > 0]
+    signal_ok = len(baseline_with_data) >= MIN_BASELINE_DAYS
+    if not signal_ok:
+        skipped.append(
+            f"drop rules disarmed: {len(baseline_with_data)}/{MIN_BASELINE_DAYS} "
+            "baseline days with tracked tweets"
+        )
 
     # Engagement drop
-    base_eng = [d["total_engagement"] for d in baseline if d["total_engagement"] > 0]
-    if base_eng:
+    base_eng = [d["total_engagement"] for d in baseline_with_data if d["total_engagement"] > 0]
+    if signal_ok and base_eng:
         median_eng = statistics.median(base_eng)
         if median_eng > 0 and today["total_engagement"] < median_eng * (1 - DROP_THRESHOLD):
             triggered = True
@@ -118,8 +152,8 @@ def check() -> dict:
             )
 
     # Impression drop
-    base_views = [d["views"] for d in baseline if d["views"] > 0]
-    if base_views:
+    base_views = [d["views"] for d in baseline_with_data if d["views"] > 0]
+    if signal_ok and base_views:
         median_views = statistics.median(base_views)
         if median_views > 0 and today["views"] < median_views * IMPR_FLOOR:
             triggered = True
@@ -131,15 +165,23 @@ def check() -> dict:
     # Follower drop
     if len(daily) >= 2:
         yesterday = daily[-2]
-        if today["followers"] < yesterday["followers"]:
-            triggered = True
-            reasons.append(
-                f"follower drop: {yesterday['followers']} → {today['followers']}"
-            )
+        f_now, f_prev = today["followers"], yesterday["followers"]
+        # followers is None whenever the profile fetch failed — a failed read is
+        # not a drop. And on a tiny account a single unfollow must not freeze posting.
+        if isinstance(f_now, int) and isinstance(f_prev, int):
+            if f_prev >= MIN_FOLLOWERS_FOR_DROP and f_now < f_prev - 1:
+                triggered = True
+                reasons.append(f"follower drop: {f_prev} → {f_now}")
+            elif f_now < f_prev:
+                skipped.append(
+                    f"follower dip {f_prev} → {f_now} below noise floor "
+                    f"(needs base ≥{MIN_FOLLOWERS_FOR_DROP} and >1 lost)"
+                )
 
     result = {
         "triggered": triggered,
         "reasons": reasons,
+        "skipped": skipped,
         "today": today,
         "baseline_median_engagement": (
             statistics.median(base_eng) if base_eng else 0
@@ -160,7 +202,10 @@ def check() -> dict:
             "Düzeldikten sonra: python crisis_check.py --clear"
         )
     else:
-        _log(f"OK · today_eng={today['total_engagement']} · followers={today['followers']}")
+        _log(
+            f"OK · today_eng={today['total_engagement']} · followers={today['followers']}"
+            + (f" · skipped={skipped}" if skipped else "")
+        )
 
     return result
 
