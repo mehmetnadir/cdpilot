@@ -37,15 +37,20 @@
 ## Aktif Çalışma
 | Durum | Alan | Açıklama |
 |-------|------|----------|
-| ✅ | v0.8.0 npm | OIDC trusted publisher ile yayında (npm provenance) |
-| ✅ | v0.9 yetenekler | friction ladder, press-hold solver, video watch, 3-tier mode, captcha-solve, multi-instance pool, offscreen, smart-close — 70+ komut, 330 test |
-| ✅ | Bench | native 45/80 (single run) + Docker 30/80 (reproducible). 12→45 journey, $0 |
-| ✅ | Site | cdpilot.ndr.ist güncel (v0.9 özellikler yansıdı) |
-| ✅ | Twitter bot | @cdpilot_dev canlı + otomatik-post (TR özet bildirimi), srv21 |
-| ⏳ | Faz 5 yayın | Twitter thread onaylı — thread-poster (8 tweet zinciri) + VPN bekliyor |
+| ✅ | v0.9.0 npm | Yayında (OIDC provenance); CI tüm platformlar yeşil (Windows dahil) |
+| ✅ | Faz 5 yayın | Thread 9/9 canlı: x.com/cdpilot_dev/status/2091520585192845488 |
+| ✅ | Twitter bot | twifork + guardrail'lı auto-post + follow-back + sentinel (30dk health watchdog, Telegram alarm + 09:00 özet) |
+| ✅ | İçerik sistemi | Pillar'lar revize (%20 "Claude ile üretim hikâyeleri"); skill'ler: x-harvest, x-algorithm-truth, x-humanizer, x-hook-extractor, x-content-planner |
+| ⏳ | v0.9.1 sprint | Bağlantı dayanıklılığı: auto-relaunch/attach + evrensel --timeout (#2) + open alias — friction analizi 292+171+14 hata |
+| ⏳ | Sentinel takip | C6: daily_analytics gece yazmıyor (debug) · C8: 2 failed auto-like sebebi |
 | ⏳ | v0.9 tls-proxy | Optional local TLS-MITM (curl-impersonate semantics) |
 
-Son Güncelleme: 2026-06-08
+## Son Oturum
+→ Detay: `.claude/session-journal/2026-08-25-1040-v090-twitter-revival.md` | Tüm geçmiş: `.claude/session-journal/INDEX.md`
+→ Durum: v0.9.0 her yerde (npm/site/CI yeşil); Twitter operasyonu tam otonom + sentinel bekçide; 185'lik kuyruk çürümesi sınıfı kapatıldı.
+→ İlk iş: sentinel C6 (analytics gece yazmıyor) debug → sonra v0.9.1 Bağlantı Dayanıklılığı Sprint'i.
+
+Son Güncelleme: 2026-08-25
 
 <!-- gitnexus:start -->
 ## GitNexus — Code Intelligence

@@ -144,10 +144,11 @@ def collect() -> list[tuple[str, str]]:
     if last_cycle and now - last_cycle > CYCLE_STALE_H * 3600:
         fails.append(("C4", f"son cycle {((now - last_cycle) / 3600):.1f}h önce — timer sağlığını kontrol et"))
 
-    # C5 — poster staleness (log mtime; timer 5dk)
-    plog = BOT / "logs" / "poster.log"
-    if plog.exists() and now - plog.stat().st_mtime > POSTER_STALE_MIN * 60:
-        fails.append(("C5", f"poster.log {((now - plog.stat().st_mtime) / 60):.0f}dk'dır sessiz (timer 5dk'da bir koşmalı)"))
+    # C5 — poster staleness. Journal-based: quiet empty-queue runs write no log
+    # line, so log mtime false-alarms during idle periods (caught on day 1).
+    last_poster = _journal_last("cdpilot-poster.service", "Finished")
+    if last_poster and now - last_poster > POSTER_STALE_MIN * 60:
+        fails.append(("C5", f"poster son koşusu {((now - last_poster) / 60):.0f}dk önce (timer 5dk'da bir koşmalı)"))
 
     # C6 — analytics freshness (after 22:15 TR today's block must exist)
     tr = time.gmtime(now + TR_OFFSET_S)
