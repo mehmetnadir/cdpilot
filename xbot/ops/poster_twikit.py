@@ -371,6 +371,35 @@ async def _follow(client: Client, to: str | None) -> dict:
     return {"ok": True, "action": "follow", "target": handle, "uid": uid}
 
 
+# X/httpx timeout classes stringify to '' — str(e) alone loses the cause.
+IDEMPOTENT_KINDS = {"like", "retweet", "rt", "bookmark", "follow"}
+
+
+def _err_str(e: BaseException) -> str:
+    """httpx.ConnectTimeout('') renders as an empty string, which wrote blank
+    `error` fields into failed/ and made post-mortems impossible (2026-08 C8)."""
+    return str(e) or repr(e)
+
+
+def _is_transient(e: BaseException) -> bool:
+    name = type(e).__name__
+    return "Timeout" in name or "Connect" in name
+
+
+async def _with_transient_retry(kind: str, item: dict, call):
+    """srv21's egress to X drops connections at random; a ConnectTimeout is not
+    a rejection. Only idempotent actions retry — re-sending a tweet/reply after
+    a timeout could duplicate a post that actually landed server-side."""
+    try:
+        return await call()
+    except Exception as first:
+        if not _is_transient(first):
+            raise
+        _log(f"  ↻ transient {type(first).__name__} on {kind} {item.get('id')} — retrying in 15s")
+        await asyncio.sleep(15)
+        return await call()
+
+
 async def _process_one(client: Client, item: dict) -> dict:
     kind = item.get("kind", "tweet")
     text = item.get("text", "")
@@ -468,6 +497,10 @@ async def main_async() -> None:
             _log(f"posting {item['id']} ({kind}): {preview}...")
             if kind == "thread":
                 result = await _post_thread(client, item, p)
+            elif kind in IDEMPOTENT_KINDS:
+                result = await _with_transient_retry(
+                    kind, item, lambda: _process_one(client, item)
+                )
             else:
                 result = await _process_one(client, item)
             if result.get("ok"):
@@ -551,7 +584,7 @@ async def main_async() -> None:
                 # Never lose a partially-posted chain to failed/ — keep the
                 # queue file (status=partial) so the next run resumes it.
                 item["status"] = "partial"
-                item["error"] = str(e)
+                item["error"] = _err_str(e)
                 p.write_text(json.dumps(item, ensure_ascii=False, indent=2))
                 _telegram_notify(
                     f"⚠️ Thread `{item['id']}` exception — kısmi ilerleme korundu, "
@@ -559,11 +592,11 @@ async def main_async() -> None:
                 )
                 continue
             item["status"] = "failed"
-            item["error"] = str(e)
+            item["error"] = _err_str(e)
             item["traceback"] = tb
             (FAILED_DIR / p.name).write_text(json.dumps(item, ensure_ascii=False, indent=2))
             p.unlink()
-            _telegram_notify(f"🔴 `{item['id']}` EXCEPTION: {str(e)[:200]}")
+            _telegram_notify(f"🔴 `{item['id']}` EXCEPTION: {_err_str(e)[:200]}")
 
 
 def main() -> None:

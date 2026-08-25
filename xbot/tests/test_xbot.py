@@ -219,6 +219,74 @@ def test_crisis_real_follower_drop_still_triggers(tmp_path, monkeypatch):
     assert crisis_check.FREEZE_FLAG.exists()
 
 
+def _import_poster(tmp_path, monkeypatch):
+    import importlib
+    import types
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    fake = types.ModuleType("twikit")
+    fake.Client = object
+    monkeypatch.setitem(sys.modules, "twikit", fake)
+    monkeypatch.setitem(sys.modules, "_twikit_patch", types.ModuleType("_twikit_patch"))
+    sys.modules.pop("poster_twikit", None)
+    return importlib.import_module("poster_twikit")
+
+
+def test_poster_err_str_never_blank(tmp_path, monkeypatch):
+    """2026-08 C8: two auto-likes died on httpx.ConnectTimeout, whose str() is
+    '' — so failed/ recorded an empty error and the cause was unrecoverable."""
+    pt = _import_poster(tmp_path, monkeypatch)
+
+    class ConnectTimeout(Exception):
+        pass
+
+    assert pt._err_str(ConnectTimeout("")) == "ConnectTimeout('')"
+    assert pt._err_str(ValueError("boom")) == "boom"
+
+
+def test_poster_transient_retry_recovers_idempotent_action(tmp_path, monkeypatch):
+    import asyncio
+    pt = _import_poster(tmp_path, monkeypatch)
+    real_sleep = asyncio.sleep  # patching the module attr in place would recurse
+    monkeypatch.setattr(pt.asyncio, "sleep", lambda *_a, **_k: real_sleep(0))
+    calls = []
+
+    class ConnectTimeout(Exception):
+        pass
+
+    async def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectTimeout("")
+        return {"ok": True, "action": "like"}
+
+    res = asyncio.run(pt._with_transient_retry("like", {"id": "x"}, flaky))
+    assert res["ok"] is True and len(calls) == 2
+
+
+def test_poster_transient_retry_reraises_real_errors(tmp_path, monkeypatch):
+    import asyncio
+    pt = _import_poster(tmp_path, monkeypatch)
+    calls = []
+
+    async def rejected():
+        calls.append(1)
+        raise ValueError("tweet not found")
+
+    with pytest.raises(ValueError):
+        asyncio.run(pt._with_transient_retry("like", {"id": "x"}, rejected))
+    assert len(calls) == 1  # no retry on a genuine rejection
+
+
+def test_poster_does_not_retry_non_idempotent_kinds(tmp_path, monkeypatch):
+    """A timeout on create_tweet may mean 'posted, response lost' — retrying
+    there would duplicate the post, so only these kinds are retried."""
+    pt = _import_poster(tmp_path, monkeypatch)
+    assert pt.IDEMPOTENT_KINDS == {"like", "retweet", "rt", "bookmark", "follow"}
+    assert "tweet" not in pt.IDEMPOTENT_KINDS
+    assert "reply" not in pt.IDEMPOTENT_KINDS
+    assert "quote" not in pt.IDEMPOTENT_KINDS
+
+
 def _import_daily_analytics(tmp_path, monkeypatch):
     """daily_analytics imports twikit at module scope; stub it so the pure
     formatting path is testable without the bot venv."""
