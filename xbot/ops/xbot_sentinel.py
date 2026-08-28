@@ -179,27 +179,48 @@ def collect() -> list[tuple[str, str]]:
     if fresh_failed:
         fails.append(("C8", f"son 24h'te {len(fresh_failed)} failed öğe: {', '.join(fresh_failed[:3])}"))
 
-    # C9 — drafting engine down (canned fallback = every reply identical)
-    drafter_log = BOT / "logs" / "reply-drafter.log"
-    if drafter_log.exists():
-        dead = 0
-        try:
-            for line in drafter_log.read_text(errors="replace").splitlines()[-400:]:
-                if "claude CLI timeout" in line or "claude unavailable" in line:
-                    stamp = line[1:20]
-                    try:
-                        t = time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
-                    except ValueError:
-                        continue
-                    if now - t < 24 * 3600:
-                        dead += 1
-        except Exception:
-            dead = 0
-        if dead:
-            fails.append(("C9", f"taslak üreteci ölü: son 24h'te {dead} claude "
-                                f"timeout/unavailable — cevaplar canned metne düşüyor"))
+    # C9 — every drafting engine down (the canned fallback makes replies identical).
+    # Running on the backup engine is NOT an anomaly: it is reported in the daily
+    # digest instead, so a months-long degraded-but-working state does not train
+    # us to ignore this alarm.
+    sig = _drafter_signal()
+    if sig["last"] == "all_down":
+        fails.append(("C9", f"TÜM taslak motorları ölü (son deneme fallback'e düştü, "
+                            f"24h'te {sig['all_down_24h']}×) — auto-post duruyor"))
 
     return fails
+
+
+def _drafter_signal() -> dict:
+    """Read reply-drafter.log: which engine is serving, and did everything fail."""
+    out = {"all_down_24h": 0, "primary_down_24h": 0, "backup_ok_24h": 0,
+           "last": None}
+    log = BOT / "logs" / "reply-drafter.log"
+    if not log.exists():
+        return out
+    now = time.time()
+    try:
+        lines = log.read_text(errors="replace").splitlines()[-600:]
+    except Exception:
+        return out
+    for line in lines:
+        try:
+            t = time.mktime(time.strptime(line[1:20], "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+        if now - t > 24 * 3600:
+            continue
+        if "ALL ENGINES DOWN" in line:
+            out["all_down_24h"] += 1
+            out["last"] = "all_down"
+        elif "claude CLI timeout" in line or "claude skipped" in line:
+            out["primary_down_24h"] += 1
+        elif "drafted via nim" in line:
+            out["backup_ok_24h"] += 1
+            out["last"] = "nim"
+        elif "drafted via claude" in line:
+            out["last"] = "claude"
+    return out
 
 
 def digest() -> str:
@@ -218,10 +239,21 @@ def digest() -> str:
                        f" ({latest.stem})")
     except Exception:
         pass
+    sig = _drafter_signal()
+    if sig["last"] == "all_down":
+        engine_line = f"⛔ tüm motorlar ölü ({sig['all_down_24h']}× fallback)"
+    elif sig["primary_down_24h"] and sig["backup_ok_24h"]:
+        engine_line = (f"⚠️ yedek motorda ({sig['backup_ok_24h']} taslak NIM'den, "
+                       f"claude {sig['primary_down_24h']}× yanıt vermedi)")
+    elif sig["backup_ok_24h"] or sig["primary_down_24h"]:
+        engine_line = f"NIM {sig['backup_ok_24h']} taslak"
+    else:
+        engine_line = "taslak üretilmedi"
     return ("📊 xbot günlük özet\n"
             f"• kuyruk: {q} öğe\n"
             f"• son 24h posted: {len(posted_24h)} ({', '.join(posted_24h[:4])})\n"
-            f"• analytics: {last_an or 'veri yok'}")
+            f"• analytics: {last_an or 'veri yok'}\n"
+            f"• taslak motoru: {engine_line}")
 
 
 def main() -> None:
