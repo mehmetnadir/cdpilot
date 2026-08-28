@@ -166,6 +166,12 @@ def _ai_draft(incoming: str, author: str) -> str | None:
             _log(f"reply_drafter fail: {proc.stderr[:200]}")
             return None
         out = json.loads(proc.stdout)
+        if out.get("fallback"):
+            # The canned fallback line is identical every time. Posting it
+            # unattended turned 14 replies into the same 6 words across 5 days
+            # (2026-08-28) — that reads as spam, not as a reply.
+            _log(f"reply_drafter fell back ({out.get('model')}) — no auto-reply")
+            return None
         return out.get("draft")
     except Exception as e:
         _log(f"reply_drafter exception: {e}")

@@ -371,6 +371,38 @@ async def _follow(client: Client, to: str | None) -> dict:
     return {"ok": True, "action": "follow", "target": handle, "uid": uid}
 
 
+DUPLICATE_WINDOW_DAYS = 30
+
+
+def _normalized(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def _duplicate_of(text: str) -> str | None:
+    """Return the id of a recently posted item with identical text, if any.
+
+    A drafting engine that silently degrades emits the same sentence forever:
+    on 2026-08-28 a dead claude CLI put the identical 6-word fallback under 14
+    different people's tweets, four of them the same account. Text-level
+    repetition is a spam signal to X and to humans, so it is blocked here —
+    the last gate before anything reaches the timeline.
+    """
+    norm = _normalized(text)
+    if not norm:
+        return None
+    cutoff = time.time() - DUPLICATE_WINDOW_DAYS * 86400
+    for f in POSTED_DIR.glob("*.json"):
+        try:
+            prev = json.loads(f.read_text())
+        except Exception:
+            continue
+        if prev.get("posted_at", 0) < cutoff:
+            continue
+        if _normalized(prev.get("text", "")) == norm:
+            return prev.get("id", f.stem)
+    return None
+
+
 # X/httpx timeout classes stringify to '' — str(e) alone loses the cause.
 IDEMPOTENT_KINDS = {"like", "retweet", "rt", "bookmark", "follow"}
 
@@ -494,6 +526,21 @@ async def main_async() -> None:
                      f"{item['id']} deferred")
                 continue
             preview = (item.get("text") or (item.get("texts") or ["?"])[0])[:80]
+            if kind in ("tweet", "reply", "quote"):
+                dup = _duplicate_of(item.get("text", ""))
+                if dup:
+                    item["status"] = "failed"
+                    item["failed_at"] = int(time.time())
+                    item["error"] = f"duplicate text already posted as {dup}"
+                    (FAILED_DIR / p.name).write_text(
+                        json.dumps(item, ensure_ascii=False, indent=2))
+                    p.unlink()
+                    _log(f"⛔ duplicate {item['id']} — same text as {dup}, not posting")
+                    _telegram_notify(
+                        f"⛔ `{item['id']}` atılmadı: metin `{dup}` ile birebir aynı. "
+                        "Taslak üreteci bozuk olabilir."
+                    )
+                    continue
             _log(f"posting {item['id']} ({kind}): {preview}...")
             if kind == "thread":
                 result = await _post_thread(client, item, p)

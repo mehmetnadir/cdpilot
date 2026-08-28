@@ -287,6 +287,33 @@ def test_poster_does_not_retry_non_idempotent_kinds(tmp_path, monkeypatch):
     assert "quote" not in pt.IDEMPOTENT_KINDS
 
 
+def test_poster_blocks_duplicate_text(tmp_path, monkeypatch):
+    """2026-08-28: a dead claude CLI put the identical fallback sentence under
+    14 different tweets over 5 days — four of them the same account."""
+    import time as _t
+    pt = _import_poster(tmp_path, monkeypatch)
+    pt.POSTED_DIR.mkdir(parents=True, exist_ok=True)
+    (pt.POSTED_DIR / "a.json").write_text(json.dumps({
+        "id": "search-reply-1", "text": "interesting. what part specifically?",
+        "posted_at": int(_t.time()) - 3600,
+    }))
+    assert pt._duplicate_of("interesting. what part specifically?") == "search-reply-1"
+    assert pt._duplicate_of("  Interesting.   What part specifically?  ") == "search-reply-1"
+    assert pt._duplicate_of("a genuinely different reply") is None
+    assert pt._duplicate_of("") is None
+
+
+def test_poster_duplicate_window_expires(tmp_path, monkeypatch):
+    import time as _t
+    pt = _import_poster(tmp_path, monkeypatch)
+    pt.POSTED_DIR.mkdir(parents=True, exist_ok=True)
+    (pt.POSTED_DIR / "old.json").write_text(json.dumps({
+        "id": "ancient", "text": "same words",
+        "posted_at": int(_t.time()) - (pt.DUPLICATE_WINDOW_DAYS + 1) * 86400,
+    }))
+    assert pt._duplicate_of("same words") is None
+
+
 def _import_daily_analytics(tmp_path, monkeypatch):
     """daily_analytics imports twikit at module scope; stub it so the pure
     formatting path is testable without the bot venv."""

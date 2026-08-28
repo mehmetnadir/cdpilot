@@ -496,6 +496,11 @@ def _ai_draft_for(c: dict) -> str | None:
             _log(f"ai_draft fail rc={proc.returncode}: {proc.stderr[:200]}")
             return None
         out = json.loads(proc.stdout)
+        if out.get("fallback"):
+            # Never auto-post the static fallback — it is the same sentence for
+            # every target, which is a spam signal rather than a reply.
+            _log(f"ai_draft fell back ({out.get('model')}) — skipping auto-reply")
+            return None
         draft = (out.get("draft") or "").strip()
         if not draft or len(draft) > 270:
             _log(f"ai_draft rejected (len={len(draft)}): {draft[:80]}")

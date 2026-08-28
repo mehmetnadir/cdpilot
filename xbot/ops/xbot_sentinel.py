@@ -15,6 +15,9 @@ Kontroller:
   C6  analytics bayatlığı: daily-log.md'de dünün/bugünün bloğu yok (22:15 sonrası)
   C7  cookie dosyası 45+ gün eski (proaktif yenileme hatırlatması)
   C8  failed/ dizininde son 24h'te yeni dosya
+  C9  taslak üreteci ölü: reply-drafter.log'da son 24h'te claude timeout/unavailable
+      (2026-08-28 dersi: srv21'in claude token'ı 21 Haziran'da doldu; bot 2 ay
+      boyunca her cevaba aynı canned cümleyi yazdı ve hiçbir şey uyarmadı)
 
 Aksiyonlar:
   - Anomali → Telegram'a direkt sendMessage (bridge'e import YOK — bridge'in
@@ -175,6 +178,26 @@ def collect() -> list[tuple[str, str]]:
                     if now - p.stat().st_mtime < 24 * 3600]
     if fresh_failed:
         fails.append(("C8", f"son 24h'te {len(fresh_failed)} failed öğe: {', '.join(fresh_failed[:3])}"))
+
+    # C9 — drafting engine down (canned fallback = every reply identical)
+    drafter_log = BOT / "logs" / "reply-drafter.log"
+    if drafter_log.exists():
+        dead = 0
+        try:
+            for line in drafter_log.read_text(errors="replace").splitlines()[-400:]:
+                if "claude CLI timeout" in line or "claude unavailable" in line:
+                    stamp = line[1:20]
+                    try:
+                        t = time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
+                    except ValueError:
+                        continue
+                    if now - t < 24 * 3600:
+                        dead += 1
+        except Exception:
+            dead = 0
+        if dead:
+            fails.append(("C9", f"taslak üreteci ölü: son 24h'te {dead} claude "
+                                f"timeout/unavailable — cevaplar canned metne düşüyor"))
 
     return fails
 
