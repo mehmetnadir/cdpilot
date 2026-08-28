@@ -219,6 +219,62 @@ def test_crisis_real_follower_drop_still_triggers(tmp_path, monkeypatch):
     assert crisis_check.FREEZE_FLAG.exists()
 
 
+def _import_drafter(tmp_path, monkeypatch):
+    import importlib
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    sys.modules.pop("reply_drafter", None)
+    return importlib.import_module("reply_drafter")
+
+
+def test_voice_lint_repairs_dashes(tmp_path, monkeypatch):
+    """Em dashes are the loudest AI tell; the fix is unambiguous so it is applied."""
+    rd = _import_drafter(tmp_path, monkeypatch)
+    out, issues = rd._voice_lint("raw CDP wins \u2014 playwright wraps it")
+    assert "\u2014" not in out and ".." in out
+    assert issues == []
+
+
+def test_voice_lint_rejects_banned_vocabulary(tmp_path, monkeypatch):
+    """Word swaps change meaning, so a hit is reported and the draft dropped."""
+    rd = _import_drafter(tmp_path, monkeypatch)
+    _, issues = rd._voice_lint("you can leverage this to streamline your flow")
+    assert "leverage" in issues and "streamline" in issues
+
+
+def test_voice_lint_flags_helpful_bot_tone(tmp_path, monkeypatch):
+    rd = _import_drafter(tmp_path, monkeypatch)
+    _, issues = rd._voice_lint("great question! hope this helps")
+    assert "great question" in issues and "hope this helps" in issues
+
+
+def test_voice_lint_flags_length_and_hashtags(tmp_path, monkeypatch):
+    rd = _import_drafter(tmp_path, monkeypatch)
+    _, issues = rd._voice_lint("x" * 300)
+    assert any("too long" in i for i in issues)
+    _, issues = rd._voice_lint("cool stuff #cdp #automation")
+    assert "multiple hashtags" in issues
+
+
+def test_voice_lint_passes_a_good_reply(tmp_path, monkeypatch):
+    rd = _import_drafter(tmp_path, monkeypatch)
+    good = ("fair, if playwright covers your flow keep it. raw CDP is for when the "
+            "framework fights you.. ever hit a site that detects automation anyway?")
+    out, issues = rd._voice_lint(good)
+    assert issues == [] and out == good
+
+
+def test_claude_availability_respects_cooldown(tmp_path, monkeypatch):
+    """shutil.which() alone was the blind spot that hid a token expired for two
+    months: the binary was present the whole time."""
+    rd = _import_drafter(tmp_path, monkeypatch)
+    monkeypatch.setattr(rd.shutil, "which", lambda _b: "/usr/local/bin/claude")
+    assert rd._claude_available() is True
+    rd._mark_unhealthy("claude")
+    assert rd._claude_available() is False
+    rd._mark_healthy("claude")
+    assert rd._claude_available() is True
+
+
 def _import_poster(tmp_path, monkeypatch):
     import importlib
     import types
