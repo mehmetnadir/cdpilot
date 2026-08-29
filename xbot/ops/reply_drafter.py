@@ -48,6 +48,12 @@ LOG_FILE = DATA / "logs" / "reply-drafter.log"
 CLAUDE_BIN = os.environ.get("CDPILOT_CLAUDE_BIN", "claude")
 MODEL = os.environ.get("CDPILOT_REPLY_MODEL", "claude-haiku-4-5")
 
+# `claude setup-token` prints a long-lived token that still has to be installed
+# where the CLI actually runs. Keeping it in a file (not a shell profile) means
+# systemd timers see it too — cron jobs never source ~/.bashrc.
+CLAUDE_TOKEN_FILE = Path(os.environ.get(
+    "CDPILOT_CLAUDE_TOKEN_FILE", str(DATA / "state" / "claude-oauth-token")))
+
 # NVIDIA NIM (second engine) — OpenAI-compatible, free tier.
 NIM_BASE = os.environ.get("CDPILOT_NIM_BASE", "https://integrate.api.nvidia.com/v1")
 NIM_KEY_FILE = Path(os.environ.get(
@@ -200,6 +206,19 @@ def _claude_available() -> bool:
     return shutil.which(CLAUDE_BIN) is not None and not _in_cooldown("claude")
 
 
+def _claude_env() -> dict:
+    """Environment for the claude subprocess, with the stored token if we have one."""
+    env = dict(os.environ)
+    if "CLAUDE_CODE_OAUTH_TOKEN" not in env and "ANTHROPIC_API_KEY" not in env:
+        try:
+            tok = CLAUDE_TOKEN_FILE.read_text().strip()
+        except Exception:
+            tok = ""
+        if tok:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+    return env
+
+
 def _nim_key() -> str | None:
     key = os.environ.get("NVIDIA_API_KEY")
     if key:
@@ -341,6 +360,7 @@ def draft(incoming: str, parent: str | None = None, author: str | None = None,
                 [CLAUDE_BIN, "-p", "--model", MODEL,
                  "--append-system-prompt", _system_prompt()],
                 input=user_prompt, capture_output=True, text=True, timeout=timeout,
+                env=_claude_env(),
             )
             raw = (proc.stdout or "").strip()
             if proc.returncode == 0 and raw:

@@ -263,6 +263,26 @@ def test_voice_lint_passes_a_good_reply(tmp_path, monkeypatch):
     assert issues == [] and out == good
 
 
+def test_claude_env_injects_stored_token(tmp_path, monkeypatch):
+    """`claude setup-token` prints a token; it still has to reach the process
+    systemd starts, which never sources a shell profile."""
+    rd = _import_drafter(tmp_path, monkeypatch)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in rd._claude_env()
+    rd.CLAUDE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    rd.CLAUDE_TOKEN_FILE.write_text("  sk-ant-oat01-testing\n")
+    assert rd._claude_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-testing"
+
+
+def test_claude_env_does_not_override_existing(tmp_path, monkeypatch):
+    rd = _import_drafter(tmp_path, monkeypatch)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "from-environment")
+    rd.CLAUDE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    rd.CLAUDE_TOKEN_FILE.write_text("from-file")
+    assert rd._claude_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "from-environment"
+
+
 def test_claude_availability_respects_cooldown(tmp_path, monkeypatch):
     """shutil.which() alone was the blind spot that hid a token expired for two
     months: the binary was present the whole time."""
