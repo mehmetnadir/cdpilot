@@ -15,6 +15,8 @@ Kontroller:
   C6  analytics bayatlığı: daily-log.md'de dünün/bugünün bloğu yok (22:15 sonrası)
   C7  cookie dosyası 45+ gün eski (proaktif yenileme hatırlatması)
   C8  failed/ dizininde son 24h'te yeni dosya
+  C10 tarayıcı sekme sızıntısı: CDP'de 20+ sayfa (2026-08-30: 513 sekme,
+      506'sı about:blank, 12.7 GB — hiçbir istemci açtığı sekmeyi kapatmıyordu)
   C9  taslak üreteci ölü: reply-drafter.log'da son 24h'te claude timeout/unavailable
       (2026-08-28 dersi: srv21'in claude token'ı 21 Haziran'da doldu; bot 2 ay
       boyunca her cevaba aynı canned cümleyi yazdı ve hiçbir şey uyarmadı)
@@ -48,6 +50,9 @@ LOG_FILE = BOT / "logs" / "sentinel.log"
 TELEGRAM_ENV = Path(os.environ.get("CDPILOT_TELEGRAM_ENV", str(BOT / "telegram.env")))
 
 QUEUE_ROT_H = 3
+# One working tab is the target; 20 leaves room for other projects sharing the
+# browser before we call it a leak.
+TAB_LEAK_LIMIT = int(os.environ.get("CDPILOT_TAB_LEAK_LIMIT", "20"))
 CYCLE_STALE_H = 8
 POSTER_STALE_MIN = 30
 COOKIE_AGE_WARN_D = 45
@@ -187,6 +192,23 @@ def collect() -> list[tuple[str, str]]:
     if sig["last"] == "all_down":
         fails.append(("C9", f"TÜM taslak motorları ölü (son deneme fallback'e düştü, "
                             f"24h'te {sig['all_down_24h']}×) — auto-post duruyor"))
+
+    # C10 — tab leak on the shared browser. Localhost CDP only: no X API, no
+    # cookies, so this stays true to the sentinel's no-auth-dependency rule.
+    # A browser that is down is not an anomaly here (C1..C8 cover the bot).
+    try:
+        import urllib.request
+        port = os.environ.get("CDPILOT_CDP_PORT", "9333")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=5) as r:
+            pages = [t for t in json.loads(r.read()) if t.get("type") == "page"]
+    except Exception:
+        pages = None
+    if pages is not None and len(pages) > TAB_LEAK_LIMIT:
+        blank = sum(1 for t in pages
+                    if (t.get("url") or "about:blank").strip().lower()
+                    in ("", "about:blank", "about:newtab"))
+        fails.append(("C10", f"tarayıcıda {len(pages)} sekme açık ({blank} boş) — "
+                             f"sızıntı; tab_reaper çalışıyor mu?"))
 
     return fails
 

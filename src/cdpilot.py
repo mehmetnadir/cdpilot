@@ -2528,7 +2528,16 @@ def cmd_launch():
     sys.exit(1)
 
 
-def cmd_tabs():
+def cmd_tabs(reap=False, max_tabs=1, include_real=False, dry_run=False):
+    if reap:
+        result = _reap_tabs(max_tabs=max_tabs, include_real=include_real,
+                            dry_run=dry_run)
+        verb = "would close" if result.get("dry_run") else "closed"
+        print(f"{verb} {len(result['closed'])} tab(s), kept {result['kept']}"
+              f" (blank {result.get('blank', 0)}, real {result.get('real', 0)})")
+        if result.get("reason"):
+            print(f"  {result['reason']}")
+        return
     tabs = get_tabs()
     pages = [t for t in tabs if t.get("type") == "page"]
     for i, p in enumerate(pages):
@@ -4525,6 +4534,87 @@ def _is_chrome_internal_url(url):
             or u.startswith("devtools://")
             or u.startswith("brave://")
             or u.startswith("vivaldi://"))
+
+
+def _close_target(target_id):
+    """Close one CDP target. Returns True when the browser accepted it."""
+    try:
+        urllib.request.urlopen(f"{CDP_BASE}/json/close/{target_id}", timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+def _reap_tabs(max_tabs=1, include_real=False, dry_run=False):
+    """Enforce a tab budget on the connected browser.
+
+    A long-lived browser accumulates abandoned tabs: every client that opens a
+    target and exits without closing it leaks one, and nothing collects them.
+    Measured on srv21 2026-08-30 — 513 pages, 506 of them about:blank, 12.7 GB
+    across 529 renderer processes, growing ~6/hour for three days on a box with
+    47 GB total.
+
+    Blank tabs go first: they hold nothing a caller could still want. Pages with
+    a real URL are never touched unless include_real is set, because on a shared
+    browser they may belong to somebody else. The session's own tab and the last
+    remaining page always survive.
+    """
+    tabs = cdp_get("/json", no_cache=True)
+    if not tabs:
+        return {"closed": [], "kept": 0, "reason": "no CDP connection"}
+    pages = [t for t in tabs if t.get("type") == "page"]
+    if len(pages) <= 1:
+        return {"closed": [], "kept": len(pages), "reason": "nothing to reap"}
+
+    session_id = _get_session_window_target_id()
+    real, blank = [], []
+    for t in pages:
+        (blank if _is_chrome_internal_url(t.get("url")) else real).append(t)
+
+    keep_ids = []
+    if session_id and any(t.get("id") == session_id for t in pages):
+        keep_ids.append(session_id)
+    if not include_real:
+        keep_ids += [t["id"] for t in real if t["id"] not in keep_ids]
+    for t in blank:
+        if len(keep_ids) >= max_tabs:
+            break
+        if t["id"] not in keep_ids:
+            keep_ids.append(t["id"])
+    if not keep_ids:  # never leave the browser with zero pages
+        keep_ids.append(pages[0]["id"])
+
+    doomed = [t for t in pages if t["id"] not in keep_ids]
+    closed = []
+    for t in doomed:
+        if dry_run or _close_target(t["id"]):
+            closed.append(t["id"])
+    if closed and not dry_run:
+        cdp_cache_invalidate()
+        owned = _load_owned_tabs()
+        if owned & set(closed):
+            _save_owned_tabs(owned - set(closed))
+    return {"closed": closed, "kept": len(keep_ids),
+            "blank": len(blank), "real": len(real), "dry_run": dry_run}
+
+
+def _enforce_tab_budget():
+    """Opt-in post-command reaping via CDPILOT_MAX_TABS.
+
+    Off unless the variable is set: silently closing tabs would be hostile on a
+    desktop where the browser is also the user's. On an unattended server it is
+    the difference between one tab and five hundred.
+    """
+    raw = os.environ.get("CDPILOT_MAX_TABS", "").strip()
+    if not raw.isdigit() or int(raw) < 1:
+        return
+    try:
+        result = _reap_tabs(max_tabs=int(raw))
+    except Exception:
+        return
+    if result.get("closed"):
+        print(f"[cdpilot] tab budget: closed {len(result['closed'])} idle tab(s)",
+              file=sys.stderr)
 
 
 async def _browser_close_graceful():
@@ -12777,7 +12867,12 @@ if __name__ == "__main__":
 
     sync_cmds = {
         'launch': cmd_launch,
-        'tabs': cmd_tabs,
+        'tabs': lambda: cmd_tabs(
+            reap='--reap' in args,
+            max_tabs=next((int(a.split('=')[1]) for a in args
+                           if a.startswith('--max=') and a.split('=')[1].isdigit()), 1),
+            include_real='--all' in args,
+            dry_run='--dry-run' in args),
         'extensions': cmd_extensions,
         'stop': cmd_stop,
         'version': cmd_version,
@@ -12857,6 +12952,7 @@ if __name__ == "__main__":
 
     if cmd in sync_cmds:
         sync_cmds[cmd]()
+        _enforce_tab_budget()
         sys.exit(0)
 
     def require_args(n, usage):
@@ -13001,6 +13097,7 @@ if __name__ == "__main__":
         if cmd in NO_CONTROL_CMDS:
             asyncio.run(async_map[cmd]())
             _update_session_timestamp()
+            _enforce_tab_budget()
         else:
             async def _wrapped():
                 ws_url = None
@@ -13021,6 +13118,7 @@ if __name__ == "__main__":
                                 await _control_end(ws_url)
             asyncio.run(_wrapped())
             _update_session_timestamp()
+            _enforce_tab_budget()
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
         all_cmds = sorted(set(list(sync_cmds.keys()) + list(async_map.keys())))

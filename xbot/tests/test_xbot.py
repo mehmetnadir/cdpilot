@@ -219,6 +219,51 @@ def test_crisis_real_follower_drop_still_triggers(tmp_path, monkeypatch):
     assert crisis_check.FREEZE_FLAG.exists()
 
 
+def _import_reaper():
+    import importlib
+    sys.modules.pop("tab_reaper", None)
+    return importlib.import_module("tab_reaper")
+
+
+def test_reaper_treats_internal_urls_as_disposable():
+    tr = _import_reaper()
+    for u in ("about:blank", "ABOUT:BLANK", "", None, "chrome://newtab",
+              "devtools://devtools/x", "brave://settings"):
+        assert tr._is_blank(u) is True
+    for u in ("https://x.com/home", "http://localhost:3000"):
+        assert tr._is_blank(u) is False
+
+
+def test_reaper_spares_real_pages_and_keeps_one_blank():
+    """srv21 2026-08-30: 513 pages, 506 blank. The browser is shared, so pages
+    with a real URL may belong to another project and are never closed."""
+    tr = _import_reaper()
+    pages = ([{"id": f"b{i}", "url": "about:blank"} for i in range(506)]
+             + [{"id": "r1", "url": "https://flashyelt.example/Home"},
+                {"id": "r2", "url": "https://akillitahta.example/Home"}])
+    doomed = tr.select_doomed(pages, max_blank=1)
+    assert len(doomed) == 505
+    assert all(d["url"] == "about:blank" for d in doomed)
+    assert {"r1", "r2"}.isdisjoint({d["id"] for d in doomed})
+
+
+def test_reaper_never_strands_the_browser_with_zero_pages():
+    tr = _import_reaper()
+    assert tr.select_doomed([{"id": "b1", "url": "about:blank"}], max_blank=1) == []
+    only_blanks = [{"id": "b1", "url": "about:blank"},
+                   {"id": "b2", "url": "about:blank"}]
+    assert len(tr.select_doomed(only_blanks, max_blank=1)) == 1
+    # max 0 with nothing else open still leaves one page alive
+    assert len(tr.select_doomed(only_blanks, max_blank=0)) == 1
+
+
+def test_reaper_noop_when_already_clean():
+    tr = _import_reaper()
+    pages = [{"id": "r1", "url": "https://x.com/home"},
+             {"id": "b1", "url": "about:blank"}]
+    assert tr.select_doomed(pages, max_blank=1) == []
+
+
 def _import_drafter(tmp_path, monkeypatch):
     import importlib
     monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))

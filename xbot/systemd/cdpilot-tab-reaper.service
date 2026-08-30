@@ -1,0 +1,9 @@
+[Unit]
+Description=cdpilot tab reaper — keep the shared browser at one working tab
+After=cdpilot-chrome.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/cdpilot-twitter-bot
+Environment=CDPILOT_CDP_PORT=9333
+ExecStart=/usr/bin/python3 /opt/cdpilot-twitter-bot/ops/tab_reaper.py --apply --max 1
