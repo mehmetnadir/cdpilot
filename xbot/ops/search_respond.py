@@ -53,16 +53,28 @@ LANG = os.environ.get("CDPILOT_TWIKIT_LANG", "en-US")
 HANDLE = os.environ.get("CDPILOT_HANDLE", "cdpilot_dev")
 
 # Niş soru patterns — "X is" değil "X how/why/help/?" tarzı
+# Two halves, matching the account's two jobs: help where we have real
+# experience, and join the conversation we actually live in. Before 2026-08-30
+# every query was an anti-bot distress signal, which is why the timeline we
+# replied to had nothing to do with building software with AI.
 SEARCH_QUERIES = [
+    # building with AI — where the discussions are
+    "claude code context window problem",
+    "coding agent lost context",
+    "cursor vs claude code workflow",
+    "ai pair programming actually",
+    "mcp server building",
+    "llm code review worth it",
+    "agent loop stuck debugging",
+    "ai generated code review problem",
+    # what we have measured ourselves
     "playwright stealth not working",
     "puppeteer captcha bypass",
     "selenium detected",
     "cdp protocol question",
     "browser automation help",
     "headless chrome detection",
-    "anti-bot bypass how",
     "scraping cloudflare 403",
-    "datadome bypass",
     "browser fingerprint randomize",
 ]
 
@@ -184,6 +196,9 @@ def _ai_draft(incoming: str, author: str) -> str | None:
             _log(f"reply_drafter fail: {proc.stderr[:200]}")
             return None
         out = json.loads(proc.stdout)
+        if out.get("skip"):
+            _log(f"drafter chose SKIP for @{author} — nothing worth adding")
+            return None
         if out.get("fallback"):
             # The canned fallback line is identical every time. Posting it
             # unattended turned 14 replies into the same 6 words across 5 days

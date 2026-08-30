@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import urllib.error
@@ -74,30 +75,52 @@ NIM_CATALOG_TTL = 24 * 3600
 ENGINE_HEALTH = DATA / "state" / "drafter-health.json"
 ENGINE_COOLDOWN_S = int(os.environ.get("CDPILOT_ENGINE_COOLDOWN", "3600"))
 
-SYSTEM_PROMPT = """You are drafting a reply tweet for the @cdpilot_dev account.
+SYSTEM_PROMPT = """You are drafting a reply tweet for @cdpilot_dev.
 
-cdpilot is an open-source browser automation CLI built on raw CDP (Chrome DevTools
-Protocol) — zero deps, stealth + adaptive escalation, currently at v0.8.0.
-Audience: dev community (browser automation, anti-bot, agents).
+WHO THIS ACCOUNT IS
+A developer who builds software with AI every day and talks about what actually
+makes the work easier. Reads and tries things constantly, then reports what held
+up and what did not. Starts and sustains real discussions: asks the question
+they genuinely want answered, and engages with the answer.
 
-REPLY TONE — strict rules:
+cdpilot (an open-source browser automation CLI on raw CDP, zero deps) is
+something this person built. It is evidence, not the subject. Mention it only
+when it is the honest answer to what someone asked, at most once in a while,
+never as a pitch in someone else's thread. An account that only talks about its
+own product has nothing to say about the work.
+
+WHEN NOT TO REPLY
+Output exactly SKIP, alone, when any of these is true:
+  - you have nothing specific to add beyond agreement or restatement
+  - the tweet is a quiz, a poll, or a company milestone/announcement post
+  - answering would require inventing a technical claim you are not sure of
+  - the only reply available is a compliment
+A reply that says nothing is worse than silence. SKIP is a good outcome, and it
+is expected often.
+
+REPLY RULES
 1. MAX 2 sentences. Usually 1. NEVER exceed 200 characters.
 2. NO helpful-bot phrases: "great question", "happy to help", "hope this helps",
    "let me know if". NO bullet points or lists.
-3. End with a curiosity hook: question, observation, or mild provocation.
-4. Latch onto ONE specific technical detail from their reply. No generic platitudes.
-5. Lowercase-prevailing, conversational shorthand (yeah, fair, tho) OK.
-6. Emoji only if they used one (max 1).
-7. NEVER put URLs in the body. Never link to anything.
-8. Match their language: if they wrote in Turkish, reply Turkish. Else English.
-9. Cool, peer voice — not aloof, not eager. Don't suck up, don't lecture.
+3. Latch onto ONE specific thing they said. No generic platitudes.
+4. End with a real question only when you would actually want the answer.
+   A question mark is not a substitute for having something to say.
+5. Bring something concrete: a number you measured, a failure mode you hit, a
+   tradeoff you chose. Opinion without evidence is noise.
+6. Never state a technical claim you cannot back. If unsure, say what you tried.
+7. Lowercase-prevailing, conversational shorthand (yeah, fair, tho) OK.
+8. Emoji only if they used one (max 1).
+9. NEVER put URLs in the body. Never link to anything.
+10. Match their language: if they wrote in Turkish, reply Turkish. Else English.
+11. Peer voice: not aloof, not eager. Don't suck up, don't lecture, don't sell.
 
 Examples of good replies (EN):
-  "yeah — raw CDP makes nested-frame traversal cheaper than playwright actually. specific timeout you're hitting?"
-  "fair. cdpilot is for the 5% where you're fighting the framework, not using it. which side are you on usually?"
+  "raw CDP makes nested-frame traversal cheaper than playwright here.. what timeout are you hitting?"
+  "we measured 3 parallel as the ceiling, 5 gave 29 timeouts. did yours degrade gradually or fall over?"
+  "the spoof was the tell for us: randomized plugin names scored worse than patching nothing at all."
 
-OUTPUT FORMAT: respond with the reply text ONLY. No quotes around it, no
-preamble, no explanation. Just the tweet body."""
+OUTPUT FORMAT: the reply text ONLY, or the single word SKIP. No quotes, no
+preamble, no explanation."""
 
 VOICE_RULES_DOC = Path(os.environ.get(
     "CDPILOT_VOICE_RULES", str(Path(__file__).resolve().parent.parent / "voice-rules.md")))
@@ -132,6 +155,29 @@ def _system_prompt() -> str:
     return f"{SYSTEM_PROMPT}\n\n--- VOICE RULES (binding) ---\n{rules}"
 
 
+# Phrases that only appear when the model narrates its own instructions instead
+# of answering. Cheap insurance: one such draft reached @vercel's timeline.
+LEAK_MARKERS = ("reply tweet for", "max 2 sentences", "banned vocabulary",
+                "we need to craft", "the user wrote", "system prompt",
+                "character limit", "output format")
+
+
+def _looks_like_leaked_prompt(text: str) -> bool:
+    low = (text or "").lower()
+    return sum(1 for m in LEAK_MARKERS if m in low) >= 2
+
+
+def _without_quotes(text: str) -> str:
+    """Drop quoted spans before checking vocabulary.
+
+    A reply about which AI cliches to watch for has to be able to name them:
+    "my money's on \"delve\" but \"it's not just X, it's Y\" keeps sneaking past"
+    is good writing, and the lint rejected it for containing the words it was
+    discussing. Quoting is mention, not use.
+    """
+    return re.sub(r'"[^"]{1,80}"|\u201c[^\u201d]{1,80}\u201d|\'[^\']{2,80}\'', " ", text or "")
+
+
 def _voice_lint(text: str) -> tuple[str, list[str]]:
     """Return (repaired_text, unfixable_issues).
 
@@ -141,7 +187,9 @@ def _voice_lint(text: str) -> tuple[str, list[str]]:
     the manual card.
     """
     repaired = text.replace("\u2014", "..").replace("\u2013", "..").replace(" -- ", " .. ")
-    low = repaired.lower()
+    if _looks_like_leaked_prompt(repaired):
+        return repaired, ["leaked prompt text"]
+    low = _without_quotes(repaired).lower()
     issues = [b for b in BANNED_SUBSTRINGS
               if b not in ("\u2014", "\u2013", " -- ") and b in low]
     if repaired.count("#") > 1:
@@ -167,8 +215,22 @@ def _health() -> dict:
 
 
 def _mark_unhealthy(engine: str) -> None:
+    """Two consecutive failures put an engine in cooldown, not one.
+
+    A single timeout is often ours: a caller passing a tight deadline, or one
+    slow request. Disabling a working engine for an hour over that costs more
+    than the retry does — it happened while testing with a 20s budget.
+    """
     h = _health()
-    h[engine] = int(time.time())
+    entry = h.get(engine)
+    if isinstance(entry, dict):
+        prior = entry.get("fails", 0)
+    elif entry is None:
+        prior = 0
+    else:  # legacy bare timestamp from an older build
+        prior = 1
+    fails = prior + 1
+    h[engine] = {"fails": fails, "since": int(time.time())}
     ENGINE_HEALTH.parent.mkdir(parents=True, exist_ok=True)
     ENGINE_HEALTH.write_text(json.dumps(h))
 
@@ -180,7 +242,20 @@ def _mark_healthy(engine: str) -> None:
 
 
 def _in_cooldown(engine: str) -> bool:
-    return (time.time() - _health().get(engine, 0)) < ENGINE_COOLDOWN_S
+    entry = _health().get(engine)
+    if entry is None:
+        return False
+    if not isinstance(entry, dict):  # legacy: bare timestamp
+        return (time.time() - entry) < ENGINE_COOLDOWN_S
+    if entry.get("fails", 0) < 2:
+        return False
+    return (time.time() - entry.get("since", 0)) < ENGINE_COOLDOWN_S
+
+
+def _is_skip(text: str) -> bool:
+    """The model declining to reply. Silence beats a reply that says nothing."""
+    stripped = (text or "").strip().strip('".\'').upper()
+    return stripped == "SKIP"
 
 
 def _clean(raw: str) -> str:
@@ -278,6 +353,8 @@ def _nim_draft(user_prompt: str, timeout: int) -> tuple[str | None, str]:
         text, last = _nim_call(key, model, user_prompt, timeout)
         if text:
             return text, model
+        if last == "skip":
+            return None, "skip"  # a judgement, not a failure — don't shop around
         _log(f"nim {model} unusable ({last}) — trying next candidate")
     return None, last
 
@@ -306,9 +383,14 @@ def _nim_call(key: str, model: str, user_prompt: str,
         msg = payload["choices"][0]["message"]
     except (KeyError, IndexError):
         return None, "nim-shape"
-    # Reasoning models leave `content` null and put the answer in
-    # `reasoning_content` (observed on gpt-oss-120b).
-    text = msg.get("content") or msg.get("reasoning_content") or ""
+    # `reasoning_content` is the model thinking out loud, NOT its answer.
+    # Reading it as the draft put "We need to craft a reply tweet for
+    # @cdpilot_dev account. Limit: max 2 sentences..." under a @vercel post on
+    # 2026-08-29. A model that leaves `content` empty has not answered.
+    text = msg.get("content") or ""
+    if _is_skip(text):
+        _log(f"nim/{model} returned SKIP — nothing worth adding")
+        return None, "skip"
     cleaned, issues = _voice_lint(_clean(text))
     if not cleaned:
         return None, "nim-empty"
@@ -364,6 +446,11 @@ def draft(incoming: str, parent: str | None = None, author: str | None = None,
             )
             raw = (proc.stdout or "").strip()
             if proc.returncode == 0 and raw:
+                if _is_skip(raw):
+                    _mark_healthy("claude")
+                    _log("claude returned SKIP — nothing worth adding")
+                    return {"draft": None, "engine": "claude", "skip": True,
+                            "fallback": False}
                 cleaned, issues = _voice_lint(_clean(raw))
                 if cleaned and not issues:
                     _mark_healthy("claude")
@@ -397,6 +484,9 @@ def draft(incoming: str, parent: str | None = None, author: str | None = None,
         if text:
             _mark_healthy("nim")
             return {"draft": text, "model": label, "engine": "nim", "fallback": False}
+        if label == "skip":
+            _mark_healthy("nim")
+            return {"draft": None, "engine": "nim", "skip": True, "fallback": False}
         errors.append(label)
         _mark_unhealthy("nim")
     else:

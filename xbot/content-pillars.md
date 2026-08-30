@@ -5,18 +5,43 @@
 
 ---
 
-## Yeni pillar karışımı (Revize 2026-08-23 — Nadir onayı)
+## Pillar karışımı (Revize 2026-08-30 — Nadir yön değişikliği)
+
+> **Kimlik:** Yapay zekâyla her gün kod yazan, işi neyin gerçekten kolaylaştırdığını
+> anlatan, sürekli araştırıp denediğini raporlayan ve ilginç şeyler üzerine yapıcı
+> tartışma başlatıp sürdüren bir geliştirici.
+>
+> cdpilot bu kişinin **yaptığı şey**, konuştuğu şey değil. Kanıt olarak geçer,
+> reklam olarak değil. Sadece kendi ürününü konuşan bir hesabın işe dair
+> söyleyecek sözü yoktur.
 
 | % | Pillar | Örnek |
 |---|---|---|
-| 30% | **cdpilot ürün** — feature, recipe, bench | "shipped v0.9.0 — video watch + friction ladder" |
-| 20% | **Claude ile üretim hikâyeleri** (build-in-public) | "needed a flipbook. every library was 200KB+ of jank. built one from scratch with Claude in a day — zero deps, 60fps. here's the approach" |
-| 20% | **LLM/AI/vibe-coder ipuçları** | "most agent stacks miss Page.setDownloadBehavior" |
-| 15% | **Az bilinen ama iyi repolar** | rebrowser-patches, twifork, anubis, vd. |
-| 10% | **Behind-the-scenes** — kararlar, tradeoffs | "why we chose Option C for TLS" |
-| 5% | **Teaser** — gizli proje sızıntıları (Faz 1+) | conductor, kokpit, mastershop, vd. |
+| 30% | **AI ile üretim pratiği** — neyi kolaylaştırdı, neyi kolaylaştırmadı | "claude code uzun refactor'da bağlamı kaybediyor; 3 dosyalık dilimlere böldüm, tutar oldu" |
+| 25% | **Araştırma notu** — denenmiş, ölçülmüş, raporlanmış | "4 modeli aynı reply prompt'uyla ölçtüm: kimi-k3 13sn tam cümle, deepseek-flash 77sn yarım" |
+| 20% | **Tartışma açan gözlem** — kanıtlı, tek fikirli, cevap isteyen | "coding agent'lar ancak iyi kodun neye benzediğini bilene yarıyor. karşı örneği olan?" |
+| 15% | **Az bilinen ama iyi repolar / araçlar** | rebrowser-patches, twifork, anubis, vd. |
+| 10% | **cdpilot** — feature, recipe, bench (kanıt olarak) | "shipped v0.9.0 — video watch + friction ladder" |
 
-cdpilot artık posts'un yarısı değil. Marka olarak değer üretmek > kendini reklam etmek.
+**Değişen ne:** cdpilot %30'dan %10'a indi. "Ürün hesabı" değil, "pratisyen hesabı".
+Araştırma ve tartışma ilk kez birer pillar — kimliğin merkezi orası.
+
+### Tartışma kuralları (2026-08-30)
+
+Bu hesap tartışma **başlatır ve sürdürür**. İkisi de ölçülebilir davranış:
+
+- **Başlatmak:** her tartışma açan post tek bir fikir + onu destekleyen somut
+  kanıt (ölçüm, hata, tradeoff) + gerçekten merak edilen bir soru içerir.
+  Kanıtsız fikir gürültüdür; soru işareti söyleyecek şey yerine geçmez.
+- **Sürdürmek:** attığımız bir tweet'e gelen cevap yanıtsız kalmaz. Konuşmayı
+  bırakıp bir sonraki hedefe geçmek "tartışma" değil, yayın yapmaktır.
+- **Susmak:** ekleyecek somut bir şey yoksa cevap yazılmaz. Taslak üreticisi
+  `SKIP` döndürebilir ve bu beklenen bir sonuçtur (bkz. reply_drafter
+  SYSTEM_PROMPT). Hiçbir şey söylemeyen cevap, sessizlikten kötüdür.
+- **Satmamak:** başkasının thread'inde ürün tanıtımı yasak. cdpilot ancak
+  sorulanın dürüst cevabı oysa geçer.
+- **Uydurmamak:** doğruluğundan emin olunmayan teknik iddia yazılmaz.
+  (2026-06 dersi: "CDP üzerinden ham SIP stack" diye bir şey yok, yine de attık.)
 
 ### "Claude ile üretim hikâyeleri" pillar kuralları (2026-08-23)
 

@@ -371,6 +371,36 @@ def test_voice_lint_passes_a_good_reply(tmp_path, monkeypatch):
     assert issues == [] and out == good
 
 
+def test_lint_allows_banned_words_inside_quotes(tmp_path, monkeypatch):
+    """A reply about AI cliches has to be able to name them. kimi-k3 wrote this
+    and the lint threw it away for containing the words it was discussing."""
+    rd = _import_drafter(tmp_path, monkeypatch)
+    good = ('38 is a lot.. which one fires most often? my money\'s on "delve" '
+            'but "it\'s not just X, it\'s Y" keeps sneaking past people')
+    out, issues = rd._voice_lint(good)
+    assert issues == [], issues
+    # Using the same word unquoted is still rejected.
+    assert "delve" in rd._voice_lint("let me delve into that")[1]
+
+
+def test_lint_rejects_leaked_prompt_text(tmp_path, monkeypatch):
+    """2026-08-29: reading `reasoning_content` as the answer put the model's
+    own instructions under a @vercel post."""
+    rd = _import_drafter(tmp_path, monkeypatch)
+    leaked = ("We need to craft a reply tweet for @cdpilot_dev account. Limit: "
+              "max 2 sentences, usually 1, never exceed 200 characters.")
+    assert rd._voice_lint(leaked)[1] == ["leaked prompt text"]
+
+
+def test_skip_is_recognised_as_a_decision(tmp_path, monkeypatch):
+    """SKIP means "nothing worth adding" — silence, not an engine failure."""
+    rd = _import_drafter(tmp_path, monkeypatch)
+    for raw in ("SKIP", "skip", " SKIP\n", '"SKIP"'):
+        assert rd._is_skip(raw) is True
+    for raw in ("skip the queue for now", "", "raw CDP skips the driver"):
+        assert rd._is_skip(raw) is False
+
+
 def test_claude_env_injects_stored_token(tmp_path, monkeypatch):
     """`claude setup-token` prints a token; it still has to reach the process
     systemd starts, which never sources a shell profile."""
@@ -396,6 +426,9 @@ def test_claude_availability_respects_cooldown(tmp_path, monkeypatch):
     months: the binary was present the whole time."""
     rd = _import_drafter(tmp_path, monkeypatch)
     monkeypatch.setattr(rd.shutil, "which", lambda _b: "/usr/local/bin/claude")
+    assert rd._claude_available() is True
+    rd._mark_unhealthy("claude")
+    # One failure is often our own tight deadline, not a dead engine.
     assert rd._claude_available() is True
     rd._mark_unhealthy("claude")
     assert rd._claude_available() is False
