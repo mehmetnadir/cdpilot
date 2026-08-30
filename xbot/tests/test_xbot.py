@@ -282,6 +282,76 @@ def test_search_score_prefers_fit_over_reach():
     assert sr._score(on_topic_small) > sr._score(off_topic_huge)
 
 
+# ── conversation keeper: sustaining without ping-pong ──
+def _keeper(tmp_path, monkeypatch, inbox=(), posted=()):
+    import importlib
+    import time as _t
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    (tmp_path / "inbox").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "posted").mkdir(parents=True, exist_ok=True)
+    for i, item in enumerate(inbox):
+        item.setdefault("tweet_id", f"t{i}")
+        item.setdefault("status", "new")
+        item.setdefault("is_reply_to_us", True)
+        item.setdefault("created_at", int(_t.time()) - 600)
+        (tmp_path / "inbox" / f"{item['tweet_id']}.json").write_text(json.dumps(item))
+    for i, item in enumerate(posted):
+        item.setdefault("posted_at", int(_t.time()) - 600)
+        (tmp_path / "posted" / f"p{i}.json").write_text(json.dumps(item))
+    sys.modules.pop("conversation_keeper", None)
+    return importlib.import_module("conversation_keeper")
+
+
+def test_keeper_answers_a_fresh_reply(tmp_path, monkeypatch):
+    ck = _keeper(tmp_path, monkeypatch,
+                 inbox=[{"author": "@dev", "text": "how does that hold at 100 tabs?",
+                         "tweet_url": "https://x.com/dev/status/1"}])
+    cands = [c for c in ck.candidates() if not c.get("_skip")]
+    assert len(cands) == 1
+
+
+def test_keeper_stops_after_two_rounds(tmp_path, monkeypatch):
+    """Sustaining a discussion is not ping-pong: after MAX_DEPTH the thread is
+    a human's to continue."""
+    ck = _keeper(
+        tmp_path, monkeypatch,
+        inbox=[{"author": "@dev", "text": "and what about shadow dom?",
+                "tweet_url": "https://x.com/dev/status/9"}],
+        posted=[{"kind": "reply", "to": "https://x.com/dev/status/1", "text": "a"},
+                {"kind": "reply", "to": "https://x.com/dev/status/2", "text": "b"}])
+    assert all("depth" in c.get("_skip", "") for c in ck.candidates())
+
+
+def test_keeper_ignores_stale_replies(tmp_path, monkeypatch):
+    """Answering a two-day-old reply reads as a bot catching up."""
+    import time as _t
+    ck = _keeper(tmp_path, monkeypatch,
+                 inbox=[{"author": "@dev", "text": "still curious about this",
+                         "created_at": int(_t.time()) - 60 * 3600,
+                         "tweet_url": "https://x.com/dev/status/1"}])
+    assert all(c.get("_skip") == "stale" for c in ck.candidates())
+
+
+def test_keeper_refuses_off_limits_even_when_dragged_in(tmp_path, monkeypatch):
+    ck = _keeper(tmp_path, monkeypatch,
+                 inbox=[{"author": "@dev",
+                         "text": "sure, but the election proves the working class was duped",
+                         "tweet_url": "https://x.com/dev/status/1"}])
+    assert all("off-limits" in c.get("_skip", "") for c in ck.candidates())
+
+
+def test_keeper_leaves_production_story_threads_to_nadir(tmp_path, monkeypatch):
+    """content-pillars: replies asking which project or how it was done are
+    answered by Nadir, not the bot."""
+    ck = _keeper(
+        tmp_path, monkeypatch,
+        inbox=[{"author": "@dev", "text": "which project was this for?",
+                "in_reply_to_status_id": "555",
+                "tweet_url": "https://x.com/dev/status/1"}],
+        posted=[{"id": "bts-flipbook", "kind": "tweet", "tweet_id": "555", "text": "x"}])
+    assert all("Nadir" in c.get("_skip", "") for c in ck.candidates())
+
+
 # ── novelty: not repeating ourselves ──
 def _novelty_home(tmp_path, posts):
     import json as _j

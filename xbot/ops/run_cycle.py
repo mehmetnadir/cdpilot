@@ -86,6 +86,11 @@ def main() -> None:
     # Always: DM inbox poll (Faz 0: max 5 drafts/slot, taslak modu)
     results.append(_run([str(OPS / "dm_handler.py")], "dm_handler"))
 
+    # Always: answer the people who answered us. Bounded (depth, freshness,
+    # daily cap) — sustaining a discussion, not ping-pong.
+    results.append(_run([str(OPS / "conversation_keeper.py"), "--apply"],
+                        "conversation_keeper"))
+
     # Midday: Search-to-Respond — find niche questions on X to reply to
     if slot == "midday":
         results.append(_run([str(OPS / "search_respond.py")], "search_respond"))
