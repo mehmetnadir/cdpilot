@@ -340,7 +340,8 @@ def _nim_models() -> list[str]:
     return ordered
 
 
-def _nim_draft(user_prompt: str, timeout: int) -> tuple[str | None, str]:
+def _nim_draft(user_prompt: str, timeout: int, system_prompt: str | None = None,
+               validate=None, max_tokens: int = 300) -> tuple[str | None, str]:
     """Second engine. Returns (draft, error_label)."""
     key = _nim_key()
     if not key:
@@ -350,7 +351,9 @@ def _nim_draft(user_prompt: str, timeout: int) -> tuple[str | None, str]:
         return None, "nim-no-model"
     last = "nim-no-candidate"
     for model in models:
-        text, last = _nim_call(key, model, user_prompt, timeout)
+        text, last = _nim_call(key, model, user_prompt, timeout,
+                               system_prompt=system_prompt, validate=validate,
+                               max_tokens=max_tokens)
         if text:
             return text, model
         if last == "skip":
@@ -359,14 +362,15 @@ def _nim_draft(user_prompt: str, timeout: int) -> tuple[str | None, str]:
     return None, last
 
 
-def _nim_call(key: str, model: str, user_prompt: str,
-              timeout: int) -> tuple[str | None, str]:
+def _nim_call(key: str, model: str, user_prompt: str, timeout: int,
+              system_prompt: str | None = None, validate=None,
+              max_tokens: int = 300) -> tuple[str | None, str]:
     body = json.dumps({
         "model": model,
-        "messages": [{"role": "system", "content": _system_prompt()},
+        "messages": [{"role": "system", "content": system_prompt or _system_prompt()},
                      {"role": "user", "content": user_prompt}],
         "temperature": 0.8,
-        "max_tokens": 300,
+        "max_tokens": max_tokens,
     }).encode()
     req = urllib.request.Request(
         f"{NIM_BASE}/chat/completions", data=body,
@@ -391,11 +395,14 @@ def _nim_call(key: str, model: str, user_prompt: str,
     if _is_skip(text):
         _log(f"nim/{model} returned SKIP — nothing worth adding")
         return None, "skip"
-    cleaned, issues = _voice_lint(_clean(text))
+    if validate is not None:
+        cleaned, issues = validate(text)
+    else:
+        cleaned, issues = _clean(text), []
     if not cleaned:
         return None, "nim-empty"
     if issues:
-        _log(f"nim/{model} draft rejected by voice lint {issues}: {cleaned}")
+        _log(f"nim/{model} output rejected {issues}: {cleaned[:120]}")
         return None, f"nim-lint:{','.join(issues)[:40]}"
     _log(f"drafted via nim/{model} ({len(cleaned)} chars): {cleaned}")
     return cleaned, model
@@ -430,17 +437,31 @@ def _static_fallback(incoming: str, lang: str | None) -> str:
     return "interesting. what part specifically?"
 
 
-def draft(incoming: str, parent: str | None = None, author: str | None = None,
-          lang: str | None = None, timeout: int = 120) -> dict:
-    user_prompt = _build_user_prompt(incoming, parent, author, lang)
+def generate(system_prompt: str, user_prompt: str, timeout: int = 120,
+             validate=None, max_tokens: int = 300) -> dict:
+    """Run the engine chain for any prompt. Reply drafting is one caller of this.
+
+    Returns {text, engine, model} on success, {skip: True} when the model
+    declined, {fallback: True} when nothing answered. `validate(text)` may
+    return (repaired_text, issues); a draft with issues is refused so the next
+    engine gets a turn.
+    """
     errors: list[str] = []
+
+    def _check(raw: str):
+        # _clean carries reply-shaped rules, including a 270-char trim. Applying
+        # it before a caller's validator silently truncated a 4-tweet JSON array
+        # into malformed output. A validator owns its own normalization.
+        if validate is None:
+            return _clean(raw), []
+        return validate((raw or "").strip())
 
     # ── Engine 1: claude CLI (subscription quota) ──
     if _claude_available():
         try:
             proc = subprocess.run(
                 [CLAUDE_BIN, "-p", "--model", MODEL,
-                 "--append-system-prompt", _system_prompt()],
+                 "--append-system-prompt", system_prompt],
                 input=user_prompt, capture_output=True, text=True, timeout=timeout,
                 env=_claude_env(),
             )
@@ -449,22 +470,23 @@ def draft(incoming: str, parent: str | None = None, author: str | None = None,
                 if _is_skip(raw):
                     _mark_healthy("claude")
                     _log("claude returned SKIP — nothing worth adding")
-                    return {"draft": None, "engine": "claude", "skip": True,
+                    return {"text": None, "engine": "claude", "skip": True,
                             "fallback": False}
-                cleaned, issues = _voice_lint(_clean(raw))
+                cleaned, issues = _check(raw)
                 if cleaned and not issues:
                     _mark_healthy("claude")
-                    _log(f"drafted via claude ({len(cleaned)} chars): {cleaned}")
-                    return {"draft": cleaned, "model": MODEL, "engine": "claude",
+                    _log(f"generated via claude ({len(cleaned)} chars)")
+                    return {"text": cleaned, "model": MODEL, "engine": "claude",
                             "fallback": False}
                 if issues:
                     _mark_healthy("claude")  # engine is alive, the draft is not
-                    _log(f"claude draft rejected by voice lint {issues}: {cleaned}")
+                    _log(f"claude output rejected {issues}: {cleaned[:120]}")
                     errors.append(f"claude-lint:{','.join(issues)[:60]}")
-            err = (proc.stderr or "")[:200]
-            _log(f"claude CLI exit={proc.returncode}: {err}")
-            errors.append(f"claude-exit{proc.returncode}")
-            _mark_unhealthy("claude")
+            else:
+                err = (proc.stderr or "")[:200]
+                _log(f"claude CLI exit={proc.returncode}: {err}")
+                errors.append(f"claude-exit{proc.returncode}")
+                _mark_unhealthy("claude")
         except subprocess.TimeoutExpired:
             _log(f"claude CLI timeout after {timeout}s")
             errors.append("claude-timeout")
@@ -480,25 +502,41 @@ def draft(incoming: str, parent: str | None = None, author: str | None = None,
 
     # ── Engine 2: NVIDIA NIM (API key, immune to OAuth expiry) ──
     if not _in_cooldown("nim"):
-        text, label = _nim_draft(user_prompt, timeout=min(timeout, 90))
+        text, label = _nim_draft(user_prompt, timeout=min(timeout, 150),
+                                 system_prompt=system_prompt, validate=_check,
+                                 max_tokens=max_tokens)
         if text:
             _mark_healthy("nim")
-            return {"draft": text, "model": label, "engine": "nim", "fallback": False}
+            return {"text": text, "model": label, "engine": "nim", "fallback": False}
         if label == "skip":
             _mark_healthy("nim")
-            return {"draft": None, "engine": "nim", "skip": True, "fallback": False}
+            return {"text": None, "engine": "nim", "skip": True, "fallback": False}
         errors.append(label)
         _mark_unhealthy("nim")
     else:
         errors.append("nim-cooldown")
 
-    # ── No engine produced anything ──
+    _log(f"ALL ENGINES DOWN ({', '.join(errors)})")
+    return {"text": None, "engine": None, "fallback": True, "errors": errors}
+
+
+def draft(incoming: str, parent: str | None = None, author: str | None = None,
+          lang: str | None = None, timeout: int = 120) -> dict:
+    user_prompt = _build_user_prompt(incoming, parent, author, lang)
+    res = generate(_system_prompt(), user_prompt, timeout=timeout,
+                   validate=lambda t: _voice_lint(_clean(t)))
+    if res.get("skip"):
+        return {"draft": None, "engine": res.get("engine"), "skip": True,
+                "fallback": False}
+    if res.get("text"):
+        return {"draft": res["text"], "model": res.get("model"),
+                "engine": res.get("engine"), "fallback": False}
     # The static line is identical for every target, so unattended callers
     # (search_respond, engagement_scanner) must drop it rather than post it.
     text = _static_fallback(incoming, lang)
-    _log(f"ALL ENGINES DOWN ({', '.join(errors)}) → static fallback, do not auto-post")
+    _log("→ static fallback, do not auto-post")
     return {"draft": text, "model": "fallback-static", "engine": None,
-            "fallback": True, "errors": errors}
+            "fallback": True, "errors": res.get("errors", [])}
 
 
 def main() -> None:

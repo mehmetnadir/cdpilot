@@ -26,6 +26,37 @@
 **Değişen ne:** cdpilot %30'dan %10'a indi. "Ürün hesabı" değil, "pratisyen hesabı".
 Araştırma ve tartışma ilk kez birer pillar — kimliğin merkezi orası.
 
+### Haber flood'u — format (2026-08-30)
+
+Haberi paylaşmak değil, **çevirmek**. Link altına "ilginç" yazmak sıfır değer üretir;
+bizim katkımız, bir şeyin inşa eden biri için ne anlama geldiğini onun kullandığı
+kelimelerle söylemek ve arkasında durabileceğimiz bir yorum eklemek.
+
+3-4 tweet, sabit iskelet (`ops/news_flood.py` bunu zorunlu tutar):
+
+| # | İçerik |
+|---|---|
+| 1 | Ne oldu — sade dil, jargon yok, link yok. Kaydıran biri tıklamadan anlamalı. |
+| 2 | Ne değişiyor — mekanizma, sıfat değil |
+| 3 | **Bizim yorumumuz** — ne yapardık, neye mal olur, nerede kırılır. Flood'un var olma sebebi bu. |
+| 4 | (opsiyonel) Dürüst çekince ya da gerçekten merak ettiğimiz soru. Doldurmak için yazılmaz. |
+
+Yasak: hype kelimeleri, "🧵", "1/4" numaralandırma, link, cdpilot reklamı,
+sahip olmadığımız deneyim iddiası ("yıllardır X çalıştırıyoruz").
+Kaynak: `discovery_scan` (HN/GitHub/arXiv). Çıktı `drafts/`'a yazılır —
+**otomatik atılmaz**, Nadir onaylar.
+
+### Kendini tekrar etmeme (2026-08-30)
+
+`ops/_novelty.py` her flood ve öneri öncesi üç eksende bakar:
+**konu** (aynı repo/ürün 21 gün içinde tekrar), **kelime** (son 30 günle %45+
+örtüşme), **ritim** (son 8 postta aynı iki kelimeyle başlamak). Üçü de
+engelleyicidir — üretilen içerik reddedilir ve sıradaki adaya geçilir.
+
+Gerekçe: poster'daki birebir-metin engeli bozuk bir üreticiyi yakalar; yavaş
+başarısızlığı yakalamaz — aynı şeyi farklı kelimelerle her hafta söyleyip
+hesabı bir döngüye çevirmek.
+
 ### Tartışma kuralları (2026-08-30)
 
 Bu hesap tartışma **başlatır ve sürdürür**. İkisi de ölçülebilir davranış:

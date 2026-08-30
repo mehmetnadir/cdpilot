@@ -102,6 +102,10 @@ def main() -> None:
         results.append(_run([str(OPS / "daily_strategist.py")], "daily_strategist"))
         # Trend listener — Faz A #3. Picks top 3 niche-relevant trends from discovery feed.
         results.append(_run([str(OPS / "trend_listener.py")], "trend_listener_morning"))
+        # News flood — one AI/dev item translated into a 3-4 tweet flood with our
+        # take. Writes to drafts/ only; Nadir approves it like any other thread.
+        results.append(_run([str(OPS / "news_flood.py"), "--timeout", "140"],
+                            "news_flood"))
 
     # Evening: engagement scan + second trend listener pass
     if slot == "evening":

@@ -282,6 +282,103 @@ def test_search_score_prefers_fit_over_reach():
     assert sr._score(on_topic_small) > sr._score(off_topic_huge)
 
 
+# ── novelty: not repeating ourselves ──
+def _novelty_home(tmp_path, posts):
+    import json as _j
+    import time as _t
+    (tmp_path / "posted").mkdir(parents=True, exist_ok=True)
+    for i, text in enumerate(posts):
+        (tmp_path / "posted" / f"p{i}.json").write_text(_j.dumps(
+            {"id": f"p{i}", "text": text, "posted_at": int(_t.time()) - 3600}))
+    return tmp_path
+
+
+def test_novelty_allows_a_genuinely_new_take(tmp_path):
+    from _novelty import check  # type: ignore
+    home = _novelty_home(tmp_path, ["measured three parallel tabs as the ceiling"])
+    ok, why = check("claude keeps losing context past 100k tokens on refactors",
+                    home)
+    assert ok is True, why
+
+
+def test_novelty_blocks_saying_the_same_thing_again(tmp_path):
+    """Exact-duplicate blocking misses the slow failure: the same point in
+    different words, week after week."""
+    from _novelty import check  # type: ignore
+    home = _novelty_home(tmp_path, [
+        "fingerprint spoofing is a treadmill you lose, real browsers and slow "
+        "request rates survive where stealth patches fail"])
+    ok, why = check(
+        "spoofing fingerprints is a treadmill nobody wins, real browsers with "
+        "slow request rates survive where stealth patches keep failing", home)
+    assert ok is False and "similar" in why
+
+
+def test_novelty_blocks_the_same_subject_too_soon(tmp_path):
+    from _novelty import check  # type: ignore
+    home = _novelty_home(tmp_path, ["took a look at rebrowser/patches this week"])
+    ok, why = check("another angle on rebrowser/patches worth noting", home)
+    assert ok is False and "subject" in why
+
+
+def test_novelty_blocks_a_repeated_opening_rhythm(tmp_path):
+    """Every post starting the same way reads as a bot even when the content
+    differs."""
+    from _novelty import check  # type: ignore
+    home = _novelty_home(tmp_path, [
+        "just shipped a tiny profiler for websocket frames",
+        "just shipped support for nested iframes in the crawler",
+    ])
+    ok, why = check("just shipped a rate limiter for the queue worker", home)
+    assert ok is False and "opening" in why
+
+
+# ── news flood: shape enforcement ──
+def _import_flood(tmp_path, monkeypatch):
+    import importlib
+    import types
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    for mod in ("twikit", "_twikit_patch"):
+        monkeypatch.setitem(sys.modules, mod, types.ModuleType(mod))
+    sys.modules["twikit"].Client = object
+    for mod in ("reply_drafter", "news_flood"):
+        sys.modules.pop(mod, None)
+    return importlib.import_module("news_flood")
+
+
+def test_flood_requires_three_or_four_clean_tweets(tmp_path, monkeypatch):
+    nf = _import_flood(tmp_path, monkeypatch)
+    ok_payload = json.dumps(["what happened, plainly", "what actually changes",
+                             "our take, with a number: 3x"])
+    assert nf._validate_flood(ok_payload)[1] == []
+    assert nf._validate_flood(json.dumps(["only", "two"]))[1] != []
+    assert nf._validate_flood("here is your flood!")[1] == ["not a JSON array"]
+    long_one = json.dumps(["fine", "fine", "x" * 300])
+    assert any("too long" in i for i in nf._validate_flood(long_one)[1])
+
+
+def test_flood_applies_voice_rules_to_every_tweet(tmp_path, monkeypatch):
+    nf = _import_flood(tmp_path, monkeypatch)
+    payload = json.dumps(["first one is fine",
+                          "you can leverage this to streamline things",
+                          "third is fine too"])
+    issues = nf._validate_flood(payload)[1]
+    assert any("leverage" in i for i in issues)
+
+
+def test_flood_candidates_drop_off_topic_and_off_limits(tmp_path, monkeypatch):
+    nf = _import_flood(tmp_path, monkeypatch)
+    ranked = nf.candidates({
+        "hn": [{"title": "Claude Code adds session URLs to commits", "url": "u", "score": 80, "comments": 20},
+               {"title": "Election results spark protests", "url": "u", "score": 900, "comments": 400},
+               {"title": "Best sourdough starter tips", "url": "u", "score": 500, "comments": 100}],
+        "github": [], "arxiv": [],
+    })
+    titles = [c["title"] for c in ranked]
+    assert any("Claude Code" in t for t in titles)
+    assert not any("Election" in t or "sourdough" in t for t in titles)
+
+
 def _import_reaper():
     import importlib
     sys.modules.pop("tab_reaper", None)
