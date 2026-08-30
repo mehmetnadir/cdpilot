@@ -66,6 +66,8 @@ SEARCH_QUERIES = [
     "browser fingerprint randomize",
 ]
 
+from _relevance import should_reply  # noqa: E402
+
 MIN_FOLLOWERS = int(os.environ.get("CDPILOT_SEARCH_MIN_FOLLOWERS", "1000"))
 MAX_AGE_HOURS = int(os.environ.get("CDPILOT_SEARCH_MAX_AGE_H", "36"))
 MAX_PROPOSALS = int(os.environ.get("CDPILOT_SEARCH_MAX_PROPOSALS", "3"))
@@ -116,6 +118,14 @@ async def _search_one(client: Client, query: str, limit: int = 5) -> list[dict]:
                 handle = getattr(user, "screen_name", "?")
                 if handle == HANDLE:
                     continue
+                # Topical gate. X search matches loosely and the ranking below
+                # rewards reach, so without this a big off-topic account beats a
+                # small on-topic one — which is how we ended up answering UK tax
+                # policy and a Pokemon pre-order guide (2026-06).
+                ok, why = should_reply(text)
+                if not ok:
+                    _log(f"skip @{handle} — {why}: {text[:70]}")
+                    continue
                 out.append({
                     "tweet_id": tw.id,
                     "url": f"https://x.com/{handle}/status/{tw.id}",
@@ -147,11 +157,19 @@ def _dedupe(items: list[dict]) -> list[dict]:
 
 
 def _score(it: dict) -> float:
-    """Higher = better candidate. Recency + follower count + low reply count."""
+    """Higher = better candidate: topical fit first, then recency and headroom.
+
+    Follower count used to carry the heaviest weight (0.5), which optimised for
+    reach rather than fit. It still counts, but it can no longer outrank being
+    about the thing we actually build.
+    """
+    from _relevance import relevance
+    fit = min(1.0, relevance(it.get("text", ""))[0] / 4.0)
     fresh_boost = max(0.0, (MAX_AGE_HOURS - it.get("hours_old", 999)) / MAX_AGE_HOURS)
     follower_log = min(1.0, (it.get("author_followers", 0) / 50000.0))
     low_reply_boost = 1.0 / (1 + it.get("replies", 0) / 5.0)
-    return round(fresh_boost * 0.3 + follower_log * 0.5 + low_reply_boost * 0.2, 3)
+    return round(fit * 0.45 + fresh_boost * 0.25 + low_reply_boost * 0.2
+                 + follower_log * 0.1, 3)
 
 
 def _ai_draft(incoming: str, author: str) -> str | None:

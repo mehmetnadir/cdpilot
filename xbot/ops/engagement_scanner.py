@@ -81,6 +81,9 @@ QUOTE_PER_DAY = int(os.environ.get("CDPILOT_QUOTE_CAP", "2"))
 
 AUTO_LIKE_THRESHOLD = int(os.environ.get("CDPILOT_AUTO_LIKE_SCORE", "6"))
 AUTO_REPLY_THRESHOLD = int(os.environ.get("CDPILOT_AUTO_REPLY_SCORE", "7"))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _relevance import off_limits as _off_limits  # noqa: E402
 AUTO_QUOTE_THRESHOLD = int(os.environ.get("CDPILOT_AUTO_QUOTE_SCORE", "8"))  # manual only
 
 FREEZE_FLAG = DATA / "state" / "crisis-freeze.flag"
@@ -419,6 +422,13 @@ async def main_async(propose_top: int) -> None:
             continue
         text = c.get("text", "")
         topic_match = bool(TOPIC_RE.search(text))
+        # TOPIC_RE only says what we are interested in, never what we must stay
+        # out of — and "agent"/"llm" match plenty of political posts. The veto
+        # covers the categories that cost the account rather than earn it.
+        blocked = _off_limits(text)
+        if blocked:
+            _log(f"veto @{c.get('handle','?')} — off-limits:{blocked}")
+            continue
 
         # === AUTO-REPLY: skor ≥ 7 + topic match + AI draft + cap altı + no crisis
         if (not crisis_active and topic_match and

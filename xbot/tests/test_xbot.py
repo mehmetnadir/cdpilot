@@ -219,6 +219,69 @@ def test_crisis_real_follower_drop_still_triggers(tmp_path, monkeypatch):
     assert crisis_check.FREEZE_FLAG.exists()
 
 
+# ── relevance gate: the replies that should never have been posted ──
+def test_relevance_blocks_the_replies_we_actually_posted():
+    """Each of these went out from @cdpilot_dev in 2026-06 and should not have."""
+    from _relevance import should_reply  # type: ignore
+    posted = {
+        "siyaset": ("@ChrisWhitt40135 Nothing to do with Ed Milliband ffs it's tax "
+                    "by stealth. why people are being duped by Reform who are "
+                    "definitely NOT on the side of the working class"),
+        "sinav-sorusu": "What protocol is used for RADIUS? A. UDP B. NetBIOS C. TCP D. Proprietary",
+        "perakende-kapma": ("Pokemon Center Pitch Black Pre-Order Success Guide. tips "
+                            "to maximize your chances when the drop goes live"),
+    }
+    for expected, text in posted.items():
+        ok, reason = should_reply(text)
+        assert ok is False, f"{expected} still passes: {reason}"
+        assert expected in reason
+
+
+def test_relevance_blocks_off_niche_without_domain_terms():
+    from _relevance import should_reply  # type: ignore
+    ok, reason = should_reply(
+        "VoipNow turns 20. On 30 May 2006 we launched VoipNow to help service "
+        "providers deliver communication services more efficiently.")
+    assert ok is False and "off-niche" in reason
+
+
+def test_relevance_passes_real_targets():
+    from _relevance import should_reply  # type: ignore
+    for text in (
+        "playwright stealth is not working, cloudflare detects headless chrome instantly",
+        "why is navigator.webdriver still true with puppeteer-extra stealth?",
+        "Browser fingerprint tool shows how easy you are to track",
+        "anyone used raw CDP instead of puppeteer? curious about the overhead",
+    ):
+        ok, reason = should_reply(text)
+        assert ok is True, f"missed a real target: {text} -> {reason}"
+
+
+def test_relevance_short_terms_need_word_boundaries():
+    """"cli" inside "cliche" and "dom" inside "domain" once read as on-topic."""
+    from _relevance import relevance  # type: ignore
+    assert relevance("My LLM cliche highlighter is up to 38 patterns")[0] == 0
+    assert relevance("I bought a new domain today")[0] == 0
+    assert relevance("the cdp session drops when the dom changes")[0] > 0
+
+
+def test_search_score_prefers_fit_over_reach():
+    """Follower count carried the heaviest weight, so a big off-topic account
+    outranked a small on-topic one. Fit now wins."""
+    sys.modules.pop("search_respond", None)
+    import types
+    for mod in ("twikit", "_twikit_patch"):
+        sys.modules.setdefault(mod, types.ModuleType(mod))
+    sys.modules["twikit"].Client = object
+    import importlib
+    sr = importlib.import_module("search_respond")
+    on_topic_small = {"text": "playwright stealth fails against cloudflare, headless detected",
+                      "hours_old": 5, "author_followers": 1200, "replies": 2}
+    off_topic_huge = {"text": "our company turns 20 today, thank you all",
+                      "hours_old": 5, "author_followers": 500000, "replies": 2}
+    assert sr._score(on_topic_small) > sr._score(off_topic_huge)
+
+
 def _import_reaper():
     import importlib
     sys.modules.pop("tab_reaper", None)
