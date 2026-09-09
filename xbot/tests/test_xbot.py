@@ -574,6 +574,31 @@ def test_lint_allows_banned_words_inside_quotes(tmp_path, monkeypatch):
     assert "delve" in rd._voice_lint("let me delve into that")[1]
 
 
+def test_clean_never_ends_mid_thought(tmp_path, monkeypatch):
+    """2026-09-08: a queued reply read "..which is why i…" — the 270-char trim
+    cut a sentence in half, and because _clean ran before the lint, the
+    over-length check never got a chance to refuse it."""
+    rd = _import_drafter(tmp_path, monkeypatch)
+    long_text = ("the analogy holds if you fold in error cost, so review earns its keep. "
+                 "where it breaks for me is that the discount is not fixed at all, "
+                 "it drops as the model earns trust on a given codebase, which is why i "
+                 "keep rewriting the threshold every few weeks in practice.")
+    out = rd._clean(long_text)
+    assert not out.endswith("…")
+    assert out.endswith(".")
+    assert len(out) <= 270
+
+
+def test_clean_leaves_unsalvageable_text_for_the_lint(tmp_path, monkeypatch):
+    """One giant sentence has no boundary to cut at: hand it to the lint, which
+    refuses it, rather than mangling it."""
+    rd = _import_drafter(tmp_path, monkeypatch)
+    wall = "word " * 100
+    out = rd._clean(wall)
+    assert len(out) > 270
+    assert any("too long" in i for i in rd._voice_lint(out)[1])
+
+
 def test_lint_rejects_leaked_prompt_text(tmp_path, monkeypatch):
     """2026-08-29: reading `reasoning_content` as the answer put the model's
     own instructions under a @vercel post."""

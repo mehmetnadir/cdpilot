@@ -268,7 +268,15 @@ def _clean(raw: str) -> str:
     if "</think>" in cleaned:
         cleaned = cleaned.rsplit("</think>", 1)[1].strip()
     if len(cleaned) > 270:
-        cleaned = cleaned[:267].rsplit(" ", 1)[0] + "…"
+        # Chopping at a character count ends the reply mid-thought — one went
+        # into the queue reading "..which is why i…" (2026-09-08). Fall back to
+        # the last complete sentence; if that leaves nothing usable, return the
+        # over-length text so _voice_lint refuses it and another engine tries.
+        cut = max(cleaned.rfind(m, 0, 270) for m in (". ", "! ", "? "))
+        end = cleaned.rfind(".", 0, 270)
+        cut = max(cut, end)
+        if cut > 80:
+            cleaned = cleaned[:cut + 1].strip()
     return cleaned
 
 
