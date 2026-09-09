@@ -192,6 +192,30 @@ def test_crisis_drop_rules_disarmed_on_thin_baseline(tmp_path, monkeypatch):
     assert not crisis_check.FREEZE_FLAG.exists()
 
 
+def test_crisis_quiet_day_is_not_a_collapse(tmp_path, monkeypatch):
+    """2026-09-08 regression: a quiet stretch empties daily_analytics' 7-day
+    window, so today reports tweets_tracked=0. That is no measurement, not a
+    measurement of zero — comparing it against busy baseline days froze the
+    account for 11 hours and guaranteed the next day's zero too."""
+    hist = [{"followers": 3, "tweet_metrics": [{"likes": 2, "views": "150"}]}
+            for _ in range(5)]
+    hist[-1] = {"followers": 3, "tweet_metrics": []}   # nothing left to track
+    crisis_check, res = _crisis_with_history(tmp_path, monkeypatch, hist)
+    assert res["triggered"] is False, res["reasons"]
+    assert any("nothing tracked today" in s for s in res["skipped"])
+    assert not crisis_check.FREEZE_FLAG.exists()
+
+
+def test_crisis_real_collapse_with_tracked_posts_still_triggers(tmp_path, monkeypatch):
+    """The rule must still fire when we DID post and engagement fell off."""
+    hist = [{"followers": 3, "tweet_metrics": [{"likes": 5, "views": "300"}]}
+            for _ in range(5)]
+    hist[-1] = {"followers": 3, "tweet_metrics": [{"likes": 0, "views": "1"}]}
+    crisis_check, res = _crisis_with_history(tmp_path, monkeypatch, hist)
+    assert res["triggered"] is True
+    assert crisis_check.FREEZE_FLAG.exists()
+
+
 def test_crisis_single_unfollow_on_small_account_does_not_freeze(tmp_path, monkeypatch):
     hist = [{"followers": 3, "tweet_metrics": []} for _ in range(4)]
     hist[-1] = {"followers": 2, "tweet_metrics": []}

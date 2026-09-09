@@ -134,7 +134,24 @@ def check() -> dict:
     # analytics tracked nothing are absence of data, not absence of engagement.
     baseline_with_data = [d for d in baseline if d["tweets_tracked"] > 0]
     signal_ok = len(baseline_with_data) >= MIN_BASELINE_DAYS
-    if not signal_ok:
+
+    # Today must itself be measurable. daily_analytics only tracks posts inside
+    # its 7-day window, so a quiet stretch empties that window and today reports
+    # tweets_tracked=0 — no measurement, not a measurement of zero. Comparing
+    # that against a baseline of busy days reads as a 100% collapse and freezes
+    # posting, which then guarantees tomorrow's zero too.
+    # 2026-09-08: exactly this fired. "engagement drop: today=0 vs median=4" and
+    # "impressions floor: today=0 vs median=276" froze the account for 11 hours
+    # while nothing was actually wrong. Same class as the C6 bug (absent data
+    # read as a zero value), reintroduced here.
+    today_measurable = today["tweets_tracked"] > 0
+    if not today_measurable:
+        signal_ok = False
+        skipped.append(
+            "drop rules disarmed: nothing tracked today — no posts inside the "
+            "analytics window, so there is nothing to compare"
+        )
+    elif not signal_ok:
         skipped.append(
             f"drop rules disarmed: {len(baseline_with_data)}/{MIN_BASELINE_DAYS} "
             "baseline days with tracked tweets"
