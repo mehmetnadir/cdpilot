@@ -8,6 +8,11 @@ All notable changes to cdpilot will be documented in this file.
 - Official MCP Registry metadata: root `server.json` (schema `2025-12-11`), `mcpName` field in `package.json`, and an MCP Registry publish step in `.github/workflows/publish.yml` (`mcp-publisher` v1.8.1, GitHub OIDC), running after the existing npm publish step.
 - README now documents `cdpilot test` (runs `*.cdpt.js` files) and `cdpilot trace open` (time-travel trace viewer) — both have existed in the dispatch table for a while but were never mentioned in README or `--help`.
 
+### Fixed
+- **Port registry never forgot a project.** `~/.cdpilot/registry.json` only marked dead entries "stopped" and never removed them, so on a long-lived machine they filled the whole 9222–9322 range and every new project failed with "No free port". Dead entries (port free *and* recorded pid gone) are now pruned before each allocation; a port that is still bound is never pruned. The registry is written atomically, and `CDPILOT_HOME` can point it elsewhere.
+- **Windows: a process-liveness probe could kill the process.** On Windows, Python turns `os.kill(pid, 0)` into `TerminateProcess`. Liveness checks (registry cleanup, `watch`) now ask the kernel via `OpenProcess`/`GetExitCodeProcess` instead of signalling.
+- `lsof`/`pkill` calls used when stopping a browser now time out after 5s instead of blocking the caller indefinitely.
+
 ### Corrected
 - v0.9.0 announced a **"Multi-instance pool" (`CDPILOT_POOL_SIZE`)** feature under "Added" below — it was never implemented; no code path reads that env var. It has been removed from README (usage example, env-var table, feature checklist) and moved to the roadmap as planned/not shipped. The v0.9.0 entry itself is left unedited for historical accuracy — this note is the correction.
 - README/CLAUDE.md/`.claude/docs/architecture.md` described `src/cdpilot.py` as "~2500–2600 lines" and README's Comparison table said "install size ~50KB". Measured today: 13,129 lines / ~542KB (`src/cdpilot.py`) + ~23KB (`bin/cdpilot.js`). Wording was replaced with non-decaying descriptions instead of a number that will drift again as the file grows.
