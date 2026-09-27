@@ -66,8 +66,13 @@ NIM_KEY_FILE = Path(os.environ.get(
 #   gpt-oss-120b 67.4s content:null · kimi-k2.6 404 despite being in the catalog.
 # The 404 is why this is a list and not a pinned id: being listed does not mean
 # being served, so candidates are tried in order until one answers.
-NIM_PREFERENCE = ("moonshotai/kimi-k3", "deepseek-ai/deepseek-v4-pro",
-                  "openai/gpt-oss-120b", "deepseek-ai/deepseek-v4-flash")
+# Measured 2026-09-27 over the live catalog (82 models): kimi-k3, glm-5.3 and
+# deepseek-v4.1 time out, gpt-oss-120b returns 410 Gone, deepseek-v4-pro left
+# the catalog. nemotron-3-ultra answers in ~6-20s and wrote the only clean
+# drafts; nemotron-3-super narrated its task in 5/5 drafts and is left out.
+# Order is preference, not a guarantee — dead ones fall to the cooldown.
+NIM_PREFERENCE = ("nvidia/nemotron-3-ultra", "moonshotai/kimi-k3",
+                  "z-ai/glm-5", "deepseek-ai/deepseek-v4")
 NIM_CATALOG_CACHE = DATA / "state" / "nim-catalog.json"
 NIM_CATALOG_TTL = 24 * 3600
 
@@ -162,8 +167,34 @@ LEAK_MARKERS = ("reply tweet for", "max 2 sentences", "banned vocabulary",
                 "character limit", "output format")
 
 
+# Structural tells of a model narrating its own task instead of doing it.
+# A phrase denylist alone misses the next model's wording: 2026-09-27
+# nemotron-3-super returned "We need to read the user's request. They gave a
+# context about how to draft replies for @cdpilot_dev. Then they gave "THEIR
+# REPLY : ..." — zero LEAK_MARKERS hits, accepted as a draft. Any ONE of these
+# is enough: a real reply never names our own handle, never echoes the
+# prompt's section labels, never opens by planning, never talks about "the
+# user" who asked for it.
+_PROMPT_LABELS = ("their reply", "our original tweet", "who this account is",
+                  "when not to reply", "reply rules", "output format")
+_LEAK_STRUCTURAL = re.compile(
+    r"@?cdpilot_dev\b"
+    r"|^\W*(?:ok(?:ay)?|alright|so|first|let'?s|hmm)?\W*(?:we|i)\s+"
+    r"(?:need|have|should|must|want|am going|will)\s+to\s+"
+    r"(?:craft|write|draft|produce|read|respond|reply|answer|analy[sz]e|figure|come up|output)"
+    r"|\bthe user(?:'s)?\s+(?:request|wants|wanted|asked|asks|is|was|has|had|gave|"
+    r"wrote|provided|message|mentions|mentioned|says|said|seems|talks|replied)\b"
+    r"|^\W*(?:\d+\.\s*)?\**\s*analy[sz]e\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 def _looks_like_leaked_prompt(text: str) -> bool:
     low = (text or "").lower()
+    if any(label in low for label in _PROMPT_LABELS):
+        return True
+    if _LEAK_STRUCTURAL.search(text or ""):
+        return True
     return sum(1 for m in LEAK_MARKERS if m in low) >= 2
 
 
@@ -191,6 +222,12 @@ _UNBACKED_CLAIM = re.compile(
     r"|\bin our (?:tests?|benchmarks?|runs?|experiments?|data|numbers)\b"
     r"|\bour (?:benchmarks?|numbers|data|tests?) (?:show|showed|shows|suggest)\b"
     r"|\bwhen we (?:tried|tested|ran|measured)\b"
+    # 2026-09-27 nemotron-3-ultra: "cache invalidation bit us harder than the
+    # scraping itself .. stale prices 18% of the time" — invented incident,
+    # invented statistic. The model has no numbers of ours to quote.
+    r"|\b(?:bit|bitten|burned|burnt|hit|cost|saved|taught) us\b"
+    r"|\b\d+(?:\.\d+)?\s?%"
+    r"|\b\d+(?:\.\d+)?x (?:faster|slower|cheaper|more|less|fewer|smaller|bigger)\b"
 )
 
 

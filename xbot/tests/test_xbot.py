@@ -1519,3 +1519,56 @@ def test_lint_allows_opinion_and_the_makers_story(text):
     from reply_drafter import _voice_lint  # type: ignore
     _, issues = _voice_lint(text)
     assert "unbacked experience claim" not in issues
+
+
+# ── leaked monologue: structural detection (2026-09-27) ──
+@pytest.mark.parametrize("text", [
+    # verbatim nemotron-3-super output that passed the old two-marker check
+    "We need to read the user's request. They gave a context about how to draft "
+    "replies for @cdpilot_dev. Then they gave \"THEIR REPLY : AI reply to @x\".",
+    "1.  **Analyze User Input:**\n   - User wants a reply tweet",
+    "Okay, I need to write a reply that sounds casual.",
+    "The user is asking for a tweet about CDP sessions.",
+    "their reply mentions playwright, so answer that part",
+])
+def test_leak_detector_catches_narrated_task(text):
+    from reply_drafter import _looks_like_leaked_prompt  # type: ignore
+    assert _looks_like_leaked_prompt(text)
+
+
+@pytest.mark.parametrize("text", [
+    "we need to talk about how flaky selectors get on shadow dom.. what broke first for you?",
+    "the user never sees the retry, which is the point.. how do you surface it in logs?",
+    "i built cdpilot for exactly this flow after playwright kept forcing fresh contexts.",
+])
+def test_leak_detector_leaves_real_replies_alone(text):
+    from reply_drafter import _looks_like_leaked_prompt  # type: ignore
+    assert not _looks_like_leaked_prompt(text)
+
+
+# ── 2026-09-27 nemotron-3-ultra drafts that slipped through ──
+@pytest.mark.parametrize("text", [
+    "The user is talking about building SocialMate in public, specifically about "
+    "reply automation.",
+    "The user is replying to a tweet about Jev for computer/browser agents.",
+])
+def test_leak_detector_catches_third_person_summary(text):
+    from reply_drafter import _looks_like_leaked_prompt  # type: ignore
+    assert _looks_like_leaked_prompt(text)
+
+
+@pytest.mark.parametrize("text", [
+    "cache invalidation bit us harder than the scraping itself .. 12h ttl on "
+    "product pages still served stale prices 18% of the time.",
+    "switching to eval-batch made it 5x faster for us.",
+])
+def test_lint_refuses_invented_incidents_and_stats(text):
+    from reply_drafter import _voice_lint  # type: ignore
+    _, issues = _voice_lint(text)
+    assert "unbacked experience claim" in issues
+
+
+def test_nim_preference_skips_models_measured_dead():
+    import reply_drafter as r  # type: ignore
+    assert r.NIM_PREFERENCE[0] == "nvidia/nemotron-3-ultra"
+    assert not any("gpt-oss" in m or "nemotron-3-super" in m for m in r.NIM_PREFERENCE)
