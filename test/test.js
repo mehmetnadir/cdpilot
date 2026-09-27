@@ -1513,6 +1513,7 @@ test('Browserbase session dict shape contains required fields', () => {
 
 (function() {
   const http = require('http');
+  const os = require('os');
   const { spawn, spawnSync } = require('child_process');
 
   const API_PORT = 19333;
@@ -1525,11 +1526,17 @@ test('Browserbase session dict shape contains required fields', () => {
     return;
   }
 
+  // Isolated registry home: _api_create_session() allocates a real port via
+  // _allocate_port()/registry.json on every POST /v1/sessions. Without this
+  // override these tests read and mutate the operator's real
+  // ~/.cdpilot/registry.json on every run.
+  const apiTestHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-api-test-'));
+
   // Start server
   const serverProc = spawn(
     'python3', [PY_SCRIPT, 'serve', '--api', `--port=${API_PORT}`],
     {
-      env: { ...process.env, CDPILOT_API_TEST_MODE: '1', CDP_PORT: '19222' },
+      env: { ...process.env, CDPILOT_API_TEST_MODE: '1', CDP_PORT: '19222', CDPILOT_HOME: apiTestHome },
       stdio: ['ignore', 'pipe', 'pipe'],
     }
   );
@@ -1618,6 +1625,224 @@ test('Browserbase session dict shape contains required fields', () => {
   });
 
   serverProc.kill();
+  fs.rmSync(apiTestHome, { recursive: true, force: true });
+})();
+
+// ── Port registry cleanup regression (vaat-denetimi-2026-09-27) ──
+// _allocate_port() used to trust every registry entry forever, even ones
+// whose port was long dead (browser closed, process exited, machine
+// rebooted). On a long-lived dev machine the registry accumulated 127
+// such entries and, once enough of them piled up inside the 100-slot
+// 9222-9322 range, _allocate_port() raised "No free port" even though
+// nothing was actually listening anywhere — which is exactly what broke
+// the `serve --api` tests above on this machine before the fix.
+// All of this runs against a throwaway CDPILOT_HOME; the user's real
+// ~/.cdpilot/registry.json is never read or written by these tests.
+(function() {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-registry-test-'));
+
+  function writeFakeRegistry(ports) {
+    const projects = {};
+    for (const port of ports) {
+      projects[`fake-project-${port}`] = {
+        cwd: `/tmp/fake-${port}`,
+        port,
+        profile_dir: `/tmp/fake-${port}/profile`,
+        // Absurdly large, guaranteed-nonexistent pid (real pids top out
+        // around 10^5-10^7 on every platform) — never collides with a
+        // real running process.
+        pid: 900000000 + port,
+        created: '2020-01-01T00:00:00',
+        last_used: '2020-01-01T00:00:00',
+        status: 'running',
+      };
+    }
+    fs.writeFileSync(
+      path.join(tmpHome, 'registry.json'),
+      JSON.stringify({ version: 1, projects }, null, 2)
+    );
+  }
+
+  function runPy(script) {
+    return spawnSync('python3', ['-c', script], {
+      encoding: 'utf-8',
+      timeout: 15000,
+      env: { ...process.env, CDPILOT_HOME: tmpHome },
+    });
+  }
+
+  // This machine may already have something genuinely bound to a handful
+  // of ports inside 9222-9322 (another tool, a leftover dev browser, ...).
+  // Probing for ports that are ACTUALLY free right now — instead of
+  // assuming the whole range is free — keeps the fake-registry tests
+  // deterministic regardless of what else is running on the host.
+  function findFreePorts(count) {
+    const script = `
+import socket, json
+
+def is_free(p):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", p))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+found = []
+for p in range(9222, 9322):
+    if is_free(p):
+        found.append(p)
+    if len(found) >= ${count}:
+        break
+print(json.dumps(found))
+`;
+    const r = spawnSync('python3', ['-c', script], { encoding: 'utf-8', timeout: 10000 });
+    if (r.status !== 0) {
+      throw new Error(`findFreePorts(${count}) failed: ${r.stderr}`);
+    }
+    const ports = JSON.parse((r.stdout || '[]').trim());
+    assert.strictEqual(ports.length, count,
+      `expected ${count} free ports in 9222-9322, only found ${ports.length}`);
+    return ports;
+  }
+
+  // Every port in 9222-9322 that is free RIGHT NOW, whatever that count is
+  // (a couple of slots may legitimately be held by something else on this
+  // host). Filling exactly these with dead registry entries still saturates
+  // the range for the pre-fix _allocate_port: the handful of genuinely-bound
+  // ports were already unavailable via its own _is_port_free() check, and
+  // every other slot is now claimed by a fake dead entry.
+  function findAllCurrentlyFreePorts() {
+    const script = `
+import socket, json
+
+def is_free(p):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", p))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+print(json.dumps([p for p in range(9222, 9322) if is_free(p)]))
+`;
+    const r = spawnSync('python3', ['-c', script], { encoding: 'utf-8', timeout: 10000 });
+    if (r.status !== 0) {
+      throw new Error(`findAllCurrentlyFreePorts failed: ${r.stderr}`);
+    }
+    return JSON.parse((r.stdout || '[]').trim());
+  }
+
+  const IMPORT_SNIPPET = `
+import importlib.util
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+`;
+
+  test('registry: pid liveness never signals the process (Windows os.kill(pid, 0) terminates it)', () => {
+    // On Windows, Python turns os.kill(pid, 0) into TerminateProcess. The
+    // registry cleanup runs on every command's startup against pids that may
+    // have been reused by unrelated programs, so a "probe" there could kill
+    // them. All liveness checks must go through _pid_alive, which asks the
+    // kernel on Windows. Comments are stripped so a mention can't pass.
+    const code = PY_CONTENT.split('\n').map((l) => l.replace(/#.*$/, '')).join('\n');
+    const probes = code.match(/os\.kill\([^,]+,\s*0\s*\)/g) || [];
+    assert.strictEqual(probes.length, 1,
+      `exactly one os.kill(pid, 0) allowed (inside _pid_alive), found ${probes.length}`);
+    const fn = (code.match(/def _pid_alive\(pid\):([\s\S]*?)\n\ndef /) || [])[1] || '';
+    assert(/os\.name == "nt"/.test(fn) && /OpenProcess/.test(fn),
+      '_pid_alive must take the OpenProcess path on Windows');
+    assert(fn.indexOf('os.name == "nt"') < fn.indexOf('os.kill('),
+      'the Windows branch must return before os.kill is reached');
+  });
+
+  test('registry: _pid_alive tells a live pid from a dead one', () => {
+    const r = runPy(IMPORT_SNIPPET +
+      'import os\nprint("SELF=" + str(mod._pid_alive(os.getpid())))\n' +
+      'print("DEAD=" + str(mod._pid_alive(900000000)))\nprint("BAD=" + str(mod._pid_alive("x")))\n');
+    assert.strictEqual(r.status, 0, `_pid_alive must not error (stderr: ${r.stderr})`);
+    assert(/SELF=True/.test(r.stdout) && /DEAD=False/.test(r.stdout) && /BAD=False/.test(r.stdout),
+      `unexpected liveness results: ${r.stdout}`);
+  });
+
+  test('registry: CDPILOT_HOME is overridable via env var (test isolation)', () => {
+    assert(PY_CONTENT.includes('os.environ.get("CDPILOT_HOME")'),
+      'CDPILOT_HOME must honor an env override so tests never touch the real ~/.cdpilot registry');
+  });
+
+  test('registry: 100 dead entries filling the whole port range no longer exhaust _allocate_port (regression)', () => {
+    // Fill every currently-free port in the 9222-9322 range with fake,
+    // dead entries: nothing is listening on any of them and none of the
+    // pids exist. A correct _allocate_port() must prune them first and
+    // hand back a free port; the pre-fix implementation trusted the
+    // registry file unconditionally and raised "No free port in range
+    // 9222-9322" once dead entries alone covered every free slot.
+    const freePorts = findAllCurrentlyFreePorts();
+    assert(freePorts.length > 0, 'need at least one free port in range to run this test');
+    writeFakeRegistry(freePorts);
+    const r = runPy(IMPORT_SNIPPET + 'print("PORT=" + str(mod._allocate_port("brand-new-project-id")))\n');
+    assert.strictEqual(r.status, 0,
+      `_allocate_port must succeed once dead entries are pruned (stderr: ${r.stderr})`);
+    assert(/PORT=\d+/.test(r.stdout || ''),
+      `expected an allocated port, got stdout=${r.stdout} stderr=${r.stderr}`);
+  });
+
+  test('registry: dead entries are actually removed from disk, not just marked stopped', () => {
+    const ports = findFreePorts(5);
+    writeFakeRegistry(ports);
+    const r = runPy(IMPORT_SNIPPET + 'reg = mod._cleanup_registry()\nprint("COUNT=" + str(len(reg)))\n');
+    assert.strictEqual(r.status, 0, `_cleanup_registry must not error (stderr: ${r.stderr})`);
+    assert(/COUNT=0/.test(r.stdout || ''),
+      `all 5 dead entries should be pruned, got stdout=${r.stdout}`);
+    const onDisk = JSON.parse(fs.readFileSync(path.join(tmpHome, 'registry.json'), 'utf-8'));
+    assert.strictEqual(Object.keys(onDisk.projects).length, 0,
+      'pruned entries must be persisted to registry.json, not just returned in memory');
+  });
+
+  test('registry: a genuinely live (listening) port is never pruned', () => {
+    // Bind a real socket on the fake entry's port *before* cleanup runs, in
+    // the same Python process, so there is no cross-process timing race:
+    // a dead-looking registry entry whose port is actually bound (e.g.
+    // another project's live browser) must survive cleanup.
+    const [livePort] = findFreePorts(1);
+    writeFakeRegistry([livePort]);
+    const script = `
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", ${livePort}))
+s.listen(1)
+${IMPORT_SNIPPET}
+reg = mod._cleanup_registry()
+print("KEPT=" + str("fake-project-${livePort}" in reg))
+s.close()
+`;
+    const r = runPy(script);
+    assert.strictEqual(r.status, 0, `cleanup must not error (stderr: ${r.stderr})`);
+    assert(/KEPT=True/.test(r.stdout || ''),
+      `a live (listening) port's registry entry must never be pruned, got stdout=${r.stdout} stderr=${r.stderr}`);
+  });
+
+  test('registry: pruning never touches the real ~/.cdpilot/registry.json', () => {
+    const realRegistry = path.join(os.homedir(), '.cdpilot', 'registry.json');
+    const before = fs.existsSync(realRegistry) ? fs.readFileSync(realRegistry, 'utf-8') : null;
+    writeFakeRegistry(findFreePorts(3));
+    runPy(IMPORT_SNIPPET + 'mod._cleanup_registry()\n');
+    const after = fs.existsSync(realRegistry) ? fs.readFileSync(realRegistry, 'utf-8') : null;
+    assert.strictEqual(before, after, "the user's real registry.json must be untouched by these tests");
+  });
+
+  fs.rmSync(tmpHome, { recursive: true, force: true });
 })();
 
 // ── Test Runner ──
