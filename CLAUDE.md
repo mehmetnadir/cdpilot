@@ -41,7 +41,8 @@
 | ✅ | İddia kapıları | Site `npm test` + repo `test/test.js`: 500x / 50KB / "40+ commands" geri gelirse kırılır. a11y-snapshot token tasarrufu diye SATILMAZ (ölçüm: `.claude/docs/token-olcumu-2026-09-27.md`) |
 | ✅ | Twitter bot | Alarm ntfy `bekci` kanalında; motor yalnız nemotron-3-ultra (düşünme kapalı); `pain_hunter` 13:00 + akşam slotunda canlı (günde ≤3 yanıt) |
 | ⏳ | Glama sahiplenme | Nadir claim edecek → sonra punkpeye/awesome-mcp-servers'a 3. PR |
-| ⏳ | v0.9.2 adayı | Bağlantı dayanıklılığı: auto-relaunch/attach + evrensel --timeout (#2); aday: iframe (#1), CSS seçicide shadow DOM (#3) — kapsam kararı Nadir'de |
+| ✅ | v0.9.2 npm + registry | 27.09: auto-launch, --timeout (#2), `open`; `stop` artık takılmıyor ve Windows'ta kullanıcı tarayıcısını öldürmüyor; headless stealth/undetected sannysoft 31/31 |
+| ⏳ | v0.9.3 adayı | iframe (#1) önerildi, Nadir onayı bekliyor; CSS seçicide shadow DOM (#3) sonra; UA override `go` bağlantısıyla sınırlı (sonraki komutlar) |
 | ⏳ | Sentinel takip | C6: daily_analytics gece yazmıyor (debug) · C8: 2 failed auto-like sebebi |
 | ⏳ | v0.9 tls-proxy | Optional local TLS-MITM (curl-impersonate semantics) |
 
