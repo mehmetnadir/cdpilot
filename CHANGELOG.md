@@ -17,6 +17,7 @@ Why: in ~1,225 real agent sessions the top failures were "CDP connection error. 
 - `new-tab`, `press-hold`, `profile warm` and the browser-level commands (`download`, `permission`) auto-launch too instead of failing when the browser is down.
 
 ### Fixed
+- `cdpilot launch` with a browser binary that cannot be started printed a Python traceback; on Windows the error did not even name the binary. It now prints `Cannot start browser '<path>': <reason>` and exits 1 (Windows CI caught the unnamed binary in the auto-launch failure line).
 - `bin/cdpilot.js` exited **0** when the Python core was killed by a signal (OOM, SIGKILL): `process.exit(code || 0)` turned `code === null` into success. It now prints the signal and exits with 128 + signal number (137 for SIGKILL).
 
 ### Corrected
