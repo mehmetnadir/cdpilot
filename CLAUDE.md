@@ -29,7 +29,7 @@
 - **Tek dosya mimari:** Tüm Python kodu `src/cdpilot.py` (büyüyor — güncel satır sayısı için `wc -l src/cdpilot.py`, 2026-09-27'de 13.129 satır)
 - **Sıfır bağımlılık:** Harici Python/npm paketi eklenmez — stdlib only
 - **Port 9222:** Varsayılan CDP, `CDP_PORT` env ile değişir
-- **Brave öncelikli:** Brave > Chrome > Chromium
+- **Tarayıcı seçimi `auto` (varsayılan):** eklenti yoksa Chrome; `ext-install` ile eklenti kayıtlıysa Brave/Vivaldi (Chrome 137+ paketlenmemiş eklentiyi yüklemiyor); macOS 26'da Brave geri sırada — sebebi `cdpilot browser status` söyler
 - **İzole profil:** `~/.cdpilot/profile` — kullanıcı tarayıcısına dokunulmaz
 - **Stealth session-bound:** `Page.addScriptToEvaluateOnNewDocument` WS kapanınca silinir
 - **cdpilot-site:** Ayrı dizin `/Users/nadir/01dev/cdpilot-site/`, Server 21 port 3400
