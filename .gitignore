@@ -23,3 +23,14 @@ content/
 src/app/
 src/components/
 src/lib/
+
+# Working reports (2026-09-27): raw third-party tweets, handles and competitor
+# probes. Kept locally for the team, never in the public repo.
+.claude/docs/*-ham/
+.claude/docs/mcp-dizin-hazirlik/
+.claude/docs/x-sorun-haritasi-*.md
+.claude/docs/cikis-ivmesi-analizi-*.md
+.claude/docs/geo-ai-oneri-denetimi-*.md
+.claude/docs/viral-icerik-plani-*.md
+.claude/docs/vaat-denetimi-*.md
+.claude/docs/mcp-dizin-denetimi-*.md

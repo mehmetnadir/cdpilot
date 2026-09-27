@@ -2,6 +2,22 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [0.9.1] - 2026-09-27
+
+### Added
+- Official MCP Registry metadata: root `server.json` (schema `2025-12-11`), `mcpName` field in `package.json`, and an MCP Registry publish step in `.github/workflows/publish.yml` (`mcp-publisher` v1.8.1, GitHub OIDC), running after the existing npm publish step.
+- README now documents `cdpilot test` (runs `*.cdpt.js` files) and `cdpilot trace open` (time-travel trace viewer) — both have existed in the dispatch table for a while but were never mentioned in README or `--help`.
+
+### Corrected
+- v0.9.0 announced a **"Multi-instance pool" (`CDPILOT_POOL_SIZE`)** feature under "Added" below — it was never implemented; no code path reads that env var. It has been removed from README (usage example, env-var table, feature checklist) and moved to the roadmap as planned/not shipped. The v0.9.0 entry itself is left unedited for historical accuracy — this note is the correction.
+- README/CLAUDE.md/`.claude/docs/architecture.md` described `src/cdpilot.py` as "~2500–2600 lines" and README's Comparison table said "install size ~50KB". Measured today: 13,129 lines / ~542KB (`src/cdpilot.py`) + ~23KB (`bin/cdpilot.js`). Wording was replaced with non-decaying descriptions instead of a number that will drift again as the file grows.
+- `bin/cdpilot.js`'s "Python not found" error said "Python 3.8+ required"; the actual requirement (PEP 604 union types) has been 3.10+ since v0.9.0. Message text corrected, no behavior change.
+- `glama.json` said "40+ commands" (README/package.json already correctly say 70+) and "python >= 3.8"; both corrected.
+- `.claude/docs/innovation-roadmap.md` marked "Test runner" and "Cloud-API uyumlu lokal" (`cdpilot test`/`trace`, `serve --api`) as 🔴 missing — both are implemented and dispatched, just undocumented. Status flipped, evidence cited.
+
+### Changed
+- `package.json` version → 0.9.1; removed the `multi-instance` npm keyword (it implied a shipped feature that isn't).
+
 ## [0.9.0] - 2026-08-23
 
 ### Changed

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.mehmetnadir/cdpilot",
+  "description": "Zero-dependency browser automation over raw CDP — no Puppeteer, Playwright, or Selenium.",
+  "version": "0.9.1",
+  "websiteUrl": "https://cdpilot.ndr.ist",
+  "repository": {
+    "url": "https://github.com/mehmetnadir/cdpilot",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "cdpilot",
+      "version": "0.9.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}

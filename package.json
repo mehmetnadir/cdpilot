@@ -1,6 +1,7 @@
 {
   "name": "cdpilot",
-  "version": "0.9.0",
+  "version": "0.9.1",
+  "mcpName": "io.github.mehmetnadir/cdpilot",
   "description": "Zero-dependency browser automation CLI. Raw CDP, 70+ commands, friction ladder, 3-tier stealth, CAPTCHA + press-and-hold solvers, proxy pools, MCP server. No Puppeteer/Playwright/Selenium.",
   "bin": {
     "cdpilot": "./bin/cdpilot.js",
@@ -48,8 +49,7 @@
     "shadow-dom",
     "perimeterx",
     "press-and-hold",
-    "progressive-resilience",
-    "multi-instance"
+    "progressive-resilience"
   ],
   "author": "Mehmet Nadir",
   "license": "MIT",

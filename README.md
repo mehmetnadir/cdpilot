@@ -562,20 +562,16 @@ on macOS — spot degradation before your automation silently stalls.
 ### Scaling & Workstation Use
 
 ```bash
-CDPILOT_POOL_SIZE=4 cdpilot launch   # 4 separate browser processes
 CDPILOT_OFFSCREEN=1 cdpilot launch   # headed, but no window on your screen
 ```
 
-- **Multi-instance pool** (`CDPILOT_POOL_SIZE=N`) starts N independent browser
-  processes and dispatches work to the least-loaded one, for `N × per-instance`
-  parallelism. Default is `1` — single instance, no change for existing users.
 - **Off-screen mode** (`CDPILOT_OFFSCREEN=1`) keeps the browser headed (real
   rendering, no headless fingerprint) but positions the window where it can't
   steal focus — meant for automating on a workstation you're also using.
-- **Docker + Xvfb harness** (`cdpilot-bench/docker/`) runs headed-in-Xvfb so
-  bench/automation runs never pop a window on the host display. CI-ready. Note
-  that software rendering (no GPU) lowers anti-bot scores versus native — it's
-  an isolated environment for reproducibility, not the headline configuration.
+- **Multi-instance pool** (`CDPILOT_POOL_SIZE`) — planned, not shipped yet.
+  See [Roadmap](#coming-soon).
+- **Docker + Xvfb harness** — used in a separate, private benchmark
+  repo (`cdpilot-bench`), not part of this package.
 
 ## Use with AI Agents
 
@@ -624,7 +620,6 @@ print(result.stdout)
 | `BROWSER_SESSION` | Auto | Session identifier |
 | `CDPILOT_MODE` | `regular` | Stealth tier override (`regular`/`stealth`/`undetected`) |
 | `CDPILOT_OFFSCREEN` | `0` | Headed but render off-screen — no window steals focus |
-| `CDPILOT_POOL_SIZE` | `1` | N separate browser processes, least-loaded dispatch |
 
 ## How It Works
 
@@ -636,7 +631,7 @@ print(result.stdout)
        │                                        │
        │  Zero dependencies                     │  Isolated profile
        │  Pure HTTP + WebSocket                 │  Separate from your
-       │  ~2500 lines, single file              │  personal browser
+       │  single file, stdlib + websockets      │  personal browser
        └────────────────────────────────────────┘
 ```
 
@@ -694,8 +689,8 @@ The full adaptive layer is bench-neutral vs baseline (30/80 vs 30/80) for Stealt
 
 | Feature | cdpilot | Puppeteer | Playwright | Selenium |
 |---------|-----------|-----------|------------|----------|
-| Install size | **~50KB** | 400MB+ | 200MB+ | 100MB+ |
-| Dependencies | **0** | 50+ | 30+ | Java + drivers |
+| Install size | **one Python file + a small Node launcher, no node_modules** | 400MB+ | 200MB+ | 100MB+ |
+| Dependencies | **0 npm** (Python: `websockets`, auto-installed) | 50+ | 30+ | Java + drivers |
 | Setup time | **instant** | minutes | minutes | painful |
 | AI-agent ready | **yes** | manual | manual | manual |
 | Browser download | **no** | yes (Chromium) | yes (3 browsers) | no |
@@ -753,6 +748,7 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] 70+ CLI commands (navigate, click, fill, screenshot, PDF, console, network, video understanding, friction ladder...)
 - [x] MCP server for AI agent integration (Claude Code, Cursor, etc.)
 - [x] **10 built-in test assertions** — assert, assert-url, assert-title, assert-count, assert-value, assert-attr, assert-visible/hidden, wait-for, check (batch), screenshot-diff
+- [x] **`test` runner + `trace` viewer** — `cdpilot test [--watch]` runs `*.cdpt.js` files; `cdpilot trace open <run>` opens a time-travel trace viewer for a run
 - [x] **Accessibility tree snapshot** (`a11y-snapshot`) — structured data with @ref references, 500x fewer tokens than screenshots
 - [x] **Token-efficient screenshots** — element-level crop (13x smaller), JPEG quality control, format selection
 - [x] **Vision fallback** (`describe`) — a11y + screenshot + text in one call
@@ -780,7 +776,7 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] **Three-tier stealth mode** (`mode regular|stealth|undetected`) — single switch over fingerprint surface, with per-host adaptive tier learning
 - [x] **Press-and-hold solver** (`press-hold`) — humanized press → hold → release gesture (Gaussian 3–7s + micro-jitter) for PerimeterX/HUMAN behavioral challenges; `captcha-solve` auto-routes here
 - [x] **Image CAPTCHA + profile warming** — offline Amazon image OCR (optional `amazoncaptcha` lib) + BYOK image-to-text (capsolver/2captcha); `profile warm` ages the profile for reCAPTCHA v3 score
-- [x] **Multi-instance pool + off-screen mode** (`CDPILOT_POOL_SIZE`, `CDPILOT_OFFSCREEN`) — N parallel browser processes; headed rendering without stealing window focus
+- [x] **Off-screen mode** (`CDPILOT_OFFSCREEN`) — headed rendering without stealing window focus
 - [x] **Data extraction** (`extract`) — structured DOM data in text, JSON, or list format
 - [x] **Page observation** (`observe`) — list all interactive elements with available actions
 - [x] **Script runner** (`run`) — execute `.cdp` script files with pass/fail reporting
@@ -788,6 +784,7 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 ### Coming Soon
 
 - [ ] **iframe** support — interact with elements inside iframes (Shadow DOM traversal already shipped in smart commands)
+- [ ] **Multi-instance pool** (`CDPILOT_POOL_SIZE`) — N independent browser processes with least-loaded dispatch
 - [ ] **Session recording & replay** — record browser sessions and replay them deterministically
 - [ ] **Stealth mode** *(Pro)* — human-like mouse/typing, anti-fingerprint, CAPTCHA solving
 - [ ] **cdpilot Cloud** — hosted browser sessions API, REST + WebSocket MCP endpoint
