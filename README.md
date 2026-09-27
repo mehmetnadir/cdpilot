@@ -169,9 +169,15 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
 - Works for `click`, `fill`, `type`, `submit`, `hover`, `dblclick`, `rightclick`,
   `smart-click`, `smart-fill`, `smart-select` and `frame list|eval|shadow`.
 - A frame hop is a CSS selector (an element *wrapping* an iframe, such as
-  `#card-element`, also works), a 0-based index, a `name`/`id`, or a `src`
-  substring (`url=` forces the substring match). `>>>` inside quotes or
-  `[...]` is literal.
+  `#card-element`, also works), a 0-based index, a `name`/`id`, or
+  `url=<src substring>`. `--frame` also takes a bare `src` substring.
+  `>>>` inside quotes or `[...]` is literal.
+- Selectors and texts that already contain `>>>` keep working: when the part
+  before the first `>>>` finds no iframe in the page, or a segment is empty
+  (`click "Next >>>"`), the whole string is used as written, exactly as
+  before. If that fails too, one stderr line explains:
+  `note: 'Home' matched no iframe; used the selector as written`.
+  `--frame` never falls back: a frame it cannot find is an error (exit 1).
 - Same-origin **and cross-origin** frames work, including out-of-process
   iframes (site isolation): cdpilot resolves each hop over CDP
   (`DOM.describeNode` → frame id → the frame's execution context, or
@@ -180,10 +186,22 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
 - Real mouse input (`hover`, `dblclick`, `rightclick`, `--entropy=on` clicks)
   is dispatched at page coordinates: the frame's offset in the page is added
   automatically, so the browser hit-tests into the right frame.
-- `smart-click` / `smart-fill` / `smart-select` fall back automatically: when
-  the text is not found in the page they search its visible frames
-  breadth-first (at most 20 frames / 2 s) and report the match on stderr:
-  `smart-click: matched inside frame iframe#card (https://…)`.
+- `smart-click` / `smart-fill` / `smart-select` look in the page first and
+  compare texts with whitespace collapsed (`&nbsp;` and line breaks count as
+  one space). An enabled page element whose text or label contains the whole
+  query is used. If the page's only such elements are disabled, the command
+  fails as before (`no enabled element matches …`) without looking in frames.
+  Otherwise the visible frames are searched breadth-first for a whole-query
+  match (at most 20 frames, and 2 s for all of the search's CDP calls) and the
+  match is reported on stderr:
+  `smart-click: matched inside frame iframe#card (https://…)`. With no frame
+  match, the page's partial (word) match is used as before. When the 2 s run
+  out: `smart-click: frame search stopped after 2s (3 of 7 frames)`.
+- `smart-fill` and `smart-select` search automatically only frames of the
+  page's own origin, so a typed value never lands in a third-party frame (an
+  ad, chat or payment widget) by accident; reach a cross-origin frame with
+  `>>>` or `--frame`. `smart-click` searches all visible frames.
+- `frame list` without `--frame` prints the same list as before.
 
 ### Debugging
 
