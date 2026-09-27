@@ -3196,6 +3196,277 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
   }
 });
 
+// ── Connection resilience: auto-launch, global --timeout, `open` alias ──
+// Measured on ~1,225 real agent sessions: "CDP connection error. Is the
+// browser running?" 292x, a hung command with no way to bound it 171x
+// (issue #2), `open <url>` typed instead of `go <url>` 14x.
+// None of these tests needs a browser: CDP_PORT points at a free port (or at a
+// socket that accepts TCP and never answers), and CHROME_BIN points at a path
+// that does not exist, so a gating bug can never start a real browser.
+// Everything runs against a throwaway CDPILOT_HOME.
+(function() {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const PY_BIN = process.platform === 'win32' ? 'python' : 'python3';
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-autolaunch-test-'));
+  const FAKE_BROWSER = path.join(home, 'no-such-browser', 'chrome');
+  const LEGACY_ERR = 'CDP connection error. Is the browser running?';
+
+  function freePort() {
+    const r = spawnSync(PY_BIN, ['-c',
+      'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); '
+      + 'print(s.getsockname()[1]); s.close()'], { encoding: 'utf-8', timeout: 10000 });
+    assert.strictEqual(r.status, 0, `freePort failed: ${r.stderr}`);
+    return r.stdout.trim();
+  }
+
+  function cliEnv(extra) {
+    const env = {
+      ...process.env,
+      CDPILOT_HOME: home,
+      CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: freePort(),
+      CHROME_BIN: FAKE_BROWSER,
+    };
+    for (const k of ['CDPILOT_TIMEOUT', 'CDPILOT_NO_AUTOLAUNCH', 'CDPILOT_TARGET']) delete env[k];
+    return { ...env, ...extra };
+  }
+
+  function cli(args, extra = {}) {
+    return spawnSync(process.execPath, [CLI, ...args], {
+      encoding: 'utf-8', timeout: 30000, env: cliEnv(extra),
+    });
+  }
+
+  const lines = (s) => (s || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+  // Runs `node bin/cdpilot.js <args>` with CDP_PORT on a socket that completes
+  // the TCP handshake (kernel backlog) but never sends a byte, so cdpilot's
+  // CDP discovery blocks. A Python wrapper holds the socket because this
+  // harness is synchronous (spawnSync blocks Node's own event loop).
+  function cliAgainstSilentPort(args, extra = {}) {
+    const wrapper = [
+      'import json, os, socket, subprocess, sys, time',
+      'srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)',
+      'srv.bind(("127.0.0.1", 0))',
+      'srv.listen(16)',
+      'env = dict(os.environ, CDP_PORT=str(srv.getsockname()[1]))',
+      't0 = time.time()',
+      'r = subprocess.run(sys.argv[1:], env=env, capture_output=True, text=True, timeout=60)',
+      'print(json.dumps({"code": r.returncode, "stderr": r.stderr, "elapsed": time.time() - t0}))',
+    ].join('\n');
+    const r = spawnSync(PY_BIN, ['-c', wrapper, process.execPath, CLI, ...args], {
+      encoding: 'utf-8', timeout: 90000, env: cliEnv(extra),
+    });
+    assert.strictEqual(r.status, 0, `silent-port wrapper failed: ${r.stderr}`);
+    return JSON.parse(r.stdout.trim());
+  }
+
+  function mainBlock() {
+    const i = PY_CONTENT.indexOf('if __name__ == "__main__":');
+    assert(i > 0, '__main__ block required');
+    return PY_CONTENT.slice(i);
+  }
+
+  function dispatchNames() {
+    const main = mainBlock();
+    const names = new Set();
+    for (const m of main.matchAll(/^\s*['"]([\w-]+)['"]:\s/gm)) names.add(m[1]);
+    for (const m of main.matchAll(/cmd == ['"]([\w-]+)['"]/g)) names.add(m[1]);
+    return names;
+  }
+
+  function skipList() {
+    const m = PY_CONTENT.match(/AUTOLAUNCH_SKIP_CMDS = frozenset\(\{([\s\S]*?)\}\)/);
+    assert(m, 'AUTOLAUNCH_SKIP_CMDS must be a frozenset literal');
+    return new Set([...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]));
+  }
+
+  test('autolaunch: CDPILOT_NO_AUTOLAUNCH=1 keeps the exact old error and exit code', () => {
+    const r = cli(['content'], { CDPILOT_NO_AUTOLAUNCH: '1' });
+    assert.strictEqual(r.status, 1, `exit ${r.status}, stderr: ${r.stderr}`);
+    assert.deepStrictEqual(lines(r.stderr), [LEGACY_ERR]);
+  });
+
+  test('autolaunch: a failed launch prints the old error plus the reason, exits non-zero', () => {
+    const r = cli(['content']);
+    assert.notStrictEqual(r.status, 0, 'must exit non-zero');
+    const l = lines(r.stderr);
+    assert.strictEqual(l[0], LEGACY_ERR, `stderr: ${r.stderr}`);
+    assert(l[1] && l[1].startsWith('cdpilot: auto-launch failed:') && l[1].includes('no-such-browser'),
+      `second stderr line must carry the launch failure reason, got: ${r.stderr}`);
+    assert.strictEqual(l.length, 2, `no retry loop — exactly one attempt, got: ${r.stderr}`);
+    assert(!r.stdout.includes('Launching browser'), 'launch progress must not leak into stdout');
+  });
+
+  test('autolaunch: never-launch commands are real dispatch names and cover lifecycle/status/servers', () => {
+    const skip = skipList();
+    const nodeHandled = new Set(['status', 'setup', 'help', '--help', '-h', '--version', '-v']);
+    const known = dispatchNames();
+    for (const name of skip) {
+      assert(known.has(name) || nodeHandled.has(name),
+        `AUTOLAUNCH_SKIP_CMDS has '${name}', which is not a command in the dispatch table`);
+    }
+    for (const name of ['launch', 'stop', 'close', 'close-tab', 'session-close', 'project-stop',
+      'stop-all', 'status', 'health', 'setup', 'help', '--help', '--version', 'version',
+      'mcp', 'serve']) {
+      assert(skip.has(name), `'${name}' must never auto-launch the browser`);
+    }
+    for (const name of ['go', 'content', 'html', 'click', 'fill', 'type', 'shot', 'eval', 'new-tab']) {
+      assert(known.has(name), `'${name}' should be a dispatch name`);
+      assert(!skip.has(name), `page command '${name}' must be allowed to auto-launch`);
+    }
+  });
+
+  test('autolaunch: a never-launch command does not attempt a launch', () => {
+    // `tabs` reaches get_tabs(); with the gate broken it would try the fake
+    // browser and print an "auto-launch failed" line.
+    const r = cli(['tabs']);
+    assert.strictEqual(r.status, 1, `exit ${r.status}, stderr: ${r.stderr}`);
+    assert.deepStrictEqual(lines(r.stderr), [LEGACY_ERR]);
+  });
+
+  test('autolaunch: go/debug/context no longer call cmd_launch directly (one gated path)', () => {
+    for (const fn of ['cmd_go', 'cmd_debug', 'cmd_context_create']) {
+      const m = PY_CONTENT.match(new RegExp(`async def ${fn}\\([\\s\\S]*?(?=\\n(?:async )?def )`));
+      assert(m, `${fn} body required`);
+      const code = m[0].split('\n').map((l) => l.replace(/#.*$/, '')).join('\n');
+      assert(!/\bcmd_launch\(\)/.test(code),`${fn} must not bypass CDPILOT_NO_AUTOLAUNCH via cmd_launch()`);
+    }
+    assert(/def get_tabs\(\):[\s\S]{0,400}_autolaunch_if_down\(\)/.test(PY_CONTENT),
+      'get_tabs must try the gated auto-launch before failing');
+  });
+
+  test('--timeout: parsed before/after the command, env fallback, flag wins, lookalikes kept', () => {
+    const script = [
+      'import importlib.util, json',
+      `spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})`,
+      'mod = importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(mod)',
+      'out = {}',
+      'def case(name, argv, env):',
+      '    try:',
+      '        out[name] = list(mod._extract_timeout(argv, env))',
+      '    except ValueError:',
+      '        out[name] = "ValueError"',
+      'case("before", ["--timeout", "10", "click", "#x"], {})',
+      'case("after", ["click", "#x", "--timeout", "10"], {})',
+      'case("equals", ["click", "--timeout=2.5", "#x"], {})',
+      'case("env", ["click", "#x"], {"CDPILOT_TIMEOUT": "7"})',
+      'case("flag_over_env", ["click", "#x", "--timeout", "3"], {"CDPILOT_TIMEOUT": "7"})',
+      'case("zero_disables", ["--timeout", "0", "click"], {"CDPILOT_TIMEOUT": "7"})',
+      'case("unset", ["click", "#x"], {})',
+      'case("bad", ["--timeout", "abc", "click"], {})',
+      'case("negative", ["click", "--timeout=-1"], {})',
+      'case("bad_env", ["click"], {"CDPILOT_TIMEOUT": "soon"})',
+      'case("missing", ["click", "--timeout"], {})',
+      'case("lookalikes", ["eval", "f(\'--timeout 5\')", "--timeout-ms=5", "--timeouts"], {})',
+      'mod.COMMANDS_WITH_OWN_TIMEOUT = frozenset({"fake-wait"})',
+      'case("own", ["--timeout", "9", "fake-wait", "#x", "--timeout", "3"], {})',
+      'print(json.dumps(out))',
+    ].join('\n');
+    const r = spawnSync(PY_BIN, ['-c', script], { encoding: 'utf-8', timeout: 20000, env: cliEnv({}) });
+    assert.strictEqual(r.status, 0, `import failed: ${r.stderr}`);
+    const c = JSON.parse(r.stdout.trim());
+    assert.deepStrictEqual(c.before, [10, ['click', '#x']]);
+    assert.deepStrictEqual(c.after, [10, ['click', '#x']]);
+    assert.deepStrictEqual(c.equals, [2.5, ['click', '#x']]);
+    assert.deepStrictEqual(c.env, [7, ['click', '#x']]);
+    assert.deepStrictEqual(c.flag_over_env, [3, ['click', '#x']]);
+    assert.deepStrictEqual(c.zero_disables, [0, ['click']]);
+    assert.deepStrictEqual(c.unset, [null, ['click', '#x']]);
+    for (const k of ['bad', 'negative', 'bad_env', 'missing']) {
+      assert.strictEqual(c[k], 'ValueError', `${k} must be rejected`);
+    }
+    assert.deepStrictEqual(c.lookalikes,
+      [null, ['eval', "f('--timeout 5')", '--timeout-ms=5', '--timeouts']]);
+    // A command that parses its own --timeout keeps it (its own value wins);
+    // the global one before the command is still read.
+    assert.deepStrictEqual(c.own, [9, ['fake-wait', '#x', '--timeout', '3']]);
+  });
+
+  test('--timeout: the launcher skips a leading --timeout to find its own commands', () => {
+    const v = cli(['--timeout', '5', '--version']);
+    assert.strictEqual(v.status, 0, v.stderr);
+    assert(v.stdout.includes(require('../package.json').version), 'should print the version');
+    const h = cli(['--timeout=5', 'help']);
+    assert.strictEqual(h.status, 0, h.stderr);
+    assert(h.stdout.includes('USAGE') && h.stdout.includes('--timeout'), 'help must document --timeout');
+  });
+
+  test('--timeout: a malformed value exits 2 with a message', () => {
+    const r = cli(['--timeout', 'abc', 'content'], { CDPILOT_NO_AUTOLAUNCH: '1' });
+    assert.strictEqual(r.status, 2, `exit ${r.status}, stderr: ${r.stderr}`);
+    assert(r.stderr.includes('--timeout expects a number of seconds'), r.stderr);
+  });
+
+  test('--timeout: a hung command exits 124 with the message (flag before the command)', () => {
+    // Without the flag this command blocks ~3s on the silent port, then fails with exit 1.
+    const r = cliAgainstSilentPort(['--timeout', '1', 'content'], { CDPILOT_NO_AUTOLAUNCH: '1' });
+    assert.strictEqual(r.code, 124, `exit ${r.code}, stderr: ${r.stderr}`);
+    assert(lines(r.stderr).includes('cdpilot: timed out after 1s (content)'), r.stderr);
+  });
+
+  test('--timeout: CDPILOT_TIMEOUT applies, and a flag after the command beats it', () => {
+    const viaEnv = cliAgainstSilentPort(['content'],
+      { CDPILOT_NO_AUTOLAUNCH: '1', CDPILOT_TIMEOUT: '1' });
+    assert.strictEqual(viaEnv.code, 124, `env: exit ${viaEnv.code}, stderr: ${viaEnv.stderr}`);
+    assert(lines(viaEnv.stderr).includes('cdpilot: timed out after 1s (content)'), viaEnv.stderr);
+    const flagWins = cliAgainstSilentPort(['content', '--timeout', '1'],
+      { CDPILOT_NO_AUTOLAUNCH: '1', CDPILOT_TIMEOUT: '60' });
+    assert.strictEqual(flagWins.code, 124, `flag: exit ${flagWins.code}, stderr: ${flagWins.stderr}`);
+    assert(flagWins.elapsed < 30, `flag must win over CDPILOT_TIMEOUT=60 (took ${flagWins.elapsed}s)`);
+  });
+
+  test('--timeout: expiry kills child processes, but not a released one (the launched browser)', () => {
+    const killed = path.join(home, 'tracked-child-alive');
+    const kept = path.join(home, 'released-child-alive');
+    const child = 'import sys, time; time.sleep(2.5); open(sys.argv[1], "w").write("alive")';
+    const script = [
+      'import importlib.util, subprocess, sys, time',
+      `spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})`,
+      'mod = importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(mod)',
+      'mod._arm_timeout_watchdog(1.0, "orphan-check")',
+      'quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)',
+      `tracked = subprocess.Popen([sys.executable, "-c", ${JSON.stringify(child)}, ${JSON.stringify(killed)}], **quiet)`,
+      `released = subprocess.Popen([sys.executable, "-c", ${JSON.stringify(child)}, ${JSON.stringify(kept)}], **quiet)`,
+      'mod._timeout_release_child(released)',
+      'time.sleep(30)',
+    ].join('\n');
+    const r = spawnSync(PY_BIN, ['-c', script], { encoding: 'utf-8', timeout: 20000, env: cliEnv({}) });
+    assert.strictEqual(r.status, 124, `exit ${r.status}, stderr: ${r.stderr}`);
+    assert(lines(r.stderr).includes('cdpilot: timed out after 1s (orphan-check)'), r.stderr);
+    // Give both children time to have written their marker if still alive.
+    const deadline = Date.now() + 8000;
+    while (!fs.existsSync(kept) && Date.now() < deadline) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+    assert(fs.existsSync(kept), 'a released child (the up-and-registered browser) must survive');
+    assert(!fs.existsSync(killed), 'a tracked child must be killed on timeout, not orphaned');
+  });
+
+  test('open: routes to go (alias in __main__, not a separate command)', () => {
+    assert(/if cmd == 'open':\s*\n\s*cmd = 'go'/.test(mainBlock()), "__main__ must alias 'open' to 'go'");
+    assert(!/^\s*['"]open['"]:\s/m.test(mainBlock()), "'open' must not have its own dispatch entry");
+    const r = cli(['open', 'https://example.com'], { CDPILOT_NO_AUTOLAUNCH: '1' });
+    assert.strictEqual(r.status, 1, `exit ${r.status}, stderr: ${r.stderr}`);
+    assert.deepStrictEqual(lines(r.stderr), [LEGACY_ERR], 'open must behave exactly like go');
+  });
+
+  test('docs: README and CHANGELOG cover --timeout, CDPILOT_TIMEOUT, CDPILOT_NO_AUTOLAUNCH', () => {
+    const root = path.join(__dirname, '..');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    for (const s of ['--timeout', '`CDPILOT_TIMEOUT`', '`CDPILOT_NO_AUTOLAUNCH`']) {
+      assert(readme.includes(s), `README must document ${s}`);
+    }
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    const firstSection = (changelog.match(/^## \[[^\]]+\]/m) || [])[0];
+    assert.strictEqual(firstSection, '## [Unreleased]', 'newest CHANGELOG section must be [Unreleased]');
+  });
+})();
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);

@@ -4,6 +4,18 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+Why: in ~1,225 real agent sessions the top failures were "CDP connection error. Is the browser running?" (292), a command hanging with no way to bound it (171, #2) and `open <url>` typed instead of `go <url>` (14).
+
+### Added
+- **Auto-launch.** A page command that finds the CDP port unreachable now launches the browser the same way `cdpilot launch` does (same profile, same headless/visible config), waits for `/json/version` (bounded, ~10s), and continues the command once. One stderr line says so: `cdpilot: browser was not running — launched it (CDPILOT_NO_AUTOLAUNCH=1 to disable)`. If the launch fails, the old error is printed followed by `cdpilot: auto-launch failed: <reason>` and the command exits non-zero — no retry loop. Lifecycle, status/diagnostic, launch-config and server commands never launch (`AUTOLAUNCH_SKIP_CMDS`: `launch`, `stop`, `close`, `close-tab`, `session-close`, `project-stop`, `stop-all`, `status`, `health`, `setup`, `help`, `version`, `tabs`, `session`, `sessions`, `projects`, `heal`, `headless`, `proxy`, `browser`, `extensions`, `ext-install`, `ext-remove`, `mcp`, `serve`).
+- **`CDPILOT_NO_AUTOLAUNCH=1`** keeps the previous behaviour: the exact "CDP connection error. Is the browser running?" error and exit code 1.
+- **Universal `--timeout <seconds>`** (#2), accepted before or after the command name, plus **`CDPILOT_TIMEOUT`** as a default (the flag wins; `0` disables; a malformed value exits 2). It bounds the whole command's wall-clock; on expiry cdpilot prints `cdpilot: timed out after <N>s (<command>)`, kills the child processes it started and exits **124**. Implemented as a watchdog thread + `os._exit` so it works on Windows (no `SIGALRM`), preempts blocking sync calls, and covers direct `python src/cdpilot.py` / MCP / `run` invocations, not only the Node launcher. The value is exported to child processes, so `mcp`/`serve` (not bounded themselves) bound every tool call/request, and `run` bounds every script line.
+- **`open <url>`** is an alias of `go <url>`.
+
+### Changed
+- `go`, `debug` and `context create` used to call `cdpilot launch` implicitly and print its progress lines ("Launching browser…", "CDP ready!") to **stdout**, mixed into the command's output. They now use the same quiet auto-launch path (one stderr line) and honour `CDPILOT_NO_AUTOLAUNCH`; so does the `watch` daemon's implicit launch.
+- `new-tab`, `press-hold`, `profile warm` and the browser-level commands (`download`, `permission`) auto-launch too instead of failing when the browser is down.
+
 ### Corrected
 - README listed bot-detection panel results from April 2026 (v0.4.x): sannysoft 24/24, incolumitas intoli 6/6, nowsecure.nl passed, areyouheadless "not headless". Re-measured 2026-09-27 on v0.9.1, headless, all three `mode` tiers: sannysoft 27/31 with 3 fails, all caused by the `HeadlessChrome` user agent that no tier rewrites; intoli 5/6; nowsecure.nl and areyouheadless could not be measured (fixed Turnstile test key / HTTP 502). README now shows the measured numbers.
 - The 0.9.1 entry says the `lsof`/`pkill` calls used when stopping a browser time out after 5s. That was true only for the local API's session release; `cdpilot stop` itself still called `lsof` with no timeout.
