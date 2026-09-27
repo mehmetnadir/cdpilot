@@ -17,6 +17,17 @@ X search'i twikit'te şu an drift'li (ClientTransaction key issue) — graceful
 zero-result, twikit düzelir düzelmez otomatik akmaya başlar.
 
 DOCTRINE.md §3 Faz A item 4.
+
+EXCLUDED FROM run_cycle.py (2026-09-27): superseded by ops/pain_hunter.py at
+the midday/evening slots. The x-sorun-haritasi-2026-09-27.md field study found
+this module's own query shape (unquoted multi-word) was ~30/30 noise on X's
+"Latest" search, and its MIN_FOLLOWERS=1000 floor filters out exactly the
+small accounts that write real, first-person complaints — the two people
+worth answering in that study had 32 and 409 followers. pain_hunter.py fixes
+both (quoted first-person queries, no follower floor) and adds a real
+classifier gate before anything reaches the reply queue. This file is kept,
+not deleted, as a rollback path — it still runs standalone if invoked
+directly.
 """
 from __future__ import annotations
 

@@ -91,9 +91,10 @@ def main() -> None:
     results.append(_run([str(OPS / "conversation_keeper.py"), "--apply"],
                         "conversation_keeper"))
 
-    # Midday: Search-to-Respond — find niche questions on X to reply to
+    # Midday: Pain Hunter — find people complaining without knowing cdpilot
+    # exists (see ops/pain_hunter.py docstring; replaces search_respond here).
     if slot == "midday":
-        results.append(_run([str(OPS / "search_respond.py")], "search_respond"))
+        results.append(_run([str(OPS / "pain_hunter.py")], "pain_hunter_midday"))
 
     # Morning: discovery + follow proposals + (Tue) grok provocation + daily strategy
     if slot == "morning":
@@ -112,12 +113,15 @@ def main() -> None:
         results.append(_run([str(OPS / "news_flood.py"), "--timeout", "140"],
                             "news_flood"))
 
-    # Evening: engagement scan + second trend listener pass
+    # Evening: engagement scan + second trend listener pass + a second
+    # pain-hunter pass (cursor rotates through a different 6 queries than the
+    # midday run, so this is not a repeat scan).
     if slot == "evening":
         results.append(_run([str(OPS / "engagement_scanner.py"), "--propose-top=3"], "engagement_scanner"))
         # Run discovery_scan first so trend listener has fresh feed (morning's may be 8h stale)
         results.append(_run([str(OPS / "discovery_scan.py"), "--limit", "8"], "discovery_scan_evening"))
         results.append(_run([str(OPS / "trend_listener.py")], "trend_listener_evening"))
+        results.append(_run([str(OPS / "pain_hunter.py")], "pain_hunter_evening"))
 
     # Night: analytics + engagement scan-only (no proposals, just scoring for record)
     if slot == "night":
@@ -131,6 +135,9 @@ def main() -> None:
         # Weekly review — Sunday night only. Produces 7-day backlog card.
         if datetime.now().weekday() == 6:  # Sunday
             results.append(_run([str(OPS / "weekly_review.py")], "weekly_review"))
+        # Pain hunter digest — Monday night only. 7-day roadmap/reply summary.
+        if datetime.now().weekday() == 0:  # Monday
+            results.append(_run([str(OPS / "pain_hunter.py"), "--digest"], "pain_hunter_digest"))
 
     print(f"\n== {slot} complete ==")
     print(json.dumps({"slot": slot, "results": results}, ensure_ascii=False, indent=2))

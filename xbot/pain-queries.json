@@ -1,0 +1,147 @@
+{
+  "_readme": "Data file for ops/pain_hunter.py — edit by hand, no code changes needed. Source: .claude/docs/x-sorun-haritasi-2026-09-27.md + curated-signal-2026-09-27.json (cdpilot repo). Queries are quoted, first-person phrasings — unquoted multi-word queries were measured 30/30 noise (see harita doc 'Sorgu kalitesi'). Every cdpilot_answer command below was verified against README.md/src/cdpilot.py (see task report for file:line).",
+  "queries": [
+    {
+      "q": "cookies keep expiring",
+      "class": "session_cookie_persistence",
+      "lang": "en"
+    },
+    {
+      "q": "keeps logging me out scraper",
+      "class": "session_cookie_persistence",
+      "lang": "en"
+    },
+    {
+      "q": "cloudflare blocking my scraper",
+      "class": "headless_detection_anti_bot",
+      "lang": "en"
+    },
+    {
+      "q": "headless chrome detected",
+      "class": "headless_detection_anti_bot",
+      "lang": "en"
+    },
+    {
+      "q": "screenshot tokens expensive agent",
+      "class": "mcp_vision_token_cost",
+      "lang": "en"
+    },
+    {
+      "q": "browser mcp tokens",
+      "class": "mcp_vision_token_cost",
+      "lang": "en"
+    },
+    {
+      "q": "playwright too heavy",
+      "class": "heavy_browser_tool_setup",
+      "lang": "en"
+    },
+    {
+      "q": "puppeteer too heavy",
+      "class": "heavy_browser_tool_setup",
+      "lang": "en"
+    },
+    {
+      "q": "agent logged in session browser",
+      "class": "agent_cant_use_own_session",
+      "lang": "en"
+    },
+    {
+      "q": "claude code browser login",
+      "class": "agent_cant_use_own_session",
+      "lang": "en"
+    },
+    {
+      "q": "selectors keep breaking",
+      "class": "flaky_selector_wait",
+      "lang": "en"
+    },
+    {
+      "q": "flaky playwright tests",
+      "class": "flaky_selector_wait",
+      "lang": "en"
+    },
+    {
+      "q": "shadow dom click automation",
+      "class": "shadow_dom",
+      "lang": "en"
+    },
+    {
+      "q": "shadow dom selenium",
+      "class": "shadow_dom",
+      "lang": "en"
+    },
+    {
+      "q": "iframe automation playwright",
+      "class": "iframe_support",
+      "lang": "en"
+    },
+    {
+      "q": "iframe puppeteer click",
+      "class": "iframe_support",
+      "lang": "en"
+    },
+    {
+      "q": "tls fingerprint headless",
+      "class": "tls_fingerprint",
+      "lang": "en"
+    },
+    {
+      "q": "ja3 fingerprint scraper",
+      "class": "tls_fingerprint",
+      "lang": "en"
+    }
+  ],
+  "classes": {
+    "session_cookie_persistence": {
+      "cdpilot_answer": "cdpilot cookies save/load, cdpilot cookies auto on (per-host cache ~/.cdpilot/cookies/<host>/, auto-replay before navigate)",
+      "missing": null
+    },
+    "headless_detection_anti_bot": {
+      "cdpilot_answer": "cdpilot mode stealth, cdpilot adaptive on, cdpilot captcha-solve — PARTIAL: own Stealth Bench shows Cloudflare ~55% but PerimeterX 11%/GeeTest 0%/Kasada 0%, be honest about the hard tiers",
+      "missing": "hard anti-bot tiers (PerimeterX/GeeTest/Kasada) remain weak in cdpilot's own bench"
+    },
+    "mcp_vision_token_cost": {
+      "cdpilot_answer": "cdpilot smart-click / cdpilot smart-fill (act on an element by its visible text, so that step needs no page snapshot and no vision model), cdpilot a11y-snapshot (structured text with @ref handles, no vision model — NOT a token saver: on link-heavy pages it is larger than a small screenshot, so never pitch it to someone whose snapshots are already too big)",
+      "missing": null
+    },
+    "heavy_browser_tool_setup": {
+      "cdpilot_answer": "npx cdpilot launch (no npm dependencies: one Python file plus a small Node launcher; Python needs the websockets module, installed on first launch)",
+      "missing": null
+    },
+    "agent_cant_use_own_session": {
+      "cdpilot_answer": "cdpilot cookies save --host <host> (from the user's real browser), cdpilot cookies load --host <host> (replay into cdpilot's isolated profile)",
+      "missing": null
+    },
+    "flaky_selector_wait": {
+      "cdpilot_answer": "cdpilot smart-click, cdpilot smart-fill (visible-text matching, auto-wait, no CSS selector), cdpilot wait-for-text",
+      "missing": null
+    },
+    "shadow_dom": {
+      "cdpilot_answer": "cdpilot smart-click, cdpilot smart-fill (Shadow DOM traversal shipped — Lightning/Polymer/lit-element widgets)",
+      "missing": null
+    },
+    "iframe_support": {
+      "cdpilot_answer": null,
+      "missing": "iframe element interaction — README lists it under 'Coming Soon', no in-tree fix today (frame list/eval exists but not full interaction inside an iframe)"
+    },
+    "tls_fingerprint": {
+      "cdpilot_answer": null,
+      "missing": "in-tree TLS fingerprint spoofing — cdpilot tls-check only probes JA3/JA4, does not patch it"
+    }
+  },
+  "negative_terms": [
+    "cloakbrowser",
+    "octobrowser",
+    "browserbase",
+    "browser-use",
+    "browser_use",
+    "typesafe",
+    "nottecore",
+    "jev"
+  ],
+  "negative_authors": [
+    "browser_use"
+  ],
+  "query_note": "Short bare word sets: X ANDs them. Measured 2026-09-27 — quoted phrases returned 0, OR-operator queries returned mostly noise. Re-measure before adding quotes or operators; the weekly digest lists queries that never produce a signal."
+}
