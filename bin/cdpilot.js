@@ -462,6 +462,16 @@ function showHelp() {
   AI AGENT
     mcp                Start MCP server (stdin/stdout JSON-RPC)
 
+  SESSION LOG (always on, local, redacted)
+    log                Today's commands for this project: time, exit, command,
+                       url, result
+    log --md           Markdown report (pages visited, actions, errors, files
+                       produced) to paste into an issue or PR
+    log --json         Raw JSON lines · log --days N · log --path (log directory)
+                       Typed values, secret-looking args and token/key/secret URL
+                       params are redacted. CDPILOT_LOG=0 turns it off;
+                       CDPILOT_LOG_DAYS (default 14) sets how many days are kept.
+
   WATCH (continuous screencast for AI video understanding)
     watch start <url>  Begin JPEG screencast at N fps to a disk ring buffer
                        (default 10fps, 5min retention, 100MB cap). Background
