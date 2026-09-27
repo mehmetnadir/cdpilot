@@ -12230,9 +12230,13 @@ class MCPServer:
             env = os.environ.copy()
             env["CDPILOT_MCP_SESSION"] = "1"
             env[SLOG_VIA_ENV] = via
+            # Both ends in UTF-8: with the locale default a child writing one
+            # code page and a parent reading another raised here, and the
+            # server logged the call a second time.
+            env["PYTHONIOENCODING"] = "utf-8"
             result = subprocess.run(
                 [sys.executable, __file__] + cli_args,
-                capture_output=True, text=True, timeout=30, env=env
+                capture_output=True, encoding="utf-8", errors="replace", timeout=30, env=env
             )
             output = result.stdout.strip()
             errors = result.stderr.strip()
@@ -14667,9 +14671,10 @@ def _slog_format_md(entries, project, days, today):
 
 def _slog_print(text):
     """Print `log` output as UTF-8 even where the pipe encoding is a legacy code
-    page (Windows: cp1252), so `«redacted»` and page titles survive. A cdpilot
-    parent (MCP server, `run`) decodes the locale encoding, so there the text
-    layer is kept and unencodable characters become '?' instead of crashing."""
+    page (a PYTHONIOENCODING the user set), so `«redacted»` and page titles
+    survive. Under the MCP server the text layer is kept (the server sets the
+    child to UTF-8 and decodes UTF-8); unencodable characters become '?'
+    instead of crashing."""
     stream = sys.stdout
     enc = (getattr(stream, "encoding", None) or "").lower().replace("-", "").replace("_", "")
     buf = getattr(stream, "buffer", None)
@@ -14739,6 +14744,15 @@ def cmd_log(*args):
 # ─── CLI ───
 
 if __name__ == "__main__":
+    # On Windows a pipe (an agent's shell, the MCP server, `> file`) gets the
+    # ANSI code page, so a Turkish page title or an emoji crashed the command
+    # with UnicodeEncodeError. Write UTF-8 unless the user chose an encoding.
+    if os.name == "nt" and not os.environ.get("PYTHONIOENCODING"):
+        for _stream in (sys.stdout, sys.stderr):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError):
+                pass
     try:
         _timeout_s, _argv = _extract_timeout(sys.argv[1:])
     except ValueError as _e:
