@@ -537,11 +537,18 @@ cdpilot profile warm          # age the profile for reCAPTCHA v3 score
 which nudges reCAPTCHA v3's behavioral score upward over time. Slow by
 design — run it ahead of a session, not inline.
 
-Verified against public bot-detection panels:
-- **bot.sannysoft.com:** 24/24 PASS (WebDriver, Chrome obj, Plugins as PluginArray, WebGL, PHANTOM_*, HEADCHR_*, SELENIUM_DRIVER)
-- **bot.incolumitas.com** intoli: 6/6 OK — new-tests: 6/7 OK (one FAIL = pure CDP presence, cannot be JS-patched)
-- **nowsecure.nl** (Cloudflare full challenge): passed
-- **arh.antoinevastel.com/areyouheadless:** "You are not Chrome headless"
+Public bot-detection panels, re-measured 2026-09-27 with v0.9.1, **headless** Brave
+(Chrome 154), all three `mode` tiers:
+- **bot.sannysoft.com:** 27 pass / 3 fail / 1 warn of 31 rows. The three fails (User-Agent,
+  HEADCHR_UA, CHR_MEMORY) come from headless mode: no tier rewrites the `HeadlessChrome`
+  user agent yet (fix in progress).
+- **bot.incolumitas.com:** intoli 5/6 (fail: userAgent), fpscanner 17/20; new-tests 8/8 in
+  `regular`/`stealth`, 6/7 in `undetected` (fail: overflowTest).
+- **nowsecure.nl** and **areyouheadless:** not measurable today (the first now uses a fixed
+  always-interactive Turnstile test key, the second returned HTTP 502).
+
+Earlier figures on this page (sannysoft 24/24, intoli 6/6) were measured on v0.4.x in April
+2026 and did not hold up on re-measurement.
 
 ### Reliability
 

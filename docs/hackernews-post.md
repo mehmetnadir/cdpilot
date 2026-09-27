@@ -63,7 +63,7 @@ npx cdpilot mcp              # expose everything as an MCP server
    The profile lives under `~/.cdpilot/` so it doesn't touch your real
    browsing session.
 
-3. **Workload-aware browser pick.** Shipped this week after Brave 1.89
+3. **Workload-aware browser pick.** Added after Brave 1.89
    started crashing on macOS 26 (Tahoe) at exactly ~7min uptime —
    SIGTRAP in ThreadPoolForegroundWorker, deterministic across repeated
    crash dumps. While digging into that I noticed Chrome 147 silently drops
@@ -80,17 +80,20 @@ npx cdpilot mcp              # expose everything as an MCP server
   for LLM vision fallback. The a11y side gives the agent structured text
   with `@ref` handles it can act on directly — no vision model needed for
   the common case.
-- `cdpilot stealth on` — built-in fingerprint patches (opt-in, no extra
-  dependency). Passes bot.sannysoft 24/24, Cloudflare full challenge at
-  nowsecure.nl, and incolumitas intoli 6/6. It does NOT beat
-  `incolumitas overflowTest` because that probe detects CDP presence itself
-  — no JS patch can hide the protocol.
+- `cdpilot mode regular|stealth|undetected` — built-in fingerprint patches
+  in three tiers (opt-in, no extra dependency). The default is `regular`,
+  because our own bench showed the full patch set *lowered* scores on some
+  sites. Honest status: hard anti-bot vendors (PerimeterX, Kasada) still
+  beat it; see the README for today's panel numbers.
+  <!-- TODO before posting: replace with the post-fix panel numbers from
+  .claude/docs/stealth-panel-olcumu-2026-09-27.md (UA fix in progress). -->
+
 - `cdpilot health` — JSON status with today's crash count from macOS
   DiagnosticReports. Designed for `until cdpilot health; do launch;
   done` watchdog loops.
 
 **What it's NOT:** not a test framework replacement for full E2E suites
-(though it does ship `cdpilot test`/`cdpilot trace` plus 10 assertion
+(though it does ship `cdpilot test`/`cdpilot trace` plus assertion
 commands for CI pipelines). It replaces the automation layer underneath.
 
 Would love feedback on the `browser auto` policy in particular — the
@@ -121,8 +124,8 @@ npm: https://www.npmjs.com/package/cdpilot
 
 **"Chrome already has remote-debugging"**
 > Yes — cdpilot is a thin ergonomic layer over that. The value is
-> `npx cdpilot go <url>` works on a fresh machine in 2 seconds vs.
-> writing the WebSocket handshake + CDP message pump yourself.
+> `npx cdpilot go <url>` on a fresh machine instead of writing the
+> WebSocket handshake + CDP message pump yourself.
 
 **"This is just curl for browsers"**
 > Basically, yeah. That's a compliment.

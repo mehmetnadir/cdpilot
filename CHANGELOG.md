@@ -2,6 +2,12 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Corrected
+- README listed bot-detection panel results from April 2026 (v0.4.x): sannysoft 24/24, incolumitas intoli 6/6, nowsecure.nl passed, areyouheadless "not headless". Re-measured 2026-09-27 on v0.9.1, headless, all three `mode` tiers: sannysoft 27/31 with 3 fails, all caused by the `HeadlessChrome` user agent that no tier rewrites; intoli 5/6; nowsecure.nl and areyouheadless could not be measured (fixed Turnstile test key / HTTP 502). README now shows the measured numbers.
+- The 0.9.1 entry says the `lsof`/`pkill` calls used when stopping a browser time out after 5s. That was true only for the local API's session release; `cdpilot stop` itself still called `lsof` with no timeout.
+
 ## [0.9.1] - 2026-09-27
 
 ### Added
