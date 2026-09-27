@@ -14453,18 +14453,20 @@ def _slog_excepthook(exc_type, exc, tb):
 
 
 def _slog_exit_code():
-    """The process exit code: an uncaught exception, else the SystemExit that
-    reached module level (its traceback starts in the __main__ frame), else 0."""
+    """The process exit code: an uncaught exception; else 0 if the __main__
+    block ran to its end (any SystemExit raised on the way was caught inside a
+    command); else the last SystemExit, which is the one that ended the process.
+
+    Not from the SystemExit's traceback: on Python 3.10/3.11 it no longer holds
+    the __main__ frame by the time atexit runs (empty for a sync command, head
+    at asyncio.run for an async one), so every exit logged as 0 there.
+    """
     if _SLOG.get("forced_code") is not None:
         return _SLOG["forced_code"]
-    exc = _SLOG.get("exit_exc")
-    tb = getattr(exc, "__traceback__", None)
-    if tb is None:
+    if _SLOG.get("main_done"):
         return 0
-    frame = tb.tb_frame
-    if frame.f_code.co_name != "<module>" or frame.f_globals.get("__name__") != "__main__":
-        return 0  # raised, then caught inside the command
-    if exc.code is None:
+    exc = _SLOG.get("exit_exc")
+    if exc is None or exc.code is None:
         return 0
     return exc.code if isinstance(exc.code, int) else 1
 
@@ -15058,3 +15060,6 @@ if __name__ == "__main__":
             print(f"Did you mean: {matches[0]}?", file=sys.stderr)
         print(f"\nAvailable commands: {', '.join(all_cmds)}", file=sys.stderr)
         sys.exit(1)
+    # Reached only when no SystemExit or exception ended the command (see
+    # _slog_exit_code): the session log then records exit 0.
+    _SLOG["main_done"] = True

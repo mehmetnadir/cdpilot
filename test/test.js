@@ -4365,6 +4365,28 @@ print(json.dumps(out, ensure_ascii=False))
     assert.strictEqual(e2.error, null);
   });
 
+  // Python 3.10/3.11 drop the __main__ frame from a SystemExit's traceback
+  // before atexit runs, so an exit code read from the traceback logged 0 for
+  // every failed command there (CI ubuntu 3.11, 2026-09-28). Run the same
+  // failing command under every interpreter this machine has.
+  test('log: the logged exit code is the process exit code on every local Python', () => {
+    const start = PY_CONTENT.indexOf('def _slog_exit_code');
+    const body = PY_CONTENT.slice(start, PY_CONTENT.indexOf('\ndef ', start + 1));
+    assert(start > 0 && !body.includes('__traceback__'), '_slog_exit_code must not read the traceback');
+    assert(/\n    _SLOG\["main_done"\] = True\s*$/.test(PY_CONTENT), '__main__ must end with the main_done marker');
+    const pys = ['python3.10', 'python3.11', 'python3.12', 'python3.13', PY_BIN].filter((py, i, all) =>
+      all.indexOf(py) === i && spawnSync(py, ['-c', 'pass'], { timeout: 10000 }).status === 0);
+    for (const py of pys) {
+      const home = newHome();
+      const r = spawnSync(py, [PY_PATH, 'fill', '#pw', SECRET], {
+        encoding: 'utf-8', timeout: 30000, env: baseEnv(home, {}),
+      });
+      assert.strictEqual(r.status, 1, `${py}: exit ${r.status}, stderr: ${r.stderr}`);
+      const got = logFileLines(home).map((l) => JSON.parse(l).exit);
+      assert.deepStrictEqual(got, [1], `${py}: logged exit ${JSON.stringify(got)}`);
+    }
+  });
+
   test('log: exit codes and output are identical with logging on and off', () => {
     for (const argv of [['version'], ['nosuchcommand'], ['fill', '#pw', SECRET], ['log', '--bogus']]) {
       const on = cli(newHome(), argv);
