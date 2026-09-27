@@ -30,7 +30,9 @@ function run(args = '') {
   return execSync(`node ${CLI} ${args} 2>&1`, {
     timeout: 10000,
     encoding: 'utf-8',
-    env: { ...process.env, CDP_PORT: '19222' }, // avoid conflict with real browser
+    // CDP_PORT avoids a conflict with a real browser; this helper does not
+    // isolate CDPILOT_HOME, so keep its commands out of the real session log.
+    env: { ...process.env, CDP_PORT: '19222', CDPILOT_LOG: '0' },
   });
 }
 
@@ -3745,6 +3747,402 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
     assert(first === 'Unreleased' || first === pkg.version,
       `newest CHANGELOG section must be [Unreleased] or [${pkg.version}], got [${first}]`);
     assert(changelog.includes('CDPILOT_NO_AUTOLAUNCH'), 'CHANGELOG must describe CDPILOT_NO_AUTOLAUNCH');
+  });
+})();
+
+// ── Session log (`cdpilot log`) ──
+// No browser anywhere: CDP_PORT is a free port, CHROME_BIN does not exist and
+// CDPILOT_NO_AUTOLAUNCH=1. Every scenario gets its own throwaway CDPILOT_HOME
+// and a fixed CDPILOT_PROJECT_ID, so the log dir is known in advance.
+(function() {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const PY_BIN = process.platform === 'win32' ? 'python' : 'python3';
+  const PROJECT = 'logtest-0001';
+  const LEGACY_ERR = 'CDP connection error. Is the browser running?';
+  const SECRET = 'hunter2-SECRET-value';
+  const LOG_KEYS = ['ts', 'cmd', 'args', 'exit', 'duration_ms', 'url', 'title', 'summary',
+    'error', 'files'];
+
+  const r0 = spawnSync(PY_BIN, ['-c',
+    'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); '
+    + 'print(s.getsockname()[1]); s.close()'], { encoding: 'utf-8', timeout: 10000 });
+  const PORT = (r0.stdout || '').trim() || '19299';
+
+  const newHome = () => fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-log-test-'));
+  const logDir = (home) => path.join(home, 'projects', PROJECT, 'log');
+  const lines = (s) => (s || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+  function localDay(daysAgo = 0) {
+    const d = new Date();
+    d.setDate(d.getDate() - daysAgo);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  }
+
+  function baseEnv(home, extra) {
+    const env = {
+      ...process.env,
+      CDPILOT_HOME: home,
+      CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: PORT,
+      CDPILOT_PROJECT_ID: PROJECT,
+      CHROME_BIN: path.join(home, 'no-such-browser', 'chrome'),
+      CDPILOT_NO_AUTOLAUNCH: '1',
+    };
+    for (const k of ['CDPILOT_LOG', 'CDPILOT_LOG_DAYS', 'CDPILOT_LOG_VIA', 'CDPILOT_TIMEOUT',
+      'CDPILOT_TARGET', 'CDPILOT_MCP_SESSION']) delete env[k];
+    return { ...env, ...extra };
+  }
+
+  function cli(home, args, extra = {}) {
+    return spawnSync(process.execPath, [CLI, ...args], {
+      encoding: 'utf-8', timeout: 30000, env: baseEnv(home, extra),
+    });
+  }
+
+  function logFileLines(home) {
+    const dir = logDir(home);
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')).sort()
+      .flatMap((f) => fs.readFileSync(path.join(dir, f), 'utf-8').split('\n').filter(Boolean));
+  }
+
+  // The redaction functions are pure; run them all in one interpreter.
+  let redactCache = null;
+  function redacted() {
+    if (redactCache) return redactCache;
+    const script = `
+import importlib.util, json
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+LONG = "x" * 60
+cases = {
+  "fill": ("fill", ["#pw", "hunter2"]),
+  "fill_multi": ("fill", ["#pw", "my", "long", "pass", "--no-heal"]),
+  "type": ("type", ["--entropy=on", "#q", "hello world"]),
+  "fill_dashes": ("fill", ["#pw", "--ladder=#a,#b", "--hunter2"]),
+  "smart_fill": ("smart-fill", ["Password", "S3cr3t!"]),
+  "smart_select": ("smart-select", ["Country", "Turkey"]),
+  "assert_value": ("assert-value", ["#pw", "hunter2"]),
+  "dialog": ("dialog", ["prompt", "my answer"]),
+  "assert_attr": ("assert-attr", ["#pw", "value", "hunter2"]),
+  "assert_attr_href": ("assert-attr", ["a", "href", "/login"]),
+  "api_key_flag": ("captcha", ["config", "--provider", "2captcha", "--api-key", "fake-value-x"]),
+  "password_flag": ("x", ["--password=hunter2", "--token", "t0k3n", "--keep"]),
+  "header": ("intercept", ["headers", "*", "Authorization: Bearer abc.def"]),
+  "header_word": ("intercept", ["headers", "*", "Authorization", "Bearer xyz"]),
+  "cookie_value": ("cookies", ["set", "sid=abc123"]),
+  "cookie_save": ("cookies", ["save", "/tmp/c.json", "example.com"]),
+  "eval": ("eval", ["var s = '" + LONG + "'; document.querySelector('#pw').value = 'hunter2'; 'ok'"]),
+  "eval_storage": ("eval", ["localStorage.setItem('k', 'v1'); fetch('https://a.example/?token=t0k3n')"]),
+  "eval_batch": ("eval-batch", [json.dumps(["document.title", "x.value === 'hunter2'"])]),
+  "url": ("go", ["https://u:pw@ex.com/cb?code=XYZ123&state=ok&access_token=abc#id_token=zzz"]),
+  "plain": ("go", ["https://example.com"]),
+  "plain_click": ("click", ["#login"]),
+  "tab_id": ("close-tab", ["E3B0C44298FC1C149AFBF4C8996FB924"]),
+  "data_url": ("go", ["data:text/html,<input value=secret123>"]),
+  "api_token": ("x", ["sk-ant-api03-abcdefghijklmnopqrstuvwxyz"]),
+  "proxy": ("proxy", ["http://user:p4ss@proxy.local:8080"]),
+}
+out = {k: m._slog_redact_args(c, a) for k, (c, a) in cases.items()}
+out["scrub_filled"] = m._slog_scrub_text("Filled: INPUT = hunter2-very-secret-value-th", ["hunter2-very-secret-value-that-is-long"])
+out["scrub_echo"] = m._slog_scrub_text("[1] go https://x.example\\n[2] fill #pw hunter2")
+out["scrub_bearer"] = m._slog_scrub_text("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijk")
+out["scrub_kv"] = m._slog_scrub_text('{"password": "pw1", "api_key": "k2", "page": 3}')
+out["summary_cookies"] = m._slog_summary("cookies", [], "sid=abc; theme=dark", [])
+out["summary_cookie_save"] = m._slog_summary("cookies", ["save", "/tmp/c.json"], "Saved 3 cookies -> /tmp/c.json", [])
+out["summary_storage"] = m._slog_summary("storage", [], '{"token": "abc"}', [])
+out["summary_eval_secret"] = m._slog_summary("eval", ["document.cookie"], "sid=abc", [])
+out["summary_fill"] = m._slog_summary("fill", ["#pw", "hunter2"], "Filled: INPUT = hunter2", ["hunter2"])
+out["mask_same"] = m._slog_mask_url("https://example.com/path?q=cats&page=2")
+print(json.dumps(out, ensure_ascii=False))
+`;
+    const home = newHome();
+    const r = spawnSync(PY_BIN, ['-c', script], {
+      encoding: 'utf-8', timeout: 20000, env: baseEnv(home, {}),
+    });
+    assert.strictEqual(r.status, 0, `redaction script failed: ${r.stderr}`);
+    redactCache = JSON.parse(r.stdout.trim());
+    return redactCache;
+  }
+  const args = (k) => redacted()[k][0];
+  const secrets = (k) => redacted()[k][1];
+
+  test('log redaction: fill/type/smart-fill/smart-select/assert-value/dialog values', () => {
+    assert.deepStrictEqual(args('fill'), ['#pw', '«redacted:7 chars»']);
+    assert(secrets('fill').includes('hunter2'), 'raw value must be returned for output scrubbing');
+    assert.deepStrictEqual(args('fill_multi'), ['#pw', '«redacted:12 chars»', '--no-heal']);
+    assert.deepStrictEqual(args('type'), ['--entropy=on', '#q', '«redacted:11 chars»']);
+    assert.deepStrictEqual(args('fill_dashes'), ['#pw', '--ladder=#a,#b', '«redacted:9 chars»'],
+      'an unknown --flag on fill may be a mistyped value');
+    assert.deepStrictEqual(args('smart_fill'), ['Password', '«redacted:7 chars»']);
+    assert.deepStrictEqual(args('smart_select'), ['Country', '«redacted:6 chars»']);
+    assert.deepStrictEqual(args('assert_value'), ['#pw', '«redacted:7 chars»']);
+    assert.deepStrictEqual(args('dialog'), ['prompt', '«redacted:9 chars»']);
+    assert.deepStrictEqual(args('assert_attr'), ['#pw', 'value', '«redacted:7 chars»']);
+    assert.deepStrictEqual(args('assert_attr_href'), ['a', 'href', '/login']);
+  });
+
+  test('log redaction: password/token/key flags, header values, cookie values', () => {
+    assert.deepStrictEqual(args('api_key_flag'),
+      ['config', '--provider', '2captcha', '--api-key', '«redacted:12 chars»']);
+    assert.deepStrictEqual(args('password_flag'),
+      ['--password=«redacted:7 chars»', '--token', '«redacted:5 chars»', '--keep']);
+    assert.deepStrictEqual(args('header'), ['headers', '*', 'Authorization: «redacted:14 chars»']);
+    assert.deepStrictEqual(args('header_word'), ['headers', '*', 'Authorization', '«redacted:10 chars»']);
+    assert.deepStrictEqual(args('cookie_value'), ['set', 'sid=«redacted:6 chars»']);
+    assert.deepStrictEqual(args('cookie_save'), ['save', '/tmp/c.json', 'example.com']);
+    const r = redacted();
+    assert(r.summary_cookies.startsWith('«output not logged'), `cookie listing leaked: ${r.summary_cookies}`);
+    assert.strictEqual(r.summary_cookie_save, 'Saved 3 cookies -> /tmp/c.json');
+    assert(r.summary_storage.startsWith('«output not logged'), `storage leaked: ${r.summary_storage}`);
+    assert(r.summary_eval_secret.startsWith('«output not logged'), 'eval reading document.cookie must not log its result');
+  });
+
+  test('log redaction: eval source kept, long string literals cut, secret literals replaced', () => {
+    const src = args('eval')[0];
+    assert(src.startsWith(`var s = '${'x'.repeat(40)}…«+20 chars»'`), src);
+    assert(src.includes(".value = '«redacted:7 chars»'"), src);
+    assert(src.includes("document.querySelector('#pw')"), 'short literals stay readable');
+    assert(src.endsWith("'ok'"), src);
+    const st = args('eval_storage')[0];
+    assert(st.includes("setItem('k', '«redacted:2 chars»')"), st);
+    assert(st.includes('?token=«redacted:5 chars»'), st);
+    const batch = JSON.parse(args('eval_batch')[0]);
+    assert.deepStrictEqual(batch, ['document.title', "x.value === '«redacted:7 chars»'"]);
+  });
+
+  test('log redaction: URL query/fragment/userinfo masking; plain commands untouched', () => {
+    assert.deepStrictEqual(args('url'), ['https://u:«redacted:2 chars»@ex.com/cb?code=«redacted:6 chars»'
+      + '&state=ok&access_token=«redacted:3 chars»#id_token=«redacted:3 chars»']);
+    assert.deepStrictEqual(redacted().plain, [['https://example.com'], []]);
+    assert.deepStrictEqual(redacted().plain_click, [['#login'], []]);
+    assert.deepStrictEqual(args('tab_id'), ['E3B0C44298FC1C149AFBF4C8996FB924'], 'CDP ids are not secrets');
+    assert.strictEqual(redacted().mask_same, 'https://example.com/path?q=cats&page=2');
+    assert.deepStrictEqual(args('data_url'), ['data:text/html,«redacted:23 chars»']);
+    assert.deepStrictEqual(args('api_token'), ['«redacted:39 chars»']);
+    assert.deepStrictEqual(args('proxy'), ['http://user:«redacted:4 chars»@proxy.local:8080']);
+  });
+
+  test('log redaction: output text — echoed values (even cut off), run echo lines, bearer/JWT, key=value', () => {
+    const r = redacted();
+    assert.strictEqual(r.scrub_filled, 'Filled: INPUT = «redacted:38 chars»');
+    assert.strictEqual(r.scrub_echo, '[1] go https://x.example\n[2] fill #pw «redacted:7 chars»');
+    assert(!/eyJ|abcdefghijk/.test(r.scrub_bearer), r.scrub_bearer);
+    assert(!r.scrub_kv.includes('pw1') && !r.scrub_kv.includes('"k2"'), r.scrub_kv);
+    assert(r.scrub_kv.includes('"page": 3'), r.scrub_kv);
+    assert.strictEqual(r.summary_fill, 'Filled: INPUT = «redacted:7 chars»');
+  });
+
+  test('log: one command writes exactly one JSON line with the expected fields; output unchanged', () => {
+    const home = newHome();
+    const r = cli(home, ['fill', '#pw', SECRET]);
+    assert.strictEqual(r.status, 1, `exit ${r.status}, stderr: ${r.stderr}`);
+    assert.deepStrictEqual(lines(r.stderr), [LEGACY_ERR], 'logging must not add output');
+    const file = path.join(logDir(home), `${localDay()}.jsonl`);
+    assert(fs.existsSync(file), `expected ${file}`);
+    const raw = fs.readFileSync(file, 'utf-8');
+    assert(!raw.includes('hunter2'), 'the typed value must never reach the disk');
+    const got = lines(raw);
+    assert.strictEqual(got.length, 1, `expected exactly one line, got ${got.length}`);
+    const e = JSON.parse(got[0]);
+    for (const k of LOG_KEYS) assert(k in e, `missing field ${k}`);
+    assert.strictEqual(e.cmd, 'fill');
+    assert.deepStrictEqual(e.args, ['#pw', `«redacted:${SECRET.length} chars»`]);
+    assert.strictEqual(e.exit, 1);
+    assert.strictEqual(e.error, LEGACY_ERR);
+    assert(Number.isInteger(e.duration_ms) && e.duration_ms >= 0, `duration_ms: ${e.duration_ms}`);
+    assert(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}([+-]\d{2}:\d{2}|Z)$/.test(e.ts), `ts: ${e.ts}`);
+    assert.strictEqual(e.ts.slice(0, 10), localDay(), 'ts is local time, file is the local day');
+    assert.deepStrictEqual(e.files, []);
+
+    const v = cli(home, ['version']);
+    assert.strictEqual(v.status, 0, v.stderr);
+    const e2 = JSON.parse(logFileLines(home)[1]);
+    assert.strictEqual(e2.cmd, 'version');
+    assert.strictEqual(e2.exit, 0);
+    assert(e2.summary.includes(require('../package.json').version), `summary: ${e2.summary}`);
+    assert.strictEqual(e2.error, null);
+  });
+
+  test('log: exit codes and output are identical with logging on and off', () => {
+    for (const argv of [['version'], ['nosuchcommand'], ['fill', '#pw', SECRET], ['log', '--bogus']]) {
+      const on = cli(newHome(), argv);
+      const off = cli(newHome(), argv, { CDPILOT_LOG: '0' });
+      assert.strictEqual(on.status, off.status, `${argv[0]}: exit ${on.status} vs ${off.status}`);
+      assert.strictEqual(on.stdout, off.stdout, `${argv[0]}: stdout differs`);
+      assert.strictEqual(on.stderr, off.stderr, `${argv[0]}: stderr differs`);
+    }
+  });
+
+  test('log: CDPILOT_LOG=0 writes nothing', () => {
+    const home = newHome();
+    cli(home, ['version'], { CDPILOT_LOG: '0' });
+    cli(home, ['fill', '#pw', SECRET], { CDPILOT_LOG: '0' });
+    assert(!fs.existsSync(logDir(home)), 'no log dir may be created');
+  });
+
+  test('log: an unwritable log dir never changes the exit code (one stderr warning)', () => {
+    const home = newHome();
+    // `log` is a file where the directory should be: fails on every OS.
+    fs.mkdirSync(path.dirname(logDir(home)), { recursive: true });
+    fs.writeFileSync(logDir(home), 'not a directory');
+    const v = cli(home, ['version']);
+    assert.strictEqual(v.status, 0, v.stderr);
+    assert(v.stdout.includes(require('../package.json').version), v.stdout);
+    const warn = lines(v.stderr).filter((l) => l.includes('session log not written'));
+    assert.strictEqual(warn.length, 1, `expected one warning, stderr: ${v.stderr}`);
+    const f = cli(home, ['fill', '#pw', SECRET]);
+    assert.strictEqual(f.status, 1, f.stderr);
+    assert.strictEqual(lines(f.stderr)[0], LEGACY_ERR);
+    assert.strictEqual(lines(f.stderr).length, 2, `error + one warning, got: ${f.stderr}`);
+    assert(!f.stderr.includes('hunter2'), 'the warning must not echo the value');
+    // A read-only directory (POSIX; root ignores permissions).
+    if (process.platform !== 'win32' && !(process.getuid && process.getuid() === 0)) {
+      const home2 = newHome();
+      fs.mkdirSync(logDir(home2), { recursive: true });
+      fs.chmodSync(logDir(home2), 0o500);
+      try {
+        const ro = cli(home2, ['fill', '#pw', SECRET]);
+        assert.strictEqual(ro.status, 1, ro.stderr);
+        assert.strictEqual(lines(ro.stderr)[0], LEGACY_ERR);
+        assert(lines(ro.stderr)[1].includes('session log not written'), ro.stderr);
+      } finally {
+        fs.chmodSync(logDir(home2), 0o700);
+      }
+    }
+  });
+
+  test('log: `log --json` round-trips the file; table/--md/--path; reading adds nothing', () => {
+    const home = newHome();
+    cli(home, ['fill', '#pw', SECRET]);
+    cli(home, ['version']);
+    cli(home, ['go', 'https://example.com/?session=abc123&page=2']);
+    const before = logFileLines(home);
+    assert.strictEqual(before.length, 3);
+    const j = cli(home, ['log', '--json']);
+    assert.strictEqual(j.status, 0, j.stderr);
+    assert.deepStrictEqual(lines(j.stdout), before, '--json prints the raw lines');
+    assert.deepStrictEqual(lines(j.stdout).map((l) => JSON.parse(l)), before.map((l) => JSON.parse(l)));
+    // Windows pipes are cp1252 by default; the output must still be the UTF-8 lines.
+    const cp = cli(home, ['log', '--json'], { PYTHONIOENCODING: 'cp1252' });
+    assert.deepStrictEqual(lines(cp.stdout), before, 'cp1252 stdout must still print UTF-8');
+    const t = cli(home, ['log']);
+    assert.strictEqual(t.status, 0, t.stderr);
+    assert(t.stdout.includes('fill #pw «redacted:') && t.stdout.includes('version'), t.stdout);
+    assert(t.stdout.includes('! ' + LEGACY_ERR.slice(0, 20)), 'failed commands show their error');
+    const md = cli(home, ['log', '--md']);
+    assert.strictEqual(md.status, 0, md.stderr);
+    for (const h of ['### Pages visited', '### Actions', '### Errors', '### Files produced']) {
+      assert(md.stdout.includes(h), `--md must have "${h}"`);
+    }
+    assert(md.stdout.includes('session=«redacted:6 chars»&page=2'), md.stdout);
+    for (const out of [j.stdout, t.stdout, md.stdout]) {
+      assert(!out.includes('hunter2') && !out.includes('abc123'), 'no secret in any view');
+    }
+    const p = cli(home, ['log', '--path']);
+    assert.strictEqual(p.stdout.trim(), logDir(home));
+    assert.strictEqual(cli(home, ['log', '--days', '3']).status, 0);
+    assert.strictEqual(cli(home, ['log', '--days=0']).status, 1, '--days must be >= 1');
+    assert.deepStrictEqual(logFileLines(home), before, '`log` must not log itself');
+  });
+
+  test('log: retention deletes day files older than CDPILOT_LOG_DAYS on the first write of a day', () => {
+    const home = newHome();
+    const dir = logDir(home);
+    fs.mkdirSync(dir, { recursive: true });
+    for (const f of ['2000-01-01.jsonl', `${localDay(20)}.jsonl`, `${localDay(14)}.jsonl`,
+      `${localDay(3)}.jsonl`, 'notes.txt']) fs.writeFileSync(path.join(dir, f), '{}\n');
+    cli(home, ['version']);
+    const left = fs.readdirSync(dir).sort();
+    assert.deepStrictEqual(left,
+      [`${localDay(14)}.jsonl`, `${localDay(3)}.jsonl`, `${localDay()}.jsonl`, 'notes.txt'].sort(),
+      `default 14 days: ${left}`);
+
+    const home2 = newHome();
+    fs.mkdirSync(logDir(home2), { recursive: true });
+    fs.writeFileSync(path.join(logDir(home2), `${localDay(3)}.jsonl`), '{}\n');
+    cli(home2, ['version'], { CDPILOT_LOG_DAYS: '2' });
+    assert(!fs.existsSync(path.join(logDir(home2), `${localDay(3)}.jsonl`)), 'CDPILOT_LOG_DAYS=2');
+
+    // Not the first write today: nothing is pruned.
+    const home3 = newHome();
+    fs.mkdirSync(logDir(home3), { recursive: true });
+    fs.writeFileSync(path.join(logDir(home3), `${localDay()}.jsonl`), '');
+    fs.writeFileSync(path.join(logDir(home3), '2000-01-01.jsonl'), '{}\n');
+    cli(home3, ['version']);
+    assert(fs.existsSync(path.join(logDir(home3), '2000-01-01.jsonl')), 'prune only on a day\'s first write');
+  });
+
+  test('log: a command killed by --timeout still writes its line (exit 124)', () => {
+    const home = newHome();
+    const wrapper = [
+      'import json, os, socket, subprocess, sys',
+      'srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)',
+      'srv.bind(("127.0.0.1", 0))',
+      'srv.listen(16)',
+      'env = dict(os.environ, CDP_PORT=str(srv.getsockname()[1]))',
+      'r = subprocess.run(sys.argv[1:], env=env, capture_output=True, text=True, timeout=60)',
+      'print(json.dumps({"code": r.returncode, "stderr": r.stderr}))',
+    ].join('\n');
+    const r = spawnSync(PY_BIN, ['-c', wrapper, process.execPath, CLI, '--timeout', '1', 'content'], {
+      encoding: 'utf-8', timeout: 90000, env: baseEnv(home, {}),
+    });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(JSON.parse(r.stdout.trim()).code, 124);
+    const got = logFileLines(home).map((l) => JSON.parse(l));
+    assert.strictEqual(got.length, 1, `lines: ${got.length}`);
+    assert.strictEqual(got[0].exit, 124);
+    assert.strictEqual(got[0].error, 'cdpilot: timed out after 1s (content)');
+  });
+
+  test('log: MCP lists browser_log; a tool call is logged once (via mcp:<tool>), browser_log reads it', () => {
+    const home = newHome();
+    const reqs = [
+      { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'browser_fill', arguments: { selector: '#pw', value: SECRET } } },
+      { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'browser_log', arguments: { format: 'json' } } },
+    ];
+    const r = spawnSync(PY_BIN, [PY_PATH, 'mcp'], {
+      input: reqs.map((x) => JSON.stringify(x)).join('\n') + '\n',
+      encoding: 'utf-8', timeout: 60000, env: baseEnv(home, {}),
+    });
+    const res = lines(r.stdout).map((l) => JSON.parse(l));
+    const tool = res.find((x) => x.id === 1).result.tools.find((t) => t.name === 'browser_log');
+    assert(tool, 'browser_log must be in tools/list');
+    assert(tool.description.length > 80 && /read-only/i.test(tool.description), tool.description);
+    assert.deepStrictEqual(tool.inputSchema.properties.format.enum, ['table', 'md', 'json']);
+    assert(/"browser_log":\s*lambda a: \["log"\]/.test(PY_CONTENT), 'tool_map must route browser_log to `log`');
+    const logged = logFileLines(home).map((l) => JSON.parse(l));
+    assert.strictEqual(logged.length, 1, `one line per tool call (no double logging), got ${logged.length}`);
+    assert.strictEqual(logged[0].cmd, 'fill');
+    assert.strictEqual(logged[0].via, 'mcp:browser_fill');
+    assert.strictEqual(logged[0].exit, 1);
+    const call = res.find((x) => x.id === 3).result;
+    assert.strictEqual(call.isError, false);
+    assert.deepStrictEqual(JSON.parse(call.content[0].text), logged[0]);
+    assert(!r.stdout.includes('hunter2') && !logFileLines(home).join('').includes('hunter2'));
+  });
+
+  test('log: wired into dispatch, never auto-launches, documented (README, CHANGELOG, help)', () => {
+    assert(/'log':\s*lambda:\s*cmd_log\(\*args\)/.test(PY_CONTENT), "'log' must be in sync_cmds");
+    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('if __name__ == "__main__":'));
+    assert(/_slog_begin\(_argv\)/.test(main), '__main__ must start the session log');
+    const skip = PY_CONTENT.match(/AUTOLAUNCH_SKIP_CMDS = frozenset\(\{([\s\S]*?)\}\)/)[1];
+    assert(/'log'/.test(skip), "'log' must never launch the browser");
+    const root = path.join(__dirname, '..');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    for (const s of ['cdpilot log --md', '`CDPILOT_LOG`', '`CDPILOT_LOG_DAYS`']) {
+      assert(readme.includes(s), `README must mention ${s}`);
+    }
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    const unreleased = changelog.split(/^## \[/m).find((s) => s.startsWith('Unreleased]'));
+    assert(unreleased && unreleased.includes('cdpilot log'), 'CHANGELOG [Unreleased] must describe `cdpilot log`');
+    const help = run('--help');
+    assert(help.includes('log --md') && help.includes('CDPILOT_LOG'), 'bin help must document log');
+    assert(PY_CONTENT.slice(0, 2000).includes('CDPILOT_LOG=0'), 'python __doc__ must document CDPILOT_LOG');
   });
 })();
 

@@ -2,6 +2,14 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Session log + `cdpilot log`.** After an agent or a person finished a browser task there was no record of what was done and found (`debug` covers one URL, `trace` only `cdpilot test` runs). Every CLI command now appends one JSON line to `<CDPILOT_HOME>/projects/<project-id>/log/<YYYY-MM-DD>.jsonl`: `ts` (local time), `cmd`, redacted `args`, `exit`, `duration_ms`, the page `url`/`title` the command already had (no extra CDP round-trip), a ~200-char redacted `summary` of stdout, the `error` line, and the `files` it wrote (paths it printed that exist and were written during the run). `cdpilot log` prints today's entries as a table; `--md` a Markdown report (pages visited, actions, errors, files produced) to paste into an issue or PR; `--json` the raw lines; `--days N`; `--path`.
+- **Redaction before write.** Values given to `fill`, `type`, `smart-fill`, `smart-select`, `assert-value` and `dialog prompt`, values of password/token/key/secret/cookie/auth flags and headers, and token-shaped args become `«redacted:N chars»`; echoes of those values in the output are scrubbed too (also when the command cut them short). `cookies` and `storage` output is never logged. `eval` source is logged with string literals over 40 chars cut and secret-looking literals (`.value = '…'`, `setItem(k, '…')`, `password: '…'`) replaced. URLs keep everything except the userinfo password and query/fragment values whose names contain token, key, secret, password, auth, code or session; `data:` URLs keep only the media type.
+- **`CDPILOT_LOG=0`** turns the log off; **`CDPILOT_LOG_DAYS`** (default 14, `0` keeps all) sets retention — day files older than that are deleted on the first write of a day. Logging is best effort: it never changes a command's output or exit code, a failed write costs one stderr line per process, and each line is one `write()` on an `O_APPEND` file so parallel invocations do not interleave. A command stopped by `--timeout` still writes its line (exit 124).
+- **MCP `browser_log`** (read-only) returns the log as a table, Markdown or JSON. Each MCP tool call is logged once, by the CLI process that runs it, tagged `"via": "mcp:<tool>"`; the server writes the line itself only when it had to kill that process.
+
 ## [0.9.2] - 2026-09-27
 
 Why: in ~1,225 real agent sessions the top failures were "CDP connection error. Is the browser running?" (292), a command hanging with no way to bound it (171, #2) and `open <url>` typed instead of `go <url>` (14).
