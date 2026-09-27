@@ -1448,3 +1448,50 @@ def test_crisis_freeze_blocks_auto_post(monkeypatch, tmp_path):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ── crisis_check: noise floor + freeze expiry (2026-09-27) ──
+def test_crisis_tiny_median_is_noise_not_a_drop(tmp_path, monkeypatch):
+    """2026-09-16 regression: "engagement drop: today=0 vs median=1" froze
+    posting for 11 days. A 60% fall from one like is one missing like."""
+    hist = [{"followers": 3, "tweet_metrics": [{"likes": 1, "views": "40"}]}
+            for _ in range(5)]
+    hist[-1] = {"followers": 3, "tweet_metrics": [{"likes": 0, "views": "10"}]}
+    crisis_check, res = _crisis_with_history(tmp_path, monkeypatch, hist)
+    assert res["triggered"] is False, res["reasons"]
+    assert any("engagement rule disarmed" in s for s in res["skipped"])
+    assert any("impressions rule disarmed" in s for s in res["skipped"])
+    assert not crisis_check.FREEZE_FLAG.exists()
+
+
+def _freeze_aged(tmp_path, monkeypatch, hours: float):
+    import time as _t
+    hist = [{"followers": 3, "tweet_metrics": []} for _ in range(5)]
+    flag = tmp_path / "state" / "crisis-freeze.flag"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text(json.dumps({"triggered_at": int(_t.time() - hours * 3600),
+                                "reasons": ["old"]}))
+    return _crisis_with_history(tmp_path, monkeypatch, hist)
+
+
+def test_crisis_stale_freeze_lifts_itself(tmp_path, monkeypatch):
+    """A freeze stops posting, so nothing can ever be measured again — the
+    evidence that would clear it never arrives. Time must be the exit."""
+    crisis_check, res = _freeze_aged(tmp_path, monkeypatch,
+                                     hours=49)
+    assert res["triggered"] is False
+    assert not crisis_check.FREEZE_FLAG.exists()
+
+
+def test_crisis_fresh_freeze_is_kept(tmp_path, monkeypatch):
+    crisis_check, res = _freeze_aged(tmp_path, monkeypatch, hours=5)
+    assert crisis_check.FREEZE_FLAG.exists()
+
+
+def test_alarms_go_to_phone_push_first(_no_real_push):
+    """crisis alerts reach ntfy before (and instead of) Telegram."""
+    sys.modules.pop("crisis_check", None)
+    import crisis_check  # type: ignore
+    crisis_check._telegram_send("probe")
+    assert _no_real_push == ["probe"]
+

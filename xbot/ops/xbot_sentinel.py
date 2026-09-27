@@ -43,6 +43,9 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _notify  # noqa: E402
+
 BOT = Path(os.environ.get("CDPILOT_BOT_HOME", "/opt/cdpilot-twitter-bot"))
 STATE_FILE = BOT / "state" / "sentinel-state.json"
 ALERTS_DIR = BOT / "alerts"
@@ -301,7 +304,7 @@ def main() -> None:
         text = f"🚨 xbot sentinel [{cid}]\n{msg}"
         ALERTS_DIR.mkdir(parents=True, exist_ok=True)
         (ALERTS_DIR / f"sentinel-{cid}-{time.strftime('%Y%m%d-%H%M')}.txt").write_text(text + "\n")
-        if _telegram(text):
+        if _notify.push(text) or _telegram(text):
             state["alerted"][cid] = now
             sent += 1
 
@@ -309,7 +312,8 @@ def main() -> None:
     tr = time.gmtime(now + TR_OFFSET_S)
     today = time.strftime("%Y-%m-%d", tr)
     if tr.tm_hour == 9 and state.get("digest_date") != today:
-        if _telegram(digest()):
+        d = digest()
+        if _notify.push(d, priority="dusuk", tag="clipboard") or _telegram(d):
             state["digest_date"] = today
 
     _save_state(state)

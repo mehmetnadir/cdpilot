@@ -9,7 +9,10 @@ Triggers (any):
 Action (if triggered):
   - Set FREEZE flag in DATA/state/crisis-freeze.flag
   - Poster checks this flag and refuses to post when set
-  - Telegram alert to Nadir with details + recovery suggestions
+  - Phone push (ntfy) to Nadir with details, Telegram only as fallback
+  - A freeze lifts itself after FREEZE_MAX_HOURS: while frozen nothing is
+    posted, so nothing can be measured, so the check can never see recovery.
+    Without a time bound a freeze is permanent (2026-09-16 → 09-27, 11 days).
 
 Detection only (Phase 1) — recovery handled by crisis-playbook skill manually.
 
@@ -29,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import bot_home  # noqa: E402
+import _notify  # noqa: E402
 
 DATA = bot_home()
 ANALYTICS = DATA / "analytics"
@@ -43,6 +47,13 @@ IMPR_FLOOR = 0.40
 # and a freeze nobody notices is how posting died for 6 weeks in 2026-08.
 MIN_BASELINE_DAYS = 3      # baseline days that actually tracked tweets
 MIN_FOLLOWERS_FOR_DROP = 25  # below this, ordinary churn is noise, not a shadowban
+# A percentage of a tiny number is noise. 2026-09-16 froze posting on
+# "engagement drop: today=0 vs median=1" and 09-11 on "impressions today=10 vs
+# median=40" — one missing like, one quiet afternoon. Drop rules need a baseline
+# large enough that a 60% fall means something.
+MIN_MEDIAN_ENGAGEMENT = 5
+MIN_MEDIAN_VIEWS = 100
+FREEZE_MAX_HOURS = 48
 
 
 def _log(msg: str) -> None:
@@ -54,6 +65,9 @@ def _log(msg: str) -> None:
 
 
 def _telegram_send(text: str) -> None:
+    """Phone push first; the Telegram bridge only if ntfy could not deliver."""
+    if _notify.push(text):
+        return
     try:
         import subprocess
         subprocess.run([sys.executable, str(TELEGRAM_BRIDGE), "send", text],
@@ -161,7 +175,12 @@ def check() -> dict:
     base_eng = [d["total_engagement"] for d in baseline_with_data if d["total_engagement"] > 0]
     if signal_ok and base_eng:
         median_eng = statistics.median(base_eng)
-        if median_eng > 0 and today["total_engagement"] < median_eng * (1 - DROP_THRESHOLD):
+        if median_eng < MIN_MEDIAN_ENGAGEMENT:
+            skipped.append(
+                f"engagement rule disarmed: baseline median {median_eng:g} < "
+                f"{MIN_MEDIAN_ENGAGEMENT} — too small for a percentage to mean anything"
+            )
+        elif today["total_engagement"] < median_eng * (1 - DROP_THRESHOLD):
             triggered = True
             reasons.append(
                 f"engagement drop: today={today['total_engagement']} "
@@ -172,7 +191,12 @@ def check() -> dict:
     base_views = [d["views"] for d in baseline_with_data if d["views"] > 0]
     if signal_ok and base_views:
         median_views = statistics.median(base_views)
-        if median_views > 0 and today["views"] < median_views * IMPR_FLOOR:
+        if median_views < MIN_MEDIAN_VIEWS:
+            skipped.append(
+                f"impressions rule disarmed: baseline median {median_views:g} < "
+                f"{MIN_MEDIAN_VIEWS} — too small for a percentage to mean anything"
+            )
+        elif today["views"] < median_views * IMPR_FLOOR:
             triggered = True
             reasons.append(
                 f"impressions floor: today={today['views']} "
@@ -215,16 +239,44 @@ def check() -> dict:
         _telegram_send(
             "🔴 CRISIS DETECT — posting frozen.\n\n"
             + "\n".join(f"• {r}" for r in reasons)
-            + "\n\nNext: crisis-playbook skill ile manuel inceleme. "
-            "Düzeldikten sonra: python crisis_check.py --clear"
+            + f"\n\nDonma {FREEZE_MAX_HOURS} saat sonra kendiliğinden kalkar. "
+            "Erken kaldırmak için: python crisis_check.py --clear"
         )
     else:
         _log(
             f"OK · today_eng={today['total_engagement']} · followers={today['followers']}"
             + (f" · skipped={skipped}" if skipped else "")
         )
+        _expire_stale_freeze()
 
     return result
+
+
+def _expire_stale_freeze(now: float | None = None) -> bool:
+    """Lift a freeze older than FREEZE_MAX_HOURS when today's check is clean.
+
+    A freeze stops posting, which empties the analytics window, which makes
+    every later check unmeasurable — so the evidence that would clear it can
+    never arrive. Time is the only exit; the next measurable day re-arms the
+    rules and re-freezes if the problem is real.
+    """
+    if not FREEZE_FLAG.exists():
+        return False
+    now = time.time() if now is None else now
+    try:
+        since = float(json.loads(FREEZE_FLAG.read_text()).get("triggered_at", 0))
+    except (ValueError, OSError, AttributeError):
+        since = FREEZE_FLAG.stat().st_mtime
+    age_h = (now - since) / 3600
+    if age_h < FREEZE_MAX_HOURS:
+        return False
+    FREEZE_FLAG.unlink()
+    _log(f"freeze auto-lifted after {age_h:.0f}h — today's check is clean")
+    _telegram_send(
+        f"🟢 Crisis freeze {age_h:.0f} saat sonra kendiliğinden kalktı — bugünkü "
+        "denetim temiz. Sorun gerçekse ilk ölçülebilir günde yeniden donar."
+    )
+    return True
 
 
 def clear() -> None:
