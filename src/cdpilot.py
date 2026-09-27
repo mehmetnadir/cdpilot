@@ -8,10 +8,17 @@ Chrome DevTools Protocol (CDP). No Puppeteer, no Playwright, no Selenium.
 Usage:
   cdpilot <command> [arguments]
 
+Global options:
+  --timeout <seconds>  Abort the command after <seconds> (exit 124). Accepted
+                       before or after the command name; 0 disables.
+
 Environment:
   CDP_PORT             CDP debugging port (default: 9222)
   CHROME_BIN           Browser binary path (auto-detected if not set)
   CDPILOT_PROFILE      Isolated browser profile directory
+  CDPILOT_TIMEOUT      Default for --timeout (the flag wins)
+  CDPILOT_NO_AUTOLAUNCH=1  Do not start the browser when a page command
+                       finds it not running (print the error instead)
 """
 
 __version__ = "0.9.1"
@@ -36,6 +43,10 @@ import glob
 import datetime
 import concurrent.futures
 import tempfile
+import contextlib
+import io
+import threading
+import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ─── Project-Based Multi-Instance Configuration ───
@@ -1224,11 +1235,86 @@ def cdp_cache_invalidate():
     _CDP_GET_CACHE.clear()
 
 
+# ─── Auto-launch ───
+# Measured on ~1,225 real agent sessions: "CDP connection error. Is the browser
+# running?" was the #1 failure (292 times) — the agent never ran `launch`, or
+# the browser died between commands. A page-level command that finds the CDP
+# port unreachable now launches the browser exactly like `cdpilot launch`
+# (same profile, same headless/visible config), then continues once.
+AUTOLAUNCH_DISABLE_ENV = "CDPILOT_NO_AUTOLAUNCH"
+AUTOLAUNCH_NOTICE = ("cdpilot: browser was not running — launched it "
+                     "(CDPILOT_NO_AUTOLAUNCH=1 to disable)")
+# Commands that never start a browser, whatever they touch:
+#   lifecycle      — launching to stop/close would be absurd;
+#   status/diag    — a check must report the state, not change it;
+#   launch config  — must take effect on the NEXT launch, not after one we forced;
+#   servers        — startup never launches (`mcp` tool calls run as separate
+#                    page-level commands and do auto-launch).
+# status/setup/help/--version are answered by bin/cdpilot.js; listed so a direct
+# `python src/cdpilot.py <name>` can never launch either.
+AUTOLAUNCH_SKIP_CMDS = frozenset({
+    'launch', 'stop', 'close', 'close-tab', 'session-close', 'project-stop', 'stop-all',
+    'status', 'health', 'setup', 'help', '--help', '-h', 'version', '--version', '-v',
+    'tabs', 'session', 'sessions', 'projects', 'heal',
+    'headless', 'proxy', 'browser', 'extensions', 'ext-install', 'ext-remove',
+    'mcp', 'serve',
+})
+# cmd is set by the CLI dispatcher; None (module imported) means never launch.
+_AUTOLAUNCH = {"cmd": None, "attempted": False, "failure": None}
+
+
+def _autolaunch_disabled():
+    return os.environ.get(AUTOLAUNCH_DISABLE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _autolaunch_if_down():
+    """Launch the browser (once per process) when this command may and CDP is down.
+
+    Returns True when CDP answers afterwards. Never exits: on failure the
+    reason is kept for _print_autolaunch_failure(), which callers print right
+    after their usual error, so CDPILOT_NO_AUTOLAUNCH=1 output stays identical.
+    """
+    cmd = _AUTOLAUNCH["cmd"]
+    if (cmd is None or cmd in AUTOLAUNCH_SKIP_CMDS or _AUTOLAUNCH["attempted"]
+            or _autolaunch_disabled()):
+        return False
+    _AUTOLAUNCH["attempted"] = True
+    if cdp_get("/json/version", no_cache=True):
+        return True  # came up meanwhile (e.g. a parallel `cdpilot launch`)
+    out, err = io.StringIO(), io.StringIO()
+    code = 0
+    try:
+        # cmd_launch's progress lines would land in the command's stdout,
+        # which agents parse — keep them out; errors become the failure reason.
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cmd_launch()
+    except SystemExit as e:
+        code = 0 if e.code is None else (e.code if isinstance(e.code, int) else 1)
+    except Exception as e:
+        err.write(f"{type(e).__name__}: {e}")
+        code = 1
+    cdp_cache_invalidate()
+    if code == 0 and cdp_get("/json/version", no_cache=True):
+        print(AUTOLAUNCH_NOTICE, file=sys.stderr)
+        return True
+    reason = err.getvalue().strip() or out.getvalue().strip() or "browser did not answer on the CDP port"
+    _AUTOLAUNCH["failure"] = " / ".join(ln.strip() for ln in reason.splitlines() if ln.strip())
+    return False
+
+
+def _print_autolaunch_failure():
+    if _AUTOLAUNCH["failure"]:
+        print(f"cdpilot: auto-launch failed: {_AUTOLAUNCH['failure']}", file=sys.stderr)
+
+
 def get_tabs():
-    """Retrieve all CDP targets."""
+    """Retrieve all CDP targets, auto-launching the browser once if allowed."""
     result = cdp_get("/json")
+    if result is None and _autolaunch_if_down():
+        result = cdp_get("/json", no_cache=True)
     if result is None:
         print("CDP connection error. Is the browser running?", file=sys.stderr)
+        _print_autolaunch_failure()
         sys.exit(1)
     return result
 
@@ -2597,6 +2683,9 @@ def cmd_launch():
         if cdp_get('/json/version'):
             if PROJECT_ID:
                 _register_project(PROJECT_ID, CDP_PORT, PROFILE_DIR, pid=proc.pid)
+            # Up and registered: the browser is meant to outlive this command,
+            # so a --timeout expiring later must not kill it as an orphan.
+            _timeout_release_child(proc)
             # Off-screen / minimized placement (opt-in). Keeps the browser
             # HEADED (anti-bot still sees a real GPU-backed window) but parks it
             # out of the way so long bench runs never steal focus or pop in
@@ -2635,9 +2724,8 @@ def cmd_tabs(reap=False, max_tabs=1, include_real=False, dry_run=False):
 
 
 async def cmd_go(url):
-    if not cdp_get("/json/version"):
-        cmd_launch()
-
+    # No explicit launch here any more: get_page_ws() -> get_tabs()
+    # auto-launches (quietly, honouring CDPILOT_NO_AUTOLAUNCH).
     ws, page = get_page_ws()
     # Mark this tab as cdpilot-owned so a later `close` knows it can shut it.
     if isinstance(page, dict):
@@ -4489,9 +4577,7 @@ async def cmd_glow(state="on"):
 
 async def cmd_debug(url=None):
     """Full auto-debug: navigate + console + network + perf + screenshot."""
-    if not cdp_get("/json/version"):
-        cmd_launch()
-
+    # get_page_ws() auto-launches the browser if needed (see _autolaunch_if_down).
     ws, page = get_page_ws()
 
     if url is None:
@@ -5103,12 +5189,13 @@ async def cmd_context_create(url='about:blank'):
     The target_id is what CDPILOT_TARGET expects.
     """
     if not cdp_get('/json/version'):
-        cmd_launch()
+        _autolaunch_if_down()
     # Resolve a base WS to talk to the browser itself (not a tab).
     ver = cdp_get('/json/version')
     browser_ws = ver.get('webSocketDebuggerUrl') if ver else None
     if not browser_ws:
         print('Cannot reach browser-level WS', file=sys.stderr)
+        _print_autolaunch_failure()
         sys.exit(1)
     r = await cdp_send(browser_ws, [
         (1, "Target.createBrowserContext", {}),
@@ -5225,6 +5312,8 @@ async def cmd_new_tab(url='about:blank'):
     """Open a new tab."""
     import urllib.parse
     safe_chars = ":/?#[]@!$&'()*+,;="
+    if not cdp_get('/json/version'):
+        _autolaunch_if_down()
     data = cdp_get(f'/json/new?{urllib.parse.quote(url, safe=safe_chars)}')
     cdp_cache_invalidate()
     if data:
@@ -5233,6 +5322,7 @@ async def cmd_new_tab(url='about:blank'):
         print(f'  ID: {data.get("id", "?")}')
     else:
         print('Failed to open tab', file=sys.stderr)
+        _print_autolaunch_failure()
 
 def cmd_switch_tab(index_or_id):
     """Switch to a tab by index number or tab ID."""
@@ -7368,9 +7458,10 @@ async def cmd_press_hold(selector=None):
       cdpilot press-hold              # auto-find the px-captcha target
       cdpilot press-hold "#px-captcha button"
     """
-    if not cdp_get("/json/version"):
+    if not cdp_get("/json/version") and not _autolaunch_if_down():
         print(json.dumps({'solved': False, 'error': 'no_browser',
                           'hint': 'Run: cdpilot launch'}, ensure_ascii=False))
+        _print_autolaunch_failure()
         sys.exit(1)
     ws, _ = get_page_ws()
     res = await _solve_press_and_hold(ws, target_sel=selector)
@@ -7515,8 +7606,9 @@ async def cmd_profile_warm(minutes=None, sites=None):
     if not site_list:
         site_list = WARM_SAFE_SITES
 
-    if not cdp_get("/json/version"):
+    if not cdp_get("/json/version") and not _autolaunch_if_down():
         print(json.dumps({'error': 'no_browser', 'hint': 'Run: cdpilot launch'}, ensure_ascii=False))
+        _print_autolaunch_failure()
         sys.exit(1)
 
     ws, _ = get_page_ws()
@@ -7974,8 +8066,11 @@ async def _get_element_center(ws_url, selector):
 async def _get_browser_ws():
     """Return the browser-level WebSocket URL (/json/version)."""
     info = cdp_get("/json/version")
+    if not info and _autolaunch_if_down():
+        info = cdp_get("/json/version", no_cache=True)
     if not info:
         print("Error: browser not running (CDP /json/version unreachable).", file=sys.stderr)
+        _print_autolaunch_failure()
         sys.exit(1)
     return info.get("webSocketDebuggerUrl")
 
@@ -12333,8 +12428,9 @@ async def _watch_daemon_run(url, fps, quality, max_width, retention_s,
     fdir = _watch_frames_dir()
     os.makedirs(fdir, exist_ok=True)
 
-    # Launch browser if needed
-    if not cdp_get("/json/version"):
+    # Launch browser if needed (the daemon is forked by `watch start`, a page
+    # command, so it follows the same CDPILOT_NO_AUTOLAUNCH switch).
+    if not cdp_get("/json/version") and not _autolaunch_disabled():
         cmd_launch()
 
     ws_url, _ = get_page_ws()
@@ -12928,9 +13024,156 @@ def _dispatch_watch_cmd(args):
 # ─── End cdpilot watch namespace ──────────────────────────────────────────────
 
 
+# ─── Global --timeout (issue #2) ───
+# Measured on ~1,225 real agent sessions: 171 had a command hang with no way to
+# bound it. `--timeout <s>` (before or after the command name) or
+# CDPILOT_TIMEOUT caps the whole command's wall-clock. On expiry: one stderr
+# line, exit 124 (GNU `timeout` convention), child processes killed.
+#
+# Mechanism: a daemon watchdog thread that ends the process with os._exit(124).
+#   - SIGALRM does not exist on Windows.
+#   - asyncio.wait_for cannot preempt the blocking sync calls commands make all
+#     over (urllib, time.sleep, subprocess.run), and many commands are sync —
+#     a cooperative timeout would miss exactly the hangs we measured.
+#   - Killing from the Node launcher would miss `python src/cdpilot.py ...`,
+#     MCP tool calls and `run` scripts, which spawn cdpilot.py directly.
+# os._exit from a helper thread ends the process on every OS whatever the main
+# thread is blocked in. Children spawned while the watchdog is armed are
+# tracked and killed first; the browser counts as ours only until it is up and
+# registered (like `cdpilot launch`, it is meant to outlive the command).
+TIMEOUT_ENV = "CDPILOT_TIMEOUT"
+TIMEOUT_EXIT_CODE = 124
+# Long-running servers are not bounded themselves; the value is exported in
+# CDPILOT_TIMEOUT so each per-request child (MCP tool call, API launch) is.
+TIMEOUT_EXEMPT_CMDS = frozenset({'mcp', 'serve'})
+# Commands that parse their own `--timeout` after the command name: that flag
+# is left in their args and wins; the global value is only their default.
+# None exist today — checked when --timeout was added.
+COMMANDS_WITH_OWN_TIMEOUT = frozenset()
+_TIMEOUT_CHILDREN = weakref.WeakSet()
+
+
+def _parse_timeout_seconds(raw, source):
+    """Seconds as float from a --timeout / CDPILOT_TIMEOUT value; 0 = no timeout."""
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{source} expects a number of seconds, got {raw!r}")
+    if val != val or val < 0 or val == float("inf"):
+        raise ValueError(f"{source} expects seconds >= 0, got {raw!r}")
+    return val
+
+
+def _extract_timeout(argv, env=None):
+    """Split the global --timeout flag out of argv (argv excludes the program).
+
+    Accepts `--timeout N` / `--timeout=N` before or after the command name.
+    Returns (seconds, remaining_argv): seconds is None when neither the flag
+    nor CDPILOT_TIMEOUT is set, 0.0 when explicitly disabled. The flag wins
+    over the env var. Raises ValueError on a malformed value.
+    """
+    env = os.environ if env is None else env
+    seconds = None
+    rest = []
+    cmd = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        own = cmd in COMMANDS_WITH_OWN_TIMEOUT
+        if not own and a == "--timeout":
+            if i + 1 >= len(argv):
+                raise ValueError("--timeout expects a number of seconds")
+            seconds = _parse_timeout_seconds(argv[i + 1], "--timeout")
+            i += 2
+            continue
+        if not own and a.startswith("--timeout="):
+            seconds = _parse_timeout_seconds(a.split("=", 1)[1], "--timeout")
+            i += 1
+            continue
+        if cmd is None:
+            cmd = a
+        rest.append(a)
+        i += 1
+    if seconds is None:
+        raw = (env.get(TIMEOUT_ENV) or "").strip()
+        if raw:
+            seconds = _parse_timeout_seconds(raw, TIMEOUT_ENV)
+    return seconds, rest
+
+
+class _TimeoutTrackedPopen(subprocess.Popen):
+    """subprocess.Popen that registers the child for the --timeout watchdog.
+
+    Installed only while a timeout is armed. Detached children (own session,
+    e.g. the `watch` daemon) are meant to outlive cdpilot and are left alone.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        detached = kwargs.get("start_new_session") or (
+            kwargs.get("creationflags", 0) & getattr(subprocess, "DETACHED_PROCESS", 0))
+        if not detached:
+            _TIMEOUT_CHILDREN.add(self)
+
+
+def _timeout_release_child(proc):
+    """Stop treating proc as a child to kill on timeout (it is meant to live on)."""
+    _TIMEOUT_CHILDREN.discard(proc)
+
+
+def _arm_timeout_watchdog(seconds, cmd):
+    """Start the watchdog: after `seconds`, kill tracked children, exit 124."""
+    subprocess.Popen = _TimeoutTrackedPopen  # subprocess.run() uses it too
+    message = f"cdpilot: timed out after {seconds:g}s ({cmd})\n".encode()
+
+    def _flush_std_streams():
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+    def _expire():
+        try:
+            children = list(_TIMEOUT_CHILDREN)
+        except RuntimeError:  # main thread added one mid-copy
+            children = list(_TIMEOUT_CHILDREN)
+        for proc in children:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+            except Exception:
+                pass
+        # Keep what the command already printed. Flush from a helper thread
+        # with a deadline: the main thread may hold the stdout lock while
+        # blocked on a full pipe, and the timeout must still fire.
+        flusher = threading.Thread(target=_flush_std_streams, daemon=True)
+        flusher.start()
+        flusher.join(0.5)
+        try:
+            os.write(2, message)
+        except OSError:
+            pass
+        os._exit(TIMEOUT_EXIT_CODE)
+
+    timer = threading.Timer(seconds, _expire)
+    timer.daemon = True
+    timer.start()
+    atexit.register(timer.cancel)  # finished in time: never fire during shutdown
+    return timer
+
+
 # ─── CLI ───
 
 if __name__ == "__main__":
+    try:
+        _timeout_s, _argv = _extract_timeout(sys.argv[1:])
+    except ValueError as _e:
+        print(f"cdpilot: {_e}", file=sys.stderr)
+        sys.exit(2)
+    # Downstream code (and anything reading sys.argv) sees argv without it.
+    sys.argv = sys.argv[:1] + _argv
+
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(0)
@@ -12947,12 +13190,26 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(0)
 
+    # `open <url>` is what agents type when they mean `go` (14 times in ~1,225
+    # measured sessions). `open` has no other meaning here, so alias it.
+    if cmd == 'open':
+        cmd = 'go'
+
     # Hidden re-entrant entry for the watch daemon. `cdpilot watch start`
     # forks this process with the flag so the screencast consumer runs in
     # the background while the foreground process returns immediately.
     if cmd == WATCH_DAEMON_FLAG:
         _cmd_watch_daemon_entry()
         sys.exit(0)
+
+    _AUTOLAUNCH["cmd"] = cmd
+    if _timeout_s is not None:
+        # Children (MCP tool calls, `run` lines, test steps) inherit the bound.
+        os.environ[TIMEOUT_ENV] = f"{_timeout_s:g}"
+    if _timeout_s and cmd not in TIMEOUT_EXEMPT_CMDS and not (
+            cmd in COMMANDS_WITH_OWN_TIMEOUT
+            and any(a == "--timeout" or a.startswith("--timeout=") for a in args)):
+        _arm_timeout_watchdog(_timeout_s, cmd)
 
     sync_cmds = {
         'launch': cmd_launch,

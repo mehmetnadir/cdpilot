@@ -321,7 +321,14 @@ function showHelp() {
   cdpilot v${VERSION} — Zero-dependency browser automation
 
   USAGE
-    cdpilot <command> [args]
+    cdpilot [--timeout <s>] <command> [args]
+
+  GLOBAL OPTIONS
+    --timeout <s>      Abort the command after <s> seconds (exit 124). Before or
+                       after the command; env CDPILOT_TIMEOUT sets a default
+                       (the flag wins, 0 disables).
+    Page commands start the browser if it is not running
+                       (set CDPILOT_NO_AUTOLAUNCH=1 to get an error instead).
 
   SETUP
     setup              Auto-detect browser, create isolated profile
@@ -332,7 +339,7 @@ function showHelp() {
                        if no user tabs remain (--force quits anyway, --keep never quits)
 
   NAVIGATION
-    go <url>           Navigate to URL
+    go <url>           Navigate to URL (alias: open)
     content            Get page text content
     html               Get page HTML
     shot [file]        Take screenshot
@@ -590,8 +597,23 @@ if (process.argv.includes('--internal-test-runner')) {
   return; // runAll() is async, this exits via process.exit
 }
 
+// Global flags may precede the command name (`cdpilot --timeout 10 click "#x"`).
+// src/cdpilot.py parses and validates them (it is also run directly, without
+// this launcher); here they only have to be skipped to find the command that
+// the launcher answers itself (help / --version / setup / status). args are
+// passed to Python unchanged.
+function commandIndex(argv) {
+  let i = 0;
+  while (i < argv.length) {
+    if (argv[i] === '--timeout') { i += 2; continue; }
+    if (argv[i].startsWith('--timeout=')) { i += 1; continue; }
+    break;
+  }
+  return i;
+}
+
 const args = process.argv.slice(2);
-const cmd = args[0];
+const cmd = args[commandIndex(args)];
 
 if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
   showHelp();

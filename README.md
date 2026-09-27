@@ -124,7 +124,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full list with rationale.
 ### Navigation & Content
 
 ```bash
-cdpilot go <url>              # Navigate to URL
+cdpilot go <url>              # Navigate to URL (alias: open <url>)
 cdpilot content               # Get page text content
 cdpilot html                  # Get page HTML
 cdpilot shot [file]           # Take screenshot (PNG)
@@ -566,6 +566,32 @@ until cdpilot health >/dev/null; do cdpilot launch; sleep 2; done
 Surfaces today's Brave crash count from `~/Library/Logs/DiagnosticReports/`
 on macOS — spot degradation before your automation silently stalls.
 
+**Auto-launch.** A page command (`go`, `content`, `click`, `shot`, …) that finds
+the browser not running starts it the same way `cdpilot launch` does (same
+profile, same headless/visible setting), then carries on, printing one line to
+stderr: `cdpilot: browser was not running — launched it (CDPILOT_NO_AUTOLAUNCH=1 to disable)`.
+Lifecycle, status and configuration commands (`launch`, `stop`, `close`,
+`close-tab`, `stop-all`, `project-stop`, `session-close`, `status`, `health`,
+`tabs`, `sessions`, `projects`, `headless`, `proxy`, `browser`, `extensions`,
+`mcp`, `serve`, …) never launch. `CDPILOT_NO_AUTOLAUNCH=1` restores the old
+"CDP connection error. Is the browser running?" error and exit code 1.
+
+**Timeouts.** Any command takes `--timeout <seconds>`, before or after the
+command name, or a default from `CDPILOT_TIMEOUT` (the flag wins; `0`
+disables). It bounds the whole command's wall-clock: on expiry cdpilot prints
+`cdpilot: timed out after <N>s (<command>)` to stderr, kills the child processes
+it started and exits with code **124** (like GNU `timeout`). A browser that was
+already up and registered is left running.
+
+```bash
+cdpilot --timeout 10 click "#submit"      # before the command...
+cdpilot shot page.png --timeout 30        # ...or after it
+CDPILOT_TIMEOUT=60 cdpilot run flow.cdp   # default for every command (and each script line)
+```
+
+For `mcp` and `serve` the value is not applied to the long-running server
+itself; it is passed on to every tool call / request it runs.
+
 ### Scaling & Workstation Use
 
 ```bash
@@ -627,6 +653,8 @@ print(result.stdout)
 | `BROWSER_SESSION` | Auto | Session identifier |
 | `CDPILOT_MODE` | `regular` | Stealth tier override (`regular`/`stealth`/`undetected`) |
 | `CDPILOT_OFFSCREEN` | `0` | Headed but render off-screen — no window steals focus |
+| `CDPILOT_TIMEOUT` | unset | Default `--timeout` in seconds for every command (flag wins, `0` disables); expiry exits 124 |
+| `CDPILOT_NO_AUTOLAUNCH` | `0` | `1` = page commands fail with the old "Is the browser running?" error instead of launching the browser |
 
 ## How It Works
 
