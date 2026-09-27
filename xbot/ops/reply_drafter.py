@@ -176,7 +176,9 @@ LEAK_MARKERS = ("reply tweet for", "max 2 sentences", "banned vocabulary",
 # prompt's section labels, never opens by planning, never talks about "the
 # user" who asked for it.
 _PROMPT_LABELS = ("their reply", "our original tweet", "who this account is",
-                  "when not to reply", "reply rules", "output format")
+                  "when not to reply", "reply rules", "output format",
+                  # pain_hunter's own prompt sections
+                  "their pain", "sorun modu", "pain_hunter")
 _LEAK_STRUCTURAL = re.compile(
     r"@?cdpilot_dev\b"
     r"|^\W*(?:ok(?:ay)?|alright|so|first|let'?s|hmm)?\W*(?:we|i)\s+"
@@ -412,17 +414,53 @@ def _nim_draft(user_prompt: str, timeout: int, system_prompt: str | None = None,
     models = _nim_models()
     if not models:
         return None, "nim-no-model"
+    # Health is tracked per model. 2026-09-27: nemotron-3-ultra answered but
+    # its text failed the caller's validator; the loop then walked into three
+    # dead models (60s timeout each), ended on a timeout label, and that put
+    # the WHOLE nim engine in cooldown — every later call that hour returned
+    # ALL ENGINES DOWN although a working model was one line away. A dead
+    # model now cools down on its own; a model that answered is alive even
+    # when its output was refused.
     last = "nim-no-candidate"
+    answered = False
     for model in models:
+        mkey = f"nim:{model}"
+        if _in_cooldown(mkey):
+            last = "nim-model-cooldown"
+            continue
         text, last = _nim_call(key, model, user_prompt, timeout,
                                system_prompt=system_prompt, validate=validate,
                                max_tokens=max_tokens)
         if text:
+            _mark_healthy(mkey)
             return text, model
         if last == "skip":
+            _mark_healthy(mkey)
             return None, "skip"  # a judgement, not a failure — don't shop around
+        if last.startswith("nim-lint"):
+            _mark_healthy(mkey)
+            answered = True
+        else:
+            _mark_unhealthy(mkey)
         _log(f"nim {model} unusable ({last}) — trying next candidate")
+    if answered:
+        return None, "nim-lint-only"
     return None, last
+
+
+def _request_extras(model: str) -> dict:
+    """Per-model request fields.
+
+    nemotron-3-ultra thinks out loud by default, and the thinking spills into
+    `content` ("The user is asking me to classify a tweet..."). 2026-09-27,
+    classifier prompt x 3 tweets on srv21: default 1/3 parseable JSON (worst
+    33.8 s); "/no_think" and "detailed thinking off" in the system prompt 1/3;
+    chat_template_kwargs enable_thinking=false 3/3 at about 2 s each. Only
+    nemotron was measured, so only nemotron gets the switch.
+    """
+    if "nemotron" in model:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {}
 
 
 def _nim_call(key: str, model: str, user_prompt: str, timeout: int,
@@ -434,6 +472,7 @@ def _nim_call(key: str, model: str, user_prompt: str, timeout: int,
                      {"role": "user", "content": user_prompt}],
         "temperature": 0.8,
         "max_tokens": max_tokens,
+        **_request_extras(model),
     }).encode()
     req = urllib.request.Request(
         f"{NIM_BASE}/chat/completions", data=body,
@@ -575,7 +614,10 @@ def generate(system_prompt: str, user_prompt: str, timeout: int = 120,
             _mark_healthy("nim")
             return {"text": None, "engine": "nim", "skip": True, "fallback": False}
         errors.append(label)
-        _mark_unhealthy("nim")
+        if label == "nim-lint-only":
+            _mark_healthy("nim")  # a model answered; the drafts were the problem
+        else:
+            _mark_unhealthy("nim")
     else:
         errors.append("nim-cooldown")
 

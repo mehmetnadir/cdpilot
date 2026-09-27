@@ -1572,3 +1572,86 @@ def test_nim_preference_skips_models_measured_dead():
     import reply_drafter as r  # type: ignore
     assert r.NIM_PREFERENCE[0] == "nvidia/nemotron-3-ultra"
     assert not any("gpt-oss" in m or "nemotron-3-super" in m for m in r.NIM_PREFERENCE)
+
+
+# ── per-model NIM health (2026-09-27) ──
+def _nim_setup(tmp_path, monkeypatch, outcomes):
+    """outcomes: model -> (text, label) returned by a fake _nim_call."""
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    sys.modules.pop("reply_drafter", None)
+    import reply_drafter as r  # type: ignore
+    calls: list[str] = []
+
+    def _fake_call(key, model, *a, **k):
+        calls.append(model)
+        return outcomes[model]
+
+    monkeypatch.setattr(r, "_nim_key", lambda: "k")
+    monkeypatch.setattr(r, "_nim_models", lambda: list(outcomes))
+    monkeypatch.setattr(r, "_nim_call", _fake_call)
+    monkeypatch.setattr(r, "_claude_available", lambda: False)
+    return r, calls
+
+
+def test_dead_models_do_not_take_the_nim_engine_down(tmp_path, monkeypatch):
+    """A live model with a refused draft + dead ones used to end on a timeout
+    label and cool down the whole engine (ALL ENGINES DOWN for an hour)."""
+    r, calls = _nim_setup(tmp_path, monkeypatch, {
+        "alive": (None, "nim-lint:invalid json"),
+        "dead": (None, "nim-TimeoutError"),
+    })
+    for _ in range(3):
+        res = r.generate("s", "u")
+        assert res.get("fallback")
+    assert not r._in_cooldown("nim"), "engine must stay up: a model answered"
+    assert r._in_cooldown("nim:dead"), "the dead model cools down on its own"
+    assert not r._in_cooldown("nim:alive")
+    assert calls.count("dead") == 2, "a cooled-down model is not called again"
+
+
+def test_engine_cools_down_only_when_no_model_answers(tmp_path, monkeypatch):
+    r, _ = _nim_setup(tmp_path, monkeypatch, {"dead": (None, "nim-TimeoutError")})
+    r.generate("s", "u")
+    r.generate("s", "u")
+    assert r._in_cooldown("nim")
+
+
+# ── nemotron thinking switch (2026-09-27) ──
+def _captured_nim_body(tmp_path, monkeypatch, model):
+    monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
+    sys.modules.pop("reply_drafter", None)
+    import reply_drafter as r  # type: ignore
+    seen: dict = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+
+    def _fake_urlopen(req, timeout=None):
+        seen.update(json.loads(req.data))
+        return _Resp()
+
+    monkeypatch.setattr(r.urllib.request, "urlopen", _fake_urlopen)
+    r._nim_call("k", model, "u", timeout=5, system_prompt="s",
+                validate=lambda t: (t, []))
+    return seen
+
+
+def test_nemotron_requests_turn_thinking_off(tmp_path, monkeypatch):
+    """With thinking on, nemotron-3-ultra wrote its analysis into `content`
+    ("The user is asking me to classify...") and 2 of 3 classifier calls had
+    no JSON at all; enable_thinking=false gave 3/3 in about 2 s."""
+    body = _captured_nim_body(tmp_path, monkeypatch,
+                              "nvidia/nemotron-3-ultra-550b-a55b")
+    assert body.get("chat_template_kwargs") == {"enable_thinking": False}
+
+
+def test_other_models_get_no_thinking_kwargs(tmp_path, monkeypatch):
+    body = _captured_nim_body(tmp_path, monkeypatch, "moonshotai/kimi-k3")
+    assert "chat_template_kwargs" not in body
