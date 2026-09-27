@@ -12,6 +12,9 @@ All notable changes to cdpilot will be documented in this file.
 - **`CDPILOT_LOG=0`** turns the log off; **`CDPILOT_LOG_DAYS`** (default 14, `0` keeps all) sets retention — day files older than that are deleted on the first write of a day. Logging is best effort: it never changes a command's output or exit code, a failed write costs one stderr line per process, and each line is one `write()` on an `O_APPEND` file so parallel invocations do not interleave. A command stopped by `--timeout` still writes its line (exit 124).
 - **MCP `browser_log`** (read-only) returns the log as a table, Markdown or JSON. Each MCP tool call is logged once, by the CLI process that runs it, tagged `"via": "mcp:<tool>"`; the server writes the line itself only when it had to kill that process.
 
+### Fixed
+- **Windows: non-ASCII output no longer crashes a command run through a pipe.** An agent's shell, the MCP server and `> file` all give Python the ANSI code page (cp1252), so a Turkish page title or an emoji from `eval`, `title` or `a11y` ended in `UnicodeEncodeError`. stdout/stderr are now UTF-8 on Windows unless you set `PYTHONIOENCODING`; the MCP server sets its child to UTF-8 and reads it as UTF-8.
+
 ## [0.9.2] - 2026-09-27
 
 Why: in ~1,225 real agent sessions the top failures were "CDP connection error. Is the browser running?" (292), a command hanging with no way to bound it (171, #2) and `open <url>` typed instead of `go <url>` (14).

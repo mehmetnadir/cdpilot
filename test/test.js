@@ -4387,6 +4387,24 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     }
   });
 
+  // Windows pipes default to the ANSI code page (cp1252): a Turkish title or
+  // an emoji crashed any command an agent ran through a pipe, and an MCP child
+  // writing one code page while the server read another made the server log
+  // the call twice. Both ends are UTF-8 now.
+  test('output: UTF-8 on Windows pipes; MCP child and server agree on UTF-8', () => {
+    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('if __name__ == "__main__":'));
+    const fix = main.indexOf('_stream.reconfigure(encoding="utf-8", errors="replace")');
+    assert(fix > 0 && fix < main.indexOf('_slog_begin(_argv)'),
+      '__main__ must switch stdout/stderr to UTF-8 on Windows before the session log wraps them');
+    assert(/os\.name == "nt" and not os\.environ\.get\("PYTHONIOENCODING"\)/.test(main),
+      'the switch is Windows-only and yields to a PYTHONIOENCODING the user set');
+    const call = PY_CONTENT.slice(PY_CONTENT.indexOf('env[SLOG_VIA_ENV] = via'));
+    const run = call.slice(0, call.indexOf('output = result.stdout'));
+    assert(run.includes('env["PYTHONIOENCODING"] = "utf-8"'), 'MCP child must write UTF-8');
+    assert(run.includes('encoding="utf-8", errors="replace"') && !run.includes('text=True'),
+      'MCP server must read the child as UTF-8');
+  });
+
   test('log: exit codes and output are identical with logging on and off', () => {
     for (const argv of [['version'], ['nosuchcommand'], ['fill', '#pw', SECRET], ['log', '--bogus']]) {
       const on = cli(newHome(), argv);
