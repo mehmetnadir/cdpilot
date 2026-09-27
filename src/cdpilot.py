@@ -7593,31 +7593,149 @@ async def cmd_profile_dispatch(args: list) -> None:
 # ─── End Captcha Solver Plugin ───────────────────────────────────────────
 
 
-def _stop_browser_on_port(port):
-    """Stop the browser process listening on the given port."""
-    import signal
+def _cdp_browser_close(port):
+    """Send CDP Browser.close to the browser answering /json/version on port.
+
+    Same command the smart close sends, through the same cdp_send. It runs on
+    a worker thread with its own loop, so callers inside a running loop
+    (_browser_close_graceful) work too. True once the command went out.
+    """
     try:
-        # Bounded: on some hosts/sandboxes `lsof`/`pkill` can hang instead of
-        # erroring (observed while testing the port-registry fix — a stuck
-        # `lsof -ti :<port>` blocked the whole /v1/sessions DELETE request).
-        # A timeout keeps this best-effort call from ever wedging the caller.
-        result = subprocess.run(
-            ["lsof", "-ti", f":{port}"],
-            capture_output=True, text=True, timeout=5
-        )
-        pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
-        if pids:
-            for pid in pids:
-                os.kill(int(pid), signal.SIGTERM)
-            return True
-        else:
-            subprocess.run(
-                ["pkill", "-f", f"remote-debugging-port={port}"],
-                capture_output=True, text=True, timeout=5
-            )
-            return True
+        url = f"http://127.0.0.1:{int(port)}/json/version"
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            ws_url = json.loads(resp.read()).get("webSocketDebuggerUrl")
     except Exception:
         return False
+    if not ws_url:
+        return False
+    import threading
+    sent = []
+
+    def _send():
+        try:
+            asyncio.run(cdp_send(ws_url, [(1, "Browser.close", {})], timeout=5))
+            sent.append(True)
+        except SystemExit:
+            pass  # cdp_send exits when it cannot connect at all
+        except Exception as e:
+            # The browser may drop the socket before it answers.
+            if type(e).__name__.startswith("ConnectionClosed"):
+                sent.append(True)
+
+    worker = threading.Thread(target=_send, daemon=True)
+    worker.start()
+    worker.join(8)
+    return bool(sent)
+
+
+def _debug_port_pids(port):
+    """Pids whose command line carries --remote-debugging-port=<port> exactly.
+
+    Port 9222 never matches a 92220 flag. Every probe is bounded: `lsof` hung
+    forever on a Mac with a stale network mount (2026-09-27), so it is gone.
+    """
+    port = int(port)
+    pids = set()
+    try:
+        if os.name == "nt":
+            script = (
+                "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID"
+                " -and $_.CommandLine -match '--remote-debugging-port=%d(?!\\d)' }"
+                " | ForEach-Object { $_.ProcessId }" % port
+            )
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, text=True, timeout=10).stdout
+        else:
+            out = subprocess.run(
+                ["pgrep", "-f", f"remote-debugging-port={port}( |$)"],
+                capture_output=True, text=True, timeout=5).stdout
+        pids = {int(t) for t in out.split() if t.isdigit()}
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # The registry pid, if alive and its command line has the exact flag
+    # (covers hosts without pgrep). Windows: the CIM query above is complete.
+    for info in _load_registry().values():
+        pid = info.get("pid")
+        if (os.name != "nt" and info.get("port") == port and _pid_alive(pid)
+                and int(pid) not in pids):
+            try:
+                with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+            except OSError:
+                try:
+                    cmd = subprocess.run(["ps", "-o", "command=", "-p", str(int(pid))],
+                                         capture_output=True, text=True, timeout=5).stdout
+                except (OSError, subprocess.SubprocessError):
+                    cmd = ""
+            if _re.search(rf"--remote-debugging-port={port}(?!\d)", cmd):
+                pids.add(int(pid))
+    pids.discard(os.getpid())
+    return pids
+
+
+def _stop_browser_on_port(port, verbose=False):
+    """Stop cdpilot's browser on `port`; True if one was stopped.
+
+    1. Graceful: CDP Browser.close, then wait up to 5 s for the port to free
+       and up to 10 s more for the browser's processes to exit.
+    2. Otherwise end ONLY the processes whose command line has
+       --remote-debugging-port=<port> exactly: SIGTERM, SIGKILL after 3 s on
+       POSIX; `taskkill /PID <pid> /T /F` on Windows. Never by image name:
+       killing every chrome.exe/brave.exe also took the user's own browser.
+    Every subprocess call has a timeout (a hung `lsof` froze `cdpilot stop`).
+    """
+    port = int(port)
+    closed = _cdp_browser_close(port)
+    deadline = time.time() + 5
+    while closed and time.time() < deadline and not _is_port_free(port):
+        time.sleep(0.1)
+    pids = _debug_port_pids(port)
+    if closed and _is_port_free(port):
+        # The main process outlives its socket while it shuts down (measured
+        # on macOS: 0.5-2 s warm, ~7 s on a fresh profile). Let it exit rather
+        # than signal it, so a following launch does not race its profile lock.
+        deadline = time.time() + 10
+        while pids and time.time() < deadline:
+            time.sleep(0.2)
+            pids = {p for p in pids if _pid_alive(p)}
+        if not pids:
+            if verbose:
+                print("  Closed via CDP Browser.close.")
+            return True
+    if not pids:
+        if closed and verbose:
+            print("  Closed via CDP Browser.close.")
+        return closed
+    if os.name == "nt":
+        for pid in sorted(pids):
+            try:
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        method = "taskkill"
+    else:
+        import signal
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        deadline = time.time() + 3
+        while time.time() < deadline and any(_pid_alive(p) for p in pids):
+            time.sleep(0.1)
+        method = "SIGTERM"
+        for pid in pids:
+            if _pid_alive(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    method = "SIGTERM+SIGKILL"
+                except OSError:
+                    pass
+    if verbose:
+        print(f"  Stopped via {method}: PID {', '.join(str(p) for p in sorted(pids))}")
+    return True
 
 
 # ─── Browserbase-Compatible Local API ───
@@ -7696,7 +7814,7 @@ def _api_release_session(session_id: str) -> bool:
     port = sess.get('port')
     # In TEST_MODE, _api_create_session never actually launched a browser on
     # `port` (see the sibling check there) — nothing is listening, so skip
-    # the lsof/pkill round trip entirely instead of paying its cost for a
+    # the Browser.close/pgrep round trip entirely instead of paying its cost for a
     # no-op every time.
     if port and os.environ.get('CDPILOT_API_TEST_MODE') != '1':
         _stop_browser_on_port(port)
@@ -7821,48 +7939,12 @@ def cmd_serve(api: bool = False, port: int = 9333):
 
 
 def cmd_stop():
-    """Stop the browser instance managed by cdpilot."""
-    if platform.system() == "Windows":
-        browser_procs = ["brave.exe", "chrome.exe", "chromium.exe"]
-        stopped_any = False
-        for proc in browser_procs:
-            try:
-                result = subprocess.run(
-                    ["taskkill", "/F", "/IM", proc],
-                    capture_output=True, text=True
-                )
-                if result.returncode == 0:
-                    print(f"  {proc} terminated")
-                    stopped_any = True
-            except Exception:
-                pass
-        if stopped_any:
-            print(f"Browser stopped (port {CDP_PORT}).")
-        else:
-            print(f"No browser process found (port {CDP_PORT}).", file=sys.stderr)
-        return
-
-    import signal
-    try:
-        result = subprocess.run(
-            ["lsof", "-ti", f":{CDP_PORT}"],
-            capture_output=True, text=True
-        )
-        pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
-        if pids:
-            for pid in pids:
-                os.kill(int(pid), signal.SIGTERM)
-                print(f"  PID {pid} terminated")
-            print(f"Browser stopped (port {CDP_PORT}).")
-        else:
-            # lsof bulamazsa pkill ile dene
-            subprocess.run(
-                ["pkill", "-f", f"remote-debugging-port={CDP_PORT}"],
-                capture_output=True, text=True
-            )
-            print(f"Browser stopped (port {CDP_PORT}).")
-    except Exception as e:
-        print(f"Stop error: {e}", file=sys.stderr)
+    """Stop the browser instance managed by cdpilot (only that one: never the
+    user's own Brave/Chrome — see _stop_browser_on_port)."""
+    if _stop_browser_on_port(CDP_PORT, verbose=True):
+        print(f"Browser stopped (port {CDP_PORT}).")
+    else:
+        print(f"No browser process found (port {CDP_PORT}).", file=sys.stderr)
 
     # Update registry
     if PROJECT_ID:

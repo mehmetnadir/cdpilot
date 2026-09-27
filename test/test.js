@@ -1871,6 +1871,138 @@ s.close()
     assert.strictEqual(before, after, "the user's real registry.json must be untouched by these tests");
   });
 
+  // ── stop: bounded, and only ever cdpilot's own browser (2026-09-27) ──
+  // `cdpilot stop` ran `lsof` with no timeout (hung forever on a Mac with a
+  // stale network mount) and, on Windows, `taskkill /IM chrome.exe` etc.,
+  // which also killed the user's personal browser.
+  const PYBIN = process.env.CDPILOT_PYTHON || 'python3';
+  const CODE_NO_COMMENTS = PY_CONTENT.split('\n').map((l) => l.replace(/#.*$/, '')).join('\n');
+
+  // Argument text of a call whose '(' sits at openIdx (string-aware).
+  function callArgs(src, openIdx) {
+    let depth = 0;
+    let quote = null;
+    for (let i = openIdx; i < src.length; i++) {
+      const c = src[i];
+      if (quote) {
+        if (c === '\\') i++;
+        else if (c === quote) quote = null;
+        continue;
+      }
+      if (c === '"' || c === "'") quote = c;
+      else if ('([{'.includes(c)) depth++;
+      else if (')]}'.includes(c) && --depth === 0) return src.slice(openIdx + 1, i);
+    }
+    return src.slice(openIdx + 1);
+  }
+
+  test('stop: no taskkill call targets an image name (/IM kills the user\'s own browser)', () => {
+    assert(!/taskkill[^\n]*\/IM\b/i.test(CODE_NO_COMMENTS),
+      'a taskkill command line must never use /IM');
+    assert(!/\[\s*["']taskkill["'][^\]]*["']\/IM["']/i.test(CODE_NO_COMMENTS),
+      'a taskkill argv must never contain "/IM"; kill by /PID of the matched process instead');
+    const fn = (CODE_NO_COMMENTS.match(/def cmd_stop\(\):([\s\S]*?)\n\ndef /) || [])[1] || '';
+    assert(/_stop_browser_on_port\(CDP_PORT/.test(fn),
+      'cmd_stop must go through the shared _stop_browser_on_port helper');
+  });
+
+  test('stop: every lsof/pkill/pgrep/taskkill/powershell subprocess.run passes timeout=', () => {
+    const re = /subprocess\.(?:run|call|check_output|check_call)\(/g;
+    let m;
+    let checked = 0;
+    const missing = [];
+    while ((m = re.exec(CODE_NO_COMMENTS)) !== null) {
+      const args = callArgs(CODE_NO_COMMENTS, m.index + m[0].length - 1);
+      const argv0 = (args.match(/^\s*\[\s*f?["']([^"']+)["']/) || [])[1] || '';
+      if (!/^(lsof|pkill|pgrep|taskkill|powershell)(\.exe)?$/i.test(argv0)) continue;
+      checked++;
+      if (!/\btimeout\s*=/.test(args)) missing.push(`${argv0}: ${args.slice(0, 80)}`);
+    }
+    assert(checked >= 3, `expected the pgrep/powershell/taskkill calls to be found, saw ${checked}`);
+    assert.deepStrictEqual(missing, [], `process-tool calls without timeout=:\n${missing.join('\n')}`);
+  });
+
+  test('stop: nothing listening -> returns fast and reports no browser found', () => {
+    const [p] = findFreePorts(1);
+    const started = Date.now();
+    const r = spawnSync(PYBIN, [PY_PATH, 'stop'], {
+      encoding: 'utf-8',
+      timeout: 30000,
+      env: {
+        ...process.env,
+        CDPILOT_HOME: tmpHome,
+        CDP_PORT: String(p),
+        CDPILOT_PROFILE: path.join(tmpHome, 'stop-profile'),
+      },
+    });
+    const elapsed = Date.now() - started;
+    assert(!r.error, `stop must not hang or fail to spawn: ${r.error}`);
+    assert(elapsed < 10000, `stop took ${elapsed} ms with nothing to stop (limit 10000)`);
+    assert(new RegExp(`No browser process found \\(port ${p}\\)`).test(r.stderr + r.stdout),
+      `expected "No browser process found (port ${p})", got stdout=${r.stdout} stderr=${r.stderr}`);
+  });
+
+  test('stop: kills the process with --remote-debugging-port=<p>, never the one with <p>0', () => {
+    // Two dummy processes, no real browser. The first listens on p like a
+    // browser would (and never answers HTTP, so the graceful Browser.close
+    // step has to give up on its own); the second only carries the look-alike
+    // flag p0. The flag text is built from pieces so this script's own command
+    // line never contains an exact match.
+    const [p] = findFreePorts(1);
+    const script = `
+import json, os, subprocess, sys, threading, time
+P = ${p}
+${IMPORT_SNIPPET}
+flag = "--remote-debugging-" + "port="
+listener = "import socket, sys, time\\ns = socket.socket()\\ns.bind(('127.0.0.1', int(sys.argv[1])))\\ns.listen(5)\\ntime.sleep(60)"
+d1 = subprocess.Popen([sys.executable, "-c", listener, str(P), flag + str(P)])
+d2 = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", flag + str(P) + "0"])
+reaper = threading.Thread(target=d1.wait, daemon=True)  # no zombie for pid checks
+reaper.start()
+out = {"d1": d1.pid, "d2": d2.pid}
+try:
+    deadline = time.time() + 10
+    while time.time() < deadline and mod._is_port_free(P):
+        time.sleep(0.1)
+    out["bound"] = not mod._is_port_free(P)
+    out["matched"] = sorted(mod._debug_port_pids(P))
+    env = dict(os.environ, CDP_PORT=str(P),
+               CDPILOT_PROFILE=os.path.join(os.environ["CDPILOT_HOME"], "stop-profile"))
+    t0 = time.time()
+    r = subprocess.run([sys.executable, ${JSON.stringify(PY_PATH)}, "stop"], env=env,
+                       capture_output=True, text=True, timeout=40)
+    out["elapsed"] = round(time.time() - t0, 2)
+    out["stdout"], out["stderr"] = r.stdout, r.stderr
+    reaper.join(10)
+    out["d1_dead"] = d1.returncode is not None
+    out["d2_alive"] = d2.poll() is None
+finally:
+    for d in (d1, d2):
+        try:
+            d.kill()
+        except OSError:
+            pass
+print("RESULT=" + json.dumps(out))
+`;
+    const r = spawnSync(PYBIN, ['-c', script], {
+      encoding: 'utf-8',
+      timeout: 60000,
+      env: { ...process.env, CDPILOT_HOME: tmpHome },
+    });
+    assert(!r.error, `harness failed to run: ${r.error}`);
+    const line = (r.stdout || '').split('\n').find((l) => l.startsWith('RESULT='));
+    assert(line, `no result (status ${r.status}) stdout=${r.stdout} stderr=${r.stderr}`);
+    const res = JSON.parse(line.slice('RESULT='.length));
+    assert(res.bound, `dummy browser never bound port ${p}: ${line}`);
+    assert(res.matched.includes(res.d1) && !res.matched.includes(res.d2),
+      `pid match must be exact (want ${res.d1}, not ${res.d2}): ${line}`);
+    assert(res.elapsed < 20, `stop took ${res.elapsed}s: ${line}`);
+    assert(new RegExp(`Browser stopped \\(port ${p}\\)`).test(res.stdout),
+      `expected "Browser stopped (port ${p})": ${line}`);
+    assert(res.d1_dead, `the --remote-debugging-port=${p} process must be stopped: ${line}`);
+    assert(res.d2_alive, `the --remote-debugging-port=${p}0 process must survive: ${line}`);
+  });
+
   fs.rmSync(tmpHome, { recursive: true, force: true });
 })();
 
