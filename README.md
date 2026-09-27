@@ -600,6 +600,36 @@ CDPILOT_TIMEOUT=60 cdpilot run flow.cdp   # default for every command (and each 
 For `mcp` and `serve` the value is not applied to the long-running server
 itself; it is passed on to every tool call / request it runs.
 
+### Session log
+
+Every command (and every MCP tool call) appends one JSON line to a local,
+per-project log, so when a browser task is done there is a record of what was
+done and found. Nothing leaves the machine.
+
+```bash
+cdpilot log                 # today's commands: time, exit, command, url, result
+cdpilot log --md            # Markdown report: pages visited, actions, errors, files produced
+cdpilot log --json          # raw lines (one JSON object per command)
+cdpilot log --days 3        # include the last 3 days
+cdpilot log --path          # where the files are
+```
+
+Each line has `ts`, `cmd`, `args`, `exit`, `duration_ms`, the page `url` and
+`title` after the command (when the command already had them), a ~200-char
+`summary` of its output, the `error` line, and `files` it wrote (screenshots,
+PDFs). Files live in `~/.cdpilot/projects/<project-id>/log/<YYYY-MM-DD>.jsonl`.
+
+Redaction happens before anything is written: values given to `fill`, `type`,
+`smart-fill`, `smart-select`, `assert-value` and `dialog prompt` become
+`«redacted:N chars»`; so do values of password/token/key/secret/cookie/auth
+flags and headers, token-shaped arguments, and URL query/fragment values whose
+names contain token, key, secret, password, auth, code or session. `cookies`
+and `storage` output is never logged; `eval` source is, with string literals
+over 40 chars cut and secret-looking ones replaced. Logging is best effort: it
+never changes a command's output or exit code, and a failed write costs one
+stderr line. `CDPILOT_LOG=0` turns it off; `CDPILOT_LOG_DAYS` (default 14)
+sets how many days are kept. The MCP server exposes it as `browser_log`.
+
 ### Scaling & Workstation Use
 
 ```bash
@@ -663,6 +693,8 @@ print(result.stdout)
 | `CDPILOT_OFFSCREEN` | `0` | Headed but render off-screen — no window steals focus |
 | `CDPILOT_TIMEOUT` | unset | Default `--timeout` in seconds for every command (flag wins, `0` disables); expiry exits 124 |
 | `CDPILOT_NO_AUTOLAUNCH` | `0` | `1` = page commands fail with the old "Is the browser running?" error instead of launching the browser |
+| `CDPILOT_LOG` | `1` | `0` = do not write the session log (`cdpilot log`) |
+| `CDPILOT_LOG_DAYS` | `14` | Days of session log to keep; older day files are deleted on the first write of a day (`0` keeps all) |
 
 ## How It Works
 
