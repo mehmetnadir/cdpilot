@@ -2676,7 +2676,14 @@ def cmd_launch():
         chrome_args.append('--headless=new')
         print('  Mode: headless')
 
-    proc = subprocess.Popen(chrome_args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        proc = subprocess.Popen(chrome_args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except OSError as e:
+        # Windows' FileNotFoundError ("[WinError 2] The system cannot find the
+        # file specified") does not name the binary; say which one, on every OS,
+        # instead of a traceback.
+        print(f"Cannot start browser {chrome_args[0]!r}: {e.strerror or e}", file=sys.stderr)
+        sys.exit(1)
 
     for _ in range(20):
         time.sleep(0.5)

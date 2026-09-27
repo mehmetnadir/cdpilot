@@ -3308,6 +3308,15 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
     assert(!r.stdout.includes('Launching browser'), 'launch progress must not leak into stdout');
   });
 
+  test('launch: a browser binary that cannot start is named, with no traceback', () => {
+    // Windows' FileNotFoundError text does not carry the path, so the failure
+    // must be reported by cdpilot itself (caught on windows-latest CI).
+    const r = cli(['launch']);
+    assert.strictEqual(r.status, 1, `stderr: ${r.stderr}`);
+    assert(/Cannot start browser '.*no-such-browser/.test(r.stderr), `stderr: ${r.stderr}`);
+    assert(!/Traceback/.test(r.stderr), `must not print a traceback: ${r.stderr}`);
+  });
+
   test('autolaunch: never-launch commands are real dispatch names and cover lifecycle/status/servers', () => {
     const skip = skipList();
     const nodeHandled = new Set(['status', 'setup', 'help', '--help', '-h', '--version', '-v']);
