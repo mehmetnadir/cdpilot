@@ -81,13 +81,12 @@ npx cdpilot mcp              # expose everything as an MCP server
   with `@ref` handles it can act on directly — no vision model needed for
   the common case.
 - `cdpilot mode regular|stealth|undetected` — built-in fingerprint patches
-  in three tiers (opt-in, no extra dependency). The default is `regular`,
-  because our own bench showed the full patch set *lowered* scores on some
-  sites. Honest status: hard anti-bot vendors (PerimeterX, Kasada) still
-  beat it; see the README for today's panel numbers.
-  <!-- TODO before posting: replace with the post-fix panel numbers from
-  .claude/docs/stealth-panel-olcumu-2026-09-27.md (UA fix in progress). -->
-
+  in three tiers (opt-in, no extra dependency). Headless, `stealth` passes
+  all 31 bot.sannysoft rows and incolumitas intoli 6/6; the one fpscanner
+  fail left is `'webdriver' in navigator`, which is true in every modern
+  Chrome. The default is `regular` (no patches), because our own bench
+  showed the full patch set *lowered* scores on some sites. Hard anti-bot
+  vendors (PerimeterX, Kasada) still beat it.
 - `cdpilot health` — JSON status with today's crash count from macOS
   DiagnosticReports. Designed for `until cdpilot health; do launch;
   done` watchdog loops.

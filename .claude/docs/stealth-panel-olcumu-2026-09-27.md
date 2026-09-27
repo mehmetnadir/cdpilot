@@ -97,3 +97,51 @@ outage, unrelated to cdpilot or headless/stealth tier.
 tool's own documented rationale for keeping `regular` as default (full patch set can leak
 via synthetic overrides). No tier fixes the UA `HeadlessChrome` token, which is the actual
 blocker on both sannysoft and incolumitas today.
+
+## Sonra (fix)
+
+Same method, same day: headless Brave Chrome/154.0.8037.58, isolated CDPILOT_HOME, port 9471,
+`cdpilot mode <tier>` → `cdpilot go <url>` → 9 s → `cdpilot eval` reading the DOM verdicts.
+"Before" was re-measured by me right before the fix (it differs slightly from the table
+above: sannysoft TRANSPARENT_PIXEL read `passed` today, fpscanner lists it as a 21st row
+with WARN, new-tests has a `connectionRTT: UNKNOWN` key).
+
+**Change** (stealth + undetected only; regular untouched): on the navigate WS that registers
+the stealth script, `Browser.getVersion` → if its UA has `HeadlessChrome`,
+`Emulation.setUserAgentOverride` with `Chrome` + `userAgentMetadata` copied from the page's
+own `getHighEntropyValues` (HeadlessChrome brand → Google Chrome; GREASE-synthesized when the
+current document is not a secure context). FULL tier: `plugins.item(i >>> 0)`, Worker
+wrapper resolves relative URLs and no longer defines `webdriver` inside workers.
+
+| Tier | sannysoft (P/F/W of 31) | intoli | fpscanner (of 21) | new-tests |
+|---|---|---|---|---|
+| regular before | 28/3/0 (User Agent, HEADCHR_UA, CHR_MEMORY) | 5/6 (userAgent) | 17 OK · 3 FAIL (HEADCHR_UA, WEBDRIVER, CHR_MEMORY) · 1 WARN | 9 keys, 8 OK + RTT UNKNOWN |
+| regular after | 28/3/0 (same) | 5/6 (same) | 17 · 3 · 1 (same) | 8 keys, 7 OK + RTT UNKNOWN (service-worker key timing) |
+| stealth before | 28/3/0 (same 3) | 5/6 | 17 · 3 · 1 | 8 keys, 7 OK + RTT UNKNOWN |
+| stealth after | **31/0/0** | **6/6** | **19 OK · 1 FAIL (WEBDRIVER) · 1 WARN** | 8 keys, 7 OK + RTT UNKNOWN |
+| undetected before | 28/3/0 (same 3) | 5/6 | 17 · 3 · 1 | 7 keys: overflowTest FAIL, worker key absent |
+| undetected after | **31/0/0** | **6/6** | **19 · 1 (WEBDRIVER) · 1** | **8 keys, 7 OK + RTT UNKNOWN** (overflowTest OK, worker key back) |
+
+Stealth/undetected "after" repeated twice, identical. httpbin.org/headers (stealth): server
+saw `Chrome/154.0.0.0` + `Sec-Ch-Ua: "Chromium";v="154", "Brave";v="154", "Not A(Brand";v="99"`;
+regular still `HeadlessChrome`. Override metadata vs the browser's real high-entropy values:
+identical (probe path and insecure-context fallback path), only the UA differs.
+
+What each check tested:
+- User Agent / HEADCHR_UA / intoli userAgent: `/HeadlessChrome/.test(navigator.userAgent)`.
+- CHR_MEMORY: `deviceMemory != 0` while ua-parser does not name the browser `Chrome` —
+  HeadlessChrome parses as "Chrome Headless", so it was a UA side effect; no memory patch.
+- overflowTest: `plugins.item(4294967296) === plugins[0]` (native WebIDL wraps to 0).
+- worker key: `new Worker("webworker2.js")` resolved against the blob: URL and never loaded.
+
+Left as is:
+- fpscanner WEBDRIVER = `'webdriver' in navigator` on a Chrome UA. Modern Chrome exposes
+  `navigator.webdriver` (value false) on Navigator.prototype per the WebDriver spec (measured
+  here: present, false, AutomationControlled off), so this flags normal Chrome too; deleting
+  the property would be the real outlier. Value checks (`webdriverPresent`, sannysoft WebDriver)
+  pass.
+- Session-bound: the override lives only while `go`'s WS is open (like the stealth script
+  registration). Load-time scripts and the request headers during load see `Chrome`; a later
+  separate CLI call reads `HeadlessChrome` again in the same document (measured), and
+  navigations started by other commands (click/back) are not overridden. Carrying it into
+  every command's session (cdp_send) is the next step — not done here.
