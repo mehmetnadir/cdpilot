@@ -6,7 +6,10 @@ Loads cdpilot.py with a stand-in `websockets` module whose sockets answer
 CDP from an in-memory frame tree (same-process frames with their own
 execution contexts, out-of-process frames reached through flat sessions).
 The real cdp_send, WS pool, frame route, rewrite and frame-search code run
-unchanged; only the wire is fake. Prints one JSON object {scenario: result};
+unchanged; only the wire is fake. A smart-* finder is the expression
+"FINDER" (wrapped by _smart_wrap): the fake answers per frame and mode
+(probe / strict / loose) and records an "act" whenever a non-probe finder
+reports found (the real finder clicks or types right there). Prints one JSON object {scenario: result};
 a scenario that raises reports {"error": traceback}.
 """
 import asyncio
@@ -28,8 +31,10 @@ class Frame:
     """A document in a frame, plus the <iframe> element that owns it."""
 
     def __init__(self, fid, origin="http://a.test", oop=False, elem_id="", name="",
-                 src="", visible=True, box=(0, 0), finder=None, slow=False, children=()):
+                 src="", visible=True, box=(0, 0), finder=None, slow=False, children=(),
+                 wrappers=()):
         self.fid, self.origin, self.oop = fid, origin, oop
+        self.wrappers = list(wrappers)  # selectors of elements around the <iframe>
         self.elem_id, self.name, self.src, self.visible = elem_id, name, src, visible
         self.box, self.finder, self.slow = box, finder or {}, slow
         self.children = list(children)
@@ -51,7 +56,7 @@ class Browser:
     def __init__(self, mod, top):
         self.mod, self.top = mod, top
         self.frames, self.ctx, self.sessions = {}, {}, {}
-        self.log, self.finder, self.mouse = [], [], []
+        self.log, self.finder, self.mouse, self.acts = [], [], [], []
         self.attached, self.detached, self.sockets = [], [], []
         self.cancel_on = None
         seq = [100]
@@ -78,20 +83,31 @@ class Browser:
         return None
 
     def find_owner(self, frame, kind, value):
+        """(child frame or None, matched through a wrapper element?)"""
         kids = frame.children
         if kind == "index":
-            return kids[value] if 0 <= value < len(kids) else None
+            return (kids[value] if 0 <= value < len(kids) else None), False
         for c in kids:
             if value == "iframe" or (c.elem_id and value in ("#" + c.elem_id, "iframe#" + c.elem_id)):
-                return c
+                return c, False
+        for c in kids:
+            if value in c.wrappers:
+                return c, True
         for c in kids:
             if value and value in (c.name, c.elem_id):
-                return c
+                return c, False
         if kind != "sel":
             for c in kids:
                 if c.src and value in c.src:
-                    return c
-        return None
+                    return c, False
+        return None, False
+
+    def answer(self, frame, mode):
+        f = frame.finder
+        if mode == "probe" and "probe" not in f:
+            s = f.get("strict", {"found": False})
+            return {"found": True, "probe": True, "score": 100} if s.get("found") else s
+        return f.get(mode, {"found": False})
 
     def handle(self, msg):
         mid, method = msg["id"], msg["method"]
@@ -154,8 +170,10 @@ class Browser:
 
         owner_call = "(" + self.mod._FRAME_OWNER_JS + ")("
         if expr.startswith(owner_call):
-            kind, val, _scroll = json.loads("[" + expr[len(owner_call):-1] + "]")
-            f = self.find_owner(frame, kind, val)
+            args = json.loads("[" + expr[len(owner_call):-1] + "]")
+            f, wrapped = self.find_owner(frame, args[0], args[1])
+            if len(args) > 3 and args[3]:  # wrappedOnly
+                return ok({"result": {"type": "boolean", "value": bool(f is not None and wrapped)}})
             if f is None:
                 return ok({"result": {"type": "object", "subtype": "null", "value": None}})
             return ok({"result": {"type": "object", "subtype": "node", "className": "HTMLIFrameElement",
@@ -174,13 +192,23 @@ class Browser:
             if m and json.loads(m.group(1)) != frame.origin:
                 self.finder.append([frame.fid, "guarded"])
                 return value(json.dumps({"found": False, "crossOrigin": True}))
-            mode = "strict" if "__cdpilotMinScore" in expr else "loose"
+            mode = ("probe" if "__cdpilotProbe" in expr
+                    else "strict" if "__cdpilotMinScore" in expr else "loose")
             self.finder.append([frame.fid, mode])
-            if frame.slow:
-                return []  # never answers
-            return value(json.dumps(frame.finder.get(mode, {"found": False})))
+            if frame.slow:  # never answers; a non-probe finder would still act
+                if mode != "probe":
+                    self.acts.append([frame.fid, mode])
+                return []
+            ans = self.answer(frame, mode)
+            if mode != "probe" and ans.get("found"):
+                self.acts.append([frame.fid, mode])
+            return value(json.dumps(ans))
         if expr == "HANG":
             return []
+        if expr.startswith("LATE:"):  # answers after LATE:<seconds>
+            out = value(frame.fid + "|late")
+            out[0]["_delay"] = float(expr[len("LATE:"):])
+            return out
         if expr.startswith("WHERE:"):
             return value(frame.fid + "|" + expr[len("WHERE:"):])
         return ok({"result": {"type": "undefined"}})
@@ -204,7 +232,11 @@ class FakeWS:
         if self.b.cancel_on == msg.get("method"):
             raise asyncio.CancelledError()
         for payload in self.b.handle(msg):
-            self.q.put_nowait(json.dumps(payload))
+            delay = payload.pop("_delay", 0)
+            if delay:
+                asyncio.get_running_loop().call_later(delay, self.q.put_nowait, json.dumps(payload))
+            else:
+                self.q.put_nowait(json.dumps(payload))
 
     async def recv(self):
         return await self.q.get()
@@ -271,7 +303,7 @@ async def call(fn, *args):
         return ["raise", type(e).__name__]
 
 
-def probe_command(mod, seen):
+def probe_command(mod, seen, kind="css"):
     """A frame-aware element command: evaluates, then clicks at (1, 2)."""
     async def probe(target):
         seen.append({"target": target, "routed": mod._FRAME_ROUTE.get() is not None,
@@ -282,7 +314,7 @@ def probe_command(mod, seen):
             (2, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": 1, "y": 2, "button": "left"}),
         ])
         return r.get(1, {}).get("result", {}).get("value")
-    return mod._frame_aware("css")(probe)
+    return mod._frame_aware(kind)(probe)
 
 
 def failing_command(mod, seen, how):
@@ -424,6 +456,10 @@ def scenario_smart_order(mod):
         "fill_same_origin": ({"top": {"strict": {"found": False}}, "card": {"strict": found}}, True),
         "fill_cross_origin": ({"top": {"strict": {"found": False}, "loose": {"found": False}},
                                "xo": {"strict": found}, "pay": {"strict": found}}, True),
+        # The probe saw a real match, the DOM changed before the act ran.
+        "act_changed": ({"top": {"strict": weak, "loose": page_loose},
+                         "card": {"probe": {"found": True, "probe": True, "score": 100},
+                                  "strict": {"found": False, "weakScore": 20}}}, False),
     }
     out = {}
     for key, (finders, same_origin_only) in cases.items():
@@ -432,8 +468,8 @@ def scenario_smart_order(mod):
             return json.loads(raw) if raw else raw
         b, res, _, err = run(mod, two_level_page(finders), body)
         lists = sum(1 for m in b.log if m.get("params", {}).get("expression") == mod._FRAME_LIST_JS)
-        out[key] = {"res": res, "finder": b.finder, "attached": b.attached, "frame_lists": lists,
-                    "stderr": err, "open_sessions": sorted(b.sessions)}
+        out[key] = {"res": res, "finder": b.finder, "acts": b.acts, "attached": b.attached,
+                    "frame_lists": lists, "stderr": err, "open_sessions": sorted(b.sessions)}
     return out
 
 
@@ -457,13 +493,13 @@ def scenario_budget(mod):
     mod.cdp_send = spy
     try:
         async def direct(b):
-            strict = f"(function () {{ var __cdpilotMinScore = {mod.SMART_STRONG_SCORE}; return (FINDER); }})()"
             t0 = time.monotonic()
-            hit = await mod._frame_search(WS, strict, "smart-x", budget_s=0.5)
+            hit = await mod._frame_search(WS, mod._smart_wrap("FINDER", probe=True), mod._smart_wrap("FINDER"),
+                                          "smart-x", budget_s=0.5)
             return {"hit": hit, "elapsed": time.monotonic() - t0,
                     "socket_kept": WS in mod._WS_POOL and not mod._WS_POOL[WS].closed}
         b, res, _, err = run(mod, top, direct)
-        res.update({"stderr": err, "finder": b.finder, "calls": calls[:]})
+        res.update({"stderr": err, "finder": b.finder, "acts": b.acts, "calls": calls[:]})
         out["direct"] = res
 
         del calls[:]
@@ -473,7 +509,7 @@ def scenario_budget(mod):
             raw = await mod._smart_eval(WS, "FINDER", "smart-x")
             return {"res": json.loads(raw), "elapsed": time.monotonic() - t0}
         b, res, _, err = run(mod, top, via_smart_eval)
-        res.update({"stderr": err, "finder": b.finder,
+        res.update({"stderr": err, "finder": b.finder, "acts": b.acts,
                     "max_search_timeout": max(c["timeout"] for c in calls[1:-1])})
         out["default_budget"] = res
     finally:
@@ -500,6 +536,83 @@ def scenario_keep_socket(mod):
                 "plain_elapsed": plain_elapsed, "dropped": WS not in mod._WS_POOL, "closed": sock.closed}
     b, res, _, _ = run(mod, Frame("top"), body)
     res["sockets"] = len(b.sockets)
+    return res
+
+
+def scenario_probe_timeout(mod):
+    """A probe cut off by the budget acted nowhere: the page fallback is the one act."""
+    def page(fill):
+        top_finder = ({"strict": {"found": False}, "loose": {"found": False}} if fill else
+                      {"strict": {"found": False, "weakScore": 35},
+                       "loose": {"found": True, "x": 1, "y": 1, "weak": True}})
+        # The slow frame holds a real match: were it acted on, it would click/type.
+        return Frame("top", finder=top_finder, children=[
+            Frame("slow", elem_id="slow", slow=True, finder={"strict": {"found": True, "x": 1, "y": 1}}),
+            Frame("later", elem_id="later", finder={"strict": {"found": True, "x": 1, "y": 1}}),
+        ])
+    out = {}
+    saved = mod.FRAME_SEARCH_BUDGET_S
+    mod.FRAME_SEARCH_BUDGET_S = 0.5
+    try:
+        for key, fill in [("click", False), ("fill_same_origin", True)]:
+            async def body(b, fill=fill):
+                t0 = time.monotonic()
+                raw = await mod._smart_eval(WS, "FINDER", "smart-x", same_origin_only=fill)
+                return {"res": json.loads(raw), "elapsed": time.monotonic() - t0}
+            b, res, _, err = run(mod, page(fill), body)
+            res.update({"stderr": err, "finder": b.finder, "acts": b.acts})
+            out[key] = res
+    finally:
+        mod.FRAME_SEARCH_BUDGET_S = saved
+    return out
+
+
+def scenario_late_reply(mod):
+    """Plain cdp_send reads a reply landing just after its timeout (flat 2 s recv)."""
+    async def body(b):
+        t0 = time.monotonic()
+        r = await mod.cdp_send(WS, [(1, "Runtime.evaluate", {"expression": "LATE:0.4"})], timeout=0.3)
+        plain = {"value": r.get(1, {}).get("result", {}).get("value"), "elapsed": time.monotonic() - t0}
+        t0 = time.monotonic()
+        r = await mod._frame_cdp(mod._FrameRoute(WS), [(1, "Runtime.evaluate", {"expression": "LATE:0.4"})],
+                                 timeout=0.3)
+        framed = {"value": r.get(1, {}).get("result", {}).get("value"), "elapsed": time.monotonic() - t0}
+        return {"plain": plain, "frame": framed}
+    _, res, _, _ = run(mod, Frame("top"), body)
+    return res
+
+
+def scenario_text_hops(mod):
+    """smart-*: a first hop of plain words is text; wrappers work with a note."""
+    seen = []
+    text_cmd, css_cmd = probe_command(mod, seen, "text"), probe_command(mod, seen, "css")
+    top = Frame("top", children=[
+        Frame("card", elem_id="card", src="http://a.test/inner.html", box=(100, 1000),
+              wrappers=["main", "Main", "#card-element"]),
+    ])
+
+    async def body(b):
+        out = {}
+        for key, fn, target, flag in [
+            ("text_main", text_cmd, "Main >>> Settings", None),
+            ("text_main_lower", text_cmd, "main >>> Settings", None),
+            ("text_page_of", text_cmd, "Page 1 of 3 >>> Next page", None),
+            ("text_selector", text_cmd, "iframe#card >>> Pay now", None),
+            ("text_wrapper", text_cmd, "#card-element >>> Pay now", None),
+            ("text_url", text_cmd, "url=inner.html >>> Pay now", None),
+            ("css_wrapper", css_cmd, "main >>> #btn", None),
+            ("css_frame", css_cmd, "#card >>> #btn", None),
+            ("flag_wrapper", css_cmd, "#btn", "#card-element"),
+        ]:
+            mod._FRAME_FLAG = flag
+            start, err_start = len(b.log), len(sys.stderr.getvalue())
+            res = await call(fn, target)
+            out[key] = {"res": res, "messages": [m["method"] for m in b.log[start:]],
+                        "stderr": sys.stderr.getvalue()[err_start:]}
+        mod._FRAME_FLAG = None
+        return out
+
+    _, res, _, _ = run(mod, top, body)
     return res
 
 
@@ -541,6 +654,9 @@ SCENARIOS = {
     "budget": scenario_budget,
     "keep_socket": scenario_keep_socket,
     "frame_list": scenario_frame_list,
+    "probe_timeout": scenario_probe_timeout,
+    "late_reply": scenario_late_reply,
+    "text_hops": scenario_text_hops,
 }
 
 

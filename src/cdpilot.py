@@ -2057,12 +2057,22 @@ atexit.register(_ws_pool_close_all)
 _FRAME_ROUTE = contextvars.ContextVar("cdpilot_frame_route", default=None)
 _CDP_EVENT_SINK = contextvars.ContextVar("cdpilot_cdp_event_sink", default=None)
 # _CDP_KEEP_SOCKET: a timed-out call keeps its pooled socket (flat sessions
-# live on it); only set by _frame_cdp, whose ids are never reused.
+# live on it) and its recv waits end at its timeout; only set by _frame_cdp,
+# whose ids are never reused.
 _CDP_KEEP_SOCKET = contextvars.ContextVar("cdpilot_cdp_keep_socket", default=False)
 
 
 def _cdp_recv_wait(start, timeout):
-    """One recv() wait: at most 2 s, never past the call's own timeout."""
+    """How long one recv() may wait.
+
+    Plain calls: a flat 2 s, as always, so the last wait may run past
+    `timeout` and a reply that lands just after it (a page-side timer set to
+    the same timeout, as in `wait`) is still read. Frame bookkeeping
+    (_frame_cdp, i.e. the smart-* frame search): never past the call's own
+    timeout, so the search budget is a real cap.
+    """
+    if not _CDP_KEEP_SOCKET.get():
+        return 2
     return min(2, max(0.01, timeout - (time.time() - start)))
 
 
@@ -2323,21 +2333,43 @@ def _frame_selector_hops(target):
     return parts[:-1], parts[-1]
 
 
-def _frame_selector_plan(target, first_hop_is_frame):
+def _frame_selector_plan(target, first_hop_is_frame, kind="css"):
     """How an element command reads `target` once its first hop was probed.
 
     Pure. Returns (hops, selector, note). hops == []: use `selector` (the
     whole string) as written, with no frame routing, exactly as before `>>>`
     existed; `note` is the stderr hint for when that literal use fails too.
     Otherwise run `selector` inside the frame chain `hops` (outermost first).
+    kind="text" (smart-*): a first hop that reads as words is never a frame.
     """
-    cand = _frame_selector_hops(target)
+    cand = _frame_chain_candidate(target, kind)
     if cand is None:
         return [], target, None
     names, inner = cand
     if not first_hop_is_frame:
         return [], target, f"note: '{names[0]}' matched no iframe; used the selector as written"
     return [_parse_frame_hop(n, implicit=True) for n in names], inner, None
+
+
+def _frame_hop_is_selector(hop):
+    """smart-* texts: does a `>>>` hop look like a frame selector, not words?
+
+    Yes if it has `#`, `.` or `[`, starts with an `iframe`/`frame` tag, or is
+    `url=...`. "Main >>> Settings" is text: querySelector("Main") would find
+    <main> and step into an iframe inside it.
+    """
+    h = hop.strip()
+    if h[:4].lower() in ("url=", "url:"):
+        return True
+    return any(ch in h for ch in "#.[") or _re.match(r"(?i)i?frame(?![\w-])", h) is not None
+
+
+def _frame_chain_candidate(target, kind="css"):
+    """_frame_selector_hops, plus the smart-* rule for the first hop."""
+    cand = _frame_selector_hops(target)
+    if cand is not None and kind == "text" and not _frame_hop_is_selector(cand[0][0]):
+        return None
+    return cand
 
 
 def _parse_frame_hop(hop, implicit=False):
@@ -2386,11 +2418,13 @@ def _extract_frame_flag(args):
 
 
 # Frame-owner element for one hop, looked up in the current document.
+# wrappedOnly: return only whether the hop matched a wrapper element (not an
+# iframe itself) and the iframe inside it was taken.
 _FRAME_OWNER_JS = r"""
-function (kind, value, scroll) {
+function (kind, value, scroll, wrappedOnly) {
   var all = Array.prototype.slice.call(document.querySelectorAll('iframe, frame'));
   var isFrame = function (e) { return !!e && /^(IFRAME|FRAME)$/.test(e.tagName); };
-  var el = null;
+  var el = null, wrapped = false;
   if (kind === 'index') {
     el = all[value] || null;
   } else {
@@ -2398,13 +2432,14 @@ function (kind, value, scroll) {
       var c = null;
       try { c = document.querySelector(value); } catch (e) {}
       // A wrapper such as <div id="card-element"> around the iframe counts too.
-      if (c) el = isFrame(c) ? c : c.querySelector('iframe, frame');
+      if (c) { el = isFrame(c) ? c : c.querySelector('iframe, frame'); wrapped = !!el && el !== c; }
       if (!el) el = all.filter(function (f) { return f.name === value || f.id === value; })[0] || null;
     }
     if (!el && kind !== 'sel') {
       el = all.filter(function (f) { return (f.src || '').indexOf(value) !== -1; })[0] || null;
     }
   }
+  if (wrappedOnly) return wrapped;
   if (el && scroll) { try { el.scrollIntoView({behavior: 'instant', block: 'nearest'}); } catch (e) {} }
   return el;
 }
@@ -2534,10 +2569,17 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     """Descend one hop: route now points at the child frame.
 
     Returns True, or False when no element matches the hop and missing_ok.
+    A hop that matched an element wrapping the iframe (Stripe's
+    #card-element) still works, with one stderr note.
     """
-    js = f"({_FRAME_OWNER_JS})({json.dumps(hop['kind'])}, {json.dumps(hop['value'])}, {json.dumps(scroll)})"
-    r = await _frame_cdp(route, [(1, "Runtime.evaluate", route.eval_params(js, by_value=False),
-                                  route.session_id)])
+    args = f"{json.dumps(hop['kind'])}, {json.dumps(hop['value'])}"
+    cmds = [(1, "Runtime.evaluate",
+             route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False),
+             route.session_id)]
+    if hop["kind"] in ("auto", "sel"):
+        cmds.append((3, "Runtime.evaluate",
+                     route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)"), route.session_id))
+    r = await _frame_cdp(route, cmds)
     obj = r.get(1, {}).get("result", {})
     oid = obj.get("objectId")
     shown = f"#{hop['value']}" if hop["kind"] == "index" else hop["value"]
@@ -2560,6 +2602,8 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     route.labels.append(obj.get("description") or shown)
     route.session_id, route.context_id, route.src = sid, ctx, src
     route.dirty = True
+    if r.get(3, {}).get("result", {}).get("value") is True:
+        print(f"note: '{hop['value']}' is not an iframe; using the iframe inside it", file=sys.stderr)
     return True
 
 
@@ -2662,24 +2706,25 @@ async def _frame_route_rewrite(route, commands):
     return out
 
 
-async def _frame_resolve_target(ws_url, flag_hops, target):
+async def _frame_resolve_target(ws_url, flag_hops, target, kind="css"):
     """Route for one element command: (route or None, selector, note).
 
     `--frame` hops are strict. A `>>>` chain in `target` is used only when its
-    first hop is an iframe (or wraps one); otherwise `target` stays a plain
-    selector / text with no routing (None) and `note` explains, if needed.
+    first hop is an iframe (or wraps one) and, for smart-* text, reads as a
+    selector; otherwise `target` stays a plain selector / text with no
+    routing (None) and `note` explains, if needed.
     """
     route = _FrameRoute(ws_url)
     try:
         _frame_pool_pin(route)
         for hop in flag_hops:
             await _frame_route_push(route, hop)
-        cand = _frame_selector_hops(target)
+        cand = _frame_chain_candidate(target, kind)
         found = False
         if cand is not None:
             first = _parse_frame_hop(cand[0][0], implicit=True)
             found = await _frame_route_push(route, first, missing_ok=True)
-        hops, selector, note = _frame_selector_plan(target, found)
+        hops, selector, note = _frame_selector_plan(target, found, kind)
         for hop in hops[1:]:
             await _frame_route_push(route, hop)
     except _FrameError as e:
@@ -2712,10 +2757,10 @@ def _frame_aware(kind="css"):
             except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(2)
-            if not flag_hops and _frame_selector_hops(target) is None:
+            if not flag_hops and _frame_chain_candidate(target, kind) is None:
                 return await fn(target, *args, **kwargs)
             ws_url, _ = get_page_ws()
-            route, selector, note = await _frame_resolve_target(ws_url, flag_hops, target)
+            route, selector, note = await _frame_resolve_target(ws_url, flag_hops, target, kind)
             token = _FRAME_ROUTE.set(route) if route is not None else None
             try:
                 return await fn(selector, *args, **kwargs)
@@ -2752,6 +2797,18 @@ def _smart_found(raw):
 SMART_STRONG_SCORE = 60
 
 
+def _smart_wrap(js, probe=False):
+    """The finder, asked for a real match only; probe=True: find, never act.
+
+    Finders read `__cdpilotMinScore` (a weaker best hit is reported, not
+    acted on) and `__cdpilotProbe` (report the hit, do not click/fill).
+    """
+    flags = f"var __cdpilotMinScore = {SMART_STRONG_SCORE};"
+    if probe:
+        flags += " var __cdpilotProbe = true;"
+    return f"(function () {{ {flags} return ({js}); }})()"
+
+
 async def _smart_eval_once(ws_url, js):
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
     return r.get(1, {}).get("result", {}).get("value", "")
@@ -2760,12 +2817,15 @@ async def _smart_eval_once(ws_url, js):
 async def _smart_eval(ws_url, js, label, same_origin_only=False):
     """Run a smart-* finder script: page first, then (maybe) its frames.
 
-    The finder both locates and acts. In order:
+    On the page the finder finds and acts in one script, as before. In order:
       (c) an enabled real match in the page -> used, no frame search;
       (d) the page's real matches are all disabled -> the page's old rules
           (the "no enabled element matches" error), no frame search;
       (e) otherwise the first frame with an enabled real match, else the
           page's old rules (smart-click's weak word-overlap match).
+    Frames are only probed (find, no action) until one is chosen; then the
+    finder acts in that one frame (see _frame_search), so a probe cut off by
+    the time budget can never have clicked or typed anything.
     same_origin_only (smart-fill / smart-select): the search enters only
     frames of the page's own origin, so a typed value never lands in a
     third-party frame; `>>>` / `--frame` still reach any frame. Explicit
@@ -2773,26 +2833,38 @@ async def _smart_eval(ws_url, js, label, same_origin_only=False):
     """
     if _FRAME_ROUTE.get() is not None:
         return await _smart_eval_once(ws_url, js)
-    strict = f"(function () {{ var __cdpilotMinScore = {SMART_STRONG_SCORE}; return ({js}); }})()"
+    strict = _smart_wrap(js)
     raw = await _smart_eval_once(ws_url, strict)
+    if not raw:
+        return raw  # no answer (timeout, page exception): one call, as before
     data = _smart_data(raw)
     if data.get("found"):
         return raw
     if data.get("disabledReal"):
         return await _smart_eval_once(ws_url, js)
-    hit = await _frame_search(ws_url, strict, label, same_origin_only=same_origin_only)
+    hit = await _frame_search(ws_url, _smart_wrap(js, probe=True), strict, label,
+                              same_origin_only=same_origin_only)
     if hit is not None:
         return hit
     return await _smart_eval_once(ws_url, js)
 
 
-async def _frame_search(ws_url, js, label, same_origin_only=False,
-                        max_frames=FRAME_SEARCH_MAX_FRAMES, budget_s=FRAME_SEARCH_BUDGET_S):
-    """Breadth-first: run `js` in each visible frame until one reports found.
+SMART_ACT_TIMEOUT_S = 15  # the act call in the chosen frame: cdp_send's default
 
-    Every CDP call gets the time left of `budget_s`; when it runs out the
-    search stops with one stderr line and the caller falls back to the page.
+
+async def _frame_search(ws_url, probe_js, act_js, label, same_origin_only=False,
+                        max_frames=FRAME_SEARCH_MAX_FRAMES, budget_s=None):
+    """Breadth-first: probe each visible frame until one reports a match.
+
+    `probe_js` only finds (no side effects). Every probe-phase CDP call gets
+    the time left of `budget_s` (default FRAME_SEARCH_BUDGET_S); a probe that
+    runs out counts as no match, and when the budget is gone the search stops
+    with one stderr line (the caller falls back to the page). In the chosen
+    frame `act_js` then runs once, with the normal command timeout; if it no
+    longer finds a match (the DOM changed) its not-found result is returned.
     """
+    if budget_s is None:
+        budget_s = FRAME_SEARCH_BUDGET_S
     deadline = time.monotonic() + budget_s
     root = _FrameRoute(ws_url)
     root.deadline = deadline
@@ -2800,14 +2872,19 @@ async def _frame_search(ws_url, js, label, same_origin_only=False,
     stopped = False
     try:
         _frame_pool_pin(root)
-        probe = js
+        guard = None
         if same_origin_only:
             r = await _frame_cdp(root, [(1, "Runtime.evaluate", root.eval_params("location.origin"))])
             origin = r.get(1, {}).get("result", {}).get("value")
             if not origin or origin == "null":
                 return None
-            probe = (f"(location.origin === {json.dumps(origin)}) ? ({js})"
-                     " : JSON.stringify({found: false, crossOrigin: true})")
+            guard = f"(location.origin === {json.dumps(origin)})"
+
+        def guarded(js):
+            if guard is None:
+                return js
+            return f"{guard} ? ({js}) : JSON.stringify({{found: false, crossOrigin: true}})"
+
         queue = [root]
         while queue and searched < max_frames:
             if time.monotonic() >= deadline:
@@ -2829,14 +2906,16 @@ async def _frame_search(ws_url, js, label, same_origin_only=False,
                                             allow_oopif=not same_origin_only)
                 except _FrameError:
                     continue
-                r = await _frame_cdp(child, [(1, "Runtime.evaluate", child.eval_params(probe),
+                r = await _frame_cdp(child, [(1, "Runtime.evaluate", child.eval_params(guarded(probe_js)),
                                               child.session_id)])
-                raw = r.get(1, {}).get("result", {}).get("value", "")
-                data = _smart_data(raw)
+                data = _smart_data(r.get(1, {}).get("result", {}).get("value", ""))
                 if data.get("found"):
                     print(f"{label}: matched inside frame {child.describe()}"
                           + (f" ({child.src[:100]})" if child.src else ""), file=sys.stderr)
                     child.deadline = None
+                    r = await _frame_cdp(child, [(1, "Runtime.evaluate", child.eval_params(guarded(act_js)),
+                                                  child.session_id)], timeout=SMART_ACT_TIMEOUT_S)
+                    raw = r.get(1, {}).get("result", {}).get("value", "")
                     return await _frame_shift_point(child, raw)
                 if not data.get("crossOrigin"):  # never descend into a foreign frame
                     queue.append(child)
@@ -10128,6 +10207,8 @@ async def cmd_smart_click(text):
       // a weak partial-word hit then reports its score instead of clicking.
       var minScore = (typeof __cdpilotMinScore === 'number') ? __cdpilotMinScore : 0;
       if (best.score < minScore) return JSON.stringify({{found: false, weakScore: best.score, disabledReal: disabledReal}});
+      // Frame-search probe (_smart_wrap probe=True): report the hit, never click.
+      if (typeof __cdpilotProbe !== 'undefined' && __cdpilotProbe) return JSON.stringify({{found: true, probe: true, score: best.score}});
       best.el.scrollIntoView({{block: 'center'}});
       var rect = best.el.getBoundingClientRect();
       best.el.click();
@@ -10498,6 +10579,8 @@ async def cmd_smart_fill(text, value):
 
       candidates.sort(function(a, b) {{ return b.score - a.score; }});
       var best = candidates[0];
+      // Frame-search probe (_smart_wrap probe=True): report the hit, never type.
+      if (typeof __cdpilotProbe !== 'undefined' && __cdpilotProbe) return JSON.stringify({{found: true, probe: true, score: best.score}});
 
       // React-compatible value setting
       var nativeSetter = Object.getOwnPropertyDescriptor(
@@ -10617,6 +10700,8 @@ async def cmd_smart_select(text, option_text):
           disabledReal: disabledCount  // every select match is a real one
         }});
       }}
+      // Frame-search probe (_smart_wrap probe=True): report the hit, never select.
+      if (typeof __cdpilotProbe !== 'undefined' && __cdpilotProbe) return JSON.stringify({{found: true, probe: true, score: bestScore}});
 
       // Find matching option
       var options = Array.from(best.options);

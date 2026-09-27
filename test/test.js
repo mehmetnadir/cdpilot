@@ -3534,10 +3534,10 @@ print(json.dumps([_frame_selector_hops(t) for t in json.load(sys.stdin)]))
   });
 
   test('frames: literal-fallback decision — a >>> whose first hop is no iframe stays the old selector', () => {
-    const src = pyFuncs(['_split_frame_chain', '_frame_selector_hops', '_parse_frame_hop',
-      '_frame_selector_plan']) + `
+    const src = 'import re as _re\n' + pyFuncs(['_split_frame_chain', '_frame_selector_hops', '_parse_frame_hop',
+      '_frame_hop_is_selector', '_frame_chain_candidate', '_frame_selector_plan']) + `
 import json, sys
-print(json.dumps([_frame_selector_plan(t, found) for t, found in json.load(sys.stdin)]))
+print(json.dumps([_frame_selector_plan(*c) for c in json.load(sys.stdin)]))
 `;
     const note = (hop) => `note: '${hop}' matched no iframe; used the selector as written`;
     const cases = [
@@ -3550,6 +3550,18 @@ print(json.dumps([_frame_selector_plan(t, found) for t, found in json.load(sys.s
       [['iframe#card >>> input', true], [[{ kind: 'sel', value: 'iframe#card' }], 'input', null]],
       [['#card >>> 1 >>> url=stripe >>> #b', true],
         [[{ kind: 'sel', value: '#card' }, { kind: 'index', value: 1 }, { kind: 'url', value: 'stripe' }], '#b', null]],
+      // smart-* text: a first hop of plain words is never a frame (querySelector("Main")
+      // would find <main> and step into an iframe inside it), even if it wraps one.
+      [['Main >>> Settings', true, 'text'], [[], 'Main >>> Settings', null]],
+      [['main >>> Settings', true, 'text'], [[], 'main >>> Settings', null]],
+      [['Page 1 of 3 >>> Next page', true, 'text'], [[], 'Page 1 of 3 >>> Next page', null]],
+      [['Frameworks >>> React', true, 'text'], [[], 'Frameworks >>> React', null]],
+      [['Main >>> Settings', true, 'css'], [[{ kind: 'sel', value: 'Main' }], 'Settings', null]],
+      [['iframe >>> Pay now', true, 'text'], [[{ kind: 'sel', value: 'iframe' }], 'Pay now', null]],
+      [['frame[name=f] >>> Pay now', true, 'text'], [[{ kind: 'sel', value: 'frame[name=f]' }], 'Pay now', null]],
+      [['#card-element >>> Pay now', true, 'text'], [[{ kind: 'sel', value: '#card-element' }], 'Pay now', null]],
+      [['.widget >>> Pay now', false, 'text'], [[], '.widget >>> Pay now', note('.widget')]],
+      [['url=stripe >>> Pay now', true, 'text'], [[{ kind: 'url', value: 'stripe' }], 'Pay now', null]],
     ];
     const got = pyCases(src, cases);
     cases.forEach((c, i) => assert.deepStrictEqual(got[i], c[1], `plan ${JSON.stringify(c[0])}`));
@@ -3694,6 +3706,31 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
     assert(/no iframe matches '#missing' in iframe#card/.test(r.later_hop_strict.stderr), r.later_hop_strict.stderr);
   });
 
+  test('frames (fake CDP): smart-click "Main >>> Settings" stays literal text (no frame lookup)', () => {
+    const r = fake('text_hops');
+    for (const key of ['text_main', 'text_main_lower', 'text_page_of']) {
+      assert.deepStrictEqual(r[key].messages, ['Runtime.evaluate', 'Input.dispatchMouseEvent'],
+        `${key}: the command alone, no frame lookup`);
+      assert.strictEqual(r[key].stderr, '', key);
+    }
+    assert.deepStrictEqual(r.text_main.res, ['ok', 'top|Main >>> Settings'], 'the page, with the whole text');
+    assert.deepStrictEqual(r.text_selector.res, ['ok', 'card|Pay now'], 'iframe#card >>> text still routes');
+    assert.deepStrictEqual(r.text_url.res, ['ok', 'card|Pay now'], 'url= >>> text still routes');
+    assert.deepStrictEqual(r.css_wrapper.res, ['ok', 'card|#btn'], 'css kind: "main" is a selector');
+  });
+
+  test('frames (fake CDP): a hop that wraps an iframe works, with one stderr note', () => {
+    const r = fake('text_hops');
+    const note = (hop) => `note: '${hop}' is not an iframe; using the iframe inside it\n`;
+    assert.deepStrictEqual(r.text_wrapper.res, ['ok', 'card|Pay now']);
+    assert.strictEqual(r.text_wrapper.stderr, note('#card-element'));
+    assert.strictEqual(r.css_wrapper.stderr, note('main'));
+    assert.deepStrictEqual(r.flag_wrapper.res, ['ok', 'card|#btn']);
+    assert.strictEqual(r.flag_wrapper.stderr, note('#card-element'), '--frame too');
+    assert.strictEqual(r.css_frame.stderr, '', 'no note when the hop is the iframe itself');
+    assert.strictEqual(r.text_selector.stderr, '');
+  });
+
   test('frames (fake CDP): CDPILOT_WS_POOL=0 is restored after an exception, SystemExit and cancellation', () => {
     const r = fake('pool_restore');
     assert.deepStrictEqual(r.pool_inside, [true, true, true, false],
@@ -3712,7 +3749,8 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
   test('frames (fake CDP): smart-* order — page real match, disabled-only, frames, then page weak match', () => {
     const r = fake('smart_order');
     const c = r.c_page_real;
-    assert.deepStrictEqual(c.finder, [['top', 'strict']]);
+    assert.deepStrictEqual(c.finder, [['top', 'strict']], 'page: one find-and-act script');
+    assert.deepStrictEqual(c.acts, [['top', 'strict']]);
     assert.strictEqual(c.frame_lists, 0, 'enabled real page match: no frame search');
     assert.deepStrictEqual(c.res, { found: true, x: 9, y: 9 });
     const d = r.d_disabled_only;
@@ -3720,28 +3758,42 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
       'only disabled real matches: the old page rules (their error), no frame search');
     assert.strictEqual(d.frame_lists, 0);
     assert.deepStrictEqual(d.res, { found: false, disabled: 1 });
+    assert.deepStrictEqual(d.acts, []);
     const e = r.e_frame_real;
-    assert.deepStrictEqual(e.finder, [['top', 'strict'], ['card', 'strict']], 'weak page match: frames searched');
+    assert.deepStrictEqual(e.finder, [['top', 'strict'], ['card', 'probe'], ['card', 'strict']],
+      'weak page match: frames probed (find only), then the finder acts in the chosen frame');
+    assert.deepStrictEqual(e.acts, [['card', 'strict']], 'exactly one action');
     assert.deepStrictEqual(e.res, { found: true, x: 105, y: 1006 }, 'frame x/y returned in page coordinates');
     assert.strictEqual(e.stderr, 'smart-x: matched inside frame iframe#card (http://a.test/inner.html)\n');
     const n = r.e_nothing;
-    assert.deepStrictEqual(n.finder, [['top', 'strict'], ['card', 'strict'], ['xo', 'strict'], ['pay', 'strict'],
+    assert.deepStrictEqual(n.finder, [['top', 'strict'], ['card', 'probe'], ['xo', 'probe'], ['pay', 'probe'],
       ['top', 'loose']], 'no frame match: back to the page weak match');
+    assert.deepStrictEqual(n.acts, [['top', 'loose']], 'frames were only probed');
     assert.deepStrictEqual(n.res, { found: true, x: 1, y: 1, weak: true });
     assert.deepStrictEqual(n.open_sessions, [], 'search sessions detached');
     const all = r.e_oopif_all;
     assert.deepStrictEqual(all.attached, ['pay'], 'smart-click searches out-of-process frames too');
     assert.deepStrictEqual(all.res, { found: true, x: 10, y: 13 });
+    assert.deepStrictEqual(all.acts, [['pay', 'strict']]);
+  });
+
+  test('frames (fake CDP): the chosen frame no longer matching at act time gives its not-found result', () => {
+    const r = fake('smart_order').act_changed;
+    assert.deepStrictEqual(r.finder, [['top', 'strict'], ['card', 'probe'], ['card', 'strict']],
+      'no page fallback after a frame was chosen');
+    assert.deepStrictEqual(r.acts, []);
+    assert.deepStrictEqual(r.res, { found: false, weakScore: 20 }, 'the command prints its normal not-found error');
   });
 
   test('frames (fake CDP): smart-fill/select auto search enters same-origin frames only', () => {
     const r = fake('smart_order');
     const same = r.fill_same_origin;
-    assert.deepStrictEqual(same.finder, [['top', 'strict'], ['card', 'strict']]);
+    assert.deepStrictEqual(same.finder, [['top', 'strict'], ['card', 'probe'], ['card', 'strict']]);
+    assert.deepStrictEqual(same.acts, [['card', 'strict']]);
     assert.deepStrictEqual(same.res, { found: true, x: 105, y: 1006 });
     const cross = r.fill_cross_origin;
     assert.deepStrictEqual(cross.attached, [], 'never attaches to an out-of-process (cross-site) frame');
-    assert.deepStrictEqual(cross.finder, [['top', 'strict'], ['card', 'strict'], ['xo', 'guarded'], ['top', 'loose']],
+    assert.deepStrictEqual(cross.finder, [['top', 'strict'], ['card', 'probe'], ['xo', 'guarded'], ['top', 'loose']],
       'a same-process cross-origin frame is skipped by the origin guard before the finder runs');
     assert.deepStrictEqual(cross.res, { found: false }, 'the old not-found result from the page');
     assert.strictEqual(cross.stderr, '');
@@ -3760,12 +3812,30 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
     // passed yet and the time left is the whole budget.
     assert(slow[0].timeout >= 0.1 && slow[0].timeout <= 0.5, `slow call timeout = time left: ${slow[0].timeout}`);
     assert.strictEqual(d.socket_kept, true, 'a timed-out search call keeps the shared socket');
+    assert.deepStrictEqual(d.finder, [['slow', 'probe']], 'the slow frame only ever gets the side-effect-free probe');
+    assert.deepStrictEqual(d.acts, []);
     const g = r.default_budget;
     assert.strictEqual(g.stderr, 'smart-x: frame search stopped after 2s (1 of 3 frames)\n');
     assert(g.elapsed >= 1.9 && g.elapsed < 3.5, `default budget 2 s, took ${g.elapsed}`);
     assert(g.max_search_timeout <= 2.0, `search calls capped at 2 s: ${g.max_search_timeout}`);
-    assert.deepStrictEqual(g.finder, [['top', 'strict'], ['slow', 'strict'], ['top', 'loose']]);
+    assert.deepStrictEqual(g.finder, [['top', 'strict'], ['slow', 'probe'], ['top', 'loose']]);
+    assert.deepStrictEqual(g.acts, [['top', 'loose']], 'exactly one action overall');
     assert.deepStrictEqual(g.res, { found: true, x: 1, y: 1, weak: true }, 'falls back to the page');
+  });
+
+  test('frames (fake CDP): a probe cut off by the budget acts nowhere; the page fallback is the one action', () => {
+    const r = fake('probe_timeout');
+    // The slow frame holds a real match: were its script the act-mode finder,
+    // it would click/type after the call gave up, and the page would act too.
+    for (const key of ['click', 'fill_same_origin']) {
+      const c = r[key];
+      assert.deepStrictEqual(c.finder, [['top', 'strict'], ['slow', 'probe'], ['top', 'loose']], key);
+      assert.strictEqual(c.stderr, 'smart-x: frame search stopped after 0.5s (1 of 2 frames)\n', key);
+      assert(c.elapsed < 1.5, `${key}: ${c.elapsed}`);
+    }
+    assert.deepStrictEqual(r.click.acts, [['top', 'loose']], 'smart-click: only the page weak match is clicked');
+    assert.deepStrictEqual(r.fill_same_origin.acts, [], 'smart-fill: nothing typed; the old not-found result');
+    assert.deepStrictEqual(r.fill_same_origin.res, { found: false });
   });
 
   test('frames (fake CDP): a frame-call timeout keeps the pooled socket; a plain cdp_send timeout drops it', () => {
@@ -3775,7 +3845,16 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
     assert.strictEqual(r.sockets, 1);
     assert(r.frame_elapsed < 1.5, `timeout=0.3 must not wait a 2 s recv slice: ${r.frame_elapsed}`);
     assert(r.dropped && r.closed, 'ordinary calls keep the old rule: drop and close after a timeout');
-    assert(r.plain_elapsed < 1.5, `plain timeout=0.3 honoured: ${r.plain_elapsed}`);
+    assert(r.plain_elapsed >= 0.3 && r.plain_elapsed < 3, `plain call: old flat 2 s recv wait: ${r.plain_elapsed}`);
+  });
+
+  test('frames (fake CDP): plain cdp_send still reads a reply that lands just after its timeout', () => {
+    // `wait "#nope" 15` answers from a 15 s page timer, at 15.0x s: the old
+    // flat 2 s recv wait read it; a wait trimmed to the timeout dropped it.
+    const r = fake('late_reply');
+    assert.strictEqual(r.plain.value, 'top|late', `reply 0.1 s after timeout=0.3 must be read (${r.plain.elapsed}s)`);
+    assert.strictEqual(r.frame.value, null, 'frame-search calls stop at their timeout');
+    assert(r.frame.elapsed < 0.39, `frame call: ${r.frame.elapsed}`);
   });
 
   test('frames (fake CDP): frame list keeps its old output; --frame lists and evals inside the frame', () => {
@@ -3805,12 +3884,13 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
     const section = (readme.split('### Element targeting inside iframes')[1] || '').split('\n### ')[0];
     assert(section, 'README needs the element-targeting section');
     for (const s of ['iframe#card >>> input[name=cardnumber]', '--frame', 'matched no iframe; used the selector as written',
-      "page's own origin", 'frame search stopped after 2s']) {
+      "page's own origin", 'frame search stopped after 2s', 'is not an iframe; using the iframe inside it']) {
       assert(section.includes(s), `README iframe section must mention ${s}`);
     }
     const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
     const unreleased = (changelog.match(/## \[Unreleased\]([\s\S]*?)\n## \[/) || [])[1] || '';
-    for (const s of ['--frame', 'matched no iframe', "page's own origin", 'frame search stopped after 2s']) {
+    for (const s of ['--frame', 'matched no iframe', "page's own origin", 'frame search stopped after 2s',
+      'is not an iframe; using the iframe inside it']) {
       assert(unreleased.includes(s), `CHANGELOG [Unreleased] must describe ${s}`);
     }
     const doc = (PY_CONTENT.match(/^"""([\s\S]*?)"""/m) || [])[1] || '';
@@ -3914,6 +3994,22 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
       const r = c('click', '#nope >>> #x');
       assert.strictEqual(r.status, 1, `exit ${r.status}`);
       assert(r.stderr.includes("note: '#nope' matched no iframe; used the selector as written"), r.stderr);
+    });
+
+    test('frames e2e: smart-click "Main >>> Settings" is page text; a wrapper hop works with a note', () => {
+      const { c, p1, p2 } = needE2E();
+      c('go', crossPage(p1, p2));
+      // iframe#child sits inside <main id="widget-box">, and the widget has a
+      // "Settings" button: querySelector("Main") must not route there.
+      const t = c('smart-click', 'Main >>> Settings');
+      ok(t, /Clicked: A "Main >>> Settings" \(score:100\)/, 'page link');
+      assert(!/note:|matched inside frame/.test(t.stderr), t.stderr);
+      ok(c('eval', 'document.body.dataset.log'), /crumb;/, 'the page link was clicked');
+      assert(!/settings/.test(frameLog(c)), 'nothing clicked in the frame');
+      const w = c('click', '#widget-box >>> #settings');
+      ok(w, /Clicked: BUTTON Settings/, 'wrapper hop');
+      assert(w.stderr.includes("note: '#widget-box' is not an iframe; using the iframe inside it"), w.stderr);
+      assert(/settings;/.test(frameLog(c)), 'clicked inside the frame');
     });
 
     test('frames e2e: smart-fill auto search stays same-origin; >>> / --frame reach a cross-origin frame', () => {

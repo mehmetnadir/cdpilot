@@ -168,16 +168,24 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
 
 - Works for `click`, `fill`, `type`, `submit`, `hover`, `dblclick`, `rightclick`,
   `smart-click`, `smart-fill`, `smart-select` and `frame list|eval|shadow`.
-- A frame hop is a CSS selector (an element *wrapping* an iframe, such as
-  `#card-element`, also works), a 0-based index, a `name`/`id`, or
+- A frame hop is a CSS selector, a 0-based index, a `name`/`id`, or
   `url=<src substring>`. `--frame` also takes a bare `src` substring.
-  `>>>` inside quotes or `[...]` is literal.
+  `>>>` inside quotes or `[...]` is literal. A selector that matches an
+  element *wrapping* an iframe (Stripe's `#card-element`) enters the iframe
+  inside it and says so on stderr:
+  `note: '#card-element' is not an iframe; using the iframe inside it`.
 - Selectors and texts that already contain `>>>` keep working: when the part
   before the first `>>>` finds no iframe in the page, or a segment is empty
   (`click "Next >>>"`), the whole string is used as written, exactly as
   before. If that fails too, one stderr line explains:
   `note: 'Home' matched no iframe; used the selector as written`.
   `--frame` never falls back: a frame it cannot find is an error (exit 1).
+- For `smart-click` / `smart-fill` / `smart-select` the part before the first
+  `>>>` is a frame only if it looks like a selector (it has `#`, `.` or `[`,
+  or starts with an `iframe`/`frame` tag) or is `url=…`; words stay text.
+  `smart-click "Main >>> Settings"` clicks the page's "Main >>> Settings"
+  link even when a `<main>` element holds an iframe. For a frame index or a
+  bare name use `--frame`.
 - Same-origin **and cross-origin** frames work, including out-of-process
   iframes (site isolation): cdpilot resolves each hop over CDP
   (`DOM.describeNode` → frame id → the frame's execution context, or
@@ -194,9 +202,12 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
   Otherwise the visible frames are searched breadth-first for a whole-query
   match (at most 20 frames, and 2 s for all of the search's CDP calls) and the
   match is reported on stderr:
-  `smart-click: matched inside frame iframe#card (https://…)`. With no frame
-  match, the page's partial (word) match is used as before. When the 2 s run
-  out: `smart-click: frame search stopped after 2s (3 of 7 frames)`.
+  `smart-click: matched inside frame iframe#card (https://…)`. The search only
+  looks (no click, no typing); the command then acts once, in the chosen
+  frame. With no frame match, the page's partial (word) match is used as
+  before. When the 2 s run out:
+  `smart-click: frame search stopped after 2s (3 of 7 frames)`; a frame that
+  had not answered by then has not been touched.
 - `smart-fill` and `smart-select` search automatically only frames of the
   page's own origin, so a typed value never lands in a third-party frame (an
   ad, chat or payment widget) by accident; reach a cross-origin frame with
