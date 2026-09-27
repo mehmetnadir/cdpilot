@@ -3756,7 +3756,9 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
     assert(d.calls.every((c) => c.timeout <= 0.5), `every call capped at the budget: ${JSON.stringify(d.calls)}`);
     const slow = d.calls.filter((c) => c.finder);
     assert.strictEqual(slow.length, 1);
-    assert(slow[0].timeout >= 0.1 && slow[0].timeout < 0.5, `slow call timeout = time left: ${slow[0].timeout}`);
+    // <= not <: Windows' monotonic clock ticks every ~16 ms, so no time may have
+    // passed yet and the time left is the whole budget.
+    assert(slow[0].timeout >= 0.1 && slow[0].timeout <= 0.5, `slow call timeout = time left: ${slow[0].timeout}`);
     assert.strictEqual(d.socket_kept, true, 'a timed-out search call keeps the shared socket');
     const g = r.default_budget;
     assert.strictEqual(g.stderr, 'smart-x: frame search stopped after 2s (1 of 3 frames)\n');
