@@ -48,7 +48,7 @@
 
 ## Son Oturum
 → 2026-09-27: sahte kriz donması (11 gün) çözüldü, pain_hunter eklendi, "500x" benchmark geri çekildi, v0.9.1 npm + MCP Registry.
-→ İlk iş: pain_hunter'ın ilk canlı kayıtlarını oku (`/opt/cdpilot-twitter-bot/pains/2026-09.jsonl`) → sonra v0.9.2.
+→ İlk iş: pain_hunter'ın ilk canlı kayıtlarını oku (`/opt/cdpilot-twitter-bot/pains/2026-09.jsonl`) → sonra v0.9.3 kapsamı (Nadir onayı).
 
 Son Güncelleme: 2026-09-27
 
