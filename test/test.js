@@ -3748,6 +3748,404 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
   });
 })();
 
+// ── Idle auto-close ──
+// A browser cdpilot launched (explicitly or by auto-launch) closes itself after
+// CDPILOT_IDLE_CLOSE minutes (default 15, 0 = off) without a cdpilot command.
+// No real browser here: the watcher's decisions are exercised in-process with
+// stubbed CDP answers, against a throwaway CDPILOT_HOME.
+(function() {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const PY_BIN = process.platform === 'win32' ? 'python' : 'python3';
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-idle-test-'));
+  const IMPORT = [
+    'import importlib.util, json, os, sys, time',
+    `spec = importlib.util.spec_from_file_location("cdpilot_idle", ${JSON.stringify(PY_PATH)})`,
+    'mod = importlib.util.module_from_spec(spec)',
+    'spec.loader.exec_module(mod)',
+  ].join('\n');
+
+  function freePort() {
+    const r = spawnSync(PY_BIN, ['-c',
+      'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); '
+      + 'print(s.getsockname()[1]); s.close()'], { encoding: 'utf-8', timeout: 10000 });
+    assert.strictEqual(r.status, 0, `freePort failed: ${r.stderr}`);
+    return r.stdout.trim();
+  }
+
+  function pyEnv(extra = {}) {
+    const env = {
+      ...process.env,
+      CDPILOT_HOME: home,
+      CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: freePort(),
+      CDPILOT_PROJECT_ID: 'idle-proj',
+      CDPILOT_NO_AUTOLAUNCH: '1',
+    };
+    for (const k of ['CDPILOT_TIMEOUT', 'CDPILOT_IDLE_CLOSE']) delete env[k];
+    return { ...env, ...extra };
+  }
+
+  function py(script, extra = {}) {
+    const r = spawnSync(PY_BIN, ['-c', IMPORT + '\n' + script], {
+      encoding: 'utf-8', timeout: 30000, env: pyEnv(extra),
+    });
+    assert(!r.error, `python failed to run: ${r.error}`);
+    const line = (r.stdout || '').split('\n').find((l) => l.startsWith('RESULT='));
+    assert(line, `no result (status ${r.status}) stdout=${r.stdout} stderr=${r.stderr}`);
+    return { res: JSON.parse(line.slice('RESULT='.length)), stderr: r.stderr };
+  }
+
+  const activityFile = path.join(home, 'projects', 'idle-proj', 'last-activity');
+
+  test('idle close: CDPILOT_IDLE_CLOSE parsing (auto default 15, explicit default off, 0/off, fractions, bad value warns)', () => {
+    const { res, stderr } = py(`
+f = mod._idle_close_minutes
+E = lambda v: {"CDPILOT_IDLE_CLOSE": v}
+out = {
+  "unset": f({}), "empty": f(E(" ")), "zero": f(E("0")), "off": f(E("off")), "frac": f(E("0.2")),
+  "thirty": f(E("30")), "bad": f(E("abc")), "neg": f(E("-3")), "nan": f(E("nan")),
+  "inf": f(E("inf")), "env": f(),
+  "x_unset": f({}, auto=False), "x_env": f(E("0.2"), auto=False), "x_zero": f(E("0"), auto=False),
+  "x_bad": f(E("abc"), auto=False), "x_flag": f({}, auto=False, flag="5"),
+  "x_flag_wins": f(E("30"), auto=False, flag="0"), "a_flag": f(E("30"), flag="2.5"),
+  "flags": [mod._idle_close_flag(a) for a in (["--idle-close", "3"], ["--idle-close=0.2"],
+            ["--idle-close"], [], ["--x"])],
+}
+try:
+    f({}, auto=False, flag="soon")
+    out["bad_flag"] = "accepted"
+except ValueError as e:
+    out["bad_flag"] = str(e)
+print("RESULT=" + json.dumps(out))
+`, { CDPILOT_IDLE_CLOSE: '7' });
+    const badFlag = res.bad_flag;
+    delete res.bad_flag;
+    assert.deepStrictEqual(res, {
+      unset: 15, empty: 15, zero: 0, off: 0, frac: 0.2, thirty: 30,
+      bad: 15, neg: 15, nan: 15, inf: 15, env: 7,
+      x_unset: 0, x_env: 0.2, x_zero: 0, x_bad: 0, x_flag: 5, x_flag_wins: 0, a_flag: 2.5,
+      flags: ['3', '0.2', '', null, null],
+    });
+    assert(badFlag.includes('--idle-close') && badFlag.includes("'soon'"), `bad flag must raise: ${badFlag}`);
+    const warnings = stderr.split('\n').filter((l) => l.includes('ignoring CDPILOT_IDLE_CLOSE'));
+    assert.strictEqual(warnings.length, 1, `one warning per process, got: ${stderr}`);
+    assert(warnings[0].includes("'abc'") && warnings[0].includes('using 15'), warnings[0]);
+  });
+
+  test('idle close: auto-launch gets a watcher; explicit launch only with env or --idle-close', () => {
+    // cmd_launch in-process with the browser and the watcher Popen faked.
+    const { res } = py(`
+spawned = []
+class FakePopen:
+    def __init__(self, argv, **kw):
+        self.pid = 4000 + len(spawned)
+        spawned.append("watcher" if mod.IDLE_WATCHER_FLAG in argv else "browser")
+    def poll(self):
+        return None
+mod.subprocess.Popen = FakePopen
+up = [False]
+def fake_cdp_get(path, no_cache=False):
+    if path == "/json/version" and up[0]:
+        return {"webSocketDebuggerUrl": "ws://x/browser/g%d" % len(spawned)}
+    return None
+mod.cdp_get = fake_cdp_get
+mod.CHROME_BIN = "/nonexistent/chrome"
+def fast_sleep(s):  # the launch wait loop: the fake browser answers from its first round
+    up[0] = True
+mod.time.sleep = fast_sleep
+out = {}
+def run(name, env=None, **kw):
+    spawned.clear(); up[0] = False
+    os.environ.pop("CDPILOT_IDLE_CLOSE", None)
+    if env is not None:
+        os.environ["CDPILOT_IDLE_CLOSE"] = env
+    code = 0
+    try:
+        mod.cmd_launch(**kw)
+    except SystemExit as e:
+        code = e.code
+    out[name] = [list(spawned), code]
+run("explicit")
+run("explicit_env", env="0.2")
+run("explicit_env0", env="0")
+run("explicit_flag", idle_close="5")
+run("explicit_bad_flag", idle_close="soon")
+run("auto", auto=True)
+run("auto_env0", env="0", auto=True)
+mod.IS_MCP_SESSION = True  # a launch from the MCP server (browser_launch -> "launch")
+run("mcp")
+run("mcp_env0", env="0")
+print("RESULT=" + json.dumps(out))
+`);
+    assert.deepStrictEqual(res.explicit, [['browser'], 0], 'explicit launch without env: no watcher');
+    assert.deepStrictEqual(res.explicit_env, [['browser', 'watcher'], 0], 'explicit launch + env > 0: watcher');
+    assert.deepStrictEqual(res.explicit_env0, [['browser'], 0]);
+    assert.deepStrictEqual(res.explicit_flag, [['browser', 'watcher'], 0], 'launch --idle-close <min>: watcher');
+    assert.deepStrictEqual(res.explicit_bad_flag, [[], 2], 'an invalid --idle-close exits 2 before starting a browser');
+    assert.deepStrictEqual(res.auto, [['browser', 'watcher'], 0], 'auto-launch: watcher by default');
+    assert.deepStrictEqual(res.auto_env0, [['browser'], 0]);
+    assert.deepStrictEqual(res.mcp, [['browser', 'watcher'], 0], 'an MCP launch counts as auto: watcher by default');
+    assert.deepStrictEqual(res.mcp_env0, [['browser'], 0], 'CDPILOT_IDLE_CLOSE=0 still turns it off for MCP');
+    assert(/"CDPILOT_MCP_SESSION"\] = "1"/.test(PY_CONTENT) && /auto = auto or IS_MCP_SESSION/.test(PY_CONTENT),
+      'MCP tool calls run with CDPILOT_MCP_SESSION=1, which cmd_launch treats as auto');
+  });
+
+  test('idle close: page fingerprint (ids + urls, no titles) and change detection are pure', () => {
+    const { res } = py(`
+fp, ch = mod._idle_page_fingerprint, mod._idle_pages_changed
+a = [{"type": "page", "id": "1", "url": "https://a/", "title": "A"},
+     {"type": "service_worker", "id": "sw", "url": "https://a/sw.js", "title": ""},
+     {"type": "page", "id": "2", "url": "about:blank", "title": ""}]
+b = list(reversed(a))
+nav = [dict(a[0], url="https://a/next")] + a[1:]
+title = [dict(a[0], title="A (1)")] + a[1:]
+opened = a + [{"type": "page", "id": "3", "url": "about:blank", "title": ""}]
+closed = a[:2]
+worker_only = a + [{"type": "iframe", "id": "f", "url": "https://ad/", "title": ""}]
+out = {
+  "order_free": fp(a) == fp(b), "pages_only": len(fp(a)),
+  "same": ch(fp(a), fp(b)), "nav": ch(fp(a), fp(nav)), "title": ch(fp(a), fp(title)),
+  "opened": ch(fp(a), fp(opened)), "closed": ch(fp(a), fp(closed)),
+  "non_page": ch(fp(a), fp(worker_only)),
+  "unknown_now": ch(fp(a), fp(None)), "first_round": ch(None, fp(a)), "none": fp(None),
+}
+print("RESULT=" + json.dumps(out))
+`);
+    assert.deepStrictEqual(res, {
+      order_free: true, pages_only: 2, same: false, nav: true, title: false,
+      opened: true, closed: true, non_page: false, unknown_now: false, first_round: false, none: null,
+    });
+  });
+
+  test('idle close: a normal command touches the activity stamp, read-only checks do not', () => {
+    fs.rmSync(activityFile, { force: true });
+    const t0 = Date.now() / 1000;
+    const r = spawnSync(PY_BIN, [PY_PATH, 'mode'], { encoding: 'utf-8', timeout: 30000, env: pyEnv() });
+    assert.strictEqual(r.status, 0, `mode failed: ${r.stderr}`);
+    assert(fs.existsSync(activityFile), 'a normal command must write projects/<id>/last-activity');
+    const stamp = parseFloat(fs.readFileSync(activityFile, 'utf-8'));
+    assert(stamp >= t0 - 1 && stamp <= Date.now() / 1000 + 1, `stamp ${stamp} is not "now" (${t0})`);
+    fs.rmSync(activityFile, { force: true });
+    for (const cmd of ['health', 'version', 'projects']) {
+      const q = spawnSync(PY_BIN, [PY_PATH, cmd], { encoding: 'utf-8', timeout: 30000, env: pyEnv() });
+      assert(!q.error, `${cmd} failed to run: ${q.error}`);
+      assert(!fs.existsSync(activityFile), `read-only \`${cmd}\` must not count as activity`);
+    }
+  });
+
+  test('idle close: decision function (now, last activity, minutes) -> close?', () => {
+    const { res } = py(`
+f = mod._idle_should_close
+print("RESULT=" + json.dumps([
+  f(1000, 100, 15), f(1000, 101, 15), f(1000, 100, 0), f(1000, None, 15),
+  f(1000, 2000, 15), f(1000, 988, 0.2), f(1000, 989, 0.2), f(1000, 0, None),
+]))
+`);
+    assert.deepStrictEqual(res, [true, false, false, false, false, true, false, false]);
+  });
+
+  test('idle close: the watcher only ever closes the browser cdpilot launched', () => {
+    const { res } = py(`
+P = 45678
+OURS = "ws://127.0.0.1:%d/devtools/browser/aaaa" % P
+calls, attached = [], [False]
+mod._stop_browser_on_port = lambda port, verbose=False: calls.append(port) or True
+mod._idle_client_attached = lambda version: attached[0]
+PAGE = {"type": "page", "id": "1", "url": "https://a/", "title": "A"}
+pages = [[PAGE]]
+mod._idle_page_targets = lambda port: pages[0]
+
+def setup(registry_pid=4242, ws=OURS, token="T", activity_age=3600):
+    now = time.time()
+    mod._save_registry({"p1": {"port": P, "pid": registry_pid, "status": "running"}})
+    mod._idle_save_state(P, {"token": token, "pid": os.getpid(), "port": P, "project_id": "p1",
+                             "browser_pid": 4242, "browser_ws": OURS, "minutes": 0.2,
+                             "started": now - 7200})
+    mod._idle_write_activity("p1", now - activity_age)
+    mod._idle_version = lambda port: {"webSocketDebuggerUrl": ws}
+
+out = {}
+setup(ws="ws://127.0.0.1:%d/devtools/browser/bbbb" % P)       # another browser took the port
+out["foreign"] = [mod._idle_watcher_step(P, "T"), list(calls), mod._idle_load_state(P)]
+setup(registry_pid=None)                                        # not (or no longer) launched by cdpilot
+out["unowned"] = [mod._idle_watcher_step(P, "T"), list(calls), mod._idle_load_state(P)]
+setup(); mod._idle_version = lambda port: None; mod._pid_alive = lambda pid: False
+out["gone"] = [mod._idle_watcher_step(P, "T"), list(calls)]
+setup(token="NEWER")                                            # a newer launch owns the port
+out["replaced"] = [mod._idle_watcher_step(P, "T"), list(calls), (mod._idle_load_state(P) or {}).get("token")]
+setup(activity_age=2)                                           # used 2 s ago
+out["recent"] = [mod._idle_watcher_step(P, "T"), list(calls)]
+setup(); attached[0] = True                                     # a CDP client holds a page
+out["attached"] = [mod._idle_watcher_step(P, "T"), list(calls),
+                   round(time.time() - mod._idle_read_activity("p1"))]
+attached[0] = False
+setup(); memo = {"pages": mod._idle_page_fingerprint([PAGE])}
+pages[0] = [dict(PAGE, url="https://a/next")]                   # navigated outside cdpilot
+out["navigated"] = [mod._idle_watcher_step(P, "T", memo=memo), list(calls),
+                    round(time.time() - mod._idle_read_activity("p1")), memo["pages"][0][1]]
+setup(); pages[0] = [dict(PAGE, url="https://a/next", title="(3) A")]   # only the title ticked
+out["unchanged"] = [mod._idle_watcher_step(P, "T", memo=memo), list(calls)]   # -> still idle
+calls.clear()
+setup()
+out["ours"] = [mod._idle_watcher_step(P, "T"), list(calls), mod._idle_load_state(P),
+               mod._load_registry()["p1"]["status"], mod._load_registry()["p1"]["pid"]]
+own = {"browser_pid": 1, "browser_ws": "ws://x/browser/a", "project_id": "p", "port": 9}
+reg = {"p": {"pid": 1, "port": 9}}
+v = {"webSocketDebuggerUrl": "ws://x/browser/a"}
+out["pure"] = [mod._idle_owns_browser(own, reg, v), mod._idle_owns_browser(own, reg, None),
+               mod._idle_owns_browser(None, reg, v), mod._idle_owns_browser(own, {}, v),
+               mod._idle_owns_browser(own, {"p": {"pid": 2, "port": 9}}, v),
+               mod._idle_owns_browser(own, {"p": {"pid": 1, "port": 10}}, v),
+               mod._idle_owns_browser(dict(own, browser_pid=None), {"p": {"pid": None, "port": 9}}, v),
+               mod._idle_owns_browser(own, reg, {"webSocketDebuggerUrl": "ws://x/browser/b"})]
+print("RESULT=" + json.dumps(out))
+`);
+    assert.deepStrictEqual(res.foreign, ['exit', [], null], 'a different browser on the port must be left alone');
+    assert.deepStrictEqual(res.unowned, ['exit', [], null], 'a browser without the launch mark must be left alone');
+    assert.deepStrictEqual(res.gone, ['exit', []], 'the watcher exits once the browser is gone');
+    assert.deepStrictEqual(res.replaced, ['exit', [], 'NEWER'], 'a replaced watcher exits and keeps the new record');
+    assert.deepStrictEqual(res.recent, ['wait', []]);
+    assert.deepStrictEqual(res.attached.slice(0, 2), ['wait', []], 'an attached CDP client counts as use');
+    assert(res.attached[2] <= 2, 'an attached client refreshes the activity stamp');
+    assert.deepStrictEqual(res.navigated.slice(0, 2), ['wait', []], 'a page change outside cdpilot counts as use');
+    assert(res.navigated[2] <= 2, 'a page change refreshes the activity stamp');
+    assert.strictEqual(res.navigated[3], 'https://a/next', 'the watcher remembers the new fingerprint');
+    assert.deepStrictEqual(res.unchanged, ['closed', [45678]],
+      'unchanged pages are not activity, and neither is a title the page rewrote itself');
+    assert.deepStrictEqual(res.ours, ['closed', [45678], null, 'stopped', null]);
+    assert.deepStrictEqual(res.pure, [true, false, false, false, false, false, false, false]);
+  });
+
+  test('idle close: watcher is spawned detached on POSIX and Windows, std streams not inherited', () => {
+    const fn = (PY_CONTENT.match(/def _idle_spawn_watcher\([\s\S]*?\n\n\ndef /) || [''])[0];
+    assert(/"start_new_session"\]\s*=\s*True/.test(fn), 'POSIX: own session (start_new_session=True)');
+    assert(/DETACHED_PROCESS/.test(fn) && /CREATE_NEW_PROCESS_GROUP/.test(fn),
+      'Windows: DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP');
+    for (const s of ['stdin', 'stdout', 'stderr']) {
+      assert(new RegExp(`"${s}": subprocess\\.DEVNULL`).test(fn), `${s} must be DEVNULL`);
+    }
+    const { res } = py(`
+seen = []
+class FakePopen:
+    def __init__(self, argv, **kw):
+        self.pid = 31337
+        seen.append({"argv": argv[2:], "kw": {k: v for k, v in kw.items() if k != "env"},
+                     "timeout_env": "CDPILOT_TIMEOUT" in kw["env"]})
+mod.subprocess.Popen = FakePopen
+mod.cdp_get = lambda path, no_cache=False: {"webSocketDebuggerUrl": "ws://x/browser/g"}
+os.environ["CDPILOT_TIMEOUT"] = "5"
+real, out = os.name, {}
+try:  # both branches on every CI OS
+    os.name = "posix"
+    out["posix"] = mod._idle_spawn_watcher(99, port=45679, project_id="p1", minutes=15)
+    os.name = "nt"
+    out["nt"] = mod._idle_spawn_watcher(99, port=45680, project_id="p1", minutes=15)
+finally:
+    os.name = real
+out["posix_state"] = mod._idle_load_state(45679)
+out["off"] = mod._idle_spawn_watcher(99, port=45679, project_id="p1", minutes=0)
+out["off_state"] = mod._idle_load_state(45679)
+out["seen"] = [{"argv": s["argv"], "timeout_env": s["timeout_env"],
+                "sns": s["kw"].get("start_new_session"), "flags": s["kw"].get("creationflags", 0),
+                "streams": [s["kw"].get(k) == mod.subprocess.DEVNULL for k in ("stdin", "stdout", "stderr")]}
+               for s in seen]
+out["flag"] = mod.IDLE_WATCHER_FLAG
+print("RESULT=" + json.dumps(out))
+`);
+    assert.strictEqual(res.posix, 31337);
+    assert.strictEqual(res.nt, 31337);
+    assert.strictEqual(res.off, null, 'CDPILOT_IDLE_CLOSE=0: no watcher');
+    assert.strictEqual(res.off_state, null, 'turning it off retires the previous record on the port');
+    assert.strictEqual(res.seen.length, 2, 'Popen must not run when idle close is off');
+    const [posix, nt] = res.seen;
+    const st = res.posix_state;
+    assert.deepStrictEqual(posix.argv, [res.flag, '45679', st.token], 'watcher argv: flag, port, token');
+    assert(st.pid === 31337 && st.browser_pid === 99 && st.browser_ws === 'ws://x/browser/g',
+      `state must carry the launch mark: ${JSON.stringify(st)}`);
+    assert.strictEqual(posix.sns, true);
+    assert.strictEqual(posix.flags, 0, 'POSIX: no Windows creation flags');
+    assert.strictEqual(nt.sns, null, 'Windows: start_new_session is POSIX-only');
+    assert.strictEqual(nt.flags & 0x8, 0x8, 'DETACHED_PROCESS');
+    assert.strictEqual(nt.flags & 0x200, 0x200, 'CREATE_NEW_PROCESS_GROUP');
+    for (const s of res.seen) {
+      assert.deepStrictEqual(s.streams, [true, true, true], 'stdin/stdout/stderr must be DEVNULL');
+      assert.strictEqual(s.timeout_env, false, 'the watcher must not inherit CDPILOT_TIMEOUT');
+    }
+  });
+
+  test('idle close: wired into launch, dispatcher, mcp and serve', () => {
+    const launch = (PY_CONTENT.match(/def cmd_launch\(auto=False, idle_close=None\):([\s\S]*?)\n\ndef /) || [])[1] || '';
+    const reg = launch.indexOf('_register_project(PROJECT_ID');
+    const spawn = launch.indexOf('_idle_spawn_watcher(proc.pid');
+    assert(reg > 0 && spawn > reg, 'launch spawns the watcher after registering the browser it started');
+    assert(launch.indexOf('already running') < launch.indexOf('subprocess.Popen(chrome_args'),
+      'an already-running browser returns before any spawn (attach never gets a watcher)');
+    assert(/def _autolaunch_if_down\(\):[\s\S]*?cmd_launch\(auto=True\)/.test(PY_CONTENT),
+      'auto-launch must launch with auto=True (idle close on by default)');
+    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('if __name__ == "__main__":'));
+    assert(/'launch': lambda: cmd_launch\(idle_close=_idle_close_flag\(args\)\)/.test(main),
+      'explicit launch passes --idle-close and defaults to auto=False');
+    const flag = main.indexOf('if cmd == IDLE_WATCHER_FLAG:');
+    assert(flag > 0 && flag < main.indexOf('_AUTOLAUNCH["cmd"] = cmd'),
+      'the hidden watcher entry must run before auto-launch / timeout setup');
+    assert(main.indexOf('_idle_touch_activity(cmd)') > flag, 'every dispatched command touches activity');
+    const entry = (PY_CONTENT.match(/def _idle_watcher_entry\([\s\S]*?\n\n\ndef /) || [''])[0];
+    assert(/memo = \{"pages": _idle_page_fingerprint\(_idle_page_targets\(port\)\)\}/.test(entry)
+      && /_idle_watcher_step\(port, token, memo=memo\)/.test(entry),
+      'the watcher loop must baseline and carry the page fingerprint between rounds');
+    assert(/def _idle_page_targets\(port\):[\s\S]{0,200}urlopen\(.*\/json", timeout=3\)/.test(PY_CONTENT),
+      'the /json read must be bounded');
+    const mcp = (PY_CONTENT.match(/def _execute_tool\([\s\S]*?\n    def run\(self\)/) || [''])[0];
+    assert(/_idle_write_activity\(\)/.test(mcp), 'each MCP tool call counts as activity');
+    assert(/def parse_request\(self\):\s*\n\s*_idle_write_activity\(\)/.test(PY_CONTENT),
+      'each serve API request counts as activity');
+    const api = (PY_CONTENT.match(/def _api_create_session\([\s\S]*?\n\n\ndef /) || [''])[0];
+    assert(/env\['CDPILOT_IDLE_CLOSE'\] = '0'/.test(api), 'serve owns its sessions: no idle watcher');
+  });
+
+  test('idle close: status (node) and health (python) show "idle close in Xm" / "idle close off"', () => {
+    const port = 45681;
+    const now = Date.now() / 1000;
+    fs.mkdirSync(path.join(home, 'idle'), { recursive: true });
+    const statePath = path.join(home, 'idle', `${port}.json`);
+    fs.writeFileSync(statePath, JSON.stringify({
+      token: 't', pid: process.pid, port, project_id: 'idle-proj', minutes: 15, started: now - 600,
+    }));
+    fs.mkdirSync(path.dirname(activityFile), { recursive: true });
+    fs.writeFileSync(activityFile, `${now - 90}\n`);
+    const js = fs.readFileSync(CLI, 'utf-8');
+    const src = (js.match(/function idleCloseLabel\(port\) \{[\s\S]*?\n\}\n/) || [])[0];
+    assert(src, 'bin/cdpilot.js must define idleCloseLabel');
+    assert(/console\.log\(`\s*\$\{idleCloseLabel\(port\)\}/.test(js), 'runStatus must print the label');
+    const label = new Function('fs', 'path', 'os', 'process', `${src}\nreturn idleCloseLabel;`)(
+      fs, path, os, { env: { CDPILOT_HOME: home }, kill: process.kill.bind(process) });
+    assert.strictEqual(label(port), 'idle close in 14m');
+    assert.strictEqual(label(port + 1), 'idle close off', 'no watcher record -> off');
+    const { res } = py(`
+print("RESULT=" + json.dumps([mod._idle_status(${port}), mod._idle_status(${port + 1})]))
+`);
+    assert.deepStrictEqual(res[0][0], 'idle close in 14m');
+    assert(res[0][1] > 780 && res[0][1] <= 810, `seconds left: ${res[0][1]}`);
+    assert.deepStrictEqual(res[1], ['idle close off', null]);
+    fs.writeFileSync(statePath, JSON.stringify({ pid: 900000000, minutes: 15, started: now, project_id: 'x' }));
+    assert.strictEqual(label(port), 'idle close off', 'a dead watcher means off');
+    assert(/info\['idle_close'\], info\['idle_close_in_s'\]/.test(PY_CONTENT), 'health reports idle_close');
+  });
+
+  test('idle close: README and CHANGELOG document CDPILOT_IDLE_CLOSE', () => {
+    const root = path.join(__dirname, '..');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    assert(/\| `CDPILOT_IDLE_CLOSE` \| `15` \|/.test(readme), 'README env table needs CDPILOT_IDLE_CLOSE');
+    assert(/Idle auto-close/.test(readme), 'README Reliability section needs the idle auto-close note');
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    const unreleased = (changelog.match(/## \[Unreleased\]([\s\S]*?)\n## \[/) || [])[1] || '';
+    assert(unreleased.includes('CDPILOT_IDLE_CLOSE'), 'CHANGELOG [Unreleased] must describe CDPILOT_IDLE_CLOSE');
+  });
+
+  fs.rmSync(home, { recursive: true, force: true });
+})();
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
