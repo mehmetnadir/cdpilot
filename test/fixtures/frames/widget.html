@@ -1,7 +1,7 @@
 <!doctype html>
 <!--
   iframe fixture — a third-party-style widget loaded inside smart.html:
-  a newsletter button, an ENABLED "Submit" and an Email field.
+  a newsletter button, an ENABLED "Submit", "Settings" and an Email field.
   Interactions are recorded in <body data-log>.
 -->
 <html>
@@ -13,6 +13,7 @@
 <body data-log="">
   <button id="newsletter" type="button" onclick="log('newsletter')">Sign up for our newsletter</button>
   <button id="submit" type="button" onclick="log('submit')">Submit</button>
+  <button id="settings" type="button" onclick="log('settings')">Settings</button>
   <label for="email">Email</label>
   <input id="email" name="email" autocomplete="off">
   <script>

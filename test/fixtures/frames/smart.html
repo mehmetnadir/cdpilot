@@ -3,8 +3,10 @@
   iframe fixture — smart-* page-vs-frame order and literal `>>>` selectors.
   ?child=<url>  src of iframe#child (default: widget.html, same origin).
   The page itself has: a "Sign up" link written with &nbsp;, a DISABLED
-  "Submit", a "Next >>>" button (text, not a frame chain), a hidden iframe,
-  and no Email field (that one lives only in the child frame).
+  "Submit", a "Next >>>" button and a "Main >>> Settings" link (text, not
+  frame chains), a hidden iframe, the child iframe inside <main id=widget-box>
+  (a wrapper, like Stripe's #card-element), and no Email field (that one
+  lives only in the child frame).
 -->
 <html>
 <head>
@@ -21,7 +23,8 @@
   <button id="next" type="button" onclick="log('next')">Next &gt;&gt;&gt;</button>
   <p id="status">idle</p>
   <iframe id="hidden-frame" src="about:blank" style="display:none"></iframe>
-  <iframe id="child" title="Widget"></iframe>
+  <a id="crumb" href="#" onclick="log('crumb'); return false">Main &gt;&gt;&gt; Settings</a>
+  <main id="widget-box"><iframe id="child" title="Widget"></iframe></main>
   <script>
     function log(s) { document.body.dataset.log += s + ';'; }
     var q = new URLSearchParams(location.search);
