@@ -352,6 +352,13 @@ function showHelp() {
     submit <form>      Submit form
     hover <sel>        Hover element
     keys <combo>       Keyboard shortcut
+    Inside an iframe:  click "iframe#card >>> input[name=cardnumber]"
+                       (nest: "iframe.a >>> iframe.b >>> button") or
+                       --frame <selector|index|url-substring>; same-origin and
+                       cross-origin frames. smart-* commands search frames
+                       automatically when the page has no match.
+    frame list|eval [--frame <f>]
+                       List iframes / run JS inside a frame
 
   DEBUGGING
     console [url]      Capture console logs

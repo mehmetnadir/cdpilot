@@ -1,0 +1,35 @@
+<!doctype html>
+<!--
+  iframe fixture — top document.
+  ?child=<url>  src of iframe#card (default: inner.html, same origin).
+  For a cross-origin (out-of-process) child serve this directory on two
+  ports and point child at the other host, e.g.
+    top.html?child=http://localhost:8762/inner.html
+  (127.0.0.1 vs localhost = different site, so Chrome isolates the frame).
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>cdpilot frames: top</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 16px; }
+    .spacer { height: 900px; background: linear-gradient(#eee, #ccc); }
+    iframe { width: 520px; height: 420px; border: 6px solid #444; padding: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Checkout</h1>
+  <button id="top-btn" onclick="document.getElementById('top-status').textContent='top clicked'">
+    Top button
+  </button>
+  <p id="top-status">idle</p>
+  <!-- Pushes the iframe below the fold: offsets must survive scrolling. -->
+  <div class="spacer"></div>
+  <iframe id="card" name="card-frame" title="Secure card payment"></iframe>
+  <script>
+    window.FRAME_NAME = 'top';
+    var q = new URLSearchParams(location.search);
+    document.getElementById('card').src = q.get('child') || 'inner.html';
+  </script>
+</body>
+</html>

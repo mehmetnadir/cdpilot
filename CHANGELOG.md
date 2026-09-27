@@ -2,6 +2,15 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **iframe targeting for element commands** (#1). Card forms (Stripe/iyzico-style), embedded login widgets and the reCAPTCHA checkbox live in `<iframe>`s that `click`/`fill`/`type` could not reach. Name the frame chain before the selector with `>>>` — `cdpilot click "iframe#card >>> input[name=cardnumber]"`, nested `"iframe.a >>> iframe.b >>> button"` — or pass `--frame <selector|index|url-substring>` (nestable with `>>>`; `url=` forces a src-substring match). Covers `click`, `fill`, `type`, `submit`, `hover`, `dblclick`, `rightclick`, `smart-click`, `smart-fill`, `smart-select`. `>>>` inside quotes or `[...]` stays literal; an empty segment exits 2.
+- **Cross-origin frames work, including out-of-process iframes.** Each hop is resolved over CDP, never through `contentDocument`: `DOM.describeNode` on the `<iframe>` gives the frame id; a same-process frame runs in its main-world execution context (read from the events `Runtime.enable` replays, disabled again immediately); an out-of-process frame gets a flat session (`Target.attachToTarget` with `flatten: true`) and its messages carry that `sessionId`. `cdp_send` accepts an optional 4th tuple element (session id).
+- **Page-coordinate mouse input inside frames.** `hover`, `dblclick`, `rightclick` and `--entropy=on` clicks dispatch `Input.dispatchMouseEvent` on the page; the frame's content-box offset (summed over nested frames, re-measured after page JS runs) is added so the browser hit-tests into the right frame. Keyboard input follows focus into the frame unchanged.
+- **Automatic frame search for `smart-click` / `smart-fill` / `smart-select`.** When the text is not found in the page, visible frames are searched breadth-first (at most 20 frames / 2 s) and the match is reported on one stderr line: `smart-click: matched inside frame iframe#card (<src>)`.
+- **`frame eval --frame <f> <js>`** runs inside that frame's own page context (was: always the main page); without `--frame` it behaves as before. `frame list --frame <f>` lists the iframes inside a frame and marks hidden ones; indices match `--frame <index>` (`<frame>` elements are now listed too).
+
 ## [0.9.2] - 2026-09-27
 
 Why: in ~1,225 real agent sessions the top failures were "CDP connection error. Is the browser running?" (292), a command hanging with no way to bound it (171, #2) and `open <url>` typed instead of `go <url>` (14).

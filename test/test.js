@@ -3463,6 +3463,323 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
   }
 });
 
+// ── iframe targeting (#1) ──
+// `click "iframe#card >>> input"` / `--frame <f>` for element commands, over
+// CDP (flat sessions for out-of-process frames), never contentDocument.
+// Parser and rewrite logic run as pure Python here; the browser path is the
+// opt-in e2e test at the end (CDPILOT_E2E=1) plus test/fixtures/frames/.
+(function() {
+  const { execFileSync, spawn, spawnSync } = require('child_process');
+  const os = require('os');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const FRAME_SEP_LINE = (PY_CONTENT.match(/^FRAME_SEP = ".*"$/m) || [])[0];
+
+  function pyFuncs(names) {
+    const fns = names.map((n) => extractPyFunc(PY_CONTENT, n));
+    fns.forEach((f, i) => assert(f, `${names[i]} must be extractable`));
+    assert(FRAME_SEP_LINE, 'FRAME_SEP constant must exist');
+    return FRAME_SEP_LINE + '\n\n' + fns.join('\n\n');
+  }
+
+  test('frames: selector parser splits >>> (nesting, quotes, brackets, escapes, strictness)', () => {
+    const src = pyFuncs(['_split_frame_chain', '_split_frame_selector']) + `
+import json, sys
+out = []
+for sel, strict in json.load(sys.stdin):
+    try:
+        f, e = _split_frame_selector(sel, strict)
+        out.append([f, e])
+    except ValueError:
+        out.append('ERR')
+print(json.dumps(out))
+`;
+    const cases = [
+      [['iframe#card >>> input[name=cardnumber]', true], [['iframe#card'], 'input[name=cardnumber]']],
+      [['iframe.a >>> iframe.b >>> button', true], [['iframe.a', 'iframe.b'], 'button']],
+      [['iframe[title="a >>> b"] >>> button', true], [['iframe[title="a >>> b"]'], 'button']],
+      [["iframe[title='x>>>y'] >>> #b", true], [["iframe[title='x>>>y']"], '#b']],
+      [['iframe[title=a>>>b] >>> #b', true], [['iframe[title=a>>>b]'], '#b']],
+      [['div:not(.a >>> .b)', true], [[], 'div:not(.a >>> .b)']],
+      [['#a\\>>> b', true], [[], '#a\\>>> b']],
+      [['button.primary', true], [[], 'button.primary']],
+      [['  iframe  >>>  button  ', true], [['iframe'], 'button']],
+      [['iframe >>> ', true], 'ERR'],
+      [[' >>> button', true], 'ERR'],
+      [['a >>> >>> b', true], 'ERR'],
+      [['Next >>>', false], [[], 'Next >>>']],
+      [['#card >>> Pay now', false], [['#card'], 'Pay now']],
+    ];
+    const got = JSON.parse(execFileSync(PYB, ['-c', src], {
+      input: JSON.stringify(cases.map((c) => c[0])), encoding: 'utf-8', timeout: 10000,
+    }).trim());
+    cases.forEach((c, i) => assert.deepStrictEqual(got[i], c[1], `split ${JSON.stringify(c[0])}`));
+  });
+
+  test('frames: --frame flag extraction and hop kinds (index / url= / auto, nested spec)', () => {
+    const src = pyFuncs(['_split_frame_chain', '_parse_frame_hop', '_parse_frame_spec', '_extract_frame_flag']) + `
+import json, sys
+def run(kind, arg):
+    try:
+        if kind == 'hop':
+            return _parse_frame_hop(arg)
+        if kind == 'spec':
+            return _parse_frame_spec(arg)
+        rest, value = _extract_frame_flag(arg)
+        return [rest, value]
+    except ValueError:
+        return 'ERR'
+print(json.dumps([run(k, a) for k, a in json.load(sys.stdin)]))
+`;
+    const cases = [
+      [['hop', '2'], { kind: 'index', value: 2 }],
+      [['hop', ' 0 '], { kind: 'index', value: 0 }],
+      [['hop', 'url=js.stripe.com'], { kind: 'url', value: 'js.stripe.com' }],
+      [['hop', 'URL:localhost:8762'], { kind: 'url', value: 'localhost:8762' }],
+      [['hop', '#card'], { kind: 'auto', value: '#card' }],
+      [['hop', 'card-frame'], { kind: 'auto', value: 'card-frame' }],
+      [['spec', '0 >>> iframe[name="x >>> y"]'],
+        [{ kind: 'index', value: 0 }, { kind: 'auto', value: 'iframe[name="x >>> y"]' }]],
+      [['spec', 'a >>> '], 'ERR'],
+      [['spec', ''], 'ERR'],
+      [['flag', ['--frame', '#card', 'button']], [['button'], '#card']],
+      [['flag', ['button', '--frame=2', '--no-heal']], [['button', '--no-heal'], '2']],
+      [['flag', ['a', 'b']], [['a', 'b'], null]],
+      [['flag', ['--framex', 'a']], [['--framex', 'a'], null]],
+      [['flag', ['a', '--frame']], 'ERR'],
+      [['flag', ['--frame=', 'a']], 'ERR'],
+      [['flag', ['--frame', ' ', 'a']], 'ERR'],
+    ];
+    const got = JSON.parse(execFileSync(PYB, ['-c', src], {
+      input: JSON.stringify(cases.map((c) => c[0])), encoding: 'utf-8', timeout: 10000,
+    }).trim());
+    cases.forEach((c, i) => assert.deepStrictEqual(got[i], c[1], `${JSON.stringify(c[0])}`));
+  });
+
+  test('frames: rewrite sends Runtime/DOM into the frame and shifts mouse x/y by the frame offset', () => {
+    const src = extractPyFunc(PY_CONTENT, '_frame_route_rewrite');
+    assert(src, '_frame_route_rewrite must be extractable');
+    const out = execFileSync(PYB, ['-c', src + `
+
+import asyncio, json
+class Route:
+    context_id, session_id, chain, dirty, offset = 42, 'S1', [('p', 'o')], True, (0.0, 0.0)
+calls = []
+async def _frame_route_refresh_offset(route):
+    calls.append(1)
+    route.offset, route.dirty = (100.0, 1000.0), False
+    return route.offset
+cmds = [
+    (1, 'Runtime.evaluate', {'expression': '1'}),
+    (2, 'DOM.describeNode', {'objectId': 'o'}),
+    (3, 'Input.dispatchMouseEvent', {'type': 'mousePressed', 'x': 10, 'y': 20}),
+    (4, 'Input.dispatchMouseEvent', {'type': 'mouseReleased', 'x': 10, 'y': 20}),
+    (5, 'Input.dispatchKeyEvent', {'type': 'keyDown', 'key': 'a'}),
+    (6, 'Page.navigate', {'url': 'about:blank'}),
+    (7, 'Runtime.evaluate', {'expression': '2', 'contextId': 99}),
+    (8, 'Runtime.evaluate', {'expression': '3'}, 'EXPLICIT'),
+    (9, 'Input.dispatchMouseEvent', {'type': 'mouseMoved', 'x': 5, 'y': 5}),
+]
+res = asyncio.run(_frame_route_rewrite(Route(), cmds))
+print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
+`], { encoding: 'utf-8', timeout: 10000 });
+    const r = JSON.parse(out.trim());
+    assert.deepStrictEqual(r.out, [
+      [1, 'Runtime.evaluate', { expression: '1', contextId: 42 }, 'S1'],
+      [2, 'DOM.describeNode', { objectId: 'o' }, 'S1'],
+      [3, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: 110, y: 1020 }],
+      [4, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: 110, y: 1020 }],
+      [5, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a' }],
+      [6, 'Page.navigate', { url: 'about:blank' }],
+      [7, 'Runtime.evaluate', { expression: '2', contextId: 99 }, 'S1'],
+      [8, 'Runtime.evaluate', { expression: '3' }, 'EXPLICIT'],
+      [9, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 105, y: 1005 }],
+    ]);
+    assert.strictEqual(r.refreshes, 2, 'offset re-measured once per page-JS run before mouse input, not per event');
+    assert.deepStrictEqual(r.orig, { type: 'mousePressed', x: 10, y: 20 }, "caller's params must not be mutated");
+  });
+
+  test('frames: click/fill/type/submit/hover/dblclick/rightclick/smart-* route through the frame-aware resolver', () => {
+    const deco = (fn) => (PY_CONTENT.match(new RegExp(`\\n@_frame_aware\\("(css|text)"\\)\\nasync def ${fn}\\(`)) || [])[1];
+    for (const fn of ['cmd_click', 'cmd_fill', 'cmd_submit', 'cmd_hover', 'cmd_dblclick', 'cmd_rightclick']) {
+      assert.strictEqual(deco(fn), 'css', `${fn} must be decorated with @_frame_aware("css")`);
+    }
+    for (const fn of ['cmd_smart_click', 'cmd_smart_fill', 'cmd_smart_select']) {
+      assert.strictEqual(deco(fn), 'text', `${fn} must be decorated with @_frame_aware("text")`);
+    }
+    assert(/"type": lambda:[^\n]*cmd_fill\(/.test(PY_CONTENT), '`type` must dispatch to cmd_fill (frame-aware)');
+    const set = (PY_CONTENT.match(/FRAME_AWARE_CMDS = frozenset\(\{([\s\S]*?)\}\)/) || [])[1] || '';
+    for (const c of ['click', 'fill', 'type', 'submit', 'hover', 'dblclick', 'rightclick',
+      'smart-click', 'smart-fill', 'smart-select', 'frame']) {
+      assert(set.includes(`"${c}"`), `FRAME_AWARE_CMDS must list ${c} (so --frame is accepted)`);
+    }
+    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('if __name__ == "__main__":'));
+    assert(/if cmd in FRAME_AWARE_CMDS:[\s\S]{0,200}_extract_frame_flag\(args\)/.test(main),
+      '__main__ must strip --frame from args for frame-aware commands');
+    const wrapper = extractPyFunc(PY_CONTENT, '_frame_aware') || '';
+    assert(/_split_frame_selector\(target, strict=\(kind == "css"\)\)/.test(wrapper), 'decorator must parse >>>');
+    assert(/_frame_route_open\(ws_url, hops\)/.test(wrapper), 'decorator must resolve the frame route');
+    assert(/finally:\s*\n\s*_FRAME_ROUTE\.reset\(token\)\s*\n\s*await _frame_route_close\(route\)/.test(wrapper),
+      'route must be uninstalled and its sessions detached even when the command exits');
+  });
+
+  test('frames: smart-* fall back to a bounded breadth-first frame search', () => {
+    for (const [fn, label] of [['cmd_smart_click', 'smart-click'], ['cmd_smart_fill', 'smart-fill'],
+      ['cmd_smart_select', 'smart-select']]) {
+      const body = extractCmdBody(PY_CONTENT, fn) || '';
+      assert(body.includes(`raw = await _smart_eval(ws_url, js, "${label}")`), `${fn} must evaluate via _smart_eval`);
+    }
+    assert(/^FRAME_SEARCH_MAX_FRAMES = 20\b/m.test(PY_CONTENT), 'search must stop after 20 frames');
+    assert(/^FRAME_SEARCH_BUDGET_S = 2\.0\b/m.test(PY_CONTENT), 'search must stop after 2 s');
+    const ev = extractPyFunc(PY_CONTENT, '_smart_eval') || '';
+    assert(/if _FRAME_ROUTE\.get\(\) is not None:\s*\n\s*return await _smart_eval_once\(ws_url, js\)/.test(ev),
+      'explicit >>> / --frame: run only in that frame, no search');
+    const order = ['var __cdpilotMinScore = {SMART_STRONG_SCORE}', 'if _smart_found(raw):',
+      'await _frame_search(ws_url, strict, label)', 'return await _smart_eval_once(ws_url, js)']
+      .map((s) => ev.lastIndexOf(s));
+    assert(order.every((p, i) => p > 0 && (i === 0 || p > order[i - 1])),
+      'order must be: real match in page -> in frames -> page again with the old (weak-match) rules');
+    assert(/^SMART_STRONG_SCORE = 60\b/m.test(PY_CONTENT), 'a real text match is score >= 60');
+    const click = extractCmdBody(PY_CONTENT, 'cmd_smart_click') || '';
+    assert(/if \(best\.score < minScore\) return JSON\.stringify\(\{\{found: false, weakScore: best\.score\}\}\);\s*\n\s*best\.el\.scrollIntoView/.test(click),
+      'smart-click must report (not click) a weak hit while a real match is being looked for');
+    assert(/typeof __cdpilotMinScore === 'number'\) \? __cdpilotMinScore : 0/.test(click),
+      'without the frame-search wrapper the old scoring applies unchanged');
+    const search = extractPyFunc(PY_CONTENT, '_frame_search') || '';
+    assert(/queue\.pop\(0\)/.test(search) && /queue\.append\(child\)/.test(search), 'search must be breadth-first');
+    assert(/time\.monotonic\(\) < deadline/.test(search), 'search must honour its time budget');
+    assert(/if f\.get\("visible"\)/.test(search), 'hidden frames must be skipped');
+    assert(/matched inside frame/.test(search) && /file=sys\.stderr/.test(search),
+      'the matching frame must be reported on stderr');
+  });
+
+  test('frames: CDP mechanism — flat sessions for OOPIFs, main-world contexts, no contentDocument', () => {
+    const ctx = extractPyFunc(PY_CONTENT, '_frame_context_for') || '';
+    assert(/"Runtime\.enable", \{\}, sid\), \(2, "Runtime\.disable"/.test(ctx),
+      'same-process frames: Runtime.enable immediately followed by Runtime.disable');
+    assert(/aux\.get\("frameId"\) == frame_id and aux\.get\("isDefault"\)/.test(ctx),
+      'must pick the frame\'s default (main-world) context');
+    assert(/"Target\.attachToTarget",\s*\{"targetId": frame_id, "flatten": True\}/.test(ctx),
+      'out-of-process frames: Target.attachToTarget with flatten: true');
+    const push = extractPyFunc(PY_CONTENT, '_frame_route_push') || '';
+    assert(/"DOM\.describeNode", \{"objectId": oid\}/.test(push), 'frame id must come from DOM.describeNode');
+    const section = PY_CONTENT.slice(PY_CONTENT.indexOf('# ─── Frame targeting'),
+      PY_CONTENT.indexOf('async def navigate_collect('));
+    assert(section.length > 1000, 'frame section must precede navigate_collect');
+    assert(!/contentDocument|contentWindow/.test(section.replace(/#.*$/gm, '')),
+      'frame code must not use contentDocument/contentWindow (blocked cross-origin)');
+    assert(/clientLeft/.test(section) && /paddingTop/.test(section),
+      'offset must be the iframe content box (border + padding skipped)');
+  });
+
+  test('frames: cdp_send carries sessionId, collects events, keeps routes on one socket', () => {
+    const body = (PY_CONTENT.match(/async def cdp_send\([\s\S]*?\n(?=async def |def )/) || [''])[0];
+    assert(/commands = await _frame_route_rewrite\(_route, commands\)/.test(body), 'cdp_send must apply the route');
+    assert(/not _route\.busy and ws_url == _route\.root_ws/.test(body), 'only the routed page, never route bookkeeping');
+    assert.strictEqual((body.match(/_cdp_wire\(cmd\)/g) || []).length, 3, 'all three send loops must use _cdp_wire');
+    assert.strictEqual((body.match(/_sink\.append\(data2?\)/g) || []).length, 3, 'all three recv loops must feed the sink');
+    const wire = extractPyFunc(PY_CONTENT, '_cdp_wire') || '';
+    assert(/msg\["sessionId"\] = cmd\[3\]/.test(wire), '4th tuple element becomes sessionId');
+    const open = extractPyFunc(PY_CONTENT, '_frame_route_open') || '';
+    assert(/route\.pool_was, _WS_POOL_ENABLED = _WS_POOL_ENABLED, True/.test(open),
+      'flat sessions die with their socket: a route must pin the WS pool on (CDPILOT_WS_POOL=0)');
+  });
+
+  test('frames: frame eval honours --frame and keeps top-page behaviour without it', () => {
+    const fr = extractPyFunc(PY_CONTENT, 'cmd_frame') || '';
+    assert(/_extract_frame_flag\(list\(subcmd_args\)\)/.test(fr), 'frame subcommands must accept --frame');
+    assert(/route = await _frame_route_open\(ws_url, hops\)/.test(fr), 'frame eval must resolve the frame');
+    assert(/route = None/.test(fr) && /if hops and subcmd in/.test(fr), 'no --frame => no route => top page');
+    const run = extractPyFunc(PY_CONTENT, '_cmd_frame_run') || '';
+    assert(/"Runtime\.evaluate", \{"expression": js_code, "returnByValue": True\}/.test(run),
+      'eval keeps its original Runtime.evaluate call (the route redirects it)');
+    assert(/_FRAME_LIST_JS/.test(run), 'frame list must share the --frame <index> ordering');
+  });
+
+  test('frames: CLI rejects --frame without a value (exit 2, before any browser work)', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-frames-test-'));
+    const r = spawnSync(process.execPath, [CLI, 'click', 'button', '--frame'], {
+      encoding: 'utf-8', timeout: 30000,
+      env: { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+        CDP_PORT: '19223', CHROME_BIN: path.join(home, 'no-such-browser'), CDPILOT_NO_AUTOLAUNCH: '1' },
+    });
+    assert.strictEqual(r.status, 2, `exit ${r.status}, stderr: ${r.stderr}`);
+    assert(/--frame needs a value/.test(r.stderr), `stderr: ${r.stderr}`);
+  });
+
+  test('frames: docs — README section, CHANGELOG [Unreleased], help text in src and bin', () => {
+    const root = path.join(__dirname, '..');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    assert(/### Element targeting inside iframes/.test(readme), 'README needs the element-targeting section');
+    assert(readme.includes('iframe#card >>> input[name=cardnumber]') && readme.includes('--frame'),
+      'README must show >>> and --frame');
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    const unreleased = (changelog.match(/## \[Unreleased\]([\s\S]*?)\n## \[/) || [])[1] || '';
+    assert(/iframe/i.test(unreleased) && unreleased.includes('--frame'), 'CHANGELOG [Unreleased] must describe iframes');
+    const doc = (PY_CONTENT.match(/^"""([\s\S]*?)"""/m) || [])[1] || '';
+    assert(doc.includes('>>>') && doc.includes('--frame'), 'python --help docstring must document frames');
+    const bin = fs.readFileSync(CLI, 'utf8');
+    assert(bin.includes('iframe#card >>> input[name=cardnumber]') && bin.includes('--frame'),
+      'bin help must document frames');
+    for (const f of ['top.html', 'inner.html', 'nested.html']) {
+      assert(fs.existsSync(path.join(__dirname, 'fixtures', 'frames', f)), `fixture frames/${f} must exist`);
+    }
+  });
+
+  // Real browser, headless, isolated CDPILOT_HOME + free ports. Opt-in: CI
+  // runners are not assumed to have a sandbox-capable Chrome.
+  if (process.env.CDPILOT_E2E !== '1') {
+    console.log('  - skipped: frames e2e (set CDPILOT_E2E=1 to run it against a headless browser)');
+    return;
+  }
+  test('frames e2e: click/fill/type/smart-click in same-origin and cross-origin (OOPIF) iframes', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-frames-e2e-'));
+    const ports = JSON.parse(execFileSync(PYB, ['-c', [
+      'import json, socket', 'ss = [socket.socket() for _ in range(3)]',
+      '[s.bind(("127.0.0.1", 0)) for s in ss]',
+      'print(json.dumps([s.getsockname()[1] for s in ss]))', '[s.close() for s in ss]',
+    ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
+    const [cdpPort, p1, p2] = ports;
+    const fixtures = path.join(__dirname, 'fixtures', 'frames');
+    const servers = [p1, p2].map((p) => spawn(PYB, ['-m', 'http.server', String(p), '--bind', '127.0.0.1'],
+      { cwd: fixtures, stdio: 'ignore' }));
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1' };
+    delete env.CDPILOT_TARGET;
+    const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf-8', timeout: 60000, env });
+    const ok = (r, re, what) => assert(re.test(r.stdout + r.stderr),
+      `${what}: exit ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    try {
+      execFileSync(PYB, ['-c', [
+        'import time, urllib.request',
+        `urls = ["http://127.0.0.1:${p1}/top.html", "http://127.0.0.1:${p2}/inner.html"]`,
+        'for u in urls:',
+        '    for _ in range(50):',
+        '        try: urllib.request.urlopen(u, timeout=1); break',
+        '        except Exception: time.sleep(0.1)',
+      ].join('\n')], { timeout: 20000 });
+      ok(c('launch'), /CDP ready/, 'launch');
+      const child = `http://localhost:${p2}/inner.html?nested=http://127.0.0.1:${p1}/nested.html`;
+      for (const url of [`http://127.0.0.1:${p1}/top.html`,
+        `http://127.0.0.1:${p1}/top.html?child=${encodeURIComponent(child)}`]) {
+        c('go', url);
+        ok(c('click', '#card >>> #pay-btn'), /Clicked: BUTTON Pay now/, `click ${url}`);
+        ok(c('fill', 'iframe#card >>> input[name=cardnumber]', '4242'), /Filled: INPUT = 4242/, 'fill');
+        ok(c('type', '--frame', 'card-frame', '#cvc', '123'), /Filled: INPUT = 123/, 'type --frame');
+        ok(c('click', '#card >>> #nested >>> #deep-btn', '--entropy=on'), /Clicked: BUTTON Deep button/, 'nested');
+        ok(c('smart-click', 'Deep button'), /matched inside frame iframe#card >>> iframe#nested/, 'smart-click');
+        ok(c('frame', 'eval', '--frame', '#card', "[window.FRAME_NAME, document.querySelector('#status').textContent,"
+          + " document.querySelector('#cc').value, document.querySelector('#cvc').value].join('|')"),
+        /Result: inner\|paid\|4242\|123/, 'frame eval');
+        ok(c('frame', 'eval', '--frame', '#card >>> #nested', 'document.body.dataset.log'),
+          /deep-click:trusted/, 'page-coordinate click landed in the nested frame');
+      }
+    } finally {
+      c('stop');
+      servers.forEach((s) => { try { s.kill(); } catch (e) { /* already gone */ } });
+    }
+  });
+})();
+
 // ── Connection resilience: auto-launch, global --timeout, `open` alias ──
 // Measured on ~1,225 real agent sessions: "CDP connection error. Is the
 // browser running?" 292x, a hung command with no way to bound it 171x
