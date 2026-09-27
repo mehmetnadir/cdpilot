@@ -26,7 +26,7 @@
 | Site kaynak kodu | `/Users/nadir/01dev/cdpilot-site/` |
 
 ## Dikkat Edilecekler
-- **Tek dosya mimari:** Tüm Python kodu `src/cdpilot.py` (~2600 satır)
+- **Tek dosya mimari:** Tüm Python kodu `src/cdpilot.py` (büyüyor — güncel satır sayısı için `wc -l src/cdpilot.py`, 2026-09-27'de 13.129 satır)
 - **Sıfır bağımlılık:** Harici Python/npm paketi eklenmez — stdlib only
 - **Port 9222:** Varsayılan CDP, `CDP_PORT` env ile değişir
 - **Brave öncelikli:** Brave > Chrome > Chromium

@@ -620,7 +620,7 @@ if (cmd === 'status') {
   // Delegate to Python
   const python = findPython();
   if (!python) {
-    console.error('Error: Python 3.8+ required. Install: https://www.python.org/downloads/');
+    console.error('Error: Python 3.10+ required. Install: https://www.python.org/downloads/');
     process.exit(1);
   }
 

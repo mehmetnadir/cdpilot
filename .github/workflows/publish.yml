@@ -29,3 +29,33 @@ jobs:
           CDPILOT_PYTHON: python
       - name: Publish to npm (OIDC)
         run: npm publish --access public --provenance
+
+      - name: Sync server.json version with package.json
+        run: |
+          V=$(node -p "require('./package.json').version")
+          jq --arg v "$V" '.version = $v | .packages[0].version = $v' server.json > server.json.tmp
+          mv server.json.tmp server.json
+
+      - name: Wait for npm to show the new version
+        run: |
+          V=$(node -p "require('./package.json').version")
+          for i in $(seq 1 12); do
+            if npm view cdpilot@"$V" version >/dev/null 2>&1; then
+              echo "npm registry has cdpilot@$V"
+              exit 0
+            fi
+            echo "waiting for npm registry to show cdpilot@$V ($i/12, 10s each)..."
+            sleep 10
+          done
+          echo "Timed out waiting for cdpilot@$V on npm" >&2
+          exit 1
+
+      - name: Install mcp-publisher (pinned v1.8.1)
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server to MCP Registry
+        run: ./mcp-publisher publish

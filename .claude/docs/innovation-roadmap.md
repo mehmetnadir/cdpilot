@@ -13,8 +13,8 @@
 | A11y token-efficient agent IF | 🟡 Yarım | Faz 3'te tamamla |
 | Stealth (binary-level / behavioral) | 🔴 Geride | Faz 2: behavioral entropy |
 | Self-healing / agentic QA | 🔴 Eksik | Faz 1: selector ladder |
-| Test runner birleşimi | 🔴 Eksik | Faz 4: cdpilot test |
-| Cloud-API uyumlu lokal | 🔴 Eksik | Faz 5: serve --api |
+| Test runner birleşimi | 🟢 Yapıldı (kod var, belgesiz) | `cmd_test`/`cmd_trace` dispatch'te (`src/cdpilot.py:11447,11556`); README/`--help`'e eklenmedi (2026-09-27 denetimi) |
+| Cloud-API uyumlu lokal | 🟢 Yapıldı (kod var, belgesiz) | `cmd_serve(api=True)` + `/v1/sessions` gerçek (`src/cdpilot.py:7643,7705`); README/`--help`'e eklenmedi (2026-09-27 denetimi) |
 
 ## Faz Sırası
 
@@ -78,6 +78,9 @@ döner. Tree diff cache (`~/.cdpilot/projects/<id>/a11y-tree.cache`).
 
 ### Faz 4 — `cdpilot test` Zero-Config Runner
 
+> **DURUM (2026-09-27 denetimi): kod zaten yazılmış** (`cmd_test`/`cmd_trace_open`
+> dispatch'te), ama README ve `--help`'te hiç anılmıyor — tek eksik iş belgeleme.
+
 **Ne:** `*.cdpt.js` veya `*.cdpt.py` dosyalarını çalıştırır. Watch mode,
 Context Pool ile paralel. Her step için **trace bundle**
 (a11y+screenshot+console+network) → `cdpilot trace open` ile time-travel.
@@ -97,6 +100,9 @@ Vitest Browser Mode'a alternatif (CDP üzerinden, daha az soyutlama).
 **Test:** Kendi test suite'imizi cdpilot test ile yaz.
 
 ### Faz 5 — Browserbase-Compatible Local API
+
+> **DURUM (2026-09-27 denetimi): kod zaten yazılmış** (`cmd_serve(api=True)`,
+> `/v1/sessions` gerçek), ama README ve `--help`'te hiç anılmıyor.
 
 **Ne:** `cdpilot serve --api` REST sunucu. Browserbase API shape:
 - `POST /v1/sessions` → CDP URL döner (context pool'dan)

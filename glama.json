@@ -1,7 +1,7 @@
 {
   "name": "cdpilot",
   "display_name": "cdpilot",
-  "description": "Zero-dependency browser automation CLI with 40+ commands and built-in MCP server. Accessibility tree snapshots for AI agents — 500x fewer tokens than screenshot-based approaches.",
+  "description": "Zero-dependency browser automation CLI with 70+ commands and a built-in MCP server. Accessibility tree snapshots for AI agents — far fewer tokens than screenshot-based approaches.",
   "repository": "https://github.com/mehmetnadir/cdpilot",
   "homepage": "https://cdpilot.ndr.ist",
   "license": "MIT",
@@ -13,6 +13,6 @@
   "tags": ["cdp", "chrome-devtools-protocol", "mcp", "accessibility", "zero-dependency"],
   "installation": {
     "command": "npx cdpilot mcp",
-    "requirements": ["node >= 18", "python >= 3.8"]
+    "requirements": ["node >= 18", "python >= 3.10"]
   }
 }

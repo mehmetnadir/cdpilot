@@ -2873,6 +2873,43 @@ test('close: CLI smoke — `stop --smart` with no browser is a graceful no-op', 
     '`stop --smart` must report no browser running instead of crashing');
 });
 
+// ── Metadata consistency (2026-09-27) ──
+// The same fact lived in several files and drifted apart: glama.json and
+// bin/cdpilot.js said Python 3.8+ while the code needs 3.10+, and the MCP
+// Registry rejects a server.json whose version differs from the npm package.
+
+test('metadata: version is identical in package.json, cdpilot.py and server.json', () => {
+  const root = path.join(__dirname, '..');
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  const py = fs.readFileSync(path.join(root, 'src', 'cdpilot.py'), 'utf8');
+  const server = JSON.parse(fs.readFileSync(path.join(root, 'server.json'), 'utf8'));
+  const pyVersion = (py.match(/^__version__ = "([^"]+)"/m) || [])[1];
+  assert.strictEqual(pyVersion, pkg.version, 'src/cdpilot.py __version__ must match package.json');
+  assert.strictEqual(server.version, pkg.version, 'server.json version must match package.json');
+  assert.strictEqual(server.packages[0].version, pkg.version,
+    'server.json packages[0].version must match package.json');
+});
+
+test('metadata: MCP Registry name matches between package.json and server.json', () => {
+  const root = path.join(__dirname, '..');
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  const server = JSON.parse(fs.readFileSync(path.join(root, 'server.json'), 'utf8'));
+  assert.strictEqual(pkg.mcpName, server.name,
+    'the registry verifies npm ownership by package.json mcpName == server.json name');
+  assert(server.description.length <= 100, 'registry schema caps description at 100 chars');
+});
+
+test('metadata: no file advertises a Python older than the 3.10 the code needs', () => {
+  const root = path.join(__dirname, '..');
+  const files = ['README.md', 'glama.json', path.join('bin', 'cdpilot.js')];
+  for (const f of files) {
+    const txt = fs.readFileSync(path.join(root, f), 'utf8');
+    assert(!/[Pp]ython\s*(?:>=|&gt;=)?\s*3\.[0-9](?![0-9])\s*\+?/.test(
+      txt.replace(/[Pp]ython\s*(?:>=|&gt;=)?\s*3\.1[0-9]/g, '')),
+      `${f} advertises a Python version below 3.10`);
+  }
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);

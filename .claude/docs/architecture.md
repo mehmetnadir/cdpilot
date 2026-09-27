@@ -9,7 +9,7 @@ bin/cdpilot.js (Node.js entry)
     ├── Tarayıcı algılama (Brave > Chrome > Chromium)
     └── → spawn python3 src/cdpilot.py <komut> <args>
 
-src/cdpilot.py (~2600 satır, TEK DOSYA)
+src/cdpilot.py (TEK DOSYA, büyüyor — güncel satır sayısı için `wc -l src/cdpilot.py`, 2026-09-27'de 13.129 satır)
     │
     ├── CDP iletişim katmanı (HTTP + WebSocket)
     │   ├── cdp_get() — HTTP GET (tab listesi vb.)
