@@ -3,6 +3,9 @@ name: Publish to npm
 on:
   release:
     types: [published]
+  # Re-runs the registry half after a partial failure. A rerun of the release
+  # run uses the workflow as it was at the tag; dispatch uses main.
+  workflow_dispatch:
 
 jobs:
   publish:
@@ -28,7 +31,15 @@ jobs:
         env:
           CDPILOT_PYTHON: python
       - name: Publish to npm (OIDC)
-        run: npm publish --access public --provenance
+        # Idempotent: a version already on npm is skipped, so a re-run can still
+        # reach the MCP Registry steps below.
+        run: |
+          V=$(node -p "require('./package.json').version")
+          if npm view cdpilot@"$V" version >/dev/null 2>&1; then
+            echo "cdpilot@$V is already on npm, skipping publish"
+          else
+            npm publish --access public --provenance
+          fi
 
       - name: Sync server.json version with package.json
         run: |
@@ -39,12 +50,14 @@ jobs:
       - name: Wait for npm to show the new version
         run: |
           V=$(node -p "require('./package.json').version")
-          for i in $(seq 1 12); do
+          # 2026-09-27: 0.9.1 was accepted ("being processed") but not visible
+          # after 2 minutes, which failed the release before the MCP Registry.
+          for i in $(seq 1 60); do
             if npm view cdpilot@"$V" version >/dev/null 2>&1; then
               echo "npm registry has cdpilot@$V"
               exit 0
             fi
-            echo "waiting for npm registry to show cdpilot@$V ($i/12, 10s each)..."
+            echo "waiting for npm registry to show cdpilot@$V ($i/60, 10s each)..."
             sleep 10
           done
           echo "Timed out waiting for cdpilot@$V on npm" >&2

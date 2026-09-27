@@ -3144,6 +3144,17 @@ test('metadata: version is identical in package.json, cdpilot.py and server.json
     'server.json packages[0].version must match package.json');
 });
 
+test('metadata: publish workflow can be re-run after npm succeeded', () => {
+  // 0.9.1: npm accepted the package but it stayed invisible past the wait, so
+  // the release failed before the MCP Registry steps. A re-run must skip the
+  // npm publish instead of dying on "version already exists".
+  const wf = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'publish.yml'), 'utf8');
+  assert(/workflow_dispatch:/.test(wf), 'publish.yml must be dispatchable to resume the registry half');
+  const step = (wf.match(/- name: Publish to npm[\s\S]*?(?=\n\s*- name:)/) || [])[0] || '';
+  assert(/npm view cdpilot@"\$V" version/.test(step) && /already on npm/.test(step),
+    'the npm publish step must skip a version that is already published');
+});
+
 test('metadata: MCP Registry name matches between package.json and server.json', () => {
   const root = path.join(__dirname, '..');
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
