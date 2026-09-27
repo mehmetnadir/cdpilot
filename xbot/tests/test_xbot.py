@@ -1495,3 +1495,27 @@ def test_alarms_go_to_phone_push_first(_no_real_push):
     crisis_check._telegram_send("probe")
     assert _no_real_push == ["probe"]
 
+
+# ── voice lint: invented findings (2026-09-27) ──
+@pytest.mark.parametrize("text", [
+    "neat. we found randomized plugin names were the biggest uniqueness signal.",
+    "browser tasks are nice.. we found replaying the session caught more divergence.",
+    "in our tests the headless flag changed nothing.",
+    "our benchmarks show a 3x gap.",
+    "i've tested this on 40 sites and it holds.",
+])
+def test_lint_refuses_invented_findings(text):
+    from reply_drafter import _voice_lint  # type: ignore
+    _, issues = _voice_lint(text)
+    assert "unbacked experience claim" in issues
+
+
+@pytest.mark.parametrize("text", [
+    "i built cdpilot for exactly this flow after playwright kept forcing fresh contexts.",
+    "the agent vs search split is the part that matters.. can you still block training?",
+    'people keep saying "we found it works" without numbers, which is the real problem.',
+])
+def test_lint_allows_opinion_and_the_makers_story(text):
+    from reply_drafter import _voice_lint  # type: ignore
+    _, issues = _voice_lint(text)
+    assert "unbacked experience claim" not in issues

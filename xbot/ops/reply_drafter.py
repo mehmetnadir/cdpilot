@@ -178,6 +178,22 @@ def _without_quotes(text: str) -> str:
     return re.sub(r'"[^"]{1,80}"|\u201c[^\u201d]{1,80}\u201d|\'[^\']{2,80}\'', " ", text or "")
 
 
+# First-person empirical claims. The drafting model has no access to anything
+# we measured, so "we found X" from it is invented by construction — and it
+# kept happening: "we found randomized plugin names were the biggest
+# uniqueness signal", "we found replaying the same session with DOM snapshots
+# caught more divergence" (2026-09). No bench record in the repo backs either.
+# The maker's own story ("i built cdpilot after playwright kept...") is not a
+# measurement and stays allowed. A real, backed finding is written by a human.
+_UNBACKED_CLAIM = re.compile(
+    r"\b(?:we|i)(?:'ve| have)? (?:found|tested|measured|benchmarked|noticed|"
+    r"discovered|observed|learned)\b"
+    r"|\bin our (?:tests?|benchmarks?|runs?|experiments?|data|numbers)\b"
+    r"|\bour (?:benchmarks?|numbers|data|tests?) (?:show|showed|shows|suggest)\b"
+    r"|\bwhen we (?:tried|tested|ran|measured)\b"
+)
+
+
 def _voice_lint(text: str) -> tuple[str, list[str]]:
     """Return (repaired_text, unfixable_issues).
 
@@ -192,6 +208,8 @@ def _voice_lint(text: str) -> tuple[str, list[str]]:
     low = _without_quotes(repaired).lower()
     issues = [b for b in BANNED_SUBSTRINGS
               if b not in ("\u2014", "\u2013", " -- ") and b in low]
+    if _UNBACKED_CLAIM.search(low):
+        issues.append("unbacked experience claim")
     if repaired.count("#") > 1:
         issues.append("multiple hashtags")
     if len(repaired) > 270:
