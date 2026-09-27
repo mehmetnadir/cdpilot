@@ -47,7 +47,9 @@ DATA = bot_home()
 LOG_FILE = DATA / "logs" / "reply-drafter.log"
 
 CLAUDE_BIN = os.environ.get("CDPILOT_CLAUDE_BIN", "claude")
-MODEL = os.environ.get("CDPILOT_REPLY_MODEL", "claude-haiku-4-5")
+# Owner's pick (2026-09-27). Public replies are few (<=3 a day) and every one is
+# judged on voice, so the strongest model is worth the subscription quota.
+MODEL = os.environ.get("CDPILOT_REPLY_MODEL", "claude-opus-5-5")
 
 # `claude setup-token` prints a long-lived token that still has to be installed
 # where the CLI actually runs. Keeping it in a file (not a shell profile) means

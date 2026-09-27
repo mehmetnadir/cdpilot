@@ -1655,3 +1655,12 @@ def test_nemotron_requests_turn_thinking_off(tmp_path, monkeypatch):
 def test_other_models_get_no_thinking_kwargs(tmp_path, monkeypatch):
     body = _captured_nim_body(tmp_path, monkeypatch, "moonshotai/kimi-k3")
     assert "chat_template_kwargs" not in body
+
+
+def test_claude_engine_defaults_to_opus_5_5(monkeypatch):
+    """Owner's pick on 2026-09-27, once srv21 had a token again. The env var
+    still overrides it for a cheaper model."""
+    monkeypatch.delenv("CDPILOT_REPLY_MODEL", raising=False)
+    sys.modules.pop("reply_drafter", None)
+    import reply_drafter as r  # type: ignore
+    assert r.MODEL == "claude-opus-5-5"
