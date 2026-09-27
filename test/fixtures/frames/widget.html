@@ -1,0 +1,23 @@
+<!doctype html>
+<!--
+  iframe fixture — a third-party-style widget loaded inside smart.html:
+  a newsletter button, an ENABLED "Submit" and an Email field.
+  Interactions are recorded in <body data-log>.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>cdpilot frames: widget</title>
+  <style>body { font: 14px system-ui, sans-serif; margin: 8px; }</style>
+</head>
+<body data-log="">
+  <button id="newsletter" type="button" onclick="log('newsletter')">Sign up for our newsletter</button>
+  <button id="submit" type="button" onclick="log('submit')">Submit</button>
+  <label for="email">Email</label>
+  <input id="email" name="email" autocomplete="off">
+  <script>
+    function log(s) { document.body.dataset.log += s + ';'; }
+    document.getElementById('email').addEventListener('input', function () { log('email-input'); });
+  </script>
+</body>
+</html>
