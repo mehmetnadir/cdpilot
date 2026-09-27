@@ -2898,6 +2898,116 @@ test('mode: backwards-compat — stealth on maps to undetected', () => {
     'cmd_stealth must keep mode.json coherent (on->undetected, off->regular)');
 });
 
+// ── Headless UA override (stealth + undetected only) ──
+// Measured 2026-09-27: every tier leaked "HeadlessChrome" (header + navigator),
+// failing sannysoft User Agent / HEADCHR_UA / CHR_MEMORY and incolumitas intoli
+// userAgent. The stealth tiers now override it on the navigate session; the
+// regular tier ("no patches") must never send it.
+
+function extractPyFunc(src, name) {
+  const re = new RegExp(`\\n((?:async )?def ${name}\\([\\s\\S]*?)(?=\\n\\n\\n)`);
+  const m = src.match(re);
+  return m ? m[1] : null;
+}
+
+const NAV_COLLECT_BODY = (PY_CONTENT.match(/async def navigate_collect\([\s\S]*?\n(?=async def |def )/) || [''])[0];
+
+test('stealth UA: stealth/undetected navigate path calls the headless UA override', () => {
+  // The override lives INSIDE the `if stealth_source:` block (stealth -> LIGHT,
+  // undetected -> FULL), on the same WS as the stealth script.
+  const m = NAV_COLLECT_BODY.match(/\n(\s+)if stealth_source:\n([\s\S]*?)\n\n/);
+  assert(m, 'navigate_collect must keep an `if stealth_source:` block');
+  assert(/await apply_headless_ua_override\(ws\)/.test(m[2]),
+    'the stealth_source block must call apply_headless_ua_override(ws)');
+  assert(/addScriptToEvaluateOnNewDocument/.test(m[2]),
+    'the UA override must sit next to the stealth script registration (same session)');
+});
+
+test('stealth UA: regular tier never reaches the UA override', () => {
+  // regular -> stealth_js_for_tier() returns None -> the guarded block is skipped.
+  // So the ONLY call site in the whole file must be the guarded one.
+  const code = PY_CONTENT.split('\n').map((l) => l.replace(/#.*$/, '')).join('\n');
+  const calls = code.match(/await apply_headless_ua_override\(/g) || [];
+  assert.strictEqual(calls.length, 1, `exactly one call site expected, found ${calls.length}`);
+  const guard = NAV_COLLECT_BODY.indexOf('if stealth_source:');
+  const call = NAV_COLLECT_BODY.indexOf('await apply_headless_ua_override(');
+  assert(guard > 0 && call > guard, 'the call must come after (inside) the stealth_source guard');
+  const tierFn = extractPyFunc(PY_CONTENT, 'stealth_js_for_tier');
+  assert(tierFn && /return None/.test(tierFn), 'regular must still resolve to None (no patch, no override)');
+});
+
+test('stealth UA: override is headless-gated, reads Browser.getVersion, sends metadata', () => {
+  const fn = extractPyFunc(PY_CONTENT, 'apply_headless_ua_override');
+  assert(fn, 'apply_headless_ua_override must exist');
+  assert(/"Browser\.getVersion"/.test(fn), 'real UA must come from Browser.getVersion (no hard-coded version)');
+  assert(/headless_ua_rewrite\(real_ua\)/.test(fn), 'UA must go through headless_ua_rewrite');
+  assert(/if not new_ua or new_ua == real_ua:\s*\n\s*return None/.test(fn),
+    'headed browser (no HeadlessChrome token) must send no override at all');
+  assert(/"Emulation\.setUserAgentOverride"/.test(fn), 'must use Emulation.setUserAgentOverride');
+  assert(/"userAgentMetadata"/.test(fn),
+    'must pass userAgentMetadata (without it navigator.userAgentData.brands is emptied)');
+  assert(/except Exception:\s*\n\s*return None\s*$/.test(fn), 'must never raise into navigation');
+});
+
+test('stealth UA: headless_ua_rewrite / brand rewrite / GREASE list (pure)', () => {
+  const { execFileSync } = require('child_process');
+  const PY_BIN = process.platform === 'win32' ? 'python' : 'python3';
+  const fns = ['headless_ua_rewrite', 'headless_brand_rewrite', 'grease_brand_list']
+    .map((n) => extractPyFunc(PY_CONTENT, n));
+  fns.forEach((f, i) => assert(f, `function #${i} must be extractable`));
+  const out = execFileSync(PY_BIN, ['-c', fns.join('\n\n') + `
+import json
+H = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36'
+C = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36'
+F = 'Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0'
+def names(l): return [b['brand'] + '/' + b['version'] for b in l]
+print(json.dumps({
+  'headless': headless_ua_rewrite(H), 'chrome': headless_ua_rewrite(C),
+  'firefox': headless_ua_rewrite(F), 'none': headless_ua_rewrite(None),
+  'brands': names(headless_brand_rewrite([{'brand': 'HeadlessChrome', 'version': '138'},
+                                          {'brand': 'Chromium', 'version': '138'}])),
+  'g120': names(grease_brand_list(120, 'Google Chrome')),
+  'g124': names(grease_brand_list(124, 'Google Chrome')),
+  'g131': names(grease_brand_list(131, 'Google Chrome')),
+  'g154': names(grease_brand_list(154, 'Brave', '154.0.0.0')),
+}))
+`], { encoding: 'utf-8', timeout: 5000 });
+  const r = JSON.parse(out.trim());
+  const C = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36';
+  assert.strictEqual(r.headless, C, 'HeadlessChrome/154 must become Chrome/154, rest untouched');
+  assert.strictEqual(r.chrome, C, 'a UA with no Headless token must come back unchanged');
+  assert.strictEqual(r.firefox, 'Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0',
+    'non-Chrome UA must come back unchanged');
+  assert.strictEqual(r.none, null, 'None passes through');
+  assert.deepStrictEqual(r.brands, ['Google Chrome/138', 'Chromium/138'],
+    'HeadlessChrome brand -> Google Chrome, others kept');
+  // Real Sec-CH-UA values (Chrome 120/124/131 headers; 154 = this Brave, measured).
+  assert.deepStrictEqual(r.g120, ['Not_A Brand/8', 'Chromium/120', 'Google Chrome/120']);
+  assert.deepStrictEqual(r.g124, ['Chromium/124', 'Google Chrome/124', 'Not-A.Brand/99']);
+  assert.deepStrictEqual(r.g131, ['Google Chrome/131', 'Chromium/131', 'Not_A Brand/24']);
+  assert.deepStrictEqual(r.g154, ['Chromium/154.0.0.0', 'Brave/154.0.0.0', 'Not A(Brand/99.0.0.0']);
+});
+
+test('stealth UA: FULL plugin item() coerces like WebIDL unsigned long (overflowTest)', () => {
+  const full = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_FULL');
+  assert(/plugins\.item = function\(i\) \{ return plugins\[i >>> 0\] \|\| null; \};/.test(full),
+    'PluginArray.item must use i >>> 0 (native item(4294967296) === item(0))');
+  assert(/p\.item = function\(i\) \{ return \(i >>> 0\) === 0 \? mime : null; \};/.test(full),
+    'Plugin.item must use i >>> 0 as well');
+});
+
+test('stealth UA: FULL Worker wrapper resolves relative URLs and only patches webdriver===true', () => {
+  const full = extractRawTripleString(PY_CONTENT, 'STEALTH_JS_FULL');
+  assert(/new URL\(String\(scriptURL\), document\.baseURI\)\.href/.test(full),
+    'relative worker URLs must be resolved against the page (blob: base broke them)');
+  assert(/self\.navigator\.webdriver===true/.test(full),
+    'worker webdriver patch must only act when the value is true (no own-property tell)');
+  assert(!/return undefined;/.test(full.match(/var workerPatch = [^\n]*/)[0]),
+    'worker patch must not force webdriver to undefined');
+  const vm = require('vm');
+  assert.doesNotThrow(() => new vm.Script(full), 'STEALTH_JS_FULL should parse as valid JS');
+});
+
 test('MCP: browser_mode tool registered', () => {
   assert(/"name":\s*"browser_mode"/.test(PY_CONTENT),
     'browser_mode must be registered in _register_tools');
