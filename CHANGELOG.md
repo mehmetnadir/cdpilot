@@ -11,6 +11,7 @@ All notable changes to cdpilot will be documented in this file.
 ### Fixed
 - **Port registry never forgot a project.** `~/.cdpilot/registry.json` only marked dead entries "stopped" and never removed them, so on a long-lived machine they filled the whole 9222–9322 range and every new project failed with "No free port". Dead entries (port free *and* recorded pid gone) are now pruned before each allocation; a port that is still bound is never pruned. The registry is written atomically, and `CDPILOT_HOME` can point it elsewhere.
 - **Windows: a process-liveness probe could kill the process.** On Windows, Python turns `os.kill(pid, 0)` into `TerminateProcess`. Liveness checks (registry cleanup, `watch`) now ask the kernel via `OpenProcess`/`GetExitCodeProcess` instead of signalling.
+- **Windows: the free-port probe called every port free.** It bound with `SO_REUSEADDR`, which on Windows lets a socket bind on top of a live listener, so port allocation could hand out a port another project's browser was using, and registry cleanup would prune that project. The probe now uses `SO_EXCLUSIVEADDRUSE` on Windows; POSIX behaviour is unchanged. Caught by the new registry test on `windows-latest` CI.
 - `lsof`/`pkill` calls used when stopping a browser now time out after 5s instead of blocking the caller indefinitely.
 
 ### Corrected

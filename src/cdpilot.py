@@ -68,10 +68,19 @@ def _get_project_id():
 
 
 def _is_port_free(port):
-    """Check if a port is available for binding."""
+    """Check if a port is available for binding.
+
+    On Windows, SO_REUSEADDR lets a socket bind on top of a port that another
+    socket is actively listening on, so a probe using it called every port
+    free (and registry cleanup pruned live entries). Exclusive use fails when
+    anything holds the port. POSIX SO_REUSEADDR only skips TIME_WAIT.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if os.name == "nt":
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("127.0.0.1", port))
             return True
         except OSError:
