@@ -4255,7 +4255,7 @@ out["summary_storage"] = m._slog_summary("storage", [], '{"token": "abc"}', [])
 out["summary_eval_secret"] = m._slog_summary("eval", ["document.cookie"], "sid=abc", [])
 out["summary_fill"] = m._slog_summary("fill", ["#pw", "hunter2"], "Filled: INPUT = hunter2", ["hunter2"])
 out["mask_same"] = m._slog_mask_url("https://example.com/path?q=cats&page=2")
-print(json.dumps(out, ensure_ascii=False))
+print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
 `;
     const home = newHome();
     const r = spawnSync(PY_BIN, ['-c', script], {
