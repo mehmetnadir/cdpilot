@@ -16,6 +16,9 @@ Why: in ~1,225 real agent sessions the top failures were "CDP connection error. 
 - `go`, `debug` and `context create` used to call `cdpilot launch` implicitly and print its progress lines ("Launching browser…", "CDP ready!") to **stdout**, mixed into the command's output. They now use the same quiet auto-launch path (one stderr line) and honour `CDPILOT_NO_AUTOLAUNCH`; so does the `watch` daemon's implicit launch.
 - `new-tab`, `press-hold`, `profile warm` and the browser-level commands (`download`, `permission`) auto-launch too instead of failing when the browser is down.
 
+### Fixed
+- `bin/cdpilot.js` exited **0** when the Python core was killed by a signal (OOM, SIGKILL): `process.exit(code || 0)` turned `code === null` into success. It now prints the signal and exits with 128 + signal number (137 for SIGKILL).
+
 ### Corrected
 - README listed bot-detection panel results from April 2026 (v0.4.x): sannysoft 24/24, incolumitas intoli 6/6, nowsecure.nl passed, areyouheadless "not headless". Re-measured 2026-09-27 on v0.9.1, headless, all three `mode` tiers: sannysoft 27/31 with 3 fails, all caused by the `HeadlessChrome` user agent that no tier rewrites; intoli 5/6; nowsecure.nl and areyouheadless could not be measured (fixed Turnstile test key / HTTP 502). README now shows the measured numbers.
 - The 0.9.1 entry says the `lsof`/`pkill` calls used when stopping a browser time out after 5s. That was true only for the local API's session release; `cdpilot stop` itself still called `lsof` with no timeout.

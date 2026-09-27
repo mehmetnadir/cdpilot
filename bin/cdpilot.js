@@ -672,7 +672,14 @@ if (cmd === 'status') {
     env,
   });
 
-  child.on('close', (code) => {
-    process.exit(code || 0);
+  // A child killed by a signal reports code === null. `code || 0` turned that
+  // into success, so an OOM-killed or SIGKILLed run looked fine to scripts
+  // and agents. Use the shell convention 128 + signal number instead.
+  child.on('close', (code, signal) => {
+    if (code === null && signal) {
+      console.error(`cdpilot: python was terminated by ${signal}`);
+      process.exit(128 + (os.constants.signals[signal] || 0));
+    }
+    process.exit(code ?? 0);
   });
 }
