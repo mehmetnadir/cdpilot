@@ -37,20 +37,19 @@
 ## Aktif Çalışma
 | Durum | Alan | Açıklama |
 |-------|------|----------|
-| ✅ | v0.9.0 npm | Yayında (OIDC provenance); CI tüm platformlar yeşil (Windows dahil) |
-| ✅ | Faz 5 yayın | Thread 9/9 canlı: x.com/cdpilot_dev/status/2091520585192845488 |
-| ✅ | Twitter bot | twifork + guardrail'lı auto-post + follow-back + sentinel (30dk health watchdog, Telegram alarm + 09:00 özet) |
-| ✅ | İçerik sistemi | Pillar'lar revize (%20 "Claude ile üretim hikâyeleri"); skill'ler: x-harvest, x-algorithm-truth, x-humanizer, x-hook-extractor, x-content-planner |
-| ⏳ | v0.9.1 sprint | Bağlantı dayanıklılığı: auto-relaunch/attach + evrensel --timeout (#2) + open alias — friction analizi 292+171+14 hata |
+| ✅ | v0.9.1 npm + MCP Registry | 27.09 yayında: port kaydı temizliği, Windows pid/port güvenliği, düzeltilmiş iddialar; resmi MCP Registry'de `io.github.mehmetnadir/cdpilot` aktif |
+| ✅ | İddia kapıları | Site `npm test` + repo `test/test.js`: 500x / 50KB / "40+ commands" geri gelirse kırılır. a11y-snapshot token tasarrufu diye SATILMAZ (ölçüm: `.claude/docs/token-olcumu-2026-09-27.md`) |
+| ✅ | Twitter bot | Alarm ntfy `bekci` kanalında; motor yalnız nemotron-3-ultra (düşünme kapalı); `pain_hunter` 13:00 + akşam slotunda canlı (günde ≤3 yanıt) |
+| ⏳ | Glama sahiplenme | Nadir claim edecek → sonra punkpeye/awesome-mcp-servers'a 3. PR |
+| ⏳ | v0.9.2 adayı | Bağlantı dayanıklılığı: auto-relaunch/attach + evrensel --timeout (#2); aday: iframe (#1), CSS seçicide shadow DOM (#3) — kapsam kararı Nadir'de |
 | ⏳ | Sentinel takip | C6: daily_analytics gece yazmıyor (debug) · C8: 2 failed auto-like sebebi |
 | ⏳ | v0.9 tls-proxy | Optional local TLS-MITM (curl-impersonate semantics) |
 
 ## Son Oturum
-→ Detay: `.claude/session-journal/2026-08-25-1040-v090-twitter-revival.md` | Tüm geçmiş: `.claude/session-journal/INDEX.md`
-→ Durum: v0.9.0 her yerde (npm/site/CI yeşil); Twitter operasyonu tam otonom + sentinel bekçide; 185'lik kuyruk çürümesi sınıfı kapatıldı.
-→ İlk iş: sentinel C6 (analytics gece yazmıyor) debug → sonra v0.9.1 Bağlantı Dayanıklılığı Sprint'i.
+→ 2026-09-27: sahte kriz donması (11 gün) çözüldü, pain_hunter eklendi, "500x" benchmark geri çekildi, v0.9.1 npm + MCP Registry.
+→ İlk iş: pain_hunter'ın ilk canlı kayıtlarını oku (`/opt/cdpilot-twitter-bot/pains/2026-09.jsonl`) → sonra v0.9.2.
 
-Son Güncelleme: 2026-08-25
+Son Güncelleme: 2026-09-27
 
 <!-- gitnexus:start -->
 ## GitNexus — Code Intelligence
