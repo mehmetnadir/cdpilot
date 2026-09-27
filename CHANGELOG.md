@@ -2,6 +2,12 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Idle auto-close.** Since 0.9.2 page commands start the browser, and nothing ever closed it: after an agent's task it kept running (and holding memory) until someone ran `stop`. A browser a page command **auto-launched**, or that the **MCP server** launched (`browser_launch` included — agents are the leak), now closes itself after 15 minutes without a cdpilot command or a visible page change. An **explicit CLI `launch`** stays open by default (a person may browse in it by hand, which no cdpilot command reflects); it gets the same idle close only with **`launch --idle-close <min>`** or **`CDPILOT_IDLE_CLOSE=<minutes>`** (the flag wins). The env var also sets the auto-launch delay (read at launch, fractions allowed), `0` turns it off; an invalid env value falls back to the default with a one-line warning, an invalid flag exits 2. A browser the user started, or one cdpilot only attached to, is never closed. Every command stamps `CDPILOT_HOME/projects/<id>/last-activity` (read-only checks — `status`, `health`, `projects`, `version` — do not, so a `health` watchdog loop cannot pin the browser); MCP tool calls and `serve` requests count too, and so do a CDP client still attached to a page and any change in the page targets' ids/URLs between two watcher rounds (someone navigating, a tab opened or closed; title changes are ignored so a page rewriting its own title cannot pin the browser). The launch starts one detached watcher per port (own session on POSIX, `DETACHED_PROCESS` on Windows) that checks every ≤30 s, stops the browser through the same path as `cdpilot stop`, marks the registry entry stopped, logs to `projects/<id>/idle-close.log` and exits; it also exits when the browser is gone or was replaced (the browser GUID from `/json/version` is the launch marker). `serve --api` sessions keep their server-managed lifecycle.
+- `cdpilot status` and `cdpilot health` (`idle_close`, `idle_close_in_s`) show `idle close in <N>m` or `idle close off`; `launch` prints whether idle close is on and how to turn it on.
+
 ## [0.9.2] - 2026-09-27
 
 Why: in ~1,225 real agent sessions the top failures were "CDP connection error. Is the browser running?" (292), a command hanging with no way to bound it (171, #2) and `open <url>` typed instead of `go <url>` (14).
