@@ -537,18 +537,26 @@ cdpilot profile warm          # age the profile for reCAPTCHA v3 score
 which nudges reCAPTCHA v3's behavioral score upward over time. Slow by
 design — run it ahead of a session, not inline.
 
-Public bot-detection panels, re-measured 2026-09-27 with v0.9.1, **headless** Brave
-(Chrome 154), all three `mode` tiers:
-- **bot.sannysoft.com:** 27 pass / 3 fail / 1 warn of 31 rows. The three fails (User-Agent,
-  HEADCHR_UA, CHR_MEMORY) come from headless mode: no tier rewrites the `HeadlessChrome`
-  user agent yet (fix in progress).
-- **bot.incolumitas.com:** intoli 5/6 (fail: userAgent), fpscanner 17/20; new-tests 8/8 in
-  `regular`/`stealth`, 6/7 in `undetected` (fail: overflowTest).
-- **nowsecure.nl** and **areyouheadless:** not measurable today (the first now uses a fixed
-  always-interactive Turnstile test key, the second returned HTTP 502).
+Public bot-detection panels, measured 2026-09-27, **headless** Brave (Chrome 154)
+([method and raw results](.claude/docs/stealth-panel-olcumu-2026-09-27.md)):
+
+| `mode` | bot.sannysoft.com (31 rows) | incolumitas intoli | incolumitas fpscanner | incolumitas new-tests |
+|---|---|---|---|---|
+| `regular` (no patches, default) | 28 pass / 3 fail | 5/6 | 17 ok / 3 fail / 1 warn | all ok |
+| `stealth` | 31 pass | 6/6 | 19 ok / 1 fail / 1 warn | all ok |
+| `undetected` | 31 pass | 6/6 | 19 ok / 1 fail / 1 warn | all ok |
+
+- The remaining fpscanner fail is `'webdriver' in navigator`, which is true in every modern
+  Chrome; faking it away would make cdpilot the odd one out.
+- `regular`'s fails all come from the `HeadlessChrome` user agent. `stealth`/`undetected`
+  rewrite it for the page load that `go` starts; a later, separate command in the same page
+  can still read `HeadlessChrome`.
+- new-tests: every key is ok; `connectionRTT` is reported as unknown in all tiers.
+- nowsecure.nl and areyouheadless could not be measured (a fixed always-interactive
+  Turnstile test key; HTTP 502).
 
 Earlier figures on this page (sannysoft 24/24, intoli 6/6) were measured on v0.4.x in April
-2026 and did not hold up on re-measurement.
+2026; they are replaced by the table above.
 
 ### Reliability
 

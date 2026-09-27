@@ -3386,6 +3386,22 @@ test('metadata: version is identical in package.json, cdpilot.py and server.json
     'server.json packages[0].version must match package.json');
 });
 
+test('claims: README panel numbers are tied to a measurement file that backs them', () => {
+  // April's "sannysoft 24/24, intoli 6/6" stayed in the README for months
+  // without re-measurement and were false by 2026-09-27. The panel table must
+  // link its evidence file, and the headline numbers must appear there.
+  const root = path.join(__dirname, '..');
+  const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+  const m = readme.match(/\]\((\.claude\/docs\/stealth-panel-olcumu-(\d{4}-\d{2}-\d{2})\.md)\)/);
+  assert(m, 'the README panel section must link a dated stealth-panel measurement file');
+  const evidencePath = path.join(root, m[1]);
+  assert(fs.existsSync(evidencePath), `${m[1]} must exist in the repo`);
+  const evidence = fs.readFileSync(evidencePath, 'utf8');
+  assert(/31\/0\/0/.test(evidence) && /\*\*6\/6\*\*/.test(evidence),
+    'the evidence file must contain the sannysoft 31/0/0 and intoli 6/6 the README claims');
+  assert(!/24\/24 PASS/.test(readme), 'the withdrawn April figure must not come back');
+});
+
 test('launcher: a python killed by a signal is not reported as success', () => {
   // `process.exit(code || 0)` exited 0 when the child died from a signal
   // (code === null), so an OOM kill looked like a clean run.
