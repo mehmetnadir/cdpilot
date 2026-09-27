@@ -3144,6 +3144,15 @@ test('metadata: version is identical in package.json, cdpilot.py and server.json
     'server.json packages[0].version must match package.json');
 });
 
+test('launcher: a python killed by a signal is not reported as success', () => {
+  // `process.exit(code || 0)` exited 0 when the child died from a signal
+  // (code === null), so an OOM kill looked like a clean run.
+  const js = fs.readFileSync(path.join(__dirname, '..', 'bin', 'cdpilot.js'), 'utf8');
+  assert(!/process\.exit\(code \|\| 0\)/.test(js), 'signal deaths must not map to exit 0');
+  assert(/on\('close', \(code, signal\)/.test(js) && /128 \+ \(os\.constants\.signals\[signal\]/.test(js),
+    'the close handler must turn a signal into 128 + signal number');
+});
+
 test('metadata: publish workflow can be re-run after npm succeeded', () => {
   // 0.9.1: npm accepted the package but it stayed invisible past the wait, so
   // the release failed before the MCP Registry steps. A re-run must skip the
