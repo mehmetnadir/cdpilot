@@ -35,13 +35,16 @@ import secrets
 import glob
 import datetime
 import concurrent.futures
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ─── Project-Based Multi-Instance Configuration ───
 # Each project directory (cwd) gets its own browser instance with
 # a unique CDP port and isolated profile directory. Zero-config.
 
-CDPILOT_HOME = os.path.expanduser("~/.cdpilot")
+# CDPILOT_HOME override lets tests (and advanced users) point the registry
+# at an isolated directory instead of the real ~/.cdpilot.
+CDPILOT_HOME = os.environ.get("CDPILOT_HOME") or os.path.expanduser("~/.cdpilot")
 REGISTRY_FILE = os.path.join(CDPILOT_HOME, "registry.json")
 CDPILOT_PORT_RANGE_START = 9222
 CDPILOT_PORT_RANGE_END = 9322
@@ -86,10 +89,26 @@ def _load_registry():
 
 
 def _save_registry(projects):
-    """Write the global project registry."""
-    os.makedirs(os.path.dirname(REGISTRY_FILE), exist_ok=True)
-    with open(REGISTRY_FILE, 'w') as f:
-        json.dump({"version": 1, "projects": projects}, f, indent=2)
+    """Write the global project registry atomically.
+
+    Writes to a temp file in the same directory and os.replace()s it into
+    place, so a concurrent cdpilot invocation reading registry.json always
+    sees either the fully-old or fully-new content — never a torn/partial
+    write (os.replace is atomic on both POSIX and Windows).
+    """
+    reg_dir = os.path.dirname(REGISTRY_FILE)
+    os.makedirs(reg_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix='.registry-', suffix='.tmp', dir=reg_dir)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump({"version": 1, "projects": projects}, f, indent=2)
+        os.replace(tmp_path, REGISTRY_FILE)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _register_project(project_id, port, profile_dir, pid=None):
@@ -108,25 +127,83 @@ def _register_project(project_id, port, profile_dir, pid=None):
     _save_registry(registry)
 
 
+def _pid_alive(pid):
+    """True if a process with this pid exists. Never signals it.
+
+    Sending signal 0 is a harmless existence probe on POSIX, but on Windows
+    Python maps every signal other than CTRL_C/CTRL_BREAK to TerminateProcess:
+    the "probe" kills the process. Registry pids are stale by nature and may
+    have been reused by an unrelated program, so on Windows ask the kernel
+    through OpenProcess/GetExitCodeProcess instead. Defined this early because
+    it runs at import time (_resolve_project_config -> _allocate_port).
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def _is_registry_entry_dead(info):
+    """A registry entry is dead only when we can PROVE nothing is using it.
+
+    Dead = nothing is listening on its port AND (if a pid was recorded)
+    that process is no longer alive. If the port is currently bound, we
+    never call it dead even if our own bookkeeping (status/pid) looks
+    stale — it may be another project's live browser instance, and a
+    live entry must never be pruned.
+    """
+    port = info.get("port")
+    if port and not _is_port_free(port):
+        return False
+    pid = info.get("pid")
+    if pid and _pid_alive(pid):
+        return False
+    return True
+
+
 def _cleanup_registry():
-    """Update status for dead processes and return cleaned registry."""
+    """Prune dead entries from the registry and return what's left.
+
+    Called before every port allocation (see _allocate_port) so the
+    registry never accumulates stale entries that starve the
+    9222-9322 port range — the root cause of the "No free port" failure
+    documented in .claude/docs/vaat-denetimi-2026-09-27.md.
+    """
     registry = _load_registry()
-    changed = False
-    for pid_key, info in registry.items():
-        if info.get("status") == "running":
-            port = info.get("port")
-            if port and _is_port_free(port):
-                info["status"] = "stopped"
-                info["pid"] = None
-                changed = True
-    if changed:
-        _save_registry(registry)
-    return registry
+    alive = {pid_key: info for pid_key, info in registry.items()
+             if not _is_registry_entry_dead(info)}
+    if len(alive) != len(registry):
+        _save_registry(alive)
+    return alive
 
 
 def _allocate_port(project_id):
     """Find a free port for the given project."""
-    registry = _load_registry()
+    registry = _cleanup_registry()
 
     # Reuse existing port if still free
     if project_id in registry:
@@ -7511,9 +7588,13 @@ def _stop_browser_on_port(port):
     """Stop the browser process listening on the given port."""
     import signal
     try:
+        # Bounded: on some hosts/sandboxes `lsof`/`pkill` can hang instead of
+        # erroring (observed while testing the port-registry fix — a stuck
+        # `lsof -ti :<port>` blocked the whole /v1/sessions DELETE request).
+        # A timeout keeps this best-effort call from ever wedging the caller.
         result = subprocess.run(
             ["lsof", "-ti", f":{port}"],
-            capture_output=True, text=True
+            capture_output=True, text=True, timeout=5
         )
         pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
         if pids:
@@ -7523,7 +7604,7 @@ def _stop_browser_on_port(port):
         else:
             subprocess.run(
                 ["pkill", "-f", f"remote-debugging-port={port}"],
-                capture_output=True, text=True
+                capture_output=True, text=True, timeout=5
             )
             return True
     except Exception:
@@ -7604,7 +7685,11 @@ def _api_release_session(session_id: str) -> bool:
     if not sess:
         return False
     port = sess.get('port')
-    if port:
+    # In TEST_MODE, _api_create_session never actually launched a browser on
+    # `port` (see the sibling check there) — nothing is listening, so skip
+    # the lsof/pkill round trip entirely instead of paying its cost for a
+    # no-op every time.
+    if port and os.environ.get('CDPILOT_API_TEST_MODE') != '1':
         _stop_browser_on_port(port)
     sess['status'] = 'STOPPED'
     del _api_session_store[session_id]
@@ -12089,13 +12174,8 @@ def _watch_clear_state():
 
 
 def _watch_pid_alive(pid):
-    if not pid:
-        return False
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError):
-        return False
+    # os.kill(pid, 0) terminates the process on Windows — see _pid_alive.
+    return _pid_alive(pid)
 
 
 def _watch_parse_timecode(spec):
