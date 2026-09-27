@@ -749,7 +749,7 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] MCP server for AI agent integration (Claude Code, Cursor, etc.)
 - [x] **10 built-in test assertions** — assert, assert-url, assert-title, assert-count, assert-value, assert-attr, assert-visible/hidden, wait-for, check (batch), screenshot-diff
 - [x] **`test` runner + `trace` viewer** — `cdpilot test [--watch]` runs `*.cdpt.js` files; `cdpilot trace open <run>` opens a time-travel trace viewer for a run
-- [x] **Accessibility tree snapshot** (`a11y-snapshot`) — structured data with @ref references, 500x fewer tokens than screenshots
+- [x] **Accessibility tree snapshot** (`a11y-snapshot`) — structured text with @ref handles the agent can act on directly, no vision model needed; 1.4–42× smaller than the page's raw HTML on the four pages we measured (2026-09-27). Not always cheaper than a screenshot: link-heavy pages produce more text than a small screenshot costs
 - [x] **Token-efficient screenshots** — element-level crop (13x smaller), JPEG quality control, format selection
 - [x] **Vision fallback** (`describe`) — a11y + screenshot + text in one call
 - [x] **Annotated screenshots** — @N badge overlays on interactive elements

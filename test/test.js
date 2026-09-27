@@ -3135,6 +3135,27 @@ test('metadata: no file advertises a Python older than the 3.10 the code needs',
   }
 });
 
+test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => {
+  const root = path.join(__dirname, '..');
+  // CHANGELOG [0.9.1] "Corrected": src/cdpilot.py is 13,129 lines / ~542KB, not
+  // "50KB"; the tool has one Python dependency (websockets) and 70+ commands,
+  // not "zero dependencies" / "40+ commands"; the "500x fewer tokens than
+  // screenshots" a11y-snapshot claim had no measurement behind it. These drafts
+  // are pre-launch (unlike twitter-launch-thread.md, which is historical and
+  // excluded) so any recurrence of the old numbers must be caught before posting.
+  const files = [
+    'hackernews-post.md',
+    'reddit-posts.md',
+    'blog-launch-post.md',
+    'platform-submission-guide.md',
+  ];
+  const banned = /50 ?KB|500x|40\+ commands/;
+  for (const f of files) {
+    const txt = fs.readFileSync(path.join(root, 'docs', f), 'utf8');
+    assert(!banned.test(txt), `docs/${f} repeats a corrected 0.9.1 number (50KB/50 KB/500x/40+ commands)`);
+  }
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
