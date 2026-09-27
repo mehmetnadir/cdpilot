@@ -1766,6 +1766,35 @@ spec.loader.exec_module(mod)
       'the Windows branch must return before os.kill is reached');
   });
 
+  test('registry: port probe cannot bind over a live listener on Windows', () => {
+    // Windows SO_REUSEADDR lets a socket bind on top of a port another socket
+    // is listening on, so a probe using it called every port free: CI on
+    // windows-latest pruned a live entry (2026-09-27). The Windows branch must
+    // ask for exclusive use instead.
+    const code = PY_CONTENT.split('\n').map((l) => l.replace(/#.*$/, '')).join('\n');
+    const fn = (code.match(/def _is_port_free\(port\):([\s\S]*?)\n\ndef /) || [])[1] || '';
+    assert(/os\.name == "nt"/.test(fn) && /SO_EXCLUSIVEADDRUSE/.test(fn),
+      '_is_port_free must use SO_EXCLUSIVEADDRUSE on Windows');
+    assert(fn.indexOf('SO_EXCLUSIVEADDRUSE, 1') < fn.indexOf('SO_REUSEADDR, 1'),
+      'SO_REUSEADDR must only be reached on the non-Windows branch');
+  });
+
+  test('registry: _is_port_free reports a listening port as taken', () => {
+    const [p] = findFreePorts(1);
+    const r = runPy(`
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(("127.0.0.1", ${p}))
+s.listen(1)
+${IMPORT_SNIPPET}
+print("FREE_WHILE_LISTENING=" + str(mod._is_port_free(${p})))
+s.close()
+`);
+    assert.strictEqual(r.status, 0, `probe must not error (stderr: ${r.stderr})`);
+    assert(/FREE_WHILE_LISTENING=False/.test(r.stdout),
+      `a listening port must not look free, got stdout=${r.stdout}`);
+  });
+
   test('registry: _pid_alive tells a live pid from a dead one', () => {
     const r = runPy(IMPORT_SNIPPET +
       'import os\nprint("SELF=" + str(mod._pid_alive(os.getpid())))\n' +
