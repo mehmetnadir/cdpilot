@@ -3738,8 +3738,13 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
       assert(readme.includes(s), `README must document ${s}`);
     }
     const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    const firstSection = (changelog.match(/^## \[[^\]]+\]/m) || [])[0];
-    assert.strictEqual(firstSection, '## [Unreleased]', 'newest CHANGELOG section must be [Unreleased]');
+    // Newest section is [Unreleased] between releases and the package version
+    // once released; either way it must be the one describing these flags.
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    const first = (changelog.match(/^## \[([^\]]+)\]/m) || [])[1];
+    assert(first === 'Unreleased' || first === pkg.version,
+      `newest CHANGELOG section must be [Unreleased] or [${pkg.version}], got [${first}]`);
+    assert(changelog.includes('CDPILOT_NO_AUTOLAUNCH'), 'CHANGELOG must describe CDPILOT_NO_AUTOLAUNCH');
   });
 })();
 

@@ -2,7 +2,7 @@
 
 All notable changes to cdpilot will be documented in this file.
 
-## [Unreleased]
+## [0.9.2] - 2026-09-27
 
 Why: in ~1,225 real agent sessions the top failures were "CDP connection error. Is the browser running?" (292), a command hanging with no way to bound it (171, #2) and `open <url>` typed instead of `go <url>` (14).
 
