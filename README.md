@@ -562,7 +562,7 @@ Earlier figures on this page (sannysoft 24/24, intoli 6/6) were measured on v0.4
 
 ```bash
 cdpilot browser [name|auto]   # workload-aware browser selection
-cdpilot health                # JSON: alive, port, tabs, browser, today's crashes
+cdpilot health                # JSON: alive, port, tabs, browser, today's crashes, idle close
 ```
 
 `cdpilot health` is designed for shell watchdogs:
@@ -583,6 +583,33 @@ Lifecycle, status and configuration commands (`launch`, `stop`, `close`,
 `tabs`, `sessions`, `projects`, `headless`, `proxy`, `browser`, `extensions`,
 `mcp`, `serve`, …) never launch. `CDPILOT_NO_AUTOLAUNCH=1` restores the old
 "CDP connection error. Is the browser running?" error and exit code 1.
+
+**Idle auto-close.** A browser that a page command auto-launched, or that the
+MCP server launched (`browser_launch` included), closes itself after
+**15 minutes** without a cdpilot command or a visible page change, so a
+finished agent task does not leave it holding memory. An explicit CLI
+`cdpilot launch` stays open (you may be browsing in it by hand) unless you ask:
+`cdpilot launch --idle-close 30` or `CDPILOT_IDLE_CLOSE=30`. The env var also
+sets the auto-launch delay (read when the browser starts; fractions allowed);
+`0` turns idle close off. A browser you started yourself, or one cdpilot merely
+attached to, is never closed.
+
+What counts as use: any cdpilot command except the read-only checks (`status`,
+`health`, `projects`, `version` — a `cdpilot health` watchdog loop does not keep
+the browser alive), MCP tool calls, `serve` requests, a CDP client still
+attached to a page (a long-running command, `watch`, Playwright via
+`connectOverCDP`), and any change in the open pages' URLs or in the set of
+tabs (someone navigating, a tab opened or closed). Title changes do not count,
+so a page that rewrites its own title (a clock, an unread counter) cannot keep
+the browser alive. `cdpilot status` and
+`cdpilot health` show `idle close in 12m` or `idle close off`.
+
+How: every command stamps `~/.cdpilot/projects/<id>/last-activity`; the launch
+starts a small detached watcher (one per port, no console window on Windows)
+that checks every ≤30 s, stops the browser like `cdpilot stop`, marks it
+stopped in the registry and exits — it also exits as soon as the browser is
+gone for any other reason. Browsers started by `serve --api` are managed by the
+server and have no idle close.
 
 **Timeouts.** Any command takes `--timeout <seconds>`, before or after the
 command name, or a default from `CDPILOT_TIMEOUT` (the flag wins; `0`
@@ -663,6 +690,7 @@ print(result.stdout)
 | `CDPILOT_OFFSCREEN` | `0` | Headed but render off-screen — no window steals focus |
 | `CDPILOT_TIMEOUT` | unset | Default `--timeout` in seconds for every command (flag wins, `0` disables); expiry exits 124 |
 | `CDPILOT_NO_AUTOLAUNCH` | `0` | `1` = page commands fail with the old "Is the browser running?" error instead of launching the browser |
+| `CDPILOT_IDLE_CLOSE` | `15` | Minutes without a cdpilot command or page change before a browser cdpilot launched closes itself (fractions allowed, `0` = never; read at launch). Default applies to auto-launch and MCP launches; an explicit CLI `launch` is off unless this is set or `--idle-close <min>` is given |
 
 ## How It Works
 

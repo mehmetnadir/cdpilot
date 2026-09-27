@@ -19,6 +19,10 @@ Environment:
   CDPILOT_TIMEOUT      Default for --timeout (the flag wins)
   CDPILOT_NO_AUTOLAUNCH=1  Do not start the browser when a page command
                        finds it not running (print the error instead)
+  CDPILOT_IDLE_CLOSE   Minutes without a cdpilot command or page change before
+                       a browser cdpilot launched closes itself (auto-launch
+                       and MCP: default 15; explicit `launch`: off unless set or
+                       `launch --idle-close <min>`; 0 = never)
 """
 
 __version__ = "0.9.2"
@@ -1302,7 +1306,7 @@ def _autolaunch_if_down():
         # cmd_launch's progress lines would land in the command's stdout,
         # which agents parse — keep them out; errors become the failure reason.
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            cmd_launch()
+            cmd_launch(auto=True)
     except SystemExit as e:
         code = 0 if e.code is None else (e.code if isinstance(e.code, int) else 1)
     except Exception as e:
@@ -1320,6 +1324,405 @@ def _autolaunch_if_down():
 def _print_autolaunch_failure():
     if _AUTOLAUNCH["failure"]:
         print(f"cdpilot: auto-launch failed: {_AUTOLAUNCH['failure']}", file=sys.stderr)
+
+
+# ─── Idle auto-close ───
+# Auto-launch starts browsers, and nothing closed them: after an agent's task
+# the browser kept running (and holding RAM) until someone ran `stop`. Every
+# CLI call is a short-lived process, so no resident cdpilot can notice "idle".
+# Design:
+#   - every command (read-only checks excepted) writes a per-project activity
+#     timestamp, CDPILOT_HOME/projects/<id>/last-activity, when it starts and
+#     when it ends;
+#   - a launch of a browser cdpilot itself started spawns a small detached
+#     watcher (same re-entrant fork as the `watch` daemon) that wakes every
+#     <= 30 s and, once no command ran for N minutes, closes the browser with
+#     _stop_browser_on_port, marks the registry entry stopped and exits;
+#   - on by default only for auto-launch (a page command found the browser
+#     down: nobody asked for a browser to keep) and for any launch from the MCP
+#     server (browser_launch included: agents are the leak). An explicit CLI
+#     `launch` may be a person who then browses by hand, which no cdpilot
+#     command reflects, so it is off unless `launch --idle-close <min>` or
+#     CDPILOT_IDLE_CLOSE asks;
+#   - a visible change counts as use too: each round the watcher compares the
+#     page targets' ids and URLs with the previous round (a person navigating,
+#     a tab opened or closed). Titles are left out on purpose: a page that
+#     rewrites its own title (clock, unread counter) would pin the browser;
+#   - CDPILOT_HOME/idle/<port>.json names the one watcher that owns a port (a
+#     random token); a newer launch on the port replaces it and the old watcher
+#     exits on its next round;
+#   - the launch marker is the browser GUID in /json/version's
+#     webSocketDebuggerUrl (new on every browser run) plus the registry pid.
+#     A browser the user started or cdpilot only attached to never gets a
+#     watcher, and one that replaced ours on the port is never touched: the
+#     watcher exits instead.
+# Why not "close on the next command": the next command may never come, which
+# is the leak. Why not launchd / Task Scheduler / cron: three platform-specific
+# installers for one timer. A CDP client still attached to a page (an in-flight
+# long command, the `watch` daemon, Playwright via connectOverCDP) counts as
+# activity, so a browser in use is not closed under its client.
+IDLE_CLOSE_ENV = "CDPILOT_IDLE_CLOSE"
+IDLE_CLOSE_DEFAULT_MIN = 15.0
+IDLE_WATCHER_FLAG = '--_idle-watcher'  # hidden — used only for the re-entrant fork
+IDLE_POLL_MAX_S = 30.0
+# Read-only checks report the state; they must not keep a browser alive (the
+# `until cdpilot health; do ...` watchdog loop would pin it forever).
+IDLE_PASSIVE_CMDS = frozenset({
+    'status', 'health', 'projects', 'version', '--version', '-v',
+    'help', '--help', '-h', 'setup',
+})
+_IDLE_WARNED = []
+
+
+def _idle_parse_minutes(raw):
+    """'15', '0.2', '0'/'off' -> float minutes; None when not a finite number >= 0."""
+    raw = str(raw).strip()
+    if raw.lower() in ("off", "false", "no"):
+        return 0.0
+    try:
+        val = float(raw)
+    except ValueError:
+        return None
+    return val if 0 <= val < float("inf") else None
+
+
+def _idle_close_minutes(env=None, auto=True, flag=None):
+    """Minutes without a command before a cdpilot-launched browser closes; 0 = off.
+
+    auto=True  (auto-launch): default IDLE_CLOSE_DEFAULT_MIN.
+    auto=False (explicit `launch`): default off.
+    `launch --idle-close <min>` (flag) wins over CDPILOT_IDLE_CLOSE; fractions
+    allowed, `0`/`off` disables. An invalid flag raises ValueError; an invalid
+    env value falls back to the default with one warning per process.
+    """
+    if flag is not None:
+        val = _idle_parse_minutes(flag)
+        if val is None:
+            raise ValueError(f"--idle-close needs minutes >= 0 (0 = off), got {flag!r}")
+        return val
+    default = IDLE_CLOSE_DEFAULT_MIN if auto else 0.0
+    env = os.environ if env is None else env
+    raw = (env.get(IDLE_CLOSE_ENV) or "").strip()
+    if not raw:
+        return default
+    val = _idle_parse_minutes(raw)
+    if val is None:
+        if not _IDLE_WARNED:
+            _IDLE_WARNED.append(raw)
+            # __stderr__: auto-launch captures sys.stderr and drops it on success.
+            print(f"cdpilot: ignoring {IDLE_CLOSE_ENV}={raw!r} (minutes >= 0, 0 = off); "
+                  + (f"using {default:g}" if default else "idle close stays off"),
+                  file=sys.__stderr__ or sys.stderr)
+        return default
+    return val
+
+
+def _idle_close_flag(args):
+    """`launch --idle-close <min>` / `--idle-close=<min>` -> the raw value, or None."""
+    for i, a in enumerate(args):
+        if a.startswith("--idle-close="):
+            return a.split("=", 1)[1]
+        if a == "--idle-close":
+            return args[i + 1] if i + 1 < len(args) else ""
+    return None
+
+
+def _idle_activity_path(project_id=None):
+    return os.path.join(CDPILOT_HOME, "projects", project_id or PROJECT_ID, "last-activity")
+
+
+def _idle_state_path(port):
+    return os.path.join(CDPILOT_HOME, "idle", f"{int(port)}.json")
+
+
+def _idle_write_activity(project_id=None, now=None):
+    """Record "cdpilot used this project's browser now". Best effort: a missed
+    write only shortens one idle window, it must never fail a command."""
+    path = _idle_activity_path(project_id)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w") as f:
+            f.write(f"{time.time() if now is None else now:.3f}\n")
+        os.replace(tmp, path)  # readers never see a half-written value
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _idle_touch_activity(cmd):
+    """Dispatcher hook: this command counts as use, now and when it ends (a
+    20-minute command must not leave a browser that looks 20 minutes idle)."""
+    if cmd in IDLE_PASSIVE_CMDS:
+        return
+    _idle_write_activity()
+    atexit.register(_idle_write_activity)
+
+
+def _idle_read_activity(project_id=None):
+    try:
+        with open(_idle_activity_path(project_id)) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _idle_load_state(port):
+    try:
+        with open(_idle_state_path(port)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _idle_save_state(port, state):
+    path = _idle_state_path(port)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def _idle_clear_state(port, token=None):
+    """Remove the port's watcher record (only if `token` still owns it)."""
+    if token is not None and (_idle_load_state(port) or {}).get("token") != token:
+        return
+    try:
+        os.remove(_idle_state_path(port))
+    except OSError:
+        pass
+
+
+def _idle_should_close(now, last_activity, minutes):
+    """Pure decision: close once `minutes` (> 0) passed since the last activity."""
+    if not minutes or minutes <= 0 or last_activity is None:
+        return False
+    return now - last_activity >= minutes * 60
+
+
+def _idle_owns_browser(state, registry, version):
+    """True only for the exact browser the watcher was started for.
+
+    state    — the watcher record written by `launch`;
+    registry — the project registry (_load_registry());
+    version  — the port's /json/version answer, None when nothing answers.
+    The browser GUID changes on every browser run, so a browser the user
+    started on the port, or one that replaced ours, never matches; the
+    registry pid is the mark `launch` leaves only on browsers it started.
+    """
+    if not state or not version:
+        return False
+    ws_url = version.get("webSocketDebuggerUrl")
+    if not ws_url or ws_url != state.get("browser_ws"):
+        return False
+    entry = (registry or {}).get(state.get("project_id")) or {}
+    return (state.get("browser_pid") is not None
+            and entry.get("pid") == state.get("browser_pid")
+            and str(entry.get("port")) == str(state.get("port")))
+
+
+def _idle_last_activity(state):
+    """Latest of the project's activity stamp and the watcher's start."""
+    stamps = [_idle_read_activity(state.get("project_id")), state.get("started")]
+    stamps = [float(s) for s in stamps if s is not None]
+    return max(stamps) if stamps else None
+
+
+def _idle_page_fingerprint(targets):
+    """Pure: what a person changes — the page targets' (id, url), order-free.
+    No titles: a page can rewrite its own (clock, unread counter) forever.
+    None when the target list is unknown (the read failed)."""
+    if targets is None:
+        return None
+    return tuple(sorted((str(t.get("id") or ""), str(t.get("url") or ""))
+                        for t in targets if t.get("type") == "page"))
+
+
+def _idle_pages_changed(prev, cur):
+    """Pure: a navigation or a tab opened/closed since the last round counts as
+    activity. An unknown side (first round, failed read) does not."""
+    return prev is not None and cur is not None and prev != cur
+
+
+def _idle_page_targets(port):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/json", timeout=3) as resp:
+            data = json.loads(resp.read())
+        return data if isinstance(data, list) else None
+    except Exception:
+        return None
+
+
+def _idle_poll_seconds(minutes):
+    return max(1.0, min(IDLE_POLL_MAX_S, minutes * 60 / 6))
+
+
+def _idle_version(port):
+    try:
+        url = f"http://127.0.0.1:{int(port)}/json/version"
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _idle_client_attached(version):
+    """True while some CDP client holds a page target (Target.getTargets
+    `attached`): an in-flight command, the `watch` daemon, Playwright. The
+    browser-level socket used for the query attaches to no page."""
+    ws_url = (version or {}).get("webSocketDebuggerUrl")
+    if not ws_url:
+        return False
+
+    async def _query():
+        import websockets
+        async with websockets.connect(ws_url, max_size=16 * 1024 * 1024) as ws:
+            await ws.send(json.dumps({"id": 1, "method": "Target.getTargets", "params": {}}))
+            while True:
+                msg = json.loads(await ws.recv())
+                if msg.get("id") == 1:
+                    return (msg.get("result") or {}).get("targetInfos") or []
+
+    try:
+        infos = asyncio.run(asyncio.wait_for(_query(), timeout=10))
+    except Exception:
+        return False  # cannot tell: closing an unresponsive idle browser is the point
+    return any(t.get("attached") and t.get("type") == "page" for t in infos)
+
+
+def _idle_spawn_watcher(browser_pid, port=None, project_id=None, minutes=None):
+    """Start the detached idle watcher for a browser `launch` just started.
+
+    Returns the watcher pid, or None when idle close is off / spawning failed.
+    Detached on both families so it outlives this command, its terminal and
+    the Node launcher: its own session on POSIX, DETACHED_PROCESS (no console)
+    + its own process group (no Ctrl+C from the launching console) on Windows.
+    All three std streams are DEVNULL: an inherited pipe would keep a caller
+    that captures output (the MCP server's subprocess.run) waiting for it.
+    """
+    port = int(port or CDP_PORT)
+    project_id = project_id or PROJECT_ID
+    minutes = _idle_close_minutes() if minutes is None else minutes
+    if minutes <= 0:
+        _idle_clear_state(port)  # an older watcher on this port stands down
+        return None
+    version = cdp_get('/json/version', no_cache=True) or {}
+    token = secrets.token_hex(8)
+    state = {
+        "token": token, "pid": None, "port": port, "project_id": project_id,
+        "browser_pid": browser_pid, "browser_ws": version.get("webSocketDebuggerUrl"),
+        "minutes": minutes, "started": time.time(),
+    }
+    # Written before the fork, so the watcher always finds its own token.
+    _idle_save_state(port, state)
+    env = os.environ.copy()
+    env.update(CDP_PORT=str(port), CDPILOT_PROJECT_ID=project_id,
+               CDPILOT_PROFILE=PROFILE_DIR, CDPILOT_HOME=CDPILOT_HOME)
+    env.pop("CDPILOT_TIMEOUT", None)  # the watcher is meant to run for minutes
+    kwargs = {
+        "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL, "env": env, "close_fds": True,
+        # Not the project dir: on Windows a process's cwd cannot be deleted.
+        "cwd": CDPILOT_HOME,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                                   | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), IDLE_WATCHER_FLAG, str(port), token],
+            **kwargs)
+    except OSError:
+        _idle_clear_state(port, token)
+        return None
+    state["pid"] = proc.pid
+    if (_idle_load_state(port) or {}).get("token") == token:
+        _idle_save_state(port, state)
+    return proc.pid
+
+
+def _idle_watcher_step(port, token, now=None, memo=None):
+    """One watcher round: 'wait', 'exit' (replaced / browser gone / not ours)
+    or 'closed' (idle for the configured minutes, browser stopped).
+    memo carries the previous round's page fingerprint ("pages")."""
+    state = _idle_load_state(port)
+    if not state or state.get("token") != token:
+        return "exit"
+    version = _idle_version(port)
+    if version is None and _pid_alive(state.get("browser_pid")) and not _is_port_free(port):
+        return "wait"  # busy, not gone
+    if not _idle_owns_browser(state, _load_registry(), version):
+        _idle_clear_state(port, token)
+        return "exit"
+    if memo is not None:
+        pages = _idle_page_fingerprint(_idle_page_targets(port))
+        if _idle_pages_changed(memo.get("pages"), pages):
+            _idle_write_activity(state.get("project_id"))
+        if pages is not None:
+            memo["pages"] = pages
+    minutes = float(state.get("minutes") or 0)
+    now = time.time() if now is None else now
+    if not _idle_should_close(now, _idle_last_activity(state), minutes):
+        return "wait"
+    if _idle_client_attached(version):
+        _idle_write_activity(state.get("project_id"))
+        return "wait"
+    if not _idle_should_close(now, _idle_last_activity(state), minutes):
+        return "wait"  # a command started while we asked the browser
+    _stop_browser_on_port(port)
+    registry = _load_registry()
+    entry = registry.get(state.get("project_id"))
+    if entry and entry.get("pid") == state.get("browser_pid"):
+        entry["status"] = "stopped"
+        entry["pid"] = None
+        _save_registry(registry)
+    try:
+        log = os.path.join(CDPILOT_HOME, "projects", state.get("project_id") or "", "idle-close.log")
+        with open(log, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} closed browser on port {port} "
+                    f"after {minutes:g} min without a cdpilot command or page change\n")
+    except OSError:
+        pass
+    _idle_clear_state(port, token)
+    return "closed"
+
+
+def _idle_watcher_entry(args):
+    """Hidden `--_idle-watcher <port> <token>` entry: the detached watcher loop."""
+    try:
+        port, token = int(args[0]), str(args[1])
+    except (IndexError, ValueError):
+        return
+    state = _idle_load_state(port) or {}
+    if state.get("token") != token:
+        return
+    poll = _idle_poll_seconds(float(state.get("minutes") or 0))
+    memo = {"pages": _idle_page_fingerprint(_idle_page_targets(port))}
+    errors = 0
+    while errors < 20:  # a persistent failure must not leave a watcher forever
+        time.sleep(poll)
+        try:
+            if _idle_watcher_step(port, token, memo=memo) != "wait":
+                return
+            errors = 0
+        except Exception:
+            errors += 1  # a transient error (registry mid-write) must not end the watch
+
+
+def _idle_status(port=None, now=None):
+    """(label, seconds_left) for status/health: 'idle close in 12m' / 'idle close off'."""
+    state = _idle_load_state(port or CDP_PORT)
+    minutes = float((state or {}).get("minutes") or 0)
+    if not state or minutes <= 0 or not _pid_alive(state.get("pid")):
+        return "idle close off", None
+    last = _idle_last_activity(state) or time.time()
+    left = max(0.0, minutes * 60 - ((time.time() if now is None else now) - last))
+    return f"idle close in {-(-int(left) // 60)}m", int(left)
 
 
 def get_tabs():
@@ -2726,9 +3129,20 @@ def _minimize_browser_window():
     asyncio.run(_do())
 
 
-def cmd_launch():
-    """Launch the browser with CDP enabled (isolated session — does not touch existing browser)."""
+def cmd_launch(auto=False, idle_close=None):
+    """Launch the browser with CDP enabled (isolated session — does not touch existing browser).
+
+    auto=True: started by a page command (auto-launch) — idle close on by
+    default; so is any launch from the MCP server (CDPILOT_MCP_SESSION=1).
+    idle_close: the `--idle-close <min>` value of an explicit launch.
+    """
     global CHROME_BIN, CDP_PORT, CDP_BASE
+    auto = auto or IS_MCP_SESSION
+    try:
+        idle_minutes = _idle_close_minutes(auto=auto, flag=idle_close)
+    except ValueError as e:
+        print(f"cdpilot: {e}", file=sys.stderr)
+        sys.exit(2)
     if cdp_get('/json/version'):
         proj_label = f' [{PROJECT_ID}]' if PROJECT_ID else ''
         print(f'Browser already running on port {CDP_PORT}{proj_label}.')
@@ -2892,6 +3306,13 @@ def cmd_launch():
         if cdp_get('/json/version'):
             if PROJECT_ID:
                 _register_project(PROJECT_ID, CDP_PORT, PROFILE_DIR, pid=proc.pid)
+                # Only browsers started right here get a watcher (see Idle auto-close).
+                if _idle_spawn_watcher(proc.pid, minutes=idle_minutes):
+                    print(f'  Idle close: after {idle_minutes:g} min without a cdpilot '
+                          f'command or page change ({IDLE_CLOSE_ENV}=0 disables)')
+                elif not auto:
+                    print(f'  Idle close: off (launch --idle-close <min> or '
+                          f'{IDLE_CLOSE_ENV}=<min> turns it on)')
             # Up and registered: the browser is meant to outlive this command,
             # so a --timeout expiring later must not kill it as an orphan.
             _timeout_release_child(proc)
@@ -5908,6 +6329,8 @@ def cmd_health():
       crashes_today  — int, Brave crash dump count from macOS today
       stealth        — bool, current stealth config
       uptime_warning — str|null, hint when browser is alive but very old
+      idle_close     — str, "idle close in <N>m" or "idle close off"
+      idle_close_in_s — int|null, seconds until the idle auto-close
 
     Exit codes: 0 = alive, 2 = down. Designed for shell watchdog loops:
       `until cdpilot health >/dev/null; do cdpilot launch; sleep 2; done`
@@ -5931,6 +6354,8 @@ def cmd_health():
         info['browser'] = ver.get('Browser') or ver.get('browser') or ''
         targets = cdp_get('/json') or []
         info['tabs'] = sum(1 for t in targets if t.get('type') == 'page')
+    info['idle_close'], info['idle_close_in_s'] = (
+        _idle_status() if info['alive'] else ("idle close off", None))
 
     # Today's crash count from macOS DiagnosticReports (Brave only).
     if platform.system() == 'Darwin':
@@ -8079,6 +8504,10 @@ def _api_create_session(opts: dict) -> dict:
         env = os.environ.copy()
         env['CDP_PORT'] = str(port)
         env['CDPILOT_PROJECT_ID'] = proj_id
+        # No idle watcher: this server ends the session (release / DELETE /
+        # shutdown), and its clients drive the browser over raw CDP that
+        # cdpilot never sees, so "no cdpilot command" does not mean idle.
+        env['CDPILOT_IDLE_CLOSE'] = '0'
         subprocess.Popen([py_bin, script, 'launch'], env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -8126,6 +8555,10 @@ def _api_release_session(session_id: str) -> bool:
 
 class BrowserbaseHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass  # quiet
+
+    def parse_request(self):
+        _idle_write_activity()  # every API request is activity (idle auto-close)
+        return super().parse_request()
 
     def _send_json(self, code: int, data):
         body = json.dumps(data).encode()
@@ -11776,6 +12209,7 @@ class MCPServer:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}}
 
         cli_args = [a for a in tool_map[tool_name](args) if a]
+        _idle_write_activity()  # a tool call is use of the browser (idle auto-close)
         try:
             env = os.environ.copy()
             env["CDPILOT_MCP_SESSION"] = "1"
@@ -12722,7 +13156,7 @@ async def _watch_daemon_run(url, fps, quality, max_width, retention_s,
     # Launch browser if needed (the daemon is forked by `watch start`, a page
     # command, so it follows the same CDPILOT_NO_AUTOLAUNCH switch).
     if not cdp_get("/json/version") and not _autolaunch_disabled():
-        cmd_launch()
+        cmd_launch(auto=True)
 
     ws_url, _ = get_page_ws()
 
@@ -13492,6 +13926,10 @@ if __name__ == "__main__":
     if cmd == WATCH_DAEMON_FLAG:
         _cmd_watch_daemon_entry()
         sys.exit(0)
+    if cmd == IDLE_WATCHER_FLAG:  # detached idle auto-close watcher (see cmd_launch)
+        _idle_watcher_entry(args)
+        sys.exit(0)
+    _idle_touch_activity(cmd)
 
     _AUTOLAUNCH["cmd"] = cmd
     if _timeout_s is not None:
@@ -13503,7 +13941,7 @@ if __name__ == "__main__":
         _arm_timeout_watchdog(_timeout_s, cmd)
 
     sync_cmds = {
-        'launch': cmd_launch,
+        'launch': lambda: cmd_launch(idle_close=_idle_close_flag(args)),
         'tabs': lambda: cmd_tabs(
             reap='--reap' in args,
             max_tabs=next((int(a.split('=')[1]) for a in args
