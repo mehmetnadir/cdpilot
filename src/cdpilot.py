@@ -485,7 +485,9 @@ STEALTH_JS_FULL = r"""
         length:      { value: 1,           enumerable: true },
         '0':         { value: mime,        enumerable: true }
       });
-      p.item = function(i) { return i === 0 ? mime : null; };
+      // `i >>> 0` = WebIDL unsigned long (ToUint32), like the native item():
+      // item(4294967296) wraps to item(0) (incolumitas overflowTest).
+      p.item = function(i) { return (i >>> 0) === 0 ? mime : null; };
       p.namedItem = function(n) { return n === mime.type ? mime : null; };
       return p;
     };
@@ -503,7 +505,7 @@ STEALTH_JS_FULL = r"""
       Object.defineProperty(plugins, p.name, { value: p });
     }
     Object.defineProperty(plugins, 'length', { value: pluginNames.length });
-    plugins.item = function(i) { return plugins[i] || null; };
+    plugins.item = function(i) { return plugins[i >>> 0] || null; };
     plugins.namedItem = function(n) {
       for (var k = 0; k < plugins.length; k++) if (plugins[k].name === n) return plugins[k];
       return null;
@@ -516,26 +518,39 @@ STEALTH_JS_FULL = r"""
   } catch (e) {}
 
   // 4b) Worker stealth — workers have their own global scope, so navigator.webdriver
-  // patches above do NOT propagate. Fingerprint scripts that probe via Worker
-  // (e.g. fpscanner.WEBDRIVER) catch this inconsistency. Fix: wrap the Worker
-  // constructor to prepend a navigator.webdriver patch via blob URL. Limitations:
-  // module workers and same-origin script URLs are best-effort (importScripts
-  // doesn't support module workers; cross-origin URLs may bypass via direct fetch).
+  // patches above do NOT propagate. Fix: wrap the Worker constructor to prepend a
+  // navigator.webdriver patch via blob URL. (fpscanner.WEBDRIVER is NOT a worker
+  // probe: it is `'webdriver' in navigator` on the page, true in every modern
+  // Chrome.) Limitations: module workers are skipped (importScripts can't load
+  // them); inside the blob worker, self.location is the blob: URL.
+  // Worker scope has no navigator.webdriver in Chrome; the patch only acts if a
+  // worker ever reports `true` (defining it unconditionally made 'webdriver' in
+  // navigator true inside workers - a tell). The script URL is resolved against
+  // the page: a relative URL inside a blob: worker resolves against blob: and
+  // failed to load (incolumitas `new Worker("webworker2.js")` never answered).
   try {
     var OrigWorker = window.Worker;
     if (OrigWorker && !window.__cdpilot_worker_patched) {
-      var workerPatch = "(function(){try{Object.defineProperty(self.navigator||{},'webdriver',{get:function(){return undefined;},configurable:true});}catch(e){}})();";
+      var workerPatch = "(function(){try{if(self.navigator&&self.navigator.webdriver===true){Object.defineProperty(self.navigator,'webdriver',{get:function(){return false;},configurable:true});}}catch(e){}})();";
       var WrappedWorker = function(scriptURL, options) {
+        var origURL = scriptURL;
         try {
           var isModule = options && options.type === 'module';
           if (typeof scriptURL === 'string' && !isModule) {
             // Wrap script in a blob that applies the patch then importScripts the original.
-            var wrapped = workerPatch + "importScripts(" + JSON.stringify(String(scriptURL)) + ");";
+            var absURL = new URL(String(scriptURL), document.baseURI).href;
+            var wrapped = workerPatch + "importScripts(" + JSON.stringify(absURL) + ");";
             var blob = new Blob([wrapped], { type: 'application/javascript' });
             scriptURL = URL.createObjectURL(blob);
           }
-        } catch (e) {}
-        return new OrigWorker(scriptURL, options);
+        } catch (e) { scriptURL = origURL; }
+        try {
+          return new OrigWorker(scriptURL, options);
+        } catch (e) {
+          // e.g. CSP forbids blob: workers - fall back to the untouched native call.
+          if (scriptURL === origURL) throw e;
+          return new OrigWorker(origURL, options);
+        }
       };
       WrappedWorker.prototype = OrigWorker.prototype;
       Object.setPrototypeOf(WrappedWorker, OrigWorker);
@@ -1799,6 +1814,9 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
                 "id": 50, "method": "Page.addScriptToEvaluateOnNewDocument",
                 "params": {"source": stealth_source}
             }))
+            # Same session, same lifetime: headless -> drop the HeadlessChrome
+            # token from UA header, navigator and UA-CH brands (regular: never).
+            await apply_headless_ua_override(ws)
 
         # Apply request blocking BEFORE navigate, on this same WS session.
         # Network.setBlockedURLs is session-bound (just like the stealth
@@ -2351,7 +2369,8 @@ def get_headless_config():
 # Tiers, weakest fingerprint footprint -> strongest spoof:
 #   regular    -> inject NOTHING (cleanest, default)
 #   stealth    -> STEALTH_JS_LIGHT (webdriver/chrome.runtime/permissions only)
-#   undetected -> STEALTH_JS_FULL  (light + plugins + WebGL + Worker)
+#                 + headless UA override (HeadlessChrome -> Chrome, UA-CH brands)
+#   undetected -> STEALTH_JS_FULL  (light + plugins + WebGL + Worker) + same UA override
 MODE_TIERS = ('regular', 'stealth', 'undetected')
 DEFAULT_MODE_TIER = 'regular'
 
@@ -2403,6 +2422,187 @@ def stealth_js_for_tier(tier):
     return None
 
 
+# ─── Headless UA override (stealth + undetected tiers only) ───────────────────
+# Headless Chromium says "HeadlessChrome/<v>" in the HTTP User-Agent header AND
+# in navigator.userAgent/appVersion. No JS patch can fix the header, and the
+# token alone fails sannysoft/incolumitas User-Agent + HEADCHR_UA; ua-parser then
+# names the browser "Chrome Headless", which is what fails fpscanner CHR_MEMORY.
+# The stealth tiers therefore send Emulation.setUserAgentOverride on the SAME
+# navigate WS that registers the stealth script (session-bound like it: active
+# for this navigation and its load; it lapses when the WS closes).
+# userAgentMetadata is mandatory: an override without it empties
+# navigator.userAgentData.brands and drops Sec-CH-UA (measured) - a louder tell.
+
+def headless_ua_rewrite(ua):
+    """'... HeadlessChrome/154.0.0.0 ...' -> '... Chrome/154.0.0.0 ...'.
+
+    Pure. A UA without the headless token (headed browser) comes back unchanged,
+    which is also how callers detect that there is nothing to override.
+    """
+    if not isinstance(ua, str) or 'HeadlessChrome' not in ua:
+        return ua
+    return ua.replace('HeadlessChrome', 'Chrome')
+
+
+def headless_brand_rewrite(brands):
+    """UA-CH brand list with 'HeadlessChrome' renamed to 'Google Chrome' (what a
+    headed Chrome reports). Chromium / Brave / GREASE entries are kept as-is."""
+    out = []
+    for b in brands or []:
+        if isinstance(b, dict) and 'brand' in b:
+            name = 'Google Chrome' if b['brand'] == 'HeadlessChrome' else str(b['brand'])
+            out.append({'brand': name, 'version': str(b.get('version', ''))})
+    return out
+
+
+def grease_brand_list(major, brand, full_version=None):
+    """Chromium's GREASEd brand list for a major version (port of
+    components/embedder_support/user_agent_utils.cc). Fallback only, for when
+    the current document is not a secure context and cannot report its own list.
+    Matches real Sec-CH-UA: 120 -> Not_A Brand/8, Chromium, Google Chrome;
+    131 -> Google Chrome, Chromium, Not_A Brand/24; 154 -> Chromium, Brave, Not A(Brand/99.
+    """
+    seed = int(major)
+    chars = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_']
+    order = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)][seed % 6]
+    grease_version = ['8', '99', '24'][seed % 3]
+    if full_version:
+        grease_version += '.0.0.0'
+    version = full_version or str(seed)
+    out = [None, None, None]
+    out[order[0]] = {'brand': 'Not' + chars[seed % 11] + 'A' + chars[(seed + 1) % 11] + 'Brand',
+                     'version': grease_version}
+    out[order[1]] = {'brand': 'Chromium', 'version': version}
+    out[order[2]] = {'brand': brand, 'version': version}
+    return out
+
+
+# Evaluated in the CURRENT document (before navigating) to copy the browser's
+# real UA-CH values. userAgentData exists only in secure contexts; the other
+# fields feed the synthesized fallback.
+UA_HINTS_PROBE_JS = r"""(async () => {
+  var r = {brave: !!navigator.brave, platform: navigator.platform};
+  try {
+    var d = navigator.userAgentData;
+    if (d && d.getHighEntropyValues) {
+      r.hints = await d.getHighEntropyValues(['architecture', 'bitness', 'model',
+        'platformVersion', 'fullVersionList', 'uaFullVersion', 'wow64', 'formFactors']);
+    }
+  } catch (e) {}
+  return JSON.stringify(r);
+})()"""
+
+
+def headless_ua_metadata(probe, version_info):
+    """CDP UserAgentMetadata for the override. Copies the live document's own
+    hints (exact) with HeadlessChrome renamed; synthesizes a Chromium-accurate
+    set only when the current document could not report them."""
+    probe = probe if isinstance(probe, dict) else {}
+    hints = probe.get('hints')
+    if isinstance(hints, dict) and hints.get('brands'):
+        meta = {
+            'brands': headless_brand_rewrite(hints.get('brands')),
+            'fullVersionList': headless_brand_rewrite(hints.get('fullVersionList')),
+            'platform': str(hints.get('platform', '')),
+            'platformVersion': str(hints.get('platformVersion', '')),
+            'architecture': str(hints.get('architecture', '')),
+            'model': str(hints.get('model', '')),
+            'mobile': bool(hints.get('mobile', False)),
+        }
+        if hints.get('uaFullVersion'):
+            meta['fullVersion'] = str(hints['uaFullVersion'])
+        if hints.get('bitness') is not None:
+            meta['bitness'] = str(hints['bitness'])
+        if 'wow64' in hints:
+            meta['wow64'] = bool(hints['wow64'])
+        if isinstance(hints.get('formFactors'), list):
+            meta['formFactors'] = [str(f) for f in hints['formFactors']]
+        return meta
+    # Fallback: insecure current document. Version from Browser.getVersion.
+    product = str((version_info or {}).get('product', ''))
+    ua = str((version_info or {}).get('userAgent', ''))
+    m = _re.search(r'Chrome/(\d+)\.(\d+)\.(\d+)\.(\d+)', product) or \
+        _re.search(r'Chrome/(\d+)\.(\d+)\.(\d+)\.(\d+)', ua)
+    if not m:
+        return None
+    major = m.group(1)
+    if probe.get('brave'):
+        brand, full = 'Brave', major + '.0.0.0'   # Brave reports reduced versions
+    else:
+        brand = 'Microsoft Edge' if 'Edg/' in ua else 'Google Chrome'
+        full = '.'.join(m.groups())
+    nav_platform = str(probe.get('platform', ''))
+    if nav_platform.startswith('Mac') or 'Macintosh' in ua:
+        plat, plat_ver = 'macOS', platform.mac_ver()[0]
+    elif nav_platform.startswith('Win') or 'Windows' in ua:
+        plat, plat_ver = 'Windows', ''
+    else:
+        plat, plat_ver = 'Linux', ''
+    machine = platform.machine().lower()
+    return {
+        'brands': grease_brand_list(major, brand),
+        'fullVersionList': grease_brand_list(major, brand, full),
+        'fullVersion': full,
+        'platform': plat,
+        'platformVersion': plat_ver,
+        'architecture': 'arm' if machine.startswith(('arm', 'aarch')) else 'x86',
+        'bitness': '64' if '64' in machine else '32',
+        'model': '',
+        'mobile': False,
+        'wow64': False,
+    }
+
+
+async def _ws_request(ws, msg_id, method, params=None, timeout=3.0):
+    """Send one CDP command on a raw navigate WS and wait for its reply,
+    skipping interleaved events. Returns the reply message or None on timeout."""
+    await ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=max(0.05, deadline - time.time()))
+        except asyncio.TimeoutError:
+            break
+        msg = json.loads(raw)
+        if msg.get("id") == msg_id:
+            return msg
+    return None
+
+
+async def apply_headless_ua_override(ws, base_id=40):
+    """Stealth/undetected tiers: on this navigate session, stop advertising
+    HeadlessChrome (HTTP header, navigator.userAgent/appVersion, UA-CH brands).
+
+    Headless is detected from the browser itself (Browser.getVersion userAgent
+    carries the HeadlessChrome token); headed browsers get no command at all.
+    Returns the applied UA, or None. Never raises - navigation must proceed.
+    """
+    try:
+        ver = await _ws_request(ws, base_id, "Browser.getVersion")
+        info = (ver or {}).get("result") or {}
+        real_ua = info.get("userAgent", "")
+        new_ua = headless_ua_rewrite(real_ua)
+        if not new_ua or new_ua == real_ua:
+            return None
+        probe = None
+        r = await _ws_request(ws, base_id + 1, "Runtime.evaluate", {
+            "expression": UA_HINTS_PROBE_JS, "returnByValue": True, "awaitPromise": True})
+        try:
+            probe = json.loads(r["result"]["result"]["value"])
+        except Exception:
+            probe = None
+        params = {"userAgent": new_ua}
+        meta = headless_ua_metadata(probe, info)
+        if meta:
+            params["userAgentMetadata"] = meta
+        res = await _ws_request(ws, base_id + 2, "Emulation.setUserAgentOverride", params)
+        if not res or "error" in res:
+            return None
+        return new_ua
+    except Exception:
+        return None
+
+
 def cmd_mode(tier=None):
     """Get or set the three-tier stealth mode (regular | stealth | undetected).
 
@@ -2422,8 +2622,10 @@ def cmd_mode(tier=None):
         current = get_mode_config()
         patch = {
             'regular': 'none (no fingerprint patch — cleanest)',
-            'stealth': 'STEALTH_JS_LIGHT (webdriver, chrome.runtime, permissions)',
-            'undetected': 'STEALTH_JS_FULL (light + plugins + WebGL + Worker)',
+            'stealth': 'STEALTH_JS_LIGHT (webdriver, chrome.runtime, permissions)'
+                       ' + headless UA override',
+            'undetected': 'STEALTH_JS_FULL (light + plugins + WebGL + Worker)'
+                          ' + headless UA override',
         }[current]
         print(f'Mode: {current}')
         print(f'  Injects: {patch}')
