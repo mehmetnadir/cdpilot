@@ -1,24 +1,24 @@
 ---
-title: "I Built a 50KB Browser Automation CLI That Replaces Playwright"
+title: "I Built a One-File Browser Automation CLI That Replaces Playwright"
 published: true
 tags: webdev, javascript, ai, productivity
 cover_image: https://raw.githubusercontent.com/mehmetnadir/cdpilot/main/cdpilot-demo.gif
 canonical_url: https://github.com/mehmetnadir/cdpilot
 ---
 
-# I Built a 50KB Browser Automation CLI That Replaces Playwright
+# I Built a One-File Browser Automation CLI That Replaces Playwright
 
 ## The Problem
 
 Every time I set up browser automation for an AI agent, the same pain:
 
 ```bash
-npm install playwright    # 200MB+ download
-npx playwright install    # 3 more browser downloads
+npm install playwright    # downloads its own bundled browser(s)
+npx playwright install    # more browser downloads
 # Write boilerplate, configure launch options, handle contexts...
 ```
 
-400MB of dependencies to take a screenshot. Dozens of files to click a button. A library designed for test suites when all I needed was a CLI command.
+Hundreds of megabytes of downloaded browser builds to take a screenshot. Dozens of files to click a button. A library designed for test suites when all I needed was a CLI command.
 
 I asked myself: **What if browser automation was as simple as `curl`?**
 
@@ -32,7 +32,9 @@ npx cdpilot shot
 
 That's it. No install step. No config files. No boilerplate.
 
-**cdpilot** is a zero-dependency browser automation CLI that talks directly to your existing browser via Chrome DevTools Protocol. It's ~50KB total, ships with 40+ commands, and includes a built-in MCP server for AI agents.
+**cdpilot** is a browser automation CLI, built as a single Python file with zero npm
+dependencies, that talks directly to your existing browser via Chrome DevTools
+Protocol. It ships with 70+ commands and includes a built-in MCP server for AI agents.
 
 ## How It Works
 
@@ -45,16 +47,16 @@ Instead of downloading a separate browser binary (like Playwright and Puppeteer 
 └─────────────┘     Protocol             └──────────────┘
 ```
 
-The entire tool is a single Python file (~2500 lines) with a thin Node.js wrapper for `npx` distribution. No compiled binaries. No native modules. No dependency tree.
+The entire tool is a single Python file with a thin Node.js wrapper for `npx` distribution. No compiled binaries. No native modules. No `node_modules` tree.
 
 ## The Numbers
 
 | | cdpilot | Puppeteer | Playwright | Selenium |
 |--|---------|-----------|------------|----------|
-| **Install size** | ~50KB | 400MB+ | 200MB+ | 100MB+ |
-| **Dependencies** | 0 | 50+ | 30+ | Java + drivers |
+| **Install** | one Python file + a small Node launcher, no `node_modules` | downloads own browser build | downloads own browser builds | Java + drivers |
+| **Dependencies** | 0 npm (Python: `websockets`, auto-installed) | several | several | Java + drivers |
 | **Setup time** | Instant | Minutes | Minutes | Painful |
-| **Browser download** | No | Yes | Yes (3 browsers) | No |
+| **Browser download** | No | Yes | Yes (its own builds) | No |
 | **CLI-first** | Yes | No (library) | No (library) | No |
 | **MCP server** | Built-in | No | Community | No |
 
@@ -100,7 +102,7 @@ cdpilot a11y summary     # Quick overview
 cdpilot a11y find button # Find all buttons
 ```
 
-This is particularly powerful for AI agents. Instead of parsing raw HTML, agents get a structured accessibility tree -- the same data screen readers use.
+This is particularly powerful for AI agents. Instead of parsing raw HTML, agents get a structured accessibility tree with `@ref` handles they can act on directly -- the same kind of data screen readers use, with no vision model needed for the common case.
 
 ## AI Agent Integration
 
@@ -121,7 +123,7 @@ Add this to your MCP config:
 }
 ```
 
-Now Claude can browse the web, take screenshots, fill forms, and interact with any website -- all through a lightweight 50KB tool.
+Now Claude can browse the web, take screenshots, fill forms, and interact with any website -- all through a lightweight, single-file tool.
 
 ### Any LLM via subprocess
 
@@ -146,7 +148,7 @@ One thing that annoyed me about headless automation: you never know what's happe
 - **Keystroke display** showing what's being typed
 - **Red warning toast** when you try to interact during automation
 
-This makes debugging automation scripts 10x easier.
+This makes it much easier to see what an automation script is actually doing.
 
 ## Multi-Project Isolation
 
@@ -167,7 +169,7 @@ No port conflicts. No session pollution. Each project is isolated.
 I believe developer tools should be:
 
 1. **Zero-config** -- work out of the box
-2. **Zero-dependency** -- no supply chain risk
+2. **Near-zero-dependency** -- no npm supply chain risk, one auto-installed Python package
 3. **CLI-first** -- composable with other tools
 4. **AI-native** -- designed for LLM tool-use, not just humans
 

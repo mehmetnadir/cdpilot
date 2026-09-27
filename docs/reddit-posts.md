@@ -6,13 +6,13 @@
 
 ## r/ClaudeAI
 
-**Title:** I built a lightweight MCP tool for browser automation -- cdpilot (50KB, zero dependencies)
+**Title:** I built a lightweight MCP tool for browser automation -- cdpilot (one Python file, zero npm dependencies)
 
 **Body:**
 
-I've been using Claude Code for development and needed a way to give it browser control without the overhead of Playwright MCP (which downloads entire browser binaries).
+I've been using Claude Code for development and needed a way to give it browser control without the overhead of Playwright MCP (which downloads and manages its own browser build).
 
-**cdpilot** is a zero-dependency browser automation CLI with a built-in MCP server. It connects to your existing Brave/Chrome browser via CDP -- no downloads, no bloat.
+**cdpilot** is a browser automation CLI with a built-in MCP server, built as a single Python file with zero npm dependencies. It connects to your existing Brave/Chrome browser via CDP -- no browser download, no bloat.
 
 ### Setup (30 seconds)
 
@@ -41,10 +41,10 @@ Then Claude can:
 
 | | cdpilot | Playwright MCP |
 |--|---------|---------------|
-| Install size | ~50KB | 200MB+ |
+| Install | one Python file + a small Node launcher, no `node_modules` | downloads its own browser build |
 | Browser download | No (uses yours) | Yes |
-| Dependencies | 0 | 30+ |
-| Commands | 40+ | Varies |
+| Dependencies | 0 npm (Python: `websockets`, auto-installed) | many |
+| Commands | 70+ | Varies |
 
 ### Key feature for AI: Accessibility tree snapshots
 
@@ -52,7 +52,7 @@ Then Claude can:
 npx cdpilot a11y
 ```
 
-Returns structured a11y data that's much more useful for AI agents than raw HTML.
+Returns structured a11y data with `@ref` handles the agent can act on directly -- no vision model needed for the common case, and it's much more useful for AI agents than raw HTML.
 
 **GitHub:** https://github.com/mehmetnadir/cdpilot
 **npm:** `npx cdpilot launch`
@@ -63,28 +63,28 @@ Would love feedback from other Claude Code users!
 
 ## r/SideProject
 
-**Title:** cdpilot -- Zero-dependency browser automation CLI (50KB vs Playwright's 200MB)
+**Title:** cdpilot -- one-file browser automation CLI, no browser download, 70+ commands
 
 **Body:**
 
 Hey everyone! Sharing a side project I've been working on.
 
 **What is it?**
-A CLI tool that lets you control a browser from your terminal. Navigate, click, type, screenshot, monitor network -- 40+ commands, all without installing any dependencies.
+A CLI tool that lets you control a browser from your terminal. Navigate, click, type, screenshot, monitor network -- 70+ commands, with zero npm dependencies.
 
 **Why I built it:**
-I was building AI agents that needed browser control. Every existing solution (Playwright, Puppeteer, Selenium) required hundreds of megabytes of downloads and complex setup. I wanted something that "just works" with `npx`.
+I was building AI agents that needed browser control. Every existing solution (Playwright, Puppeteer, Selenium) downloads its own browser build and needs a real setup step. I wanted something that "just works" with `npx`.
 
 **The interesting technical bits:**
-- Zero npm and Python dependencies -- uses only standard library
-- Single Python file (~2500 lines) as the core
+- Zero npm dependencies; the Python core needs exactly one package, `websockets`, which `cdpilot setup` auto-installs
+- Single Python file as the core -- no separate library modules
 - Talks directly to your browser via Chrome DevTools Protocol
 - Built-in MCP server for AI agent integration
 - Visual feedback system (green glow, cursor vis, click ripples)
 
 **The numbers:**
-- ~50KB total install size (vs 200-400MB for alternatives)
-- 40+ commands
+- One Python file, no `node_modules`, no browser download -- it drives the Chrome/Brave/Chromium you already have
+- 70+ commands
 - Works with Brave, Chrome, and Chromium
 - Multi-project isolation (each project gets its own browser)
 
@@ -103,34 +103,34 @@ Feedback and contributions welcome! MIT licensed.
 
 ## r/opensource
 
-**Title:** cdpilot: Zero-dependency, single-file browser automation CLI [MIT]
+**Title:** cdpilot: one-file, zero-npm-dependency browser automation CLI [MIT]
 
 **Body:**
 
 I'm open-sourcing **cdpilot**, a browser automation CLI built with a minimalist philosophy:
 
 **Core principles:**
-1. **Zero dependencies** -- no npm packages, no Python packages. Pure stdlib.
-2. **Single file** -- the entire core is one Python file (~2500 lines). Easy to audit.
+1. **Zero npm dependencies** -- no npm packages at all. The Python core needs exactly one package, `websockets`, auto-installed by `cdpilot setup`.
+2. **Single file** -- the entire core is one Python file. Easy to audit.
 3. **CLI-first** -- every operation is a standalone command. Composable with scripts and pipes.
 4. **Use what you have** -- connects to your existing browser, doesn't download its own.
 
-**Why zero dependencies matters:**
-- No supply chain attack surface
-- No version conflicts
+**Why the near-zero-dependency discipline matters:**
+- Minimal supply chain attack surface (no npm tree at all)
+- No npm version conflicts
 - No `npm audit` warnings
-- No breaking changes from upstream packages
+- No breaking changes from upstream npm packages
 - Auditable in an afternoon
 
 **What it does:**
-40+ commands for browser automation: navigate, interact, screenshot, PDF, network monitoring, console capture, device emulation, accessibility tree, request interception, and more.
+70+ commands for browser automation: navigate, interact, screenshot, PDF, network monitoring, console capture, device emulation, accessibility tree, request interception, and more.
 
 **Architecture:**
 ```
 Node.js entry (npx compatible) -> spawns Python core -> CDP over HTTP/WebSocket -> Your browser
 ```
 
-The Node.js layer handles browser detection and Python discovery. The Python core handles all CDP communication using only `urllib` and `asyncio`.
+The Node.js layer handles browser detection and Python discovery. The Python core handles all CDP communication using `asyncio` plus the one `websockets` package.
 
 **AI integration:**
 Includes a built-in MCP (Model Context Protocol) server, so AI agents like Claude Code can control the browser natively.
@@ -148,7 +148,7 @@ Looking for contributors, especially for:
 
 ## r/webdev
 
-**Title:** Built a Puppeteer/Playwright alternative that's 50KB with zero dependencies
+**Title:** Built a Puppeteer/Playwright alternative: one Python file, zero npm dependencies
 
 **Body:**
 
@@ -169,11 +169,11 @@ No library imports. No async/await boilerplate. No browser downloads. Just CLI c
 
 | | cdpilot | Puppeteer | Playwright | Selenium |
 |--|---------|-----------|------------|----------|
-| Install size | ~50KB | 400MB+ | 200MB+ | 100MB+ |
-| Dependencies | 0 | 50+ | 30+ | Java + drivers |
+| Install | one Python file + small Node launcher, no `node_modules` | downloads own browser build | downloads own browser builds | Java + drivers |
+| Dependencies | 0 npm (Python: `websockets`, auto-installed) | several | several | Java + drivers |
 | Setup | `npx` | `npm i` + download | `npm i` + install | JDK + drivers |
 | Interface | CLI | Library | Library | Library |
-| Browser | Yours | Downloads Chromium | Downloads 3 | Uses yours |
+| Browser | Yours | Downloads Chromium | Downloads its own | Uses yours |
 
 **What it's NOT:**
 - Not a test framework (no assertions, no test runner)

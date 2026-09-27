@@ -12,7 +12,7 @@
 3. Fill in:
    - **Name:** cdpilot
    - **Website:** https://github.com/mehmetnadir/cdpilot
-   - **Description:** Zero-dependency browser automation CLI. 50KB, 40+ commands, built-in MCP server for AI agents. Uses your existing browser via Chrome DevTools Protocol. No Playwright, no Puppeteer, no Selenium.
+   - **Description:** One-file browser automation CLI, zero npm dependencies, 70+ commands, built-in MCP server for AI agents. Uses your existing browser via Chrome DevTools Protocol -- no bundled browser download. No Playwright, no Puppeteer, no Selenium.
    - **License:** MIT / Open Source
    - **Platforms:** macOS, Linux, Windows
    - **Category:** Development Tools > Browser Automation
@@ -23,8 +23,8 @@
    - Selenium
    - Cypress (partial alternative)
 5. Write a review highlighting:
-   - 50KB vs 200-400MB install size
-   - Zero dependencies
+   - No bundled browser download vs. Playwright/Puppeteer's own browser builds
+   - Zero npm dependencies (one auto-installed Python package)
    - CLI-first (vs library approach)
    - Built-in AI agent support (MCP)
 
@@ -39,7 +39,7 @@
    - **Name:** cdpilot
    - **Website:** https://github.com/mehmetnadir/cdpilot
    - **Category:** Build, Test, Deploy > Browser Testing
-   - **Description:** Zero-dependency browser automation CLI with 40+ commands and built-in MCP server. Uses existing Brave/Chrome browser via CDP. ~50KB total, no Playwright/Puppeteer needed.
+   - **Description:** One-file browser automation CLI with 70+ commands and a built-in MCP server. Zero npm dependencies. Uses existing Brave/Chrome browser via CDP -- no Playwright/Puppeteer browser download needed.
    - **GitHub URL:** https://github.com/mehmetnadir/cdpilot
    - **npm URL:** https://www.npmjs.com/package/cdpilot
 4. After creation, add to your personal stack and any relevant "Stack Decisions"
@@ -59,7 +59,7 @@
 1. Go to https://github.com/sindresorhus/awesome-nodejs
 2. The list is curated -- open a PR to add cdpilot under "Testing" or "Command-line utilities":
    ```markdown
-   - [cdpilot](https://github.com/mehmetnadir/cdpilot) - Zero-dependency browser automation CLI with 40+ commands and built-in MCP server.
+   - [cdpilot](https://github.com/mehmetnadir/cdpilot) - One-file browser automation CLI with 70+ commands and a built-in MCP server.
    ```
 3. Follow their contribution guidelines (minimum star count may apply)
 
@@ -67,14 +67,14 @@
 1. Go to https://github.com/punkpeye/awesome-mcp-servers
 2. Open a PR to add cdpilot under "Browser Automation" or "Web" section:
    ```markdown
-   - [cdpilot](https://github.com/mehmetnadir/cdpilot) - Zero-dependency browser automation with 40+ CLI commands. Uses existing browser via CDP. ~50KB.
+   - [cdpilot](https://github.com/mehmetnadir/cdpilot) - Zero-npm-dependency browser automation with 70+ CLI commands. Uses existing browser via CDP, no bundled browser download.
    ```
 
 ### awesome-chrome-devtools (GitHub)
 1. Go to https://github.com/nicedoc/awesome-chrome-devtools
 2. Open a PR to add under "Automation" section:
    ```markdown
-   - [cdpilot](https://github.com/mehmetnadir/cdpilot) - Zero-dependency CLI for browser automation via CDP. 40+ commands, built-in MCP server.
+   - [cdpilot](https://github.com/mehmetnadir/cdpilot) - Zero-npm-dependency CLI for browser automation via CDP. 70+ commands, built-in MCP server.
    ```
 
 ---
@@ -86,13 +86,13 @@
 2. Go to https://www.producthunt.com/posts/new
 3. Fill in:
    - **Name:** cdpilot
-   - **Tagline:** Zero-dependency browser automation CLI. 50KB, 40+ commands, AI-ready.
+   - **Tagline:** One-file browser automation CLI. Zero npm deps, 70+ commands, AI-ready.
    - **Website:** https://github.com/mehmetnadir/cdpilot
    - **Description:**
-     cdpilot is a browser automation CLI that replaces Playwright and Puppeteer for common tasks. At just 50KB with zero dependencies, it connects to your existing browser via Chrome DevTools Protocol.
+     cdpilot is a browser automation CLI that replaces Playwright and Puppeteer for common tasks. Built as a single Python file with zero npm dependencies, it connects to your existing browser via Chrome DevTools Protocol -- no bundled browser download.
 
      Key features:
-     - 40+ CLI commands (navigate, click, type, screenshot, PDF, console, network...)
+     - 70+ CLI commands (navigate, click, type, screenshot, PDF, console, network...)
      - Built-in MCP server for AI agents (Claude Code, GPT, etc.)
      - Visual feedback (green glow, cursor vis, click ripples)
      - Multi-project browser isolation

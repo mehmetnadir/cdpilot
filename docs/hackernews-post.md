@@ -1,13 +1,14 @@
-# Hacker News — Show HN Post (revised 2026-04-22)
+# Hacker News — Show HN Post (revised 2026-09-27)
 
 ## Title Options (pick one)
 
-1. **Show HN: cdpilot – zero-dependency browser automation CLI (1/4000th of Playwright)**
-2. **Show HN: cdpilot – 60KB browser automation for AI agents, with built-in MCP server**
+1. **Show HN: cdpilot – one Python file, zero npm dependencies, drives the browser you already have**
+2. **Show HN: cdpilot – 70+ command browser automation CLI for AI agents, with built-in MCP server**
 3. **Show HN: cdpilot – I debugged a Brave-macOS-26 crash in prod; the fix became a browser picker**
 
-> Recommendation: **Option 1** — pure comparison numbers beat feature lists on HN.
-> Option 3 is tempting but too narrative for a title; move the story to the comment.
+> Recommendation: **Option 1** — the "no browser download, drives what you have" framing is the
+> real differentiator and every word in it is true. Option 3 is tempting but too narrative for a
+> title; move the story to the comment.
 
 ---
 
@@ -29,16 +30,17 @@ for ~4 hours after posting.
 
 Hey HN — author here.
 
-**The itch:** Every AI agent demo that touches a browser pulls in
-Playwright (~200MB) or Puppeteer (~400MB) plus a bundled Chromium.
-For what — a screenshot and three clicks? I wanted a version that
-talks to my already-installed Brave over CDP and does nothing else.
+**The itch:** Every AI agent demo that touches a browser pulls in Playwright or
+Puppeteer, which download and manage their own bundled Chromium build. For
+what — a screenshot and three clicks? I wanted a version that talks to my
+already-installed Brave over CDP and does nothing else.
 
-cdpilot is a CLI that does exactly that. The distribution is a single
-Python file (`src/cdpilot.py`) plus a thin Node wrapper
-(`bin/cdpilot.js`) for `npx` support. Total unpacked size: 233KB.
-Zero npm deps, zero pip deps — stdlib only. You can audit the whole
-thing in an afternoon.
+cdpilot is a CLI that does exactly that. The distribution is a single Python
+file (`src/cdpilot.py`) plus a thin Node wrapper (`bin/cdpilot.js`) for `npx`
+support — no browser download, no `node_modules` tree. Zero npm
+dependencies; the Python core needs exactly one package, `websockets`, which
+`cdpilot setup` auto-installs and verifies against the same interpreter
+cdpilot picks. Requirements are Node.js 18+ and Python 3.10+.
 
 ```
 npx cdpilot launch          # start an isolated Brave/Chrome/Vivaldi
@@ -63,8 +65,8 @@ npx cdpilot mcp              # expose everything as an MCP server
 
 3. **Workload-aware browser pick.** Shipped this week after Brave 1.89
    started crashing on macOS 26 (Tahoe) at exactly ~7min uptime —
-   SIGTRAP in ThreadPoolForegroundWorker, deterministic across 9+
-   dumps. While digging into that I noticed Chrome 147 silently drops
+   SIGTRAP in ThreadPoolForegroundWorker, deterministic across repeated
+   crash dumps. While digging into that I noticed Chrome 147 silently drops
    `--load-extension` for unpacked extensions (no error, no warning).
    So `cdpilot browser auto` now reads the dev-extension registry:
    if you're doing extension work it prefers Vivaldi/Brave/Edge (they
@@ -75,20 +77,21 @@ npx cdpilot mcp              # expose everything as an MCP server
 **What's in it that surprised people in testing:**
 
 - `cdpilot describe` — one command combines a11y tree + OCR + screenshot
-  for LLM vision fallback. A screenshot-describe round-trip goes from
-  ~250k tokens (Computer Use style) to ~500 tokens.
-- `cdpilot stealth on` — zero-dep fingerprint patches (opt-in). Passes
-  bot.sannysoft 24/24, Cloudflare full challenge at nowsecure.nl, and
-  incolumitas intoli 6/6. It does NOT beat `incolumitas overflowTest`
-  because that probe detects CDP presence itself — no JS patch can hide
-  the protocol.
+  for LLM vision fallback. The a11y side gives the agent structured text
+  with `@ref` handles it can act on directly — no vision model needed for
+  the common case.
+- `cdpilot stealth on` — built-in fingerprint patches (opt-in, no extra
+  dependency). Passes bot.sannysoft 24/24, Cloudflare full challenge at
+  nowsecure.nl, and incolumitas intoli 6/6. It does NOT beat
+  `incolumitas overflowTest` because that probe detects CDP presence itself
+  — no JS patch can hide the protocol.
 - `cdpilot health` — JSON status with today's crash count from macOS
   DiagnosticReports. Designed for `until cdpilot health; do launch;
   done` watchdog loops.
 
-**What it's NOT:** not a test framework. No runner, no assertion DSL
-(though there are 10 assertion commands for CI pipelines). It replaces
-the automation layer only.
+**What it's NOT:** not a test framework replacement for full E2E suites
+(though it does ship `cdpilot test`/`cdpilot trace` plus 10 assertion
+commands for CI pipelines). It replaces the automation layer underneath.
 
 Would love feedback on the `browser auto` policy in particular — the
 two-axis (extension workload × platform stability) ended up being one
@@ -106,15 +109,15 @@ npm: https://www.npmjs.com/package/cdpilot
 > Fair — if you're writing a test suite, Playwright is the right tool.
 > cdpilot replaces the automation layer below the test runner. If
 > you're an AI agent that needs to take a screenshot of a user's
-> browser, shipping 200MB + a bundled Chromium just to call
+> browser, downloading and managing a bundled Chromium just to call
 > `page.screenshot()` is wrong-sized for the job.
 
-**"Zero dependencies is a feature until you need something"**
-> Agreed — if I ever need something stdlib can't provide, the zero-dep
-> promise breaks. So far (3600 LOC Python) the discipline has been
-> useful: it forced me to think about what's actually essential vs.
-> what's library habit. The WebSocket client is 80 lines of asyncio.
-> The CDP protocol handler is 30. That's the whole "dependency."
+**"So it's not actually zero dependencies?"**
+> Correct — zero *npm* dependencies. The Python core needs exactly one
+> package, `websockets`, and `cdpilot setup` installs and verifies it for
+> you. Everything else — the CDP protocol handling, the WebSocket message
+> pump — is hand-rolled in `src/cdpilot.py`, which is what keeps a single
+> file auditable end to end even as it grows.
 
 **"Chrome already has remote-debugging"**
 > Yes — cdpilot is a thin ergonomic layer over that. The value is
@@ -141,5 +144,4 @@ https://github.com/mehmetnadir/cdpilot
   > defensive rebuttal.
 - **If someone says "there's already X"** — thank them, check X,
   acknowledge differences without trashing X.
-- **First 30 minutes matter most.** One upvote in the first 10 min
-  = 10 in hour 3.
+- **First 30 minutes matter most.** Early upvotes compound — don't skip them.

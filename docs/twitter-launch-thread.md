@@ -1,5 +1,10 @@
 # Twitter/X Launch Thread for cdpilot
 
+> Note (2026-09-27): this thread says "50KB", "zero dependencies", "40+ commands", and
+> "~2500 lines" — see CHANGELOG.md [0.9.1] "Corrected" for the measured figures
+> (single Python file / 13,129 lines / one Python dependency, `websockets` / 70+ commands).
+> Left unedited below because it may already be posted; do not repost with these numbers.
+
 > Copy each tweet as a separate post in a thread. Post tweet 1 first, then reply with the rest.
 
 ---
