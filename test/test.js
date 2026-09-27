@@ -30,7 +30,9 @@ function run(args = '') {
   return execSync(`node ${CLI} ${args} 2>&1`, {
     timeout: 10000,
     encoding: 'utf-8',
-    env: { ...process.env, CDP_PORT: '19222' }, // avoid conflict with real browser
+    // CDP_PORT avoids a conflict with a real browser; this helper does not
+    // isolate CDPILOT_HOME, so keep its commands out of the real session log.
+    env: { ...process.env, CDP_PORT: '19222', CDPILOT_LOG: '0' },
   });
 }
 
@@ -4062,6 +4064,840 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
     assert(first === 'Unreleased' || first === pkg.version,
       `newest CHANGELOG section must be [Unreleased] or [${pkg.version}], got [${first}]`);
     assert(changelog.includes('CDPILOT_NO_AUTOLAUNCH'), 'CHANGELOG must describe CDPILOT_NO_AUTOLAUNCH');
+  });
+})();
+
+// ── Idle auto-close ──
+// A browser cdpilot launched (explicitly or by auto-launch) closes itself after
+// CDPILOT_IDLE_CLOSE minutes (default 15, 0 = off) without a cdpilot command.
+// No real browser here: the watcher's decisions are exercised in-process with
+// stubbed CDP answers, against a throwaway CDPILOT_HOME.
+(function() {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const PY_BIN = process.platform === 'win32' ? 'python' : 'python3';
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-idle-test-'));
+  const IMPORT = [
+    'import importlib.util, json, os, sys, time',
+    `spec = importlib.util.spec_from_file_location("cdpilot_idle", ${JSON.stringify(PY_PATH)})`,
+    'mod = importlib.util.module_from_spec(spec)',
+    'spec.loader.exec_module(mod)',
+  ].join('\n');
+
+  function freePort() {
+    const r = spawnSync(PY_BIN, ['-c',
+      'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); '
+      + 'print(s.getsockname()[1]); s.close()'], { encoding: 'utf-8', timeout: 10000 });
+    assert.strictEqual(r.status, 0, `freePort failed: ${r.stderr}`);
+    return r.stdout.trim();
+  }
+
+  function pyEnv(extra = {}) {
+    const env = {
+      ...process.env,
+      CDPILOT_HOME: home,
+      CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: freePort(),
+      CDPILOT_PROJECT_ID: 'idle-proj',
+      CDPILOT_NO_AUTOLAUNCH: '1',
+    };
+    for (const k of ['CDPILOT_TIMEOUT', 'CDPILOT_IDLE_CLOSE']) delete env[k];
+    return { ...env, ...extra };
+  }
+
+  function py(script, extra = {}) {
+    const r = spawnSync(PY_BIN, ['-c', IMPORT + '\n' + script], {
+      encoding: 'utf-8', timeout: 30000, env: pyEnv(extra),
+    });
+    assert(!r.error, `python failed to run: ${r.error}`);
+    const line = (r.stdout || '').split('\n').find((l) => l.startsWith('RESULT='));
+    assert(line, `no result (status ${r.status}) stdout=${r.stdout} stderr=${r.stderr}`);
+    return { res: JSON.parse(line.slice('RESULT='.length)), stderr: r.stderr };
+  }
+
+  const activityFile = path.join(home, 'projects', 'idle-proj', 'last-activity');
+
+  test('idle close: CDPILOT_IDLE_CLOSE parsing (auto default 15, explicit default off, 0/off, fractions, bad value warns)', () => {
+    const { res, stderr } = py(`
+f = mod._idle_close_minutes
+E = lambda v: {"CDPILOT_IDLE_CLOSE": v}
+out = {
+  "unset": f({}), "empty": f(E(" ")), "zero": f(E("0")), "off": f(E("off")), "frac": f(E("0.2")),
+  "thirty": f(E("30")), "bad": f(E("abc")), "neg": f(E("-3")), "nan": f(E("nan")),
+  "inf": f(E("inf")), "env": f(),
+  "x_unset": f({}, auto=False), "x_env": f(E("0.2"), auto=False), "x_zero": f(E("0"), auto=False),
+  "x_bad": f(E("abc"), auto=False), "x_flag": f({}, auto=False, flag="5"),
+  "x_flag_wins": f(E("30"), auto=False, flag="0"), "a_flag": f(E("30"), flag="2.5"),
+  "flags": [mod._idle_close_flag(a) for a in (["--idle-close", "3"], ["--idle-close=0.2"],
+            ["--idle-close"], [], ["--x"])],
+}
+try:
+    f({}, auto=False, flag="soon")
+    out["bad_flag"] = "accepted"
+except ValueError as e:
+    out["bad_flag"] = str(e)
+print("RESULT=" + json.dumps(out))
+`, { CDPILOT_IDLE_CLOSE: '7' });
+    const badFlag = res.bad_flag;
+    delete res.bad_flag;
+    assert.deepStrictEqual(res, {
+      unset: 15, empty: 15, zero: 0, off: 0, frac: 0.2, thirty: 30,
+      bad: 15, neg: 15, nan: 15, inf: 15, env: 7,
+      x_unset: 0, x_env: 0.2, x_zero: 0, x_bad: 0, x_flag: 5, x_flag_wins: 0, a_flag: 2.5,
+      flags: ['3', '0.2', '', null, null],
+    });
+    assert(badFlag.includes('--idle-close') && badFlag.includes("'soon'"), `bad flag must raise: ${badFlag}`);
+    const warnings = stderr.split('\n').filter((l) => l.includes('ignoring CDPILOT_IDLE_CLOSE'));
+    assert.strictEqual(warnings.length, 1, `one warning per process, got: ${stderr}`);
+    assert(warnings[0].includes("'abc'") && warnings[0].includes('using 15'), warnings[0]);
+  });
+
+  test('idle close: auto-launch gets a watcher; explicit launch only with env or --idle-close', () => {
+    // cmd_launch in-process with the browser and the watcher Popen faked.
+    const { res } = py(`
+spawned = []
+class FakePopen:
+    def __init__(self, argv, **kw):
+        self.pid = 4000 + len(spawned)
+        spawned.append("watcher" if mod.IDLE_WATCHER_FLAG in argv else "browser")
+    def poll(self):
+        return None
+mod.subprocess.Popen = FakePopen
+up = [False]
+def fake_cdp_get(path, no_cache=False):
+    if path == "/json/version" and up[0]:
+        return {"webSocketDebuggerUrl": "ws://x/browser/g%d" % len(spawned)}
+    return None
+mod.cdp_get = fake_cdp_get
+mod.CHROME_BIN = "/nonexistent/chrome"
+def fast_sleep(s):  # the launch wait loop: the fake browser answers from its first round
+    up[0] = True
+mod.time.sleep = fast_sleep
+out = {}
+def run(name, env=None, **kw):
+    spawned.clear(); up[0] = False
+    os.environ.pop("CDPILOT_IDLE_CLOSE", None)
+    if env is not None:
+        os.environ["CDPILOT_IDLE_CLOSE"] = env
+    code = 0
+    try:
+        mod.cmd_launch(**kw)
+    except SystemExit as e:
+        code = e.code
+    out[name] = [list(spawned), code]
+run("explicit")
+run("explicit_env", env="0.2")
+run("explicit_env0", env="0")
+run("explicit_flag", idle_close="5")
+run("explicit_bad_flag", idle_close="soon")
+run("auto", auto=True)
+run("auto_env0", env="0", auto=True)
+mod.IS_MCP_SESSION = True  # a launch from the MCP server (browser_launch -> "launch")
+run("mcp")
+run("mcp_env0", env="0")
+print("RESULT=" + json.dumps(out))
+`);
+    assert.deepStrictEqual(res.explicit, [['browser'], 0], 'explicit launch without env: no watcher');
+    assert.deepStrictEqual(res.explicit_env, [['browser', 'watcher'], 0], 'explicit launch + env > 0: watcher');
+    assert.deepStrictEqual(res.explicit_env0, [['browser'], 0]);
+    assert.deepStrictEqual(res.explicit_flag, [['browser', 'watcher'], 0], 'launch --idle-close <min>: watcher');
+    assert.deepStrictEqual(res.explicit_bad_flag, [[], 2], 'an invalid --idle-close exits 2 before starting a browser');
+    assert.deepStrictEqual(res.auto, [['browser', 'watcher'], 0], 'auto-launch: watcher by default');
+    assert.deepStrictEqual(res.auto_env0, [['browser'], 0]);
+    assert.deepStrictEqual(res.mcp, [['browser', 'watcher'], 0], 'an MCP launch counts as auto: watcher by default');
+    assert.deepStrictEqual(res.mcp_env0, [['browser'], 0], 'CDPILOT_IDLE_CLOSE=0 still turns it off for MCP');
+    assert(/"CDPILOT_MCP_SESSION"\] = "1"/.test(PY_CONTENT) && /auto = auto or IS_MCP_SESSION/.test(PY_CONTENT),
+      'MCP tool calls run with CDPILOT_MCP_SESSION=1, which cmd_launch treats as auto');
+  });
+
+  test('idle close: page fingerprint (ids + urls, no titles) and change detection are pure', () => {
+    const { res } = py(`
+fp, ch = mod._idle_page_fingerprint, mod._idle_pages_changed
+a = [{"type": "page", "id": "1", "url": "https://a/", "title": "A"},
+     {"type": "service_worker", "id": "sw", "url": "https://a/sw.js", "title": ""},
+     {"type": "page", "id": "2", "url": "about:blank", "title": ""}]
+b = list(reversed(a))
+nav = [dict(a[0], url="https://a/next")] + a[1:]
+title = [dict(a[0], title="A (1)")] + a[1:]
+opened = a + [{"type": "page", "id": "3", "url": "about:blank", "title": ""}]
+closed = a[:2]
+worker_only = a + [{"type": "iframe", "id": "f", "url": "https://ad/", "title": ""}]
+out = {
+  "order_free": fp(a) == fp(b), "pages_only": len(fp(a)),
+  "same": ch(fp(a), fp(b)), "nav": ch(fp(a), fp(nav)), "title": ch(fp(a), fp(title)),
+  "opened": ch(fp(a), fp(opened)), "closed": ch(fp(a), fp(closed)),
+  "non_page": ch(fp(a), fp(worker_only)),
+  "unknown_now": ch(fp(a), fp(None)), "first_round": ch(None, fp(a)), "none": fp(None),
+}
+print("RESULT=" + json.dumps(out))
+`);
+    assert.deepStrictEqual(res, {
+      order_free: true, pages_only: 2, same: false, nav: true, title: false,
+      opened: true, closed: true, non_page: false, unknown_now: false, first_round: false, none: null,
+    });
+  });
+
+  test('idle close: a normal command touches the activity stamp, read-only checks do not', () => {
+    fs.rmSync(activityFile, { force: true });
+    const t0 = Date.now() / 1000;
+    const r = spawnSync(PY_BIN, [PY_PATH, 'mode'], { encoding: 'utf-8', timeout: 30000, env: pyEnv() });
+    assert.strictEqual(r.status, 0, `mode failed: ${r.stderr}`);
+    assert(fs.existsSync(activityFile), 'a normal command must write projects/<id>/last-activity');
+    const stamp = parseFloat(fs.readFileSync(activityFile, 'utf-8'));
+    assert(stamp >= t0 - 1 && stamp <= Date.now() / 1000 + 1, `stamp ${stamp} is not "now" (${t0})`);
+    fs.rmSync(activityFile, { force: true });
+    for (const cmd of ['health', 'version', 'projects']) {
+      const q = spawnSync(PY_BIN, [PY_PATH, cmd], { encoding: 'utf-8', timeout: 30000, env: pyEnv() });
+      assert(!q.error, `${cmd} failed to run: ${q.error}`);
+      assert(!fs.existsSync(activityFile), `read-only \`${cmd}\` must not count as activity`);
+    }
+  });
+
+  test('idle close: decision function (now, last activity, minutes) -> close?', () => {
+    const { res } = py(`
+f = mod._idle_should_close
+print("RESULT=" + json.dumps([
+  f(1000, 100, 15), f(1000, 101, 15), f(1000, 100, 0), f(1000, None, 15),
+  f(1000, 2000, 15), f(1000, 988, 0.2), f(1000, 989, 0.2), f(1000, 0, None),
+]))
+`);
+    assert.deepStrictEqual(res, [true, false, false, false, false, true, false, false]);
+  });
+
+  test('idle close: the watcher only ever closes the browser cdpilot launched', () => {
+    const { res } = py(`
+P = 45678
+OURS = "ws://127.0.0.1:%d/devtools/browser/aaaa" % P
+calls, attached = [], [False]
+mod._stop_browser_on_port = lambda port, verbose=False: calls.append(port) or True
+mod._idle_client_attached = lambda version: attached[0]
+PAGE = {"type": "page", "id": "1", "url": "https://a/", "title": "A"}
+pages = [[PAGE]]
+mod._idle_page_targets = lambda port: pages[0]
+
+def setup(registry_pid=4242, ws=OURS, token="T", activity_age=3600):
+    now = time.time()
+    mod._save_registry({"p1": {"port": P, "pid": registry_pid, "status": "running"}})
+    mod._idle_save_state(P, {"token": token, "pid": os.getpid(), "port": P, "project_id": "p1",
+                             "browser_pid": 4242, "browser_ws": OURS, "minutes": 0.2,
+                             "started": now - 7200})
+    mod._idle_write_activity("p1", now - activity_age)
+    mod._idle_version = lambda port: {"webSocketDebuggerUrl": ws}
+
+out = {}
+setup(ws="ws://127.0.0.1:%d/devtools/browser/bbbb" % P)       # another browser took the port
+out["foreign"] = [mod._idle_watcher_step(P, "T"), list(calls), mod._idle_load_state(P)]
+setup(registry_pid=None)                                        # not (or no longer) launched by cdpilot
+out["unowned"] = [mod._idle_watcher_step(P, "T"), list(calls), mod._idle_load_state(P)]
+setup(); mod._idle_version = lambda port: None; mod._pid_alive = lambda pid: False
+out["gone"] = [mod._idle_watcher_step(P, "T"), list(calls)]
+setup(token="NEWER")                                            # a newer launch owns the port
+out["replaced"] = [mod._idle_watcher_step(P, "T"), list(calls), (mod._idle_load_state(P) or {}).get("token")]
+setup(activity_age=2)                                           # used 2 s ago
+out["recent"] = [mod._idle_watcher_step(P, "T"), list(calls)]
+setup(); attached[0] = True                                     # a CDP client holds a page
+out["attached"] = [mod._idle_watcher_step(P, "T"), list(calls),
+                   round(time.time() - mod._idle_read_activity("p1"))]
+attached[0] = False
+setup(); memo = {"pages": mod._idle_page_fingerprint([PAGE])}
+pages[0] = [dict(PAGE, url="https://a/next")]                   # navigated outside cdpilot
+out["navigated"] = [mod._idle_watcher_step(P, "T", memo=memo), list(calls),
+                    round(time.time() - mod._idle_read_activity("p1")), memo["pages"][0][1]]
+setup(); pages[0] = [dict(PAGE, url="https://a/next", title="(3) A")]   # only the title ticked
+out["unchanged"] = [mod._idle_watcher_step(P, "T", memo=memo), list(calls)]   # -> still idle
+calls.clear()
+setup()
+out["ours"] = [mod._idle_watcher_step(P, "T"), list(calls), mod._idle_load_state(P),
+               mod._load_registry()["p1"]["status"], mod._load_registry()["p1"]["pid"]]
+own = {"browser_pid": 1, "browser_ws": "ws://x/browser/a", "project_id": "p", "port": 9}
+reg = {"p": {"pid": 1, "port": 9}}
+v = {"webSocketDebuggerUrl": "ws://x/browser/a"}
+out["pure"] = [mod._idle_owns_browser(own, reg, v), mod._idle_owns_browser(own, reg, None),
+               mod._idle_owns_browser(None, reg, v), mod._idle_owns_browser(own, {}, v),
+               mod._idle_owns_browser(own, {"p": {"pid": 2, "port": 9}}, v),
+               mod._idle_owns_browser(own, {"p": {"pid": 1, "port": 10}}, v),
+               mod._idle_owns_browser(dict(own, browser_pid=None), {"p": {"pid": None, "port": 9}}, v),
+               mod._idle_owns_browser(own, reg, {"webSocketDebuggerUrl": "ws://x/browser/b"})]
+print("RESULT=" + json.dumps(out))
+`);
+    assert.deepStrictEqual(res.foreign, ['exit', [], null], 'a different browser on the port must be left alone');
+    assert.deepStrictEqual(res.unowned, ['exit', [], null], 'a browser without the launch mark must be left alone');
+    assert.deepStrictEqual(res.gone, ['exit', []], 'the watcher exits once the browser is gone');
+    assert.deepStrictEqual(res.replaced, ['exit', [], 'NEWER'], 'a replaced watcher exits and keeps the new record');
+    assert.deepStrictEqual(res.recent, ['wait', []]);
+    assert.deepStrictEqual(res.attached.slice(0, 2), ['wait', []], 'an attached CDP client counts as use');
+    assert(res.attached[2] <= 2, 'an attached client refreshes the activity stamp');
+    assert.deepStrictEqual(res.navigated.slice(0, 2), ['wait', []], 'a page change outside cdpilot counts as use');
+    assert(res.navigated[2] <= 2, 'a page change refreshes the activity stamp');
+    assert.strictEqual(res.navigated[3], 'https://a/next', 'the watcher remembers the new fingerprint');
+    assert.deepStrictEqual(res.unchanged, ['closed', [45678]],
+      'unchanged pages are not activity, and neither is a title the page rewrote itself');
+    assert.deepStrictEqual(res.ours, ['closed', [45678], null, 'stopped', null]);
+    assert.deepStrictEqual(res.pure, [true, false, false, false, false, false, false, false]);
+  });
+
+  test('idle close: watcher is spawned detached on POSIX and Windows, std streams not inherited', () => {
+    const fn = (PY_CONTENT.match(/def _idle_spawn_watcher\([\s\S]*?\n\n\ndef /) || [''])[0];
+    assert(/"start_new_session"\]\s*=\s*True/.test(fn), 'POSIX: own session (start_new_session=True)');
+    assert(/DETACHED_PROCESS/.test(fn) && /CREATE_NEW_PROCESS_GROUP/.test(fn),
+      'Windows: DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP');
+    for (const s of ['stdin', 'stdout', 'stderr']) {
+      assert(new RegExp(`"${s}": subprocess\\.DEVNULL`).test(fn), `${s} must be DEVNULL`);
+    }
+    const { res } = py(`
+seen = []
+class FakePopen:
+    def __init__(self, argv, **kw):
+        self.pid = 31337
+        seen.append({"argv": argv[2:], "kw": {k: v for k, v in kw.items() if k != "env"},
+                     "timeout_env": "CDPILOT_TIMEOUT" in kw["env"]})
+mod.subprocess.Popen = FakePopen
+mod.cdp_get = lambda path, no_cache=False: {"webSocketDebuggerUrl": "ws://x/browser/g"}
+os.environ["CDPILOT_TIMEOUT"] = "5"
+real, out = os.name, {}
+try:  # both branches on every CI OS
+    os.name = "posix"
+    out["posix"] = mod._idle_spawn_watcher(99, port=45679, project_id="p1", minutes=15)
+    os.name = "nt"
+    out["nt"] = mod._idle_spawn_watcher(99, port=45680, project_id="p1", minutes=15)
+finally:
+    os.name = real
+out["posix_state"] = mod._idle_load_state(45679)
+out["off"] = mod._idle_spawn_watcher(99, port=45679, project_id="p1", minutes=0)
+out["off_state"] = mod._idle_load_state(45679)
+out["seen"] = [{"argv": s["argv"], "timeout_env": s["timeout_env"],
+                "sns": s["kw"].get("start_new_session"), "flags": s["kw"].get("creationflags", 0),
+                "streams": [s["kw"].get(k) == mod.subprocess.DEVNULL for k in ("stdin", "stdout", "stderr")]}
+               for s in seen]
+out["flag"] = mod.IDLE_WATCHER_FLAG
+print("RESULT=" + json.dumps(out))
+`);
+    assert.strictEqual(res.posix, 31337);
+    assert.strictEqual(res.nt, 31337);
+    assert.strictEqual(res.off, null, 'CDPILOT_IDLE_CLOSE=0: no watcher');
+    assert.strictEqual(res.off_state, null, 'turning it off retires the previous record on the port');
+    assert.strictEqual(res.seen.length, 2, 'Popen must not run when idle close is off');
+    const [posix, nt] = res.seen;
+    const st = res.posix_state;
+    assert.deepStrictEqual(posix.argv, [res.flag, '45679', st.token], 'watcher argv: flag, port, token');
+    assert(st.pid === 31337 && st.browser_pid === 99 && st.browser_ws === 'ws://x/browser/g',
+      `state must carry the launch mark: ${JSON.stringify(st)}`);
+    assert.strictEqual(posix.sns, true);
+    assert.strictEqual(posix.flags, 0, 'POSIX: no Windows creation flags');
+    assert.strictEqual(nt.sns, null, 'Windows: start_new_session is POSIX-only');
+    assert.strictEqual(nt.flags & 0x8, 0x8, 'DETACHED_PROCESS');
+    assert.strictEqual(nt.flags & 0x200, 0x200, 'CREATE_NEW_PROCESS_GROUP');
+    for (const s of res.seen) {
+      assert.deepStrictEqual(s.streams, [true, true, true], 'stdin/stdout/stderr must be DEVNULL');
+      assert.strictEqual(s.timeout_env, false, 'the watcher must not inherit CDPILOT_TIMEOUT');
+    }
+  });
+
+  test('idle close: wired into launch, dispatcher, mcp and serve', () => {
+    const launch = (PY_CONTENT.match(/def cmd_launch\(auto=False, idle_close=None\):([\s\S]*?)\n\ndef /) || [])[1] || '';
+    const reg = launch.indexOf('_register_project(PROJECT_ID');
+    const spawn = launch.indexOf('_idle_spawn_watcher(proc.pid');
+    assert(reg > 0 && spawn > reg, 'launch spawns the watcher after registering the browser it started');
+    assert(launch.indexOf('already running') < launch.indexOf('subprocess.Popen(chrome_args'),
+      'an already-running browser returns before any spawn (attach never gets a watcher)');
+    assert(/def _autolaunch_if_down\(\):[\s\S]*?cmd_launch\(auto=True\)/.test(PY_CONTENT),
+      'auto-launch must launch with auto=True (idle close on by default)');
+    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('if __name__ == "__main__":'));
+    assert(/'launch': lambda: cmd_launch\(idle_close=_idle_close_flag\(args\)\)/.test(main),
+      'explicit launch passes --idle-close and defaults to auto=False');
+    const flag = main.indexOf('if cmd == IDLE_WATCHER_FLAG:');
+    assert(flag > 0 && flag < main.indexOf('_AUTOLAUNCH["cmd"] = cmd'),
+      'the hidden watcher entry must run before auto-launch / timeout setup');
+    assert(main.indexOf('_idle_touch_activity(cmd)') > flag, 'every dispatched command touches activity');
+    const entry = (PY_CONTENT.match(/def _idle_watcher_entry\([\s\S]*?\n\n\ndef /) || [''])[0];
+    assert(/memo = \{"pages": _idle_page_fingerprint\(_idle_page_targets\(port\)\)\}/.test(entry)
+      && /_idle_watcher_step\(port, token, memo=memo\)/.test(entry),
+      'the watcher loop must baseline and carry the page fingerprint between rounds');
+    assert(/def _idle_page_targets\(port\):[\s\S]{0,200}urlopen\(.*\/json", timeout=3\)/.test(PY_CONTENT),
+      'the /json read must be bounded');
+    const mcp = (PY_CONTENT.match(/def _execute_tool\([\s\S]*?\n    def run\(self\)/) || [''])[0];
+    assert(/_idle_write_activity\(\)/.test(mcp), 'each MCP tool call counts as activity');
+    assert(/def parse_request\(self\):\s*\n\s*_idle_write_activity\(\)/.test(PY_CONTENT),
+      'each serve API request counts as activity');
+    const api = (PY_CONTENT.match(/def _api_create_session\([\s\S]*?\n\n\ndef /) || [''])[0];
+    assert(/env\['CDPILOT_IDLE_CLOSE'\] = '0'/.test(api), 'serve owns its sessions: no idle watcher');
+  });
+
+  test('idle close: status (node) and health (python) show "idle close in Xm" / "idle close off"', () => {
+    const port = 45681;
+    const now = Date.now() / 1000;
+    fs.mkdirSync(path.join(home, 'idle'), { recursive: true });
+    const statePath = path.join(home, 'idle', `${port}.json`);
+    fs.writeFileSync(statePath, JSON.stringify({
+      token: 't', pid: process.pid, port, project_id: 'idle-proj', minutes: 15, started: now - 600,
+    }));
+    fs.mkdirSync(path.dirname(activityFile), { recursive: true });
+    fs.writeFileSync(activityFile, `${now - 90}\n`);
+    const js = fs.readFileSync(CLI, 'utf-8');
+    const src = (js.match(/function idleCloseLabel\(port\) \{[\s\S]*?\n\}\n/) || [])[0];
+    assert(src, 'bin/cdpilot.js must define idleCloseLabel');
+    assert(/console\.log\(`\s*\$\{idleCloseLabel\(port\)\}/.test(js), 'runStatus must print the label');
+    const label = new Function('fs', 'path', 'os', 'process', `${src}\nreturn idleCloseLabel;`)(
+      fs, path, os, { env: { CDPILOT_HOME: home }, kill: process.kill.bind(process) });
+    assert.strictEqual(label(port), 'idle close in 14m');
+    assert.strictEqual(label(port + 1), 'idle close off', 'no watcher record -> off');
+    const { res } = py(`
+print("RESULT=" + json.dumps([mod._idle_status(${port}), mod._idle_status(${port + 1})]))
+`);
+    assert.deepStrictEqual(res[0][0], 'idle close in 14m');
+    assert(res[0][1] > 780 && res[0][1] <= 810, `seconds left: ${res[0][1]}`);
+    assert.deepStrictEqual(res[1], ['idle close off', null]);
+    fs.writeFileSync(statePath, JSON.stringify({ pid: 900000000, minutes: 15, started: now, project_id: 'x' }));
+    assert.strictEqual(label(port), 'idle close off', 'a dead watcher means off');
+    assert(/info\['idle_close'\], info\['idle_close_in_s'\]/.test(PY_CONTENT), 'health reports idle_close');
+  });
+
+  test('idle close: README and CHANGELOG document CDPILOT_IDLE_CLOSE', () => {
+    const root = path.join(__dirname, '..');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    assert(/\| `CDPILOT_IDLE_CLOSE` \| `15` \|/.test(readme), 'README env table needs CDPILOT_IDLE_CLOSE');
+    assert(/Idle auto-close/.test(readme), 'README Reliability section needs the idle auto-close note');
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    const unreleased = (changelog.match(/## \[Unreleased\]([\s\S]*?)\n## \[/) || [])[1] || '';
+    assert(unreleased.includes('CDPILOT_IDLE_CLOSE'), 'CHANGELOG [Unreleased] must describe CDPILOT_IDLE_CLOSE');
+  });
+
+  fs.rmSync(home, { recursive: true, force: true });
+})();
+
+// ── Session log (`cdpilot log`) ──
+// No browser anywhere: CDP_PORT is a free port, CHROME_BIN does not exist and
+// CDPILOT_NO_AUTOLAUNCH=1. Every scenario gets its own throwaway CDPILOT_HOME
+// and a fixed CDPILOT_PROJECT_ID, so the log dir is known in advance.
+(function() {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const PY_BIN = process.platform === 'win32' ? 'python' : 'python3';
+  const PROJECT = 'logtest-0001';
+  const LEGACY_ERR = 'CDP connection error. Is the browser running?';
+  const SECRET = 'hunter2-SECRET-value';
+  const LOG_KEYS = ['ts', 'cmd', 'args', 'exit', 'duration_ms', 'url', 'title', 'summary',
+    'error', 'files'];
+
+  const r0 = spawnSync(PY_BIN, ['-c',
+    'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); '
+    + 'print(s.getsockname()[1]); s.close()'], { encoding: 'utf-8', timeout: 10000 });
+  const PORT = (r0.stdout || '').trim() || '19299';
+
+  const newHome = () => fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-log-test-'));
+  const logDir = (home) => path.join(home, 'projects', PROJECT, 'log');
+  const lines = (s) => (s || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+  function localDay(daysAgo = 0) {
+    const d = new Date();
+    d.setDate(d.getDate() - daysAgo);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  }
+
+  function baseEnv(home, extra) {
+    const env = {
+      ...process.env,
+      CDPILOT_HOME: home,
+      CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: PORT,
+      CDPILOT_PROJECT_ID: PROJECT,
+      CHROME_BIN: path.join(home, 'no-such-browser', 'chrome'),
+      CDPILOT_NO_AUTOLAUNCH: '1',
+    };
+    for (const k of ['CDPILOT_LOG', 'CDPILOT_LOG_DAYS', 'CDPILOT_LOG_VIA', 'CDPILOT_TIMEOUT',
+      'CDPILOT_TARGET', 'CDPILOT_MCP_SESSION']) delete env[k];
+    return { ...env, ...extra };
+  }
+
+  function cli(home, args, extra = {}) {
+    return spawnSync(process.execPath, [CLI, ...args], {
+      encoding: 'utf-8', timeout: 30000, env: baseEnv(home, extra),
+    });
+  }
+
+  function logFileLines(home) {
+    const dir = logDir(home);
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')).sort()
+      .flatMap((f) => fs.readFileSync(path.join(dir, f), 'utf-8').split('\n').filter(Boolean));
+  }
+
+  // The redaction functions are pure; run them all in one interpreter.
+  let redactCache = null;
+  function redacted() {
+    if (redactCache) return redactCache;
+    const script = `
+import importlib.util, json
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+LONG = "x" * 60
+cases = {
+  "fill": ("fill", ["#pw", "hunter2"]),
+  "fill_multi": ("fill", ["#pw", "my", "long", "pass", "--no-heal"]),
+  "type": ("type", ["--entropy=on", "#q", "hello world"]),
+  "fill_dashes": ("fill", ["#pw", "--ladder=#a,#b", "--hunter2"]),
+  "smart_fill": ("smart-fill", ["Password", "S3cr3t!"]),
+  "smart_select": ("smart-select", ["Country", "Turkey"]),
+  "assert_value": ("assert-value", ["#pw", "hunter2"]),
+  "dialog": ("dialog", ["prompt", "my answer"]),
+  "assert_attr": ("assert-attr", ["#pw", "value", "hunter2"]),
+  "assert_attr_href": ("assert-attr", ["a", "href", "/login"]),
+  "api_key_flag": ("captcha", ["config", "--provider", "2captcha", "--api-key", "fake-value-x"]),
+  "password_flag": ("x", ["--password=hunter2", "--token", "t0k3n", "--keep"]),
+  "header": ("intercept", ["headers", "*", "Authorization: Bearer abc.def"]),
+  "header_word": ("intercept", ["headers", "*", "Authorization", "Bearer xyz"]),
+  "cookie_value": ("cookies", ["set", "sid=abc123"]),
+  "cookie_save": ("cookies", ["save", "/tmp/c.json", "example.com"]),
+  "eval": ("eval", ["var s = '" + LONG + "'; document.querySelector('#pw').value = 'hunter2'; 'ok'"]),
+  "eval_storage": ("eval", ["localStorage.setItem('k', 'v1'); fetch('https://a.example/?token=t0k3n')"]),
+  "eval_batch": ("eval-batch", [json.dumps(["document.title", "x.value === 'hunter2'"])]),
+  "url": ("go", ["https://u:pw@ex.com/cb?code=XYZ123&state=ok&access_token=abc#id_token=zzz"]),
+  "plain": ("go", ["https://example.com"]),
+  "plain_click": ("click", ["#login"]),
+  "tab_id": ("close-tab", ["E3B0C44298FC1C149AFBF4C8996FB924"]),
+  "data_url": ("go", ["data:text/html,<input value=secret123>"]),
+  "api_token": ("x", ["sk-ant-api03-abcdefghijklmnopqrstuvwxyz"]),
+  "proxy": ("proxy", ["http://user:p4ss@proxy.local:8080"]),
+}
+out = {k: m._slog_redact_args(c, a) for k, (c, a) in cases.items()}
+out["scrub_filled"] = m._slog_scrub_text("Filled: INPUT = hunter2-very-secret-value-th", ["hunter2-very-secret-value-that-is-long"])
+out["scrub_echo"] = m._slog_scrub_text("[1] go https://x.example\\n[2] fill #pw hunter2")
+out["scrub_bearer"] = m._slog_scrub_text("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijk")
+out["scrub_kv"] = m._slog_scrub_text('{"password": "pw1", "api_key": "k2", "page": 3}')
+out["summary_cookies"] = m._slog_summary("cookies", [], "sid=abc; theme=dark", [])
+out["summary_cookie_save"] = m._slog_summary("cookies", ["save", "/tmp/c.json"], "Saved 3 cookies -> /tmp/c.json", [])
+out["summary_storage"] = m._slog_summary("storage", [], '{"token": "abc"}', [])
+out["summary_eval_secret"] = m._slog_summary("eval", ["document.cookie"], "sid=abc", [])
+out["summary_fill"] = m._slog_summary("fill", ["#pw", "hunter2"], "Filled: INPUT = hunter2", ["hunter2"])
+out["mask_same"] = m._slog_mask_url("https://example.com/path?q=cats&page=2")
+print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
+`;
+    const home = newHome();
+    const r = spawnSync(PY_BIN, ['-c', script], {
+      encoding: 'utf-8', timeout: 20000, env: baseEnv(home, {}),
+    });
+    assert.strictEqual(r.status, 0, `redaction script failed: ${r.stderr}`);
+    redactCache = JSON.parse(r.stdout.trim());
+    return redactCache;
+  }
+  const args = (k) => redacted()[k][0];
+  const secrets = (k) => redacted()[k][1];
+
+  test('log redaction: fill/type/smart-fill/smart-select/assert-value/dialog values', () => {
+    assert.deepStrictEqual(args('fill'), ['#pw', '«redacted:7 chars»']);
+    assert(secrets('fill').includes('hunter2'), 'raw value must be returned for output scrubbing');
+    assert.deepStrictEqual(args('fill_multi'), ['#pw', '«redacted:12 chars»', '--no-heal']);
+    assert.deepStrictEqual(args('type'), ['--entropy=on', '#q', '«redacted:11 chars»']);
+    assert.deepStrictEqual(args('fill_dashes'), ['#pw', '--ladder=#a,#b', '«redacted:9 chars»'],
+      'an unknown --flag on fill may be a mistyped value');
+    assert.deepStrictEqual(args('smart_fill'), ['Password', '«redacted:7 chars»']);
+    assert.deepStrictEqual(args('smart_select'), ['Country', '«redacted:6 chars»']);
+    assert.deepStrictEqual(args('assert_value'), ['#pw', '«redacted:7 chars»']);
+    assert.deepStrictEqual(args('dialog'), ['prompt', '«redacted:9 chars»']);
+    assert.deepStrictEqual(args('assert_attr'), ['#pw', 'value', '«redacted:7 chars»']);
+    assert.deepStrictEqual(args('assert_attr_href'), ['a', 'href', '/login']);
+  });
+
+  test('log redaction: password/token/key flags, header values, cookie values', () => {
+    assert.deepStrictEqual(args('api_key_flag'),
+      ['config', '--provider', '2captcha', '--api-key', '«redacted:12 chars»']);
+    assert.deepStrictEqual(args('password_flag'),
+      ['--password=«redacted:7 chars»', '--token', '«redacted:5 chars»', '--keep']);
+    assert.deepStrictEqual(args('header'), ['headers', '*', 'Authorization: «redacted:14 chars»']);
+    assert.deepStrictEqual(args('header_word'), ['headers', '*', 'Authorization', '«redacted:10 chars»']);
+    assert.deepStrictEqual(args('cookie_value'), ['set', 'sid=«redacted:6 chars»']);
+    assert.deepStrictEqual(args('cookie_save'), ['save', '/tmp/c.json', 'example.com']);
+    const r = redacted();
+    assert(r.summary_cookies.startsWith('«output not logged'), `cookie listing leaked: ${r.summary_cookies}`);
+    assert.strictEqual(r.summary_cookie_save, 'Saved 3 cookies -> /tmp/c.json');
+    assert(r.summary_storage.startsWith('«output not logged'), `storage leaked: ${r.summary_storage}`);
+    assert(r.summary_eval_secret.startsWith('«output not logged'), 'eval reading document.cookie must not log its result');
+  });
+
+  test('log redaction: eval source kept, long string literals cut, secret literals replaced', () => {
+    const src = args('eval')[0];
+    assert(src.startsWith(`var s = '${'x'.repeat(40)}…«+20 chars»'`), src);
+    assert(src.includes(".value = '«redacted:7 chars»'"), src);
+    assert(src.includes("document.querySelector('#pw')"), 'short literals stay readable');
+    assert(src.endsWith("'ok'"), src);
+    const st = args('eval_storage')[0];
+    assert(st.includes("setItem('k', '«redacted:2 chars»')"), st);
+    assert(st.includes('?token=«redacted:5 chars»'), st);
+    const batch = JSON.parse(args('eval_batch')[0]);
+    assert.deepStrictEqual(batch, ['document.title', "x.value === '«redacted:7 chars»'"]);
+  });
+
+  test('log redaction: URL query/fragment/userinfo masking; plain commands untouched', () => {
+    assert.deepStrictEqual(args('url'), ['https://u:«redacted:2 chars»@ex.com/cb?code=«redacted:6 chars»'
+      + '&state=ok&access_token=«redacted:3 chars»#id_token=«redacted:3 chars»']);
+    assert.deepStrictEqual(redacted().plain, [['https://example.com'], []]);
+    assert.deepStrictEqual(redacted().plain_click, [['#login'], []]);
+    assert.deepStrictEqual(args('tab_id'), ['E3B0C44298FC1C149AFBF4C8996FB924'], 'CDP ids are not secrets');
+    assert.strictEqual(redacted().mask_same, 'https://example.com/path?q=cats&page=2');
+    assert.deepStrictEqual(args('data_url'), ['data:text/html,«redacted:23 chars»']);
+    assert.deepStrictEqual(args('api_token'), ['«redacted:39 chars»']);
+    assert.deepStrictEqual(args('proxy'), ['http://user:«redacted:4 chars»@proxy.local:8080']);
+  });
+
+  test('log redaction: output text — echoed values (even cut off), run echo lines, bearer/JWT, key=value', () => {
+    const r = redacted();
+    assert.strictEqual(r.scrub_filled, 'Filled: INPUT = «redacted:38 chars»');
+    assert.strictEqual(r.scrub_echo, '[1] go https://x.example\n[2] fill #pw «redacted:7 chars»');
+    assert(!/eyJ|abcdefghijk/.test(r.scrub_bearer), r.scrub_bearer);
+    assert(!r.scrub_kv.includes('pw1') && !r.scrub_kv.includes('"k2"'), r.scrub_kv);
+    assert(r.scrub_kv.includes('"page": 3'), r.scrub_kv);
+    assert.strictEqual(r.summary_fill, 'Filled: INPUT = «redacted:7 chars»');
+  });
+
+  test('log: one command writes exactly one JSON line with the expected fields; output unchanged', () => {
+    const home = newHome();
+    const r = cli(home, ['fill', '#pw', SECRET]);
+    assert.strictEqual(r.status, 1, `exit ${r.status}, stderr: ${r.stderr}`);
+    assert.deepStrictEqual(lines(r.stderr), [LEGACY_ERR], 'logging must not add output');
+    const file = path.join(logDir(home), `${localDay()}.jsonl`);
+    assert(fs.existsSync(file), `expected ${file}`);
+    const raw = fs.readFileSync(file, 'utf-8');
+    assert(!raw.includes('hunter2'), 'the typed value must never reach the disk');
+    const got = lines(raw);
+    assert.strictEqual(got.length, 1, `expected exactly one line, got ${got.length}`);
+    const e = JSON.parse(got[0]);
+    for (const k of LOG_KEYS) assert(k in e, `missing field ${k}`);
+    assert.strictEqual(e.cmd, 'fill');
+    assert.deepStrictEqual(e.args, ['#pw', `«redacted:${SECRET.length} chars»`]);
+    assert.strictEqual(e.exit, 1);
+    assert.strictEqual(e.error, LEGACY_ERR);
+    assert(Number.isInteger(e.duration_ms) && e.duration_ms >= 0, `duration_ms: ${e.duration_ms}`);
+    assert(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}([+-]\d{2}:\d{2}|Z)$/.test(e.ts), `ts: ${e.ts}`);
+    assert.strictEqual(e.ts.slice(0, 10), localDay(), 'ts is local time, file is the local day');
+    assert.deepStrictEqual(e.files, []);
+
+    const v = cli(home, ['version']);
+    assert.strictEqual(v.status, 0, v.stderr);
+    const e2 = JSON.parse(logFileLines(home)[1]);
+    assert.strictEqual(e2.cmd, 'version');
+    assert.strictEqual(e2.exit, 0);
+    assert(e2.summary.includes(require('../package.json').version), `summary: ${e2.summary}`);
+    assert.strictEqual(e2.error, null);
+  });
+
+  // Python 3.10/3.11 drop the __main__ frame from a SystemExit's traceback
+  // before atexit runs, so an exit code read from the traceback logged 0 for
+  // every failed command there (CI ubuntu 3.11, 2026-09-28). Run the same
+  // failing command under every interpreter this machine has.
+  test('log: the logged exit code is the process exit code on every local Python', () => {
+    const start = PY_CONTENT.indexOf('def _slog_exit_code');
+    const body = PY_CONTENT.slice(start, PY_CONTENT.indexOf('\ndef ', start + 1));
+    assert(start > 0 && !body.includes('__traceback__'), '_slog_exit_code must not read the traceback');
+    assert(/\n    _SLOG\["main_done"\] = True\s*$/.test(PY_CONTENT), '__main__ must end with the main_done marker');
+    const pys = ['python3.10', 'python3.11', 'python3.12', 'python3.13', PY_BIN].filter((py, i, all) =>
+      all.indexOf(py) === i && spawnSync(py, ['-c', 'pass'], { timeout: 10000 }).status === 0);
+    for (const py of pys) {
+      const home = newHome();
+      const r = spawnSync(py, [PY_PATH, 'fill', '#pw', SECRET], {
+        encoding: 'utf-8', timeout: 30000, env: baseEnv(home, {}),
+      });
+      assert.strictEqual(r.status, 1, `${py}: exit ${r.status}, stderr: ${r.stderr}`);
+      const got = logFileLines(home).map((l) => JSON.parse(l).exit);
+      assert.deepStrictEqual(got, [1], `${py}: logged exit ${JSON.stringify(got)}`);
+    }
+  });
+
+  // Windows pipes default to the ANSI code page (cp1252): a Turkish title or
+  // an emoji crashed any command an agent ran through a pipe, and an MCP child
+  // writing one code page while the server read another made the server log
+  // the call twice. Both ends are UTF-8 now.
+  test('output: UTF-8 on Windows pipes; MCP child and server agree on UTF-8', () => {
+    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('if __name__ == "__main__":'));
+    const fix = main.indexOf('_stream.reconfigure(encoding="utf-8", errors="replace")');
+    assert(fix > 0 && fix < main.indexOf('_slog_begin(_argv)'),
+      '__main__ must switch stdout/stderr to UTF-8 on Windows before the session log wraps them');
+    assert(/os\.name == "nt" and not os\.environ\.get\("PYTHONIOENCODING"\)/.test(main),
+      'the switch is Windows-only and yields to a PYTHONIOENCODING the user set');
+    const call = PY_CONTENT.slice(PY_CONTENT.indexOf('env[SLOG_VIA_ENV] = via'));
+    const run = call.slice(0, call.indexOf('output = result.stdout'));
+    assert(run.includes('env["PYTHONIOENCODING"] = "utf-8"'), 'MCP child must write UTF-8');
+    assert(run.includes('encoding="utf-8", errors="replace"') && !run.includes('text=True'),
+      'MCP server must read the child as UTF-8');
+  });
+
+  test('log: exit codes and output are identical with logging on and off', () => {
+    for (const argv of [['version'], ['nosuchcommand'], ['fill', '#pw', SECRET], ['log', '--bogus']]) {
+      const on = cli(newHome(), argv);
+      const off = cli(newHome(), argv, { CDPILOT_LOG: '0' });
+      assert.strictEqual(on.status, off.status, `${argv[0]}: exit ${on.status} vs ${off.status}`);
+      assert.strictEqual(on.stdout, off.stdout, `${argv[0]}: stdout differs`);
+      assert.strictEqual(on.stderr, off.stderr, `${argv[0]}: stderr differs`);
+    }
+  });
+
+  test('log: CDPILOT_LOG=0 writes nothing', () => {
+    const home = newHome();
+    cli(home, ['version'], { CDPILOT_LOG: '0' });
+    cli(home, ['fill', '#pw', SECRET], { CDPILOT_LOG: '0' });
+    assert(!fs.existsSync(logDir(home)), 'no log dir may be created');
+  });
+
+  test('log: an unwritable log dir never changes the exit code (one stderr warning)', () => {
+    const home = newHome();
+    // `log` is a file where the directory should be: fails on every OS.
+    fs.mkdirSync(path.dirname(logDir(home)), { recursive: true });
+    fs.writeFileSync(logDir(home), 'not a directory');
+    const v = cli(home, ['version']);
+    assert.strictEqual(v.status, 0, v.stderr);
+    assert(v.stdout.includes(require('../package.json').version), v.stdout);
+    const warn = lines(v.stderr).filter((l) => l.includes('session log not written'));
+    assert.strictEqual(warn.length, 1, `expected one warning, stderr: ${v.stderr}`);
+    const f = cli(home, ['fill', '#pw', SECRET]);
+    assert.strictEqual(f.status, 1, f.stderr);
+    assert.strictEqual(lines(f.stderr)[0], LEGACY_ERR);
+    assert.strictEqual(lines(f.stderr).length, 2, `error + one warning, got: ${f.stderr}`);
+    assert(!f.stderr.includes('hunter2'), 'the warning must not echo the value');
+    // A read-only directory (POSIX; root ignores permissions).
+    if (process.platform !== 'win32' && !(process.getuid && process.getuid() === 0)) {
+      const home2 = newHome();
+      fs.mkdirSync(logDir(home2), { recursive: true });
+      fs.chmodSync(logDir(home2), 0o500);
+      try {
+        const ro = cli(home2, ['fill', '#pw', SECRET]);
+        assert.strictEqual(ro.status, 1, ro.stderr);
+        assert.strictEqual(lines(ro.stderr)[0], LEGACY_ERR);
+        assert(lines(ro.stderr)[1].includes('session log not written'), ro.stderr);
+      } finally {
+        fs.chmodSync(logDir(home2), 0o700);
+      }
+    }
+  });
+
+  test('log: `log --json` round-trips the file; table/--md/--path; reading adds nothing', () => {
+    const home = newHome();
+    cli(home, ['fill', '#pw', SECRET]);
+    cli(home, ['version']);
+    cli(home, ['go', 'https://example.com/?session=abc123&page=2']);
+    const before = logFileLines(home);
+    assert.strictEqual(before.length, 3);
+    const j = cli(home, ['log', '--json']);
+    assert.strictEqual(j.status, 0, j.stderr);
+    assert.deepStrictEqual(lines(j.stdout), before, '--json prints the raw lines');
+    assert.deepStrictEqual(lines(j.stdout).map((l) => JSON.parse(l)), before.map((l) => JSON.parse(l)));
+    // Windows pipes are cp1252 by default; the output must still be the UTF-8 lines.
+    const cp = cli(home, ['log', '--json'], { PYTHONIOENCODING: 'cp1252' });
+    assert.deepStrictEqual(lines(cp.stdout), before, 'cp1252 stdout must still print UTF-8');
+    const t = cli(home, ['log']);
+    assert.strictEqual(t.status, 0, t.stderr);
+    assert(t.stdout.includes('fill #pw «redacted:') && t.stdout.includes('version'), t.stdout);
+    assert(t.stdout.includes('! ' + LEGACY_ERR.slice(0, 20)), 'failed commands show their error');
+    const md = cli(home, ['log', '--md']);
+    assert.strictEqual(md.status, 0, md.stderr);
+    for (const h of ['### Pages visited', '### Actions', '### Errors', '### Files produced']) {
+      assert(md.stdout.includes(h), `--md must have "${h}"`);
+    }
+    assert(md.stdout.includes('session=«redacted:6 chars»&page=2'), md.stdout);
+    for (const out of [j.stdout, t.stdout, md.stdout]) {
+      assert(!out.includes('hunter2') && !out.includes('abc123'), 'no secret in any view');
+    }
+    const p = cli(home, ['log', '--path']);
+    assert.strictEqual(p.stdout.trim(), logDir(home));
+    assert.strictEqual(cli(home, ['log', '--days', '3']).status, 0);
+    assert.strictEqual(cli(home, ['log', '--days=0']).status, 1, '--days must be >= 1');
+    assert.deepStrictEqual(logFileLines(home), before, '`log` must not log itself');
+  });
+
+  test('log: retention deletes day files older than CDPILOT_LOG_DAYS on the first write of a day', () => {
+    const home = newHome();
+    const dir = logDir(home);
+    fs.mkdirSync(dir, { recursive: true });
+    for (const f of ['2000-01-01.jsonl', `${localDay(20)}.jsonl`, `${localDay(14)}.jsonl`,
+      `${localDay(3)}.jsonl`, 'notes.txt']) fs.writeFileSync(path.join(dir, f), '{}\n');
+    cli(home, ['version']);
+    const left = fs.readdirSync(dir).sort();
+    assert.deepStrictEqual(left,
+      [`${localDay(14)}.jsonl`, `${localDay(3)}.jsonl`, `${localDay()}.jsonl`, 'notes.txt'].sort(),
+      `default 14 days: ${left}`);
+
+    const home2 = newHome();
+    fs.mkdirSync(logDir(home2), { recursive: true });
+    fs.writeFileSync(path.join(logDir(home2), `${localDay(3)}.jsonl`), '{}\n');
+    cli(home2, ['version'], { CDPILOT_LOG_DAYS: '2' });
+    assert(!fs.existsSync(path.join(logDir(home2), `${localDay(3)}.jsonl`)), 'CDPILOT_LOG_DAYS=2');
+
+    // Not the first write today: nothing is pruned.
+    const home3 = newHome();
+    fs.mkdirSync(logDir(home3), { recursive: true });
+    fs.writeFileSync(path.join(logDir(home3), `${localDay()}.jsonl`), '');
+    fs.writeFileSync(path.join(logDir(home3), '2000-01-01.jsonl'), '{}\n');
+    cli(home3, ['version']);
+    assert(fs.existsSync(path.join(logDir(home3), '2000-01-01.jsonl')), 'prune only on a day\'s first write');
+  });
+
+  test('log: a command killed by --timeout still writes its line (exit 124)', () => {
+    const home = newHome();
+    const wrapper = [
+      'import json, os, socket, subprocess, sys',
+      'srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)',
+      'srv.bind(("127.0.0.1", 0))',
+      'srv.listen(16)',
+      'env = dict(os.environ, CDP_PORT=str(srv.getsockname()[1]))',
+      'r = subprocess.run(sys.argv[1:], env=env, capture_output=True, text=True, timeout=60)',
+      'print(json.dumps({"code": r.returncode, "stderr": r.stderr}))',
+    ].join('\n');
+    const r = spawnSync(PY_BIN, ['-c', wrapper, process.execPath, CLI, '--timeout', '1', 'content'], {
+      encoding: 'utf-8', timeout: 90000, env: baseEnv(home, {}),
+    });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(JSON.parse(r.stdout.trim()).code, 124);
+    const got = logFileLines(home).map((l) => JSON.parse(l));
+    assert.strictEqual(got.length, 1, `lines: ${got.length}`);
+    assert.strictEqual(got[0].exit, 124);
+    assert.strictEqual(got[0].error, 'cdpilot: timed out after 1s (content)');
+  });
+
+  test('log: MCP lists browser_log; a tool call is logged once (via mcp:<tool>), browser_log reads it', () => {
+    const home = newHome();
+    const reqs = [
+      { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'browser_fill', arguments: { selector: '#pw', value: SECRET } } },
+      { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'browser_log', arguments: { format: 'json' } } },
+    ];
+    const r = spawnSync(PY_BIN, [PY_PATH, 'mcp'], {
+      input: reqs.map((x) => JSON.stringify(x)).join('\n') + '\n',
+      encoding: 'utf-8', timeout: 60000, env: baseEnv(home, {}),
+    });
+    const res = lines(r.stdout).map((l) => JSON.parse(l));
+    const tool = res.find((x) => x.id === 1).result.tools.find((t) => t.name === 'browser_log');
+    assert(tool, 'browser_log must be in tools/list');
+    assert(tool.description.length > 80 && /read-only/i.test(tool.description), tool.description);
+    assert.deepStrictEqual(tool.inputSchema.properties.format.enum, ['table', 'md', 'json']);
+    assert(/"browser_log":\s*lambda a: \["log"\]/.test(PY_CONTENT), 'tool_map must route browser_log to `log`');
+    const logged = logFileLines(home).map((l) => JSON.parse(l));
+    assert.strictEqual(logged.length, 1, `one line per tool call (no double logging), got ${logged.length}`);
+    assert.strictEqual(logged[0].cmd, 'fill');
+    assert.strictEqual(logged[0].via, 'mcp:browser_fill');
+    assert.strictEqual(logged[0].exit, 1);
+    const call = res.find((x) => x.id === 3).result;
+    assert.strictEqual(call.isError, false);
+    assert.deepStrictEqual(JSON.parse(call.content[0].text), logged[0]);
+    assert(!r.stdout.includes('hunter2') && !logFileLines(home).join('').includes('hunter2'));
+  });
+
+  test('log: wired into dispatch, never auto-launches, documented (README, CHANGELOG, help)', () => {
+    assert(/'log':\s*lambda:\s*cmd_log\(\*args\)/.test(PY_CONTENT), "'log' must be in sync_cmds");
+    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('if __name__ == "__main__":'));
+    assert(/_slog_begin\(_argv\)/.test(main), '__main__ must start the session log');
+    const skip = PY_CONTENT.match(/AUTOLAUNCH_SKIP_CMDS = frozenset\(\{([\s\S]*?)\}\)/)[1];
+    assert(/'log'/.test(skip), "'log' must never launch the browser");
+    const root = path.join(__dirname, '..');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    for (const s of ['cdpilot log --md', '`CDPILOT_LOG`', '`CDPILOT_LOG_DAYS`']) {
+      assert(readme.includes(s), `README must mention ${s}`);
+    }
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    const unreleased = changelog.split(/^## \[/m).find((s) => s.startsWith('Unreleased]'));
+    assert(unreleased && unreleased.includes('cdpilot log'), 'CHANGELOG [Unreleased] must describe `cdpilot log`');
+    const help = run('--help');
+    assert(help.includes('log --md') && help.includes('CDPILOT_LOG'), 'bin help must document log');
+    assert(PY_CONTENT.slice(0, 2000).includes('CDPILOT_LOG=0'), 'python __doc__ must document CDPILOT_LOG');
   });
 })();
 

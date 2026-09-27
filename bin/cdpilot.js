@@ -242,7 +242,8 @@ function runStatus() {
           console.log(`  ✓ Connected`);
           console.log(`  Browser: ${info.Browser || 'Unknown'}`);
           console.log(`  Protocol: ${info['Protocol-Version'] || 'Unknown'}`);
-          console.log(`  WebSocket: ${info.webSocketDebuggerUrl || 'N/A'}\n`);
+          console.log(`  WebSocket: ${info.webSocketDebuggerUrl || 'N/A'}`);
+          console.log(`  ${idleCloseLabel(port)}\n`);
         } catch {
           console.log('  ✓ CDP responding but version info unavailable\n');
         }
@@ -259,6 +260,33 @@ function runStatus() {
     });
   } catch {
     console.log('  ❌ Could not check status.\n');
+  }
+}
+
+// Idle auto-close countdown, from the files src/cdpilot.py keeps (see
+// _idle_status there): CDPILOT_HOME/idle/<port>.json names the watcher and its
+// minutes, CDPILOT_HOME/projects/<id>/last-activity the last command.
+function idleCloseLabel(port) {
+  const home = process.env.CDPILOT_HOME || path.join(os.homedir(), '.cdpilot');
+  try {
+    const st = JSON.parse(fs.readFileSync(path.join(home, 'idle', `${port}.json`), 'utf-8'));
+    const minutes = Number(st.minutes) || 0;
+    if (minutes <= 0 || !st.pid) return 'idle close off';
+    try {
+      process.kill(st.pid, 0); // existence probe; safe on Windows in Node
+    } catch (e) {
+      if (e.code !== 'EPERM') return 'idle close off';
+    }
+    let last = Number(st.started) || Date.now() / 1000;
+    try {
+      const file = path.join(home, 'projects', String(st.project_id), 'last-activity');
+      const t = parseFloat(fs.readFileSync(file, 'utf-8'));
+      if (t > last) last = t;
+    } catch {}
+    const left = Math.max(0, Math.floor(minutes * 60 - (Date.now() / 1000 - last)));
+    return `idle close in ${Math.ceil(left / 60)}m`;
+  } catch {
+    return 'idle close off';
   }
 }
 
@@ -329,10 +357,14 @@ function showHelp() {
                        (the flag wins, 0 disables).
     Page commands start the browser if it is not running
                        (set CDPILOT_NO_AUTOLAUNCH=1 to get an error instead).
+    An auto-launched (or MCP-launched) browser closes after 15 min without a
+                       cdpilot command or page change (CDPILOT_IDLE_CLOSE=<minutes>,
+                       0 = never); an explicit launch stays open unless asked (below).
 
   SETUP
     setup              Auto-detect browser, create isolated profile
-    launch             Start browser with CDP enabled
+    launch [--idle-close <min>]  Start browser with CDP enabled (--idle-close or
+                       CDPILOT_IDLE_CLOSE: close it after <min> idle minutes)
     status             Check browser connection
     stop [--smart]     Stop browser (--smart = close owned tabs, quit if empty)
     close [--force|--keep]  Smart close: close cdpilot's tabs; quit browser only
@@ -436,6 +468,16 @@ function showHelp() {
 
   AI AGENT
     mcp                Start MCP server (stdin/stdout JSON-RPC)
+
+  SESSION LOG (always on, local, redacted)
+    log                Today's commands for this project: time, exit, command,
+                       url, result
+    log --md           Markdown report (pages visited, actions, errors, files
+                       produced) to paste into an issue or PR
+    log --json         Raw JSON lines · log --days N · log --path (log directory)
+                       Typed values, secret-looking args and token/key/secret URL
+                       params are redacted. CDPILOT_LOG=0 turns it off;
+                       CDPILOT_LOG_DAYS (default 14) sets how many days are kept.
 
   WATCH (continuous screencast for AI video understanding)
     watch start <url>  Begin JPEG screencast at N fps to a disk ring buffer

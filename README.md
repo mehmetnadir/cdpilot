@@ -604,7 +604,7 @@ Earlier figures on this page (sannysoft 24/24, intoli 6/6) were measured on v0.4
 
 ```bash
 cdpilot browser [name|auto]   # workload-aware browser selection
-cdpilot health                # JSON: alive, port, tabs, browser, today's crashes
+cdpilot health                # JSON: alive, port, tabs, browser, today's crashes, idle close
 ```
 
 `cdpilot health` is designed for shell watchdogs:
@@ -626,6 +626,33 @@ Lifecycle, status and configuration commands (`launch`, `stop`, `close`,
 `mcp`, `serve`, …) never launch. `CDPILOT_NO_AUTOLAUNCH=1` restores the old
 "CDP connection error. Is the browser running?" error and exit code 1.
 
+**Idle auto-close.** A browser that a page command auto-launched, or that the
+MCP server launched (`browser_launch` included), closes itself after
+**15 minutes** without a cdpilot command or a visible page change, so a
+finished agent task does not leave it holding memory. An explicit CLI
+`cdpilot launch` stays open (you may be browsing in it by hand) unless you ask:
+`cdpilot launch --idle-close 30` or `CDPILOT_IDLE_CLOSE=30`. The env var also
+sets the auto-launch delay (read when the browser starts; fractions allowed);
+`0` turns idle close off. A browser you started yourself, or one cdpilot merely
+attached to, is never closed.
+
+What counts as use: any cdpilot command except the read-only checks (`status`,
+`health`, `projects`, `version` — a `cdpilot health` watchdog loop does not keep
+the browser alive), MCP tool calls, `serve` requests, a CDP client still
+attached to a page (a long-running command, `watch`, Playwright via
+`connectOverCDP`), and any change in the open pages' URLs or in the set of
+tabs (someone navigating, a tab opened or closed). Title changes do not count,
+so a page that rewrites its own title (a clock, an unread counter) cannot keep
+the browser alive. `cdpilot status` and
+`cdpilot health` show `idle close in 12m` or `idle close off`.
+
+How: every command stamps `~/.cdpilot/projects/<id>/last-activity`; the launch
+starts a small detached watcher (one per port, no console window on Windows)
+that checks every ≤30 s, stops the browser like `cdpilot stop`, marks it
+stopped in the registry and exits — it also exits as soon as the browser is
+gone for any other reason. Browsers started by `serve --api` are managed by the
+server and have no idle close.
+
 **Timeouts.** Any command takes `--timeout <seconds>`, before or after the
 command name, or a default from `CDPILOT_TIMEOUT` (the flag wins; `0`
 disables). It bounds the whole command's wall-clock: on expiry cdpilot prints
@@ -641,6 +668,36 @@ CDPILOT_TIMEOUT=60 cdpilot run flow.cdp   # default for every command (and each 
 
 For `mcp` and `serve` the value is not applied to the long-running server
 itself; it is passed on to every tool call / request it runs.
+
+### Session log
+
+Every command (and every MCP tool call) appends one JSON line to a local,
+per-project log, so when a browser task is done there is a record of what was
+done and found. Nothing leaves the machine.
+
+```bash
+cdpilot log                 # today's commands: time, exit, command, url, result
+cdpilot log --md            # Markdown report: pages visited, actions, errors, files produced
+cdpilot log --json          # raw lines (one JSON object per command)
+cdpilot log --days 3        # include the last 3 days
+cdpilot log --path          # where the files are
+```
+
+Each line has `ts`, `cmd`, `args`, `exit`, `duration_ms`, the page `url` and
+`title` after the command (when the command already had them), a ~200-char
+`summary` of its output, the `error` line, and `files` it wrote (screenshots,
+PDFs). Files live in `~/.cdpilot/projects/<project-id>/log/<YYYY-MM-DD>.jsonl`.
+
+Redaction happens before anything is written: values given to `fill`, `type`,
+`smart-fill`, `smart-select`, `assert-value` and `dialog prompt` become
+`«redacted:N chars»`; so do values of password/token/key/secret/cookie/auth
+flags and headers, token-shaped arguments, and URL query/fragment values whose
+names contain token, key, secret, password, auth, code or session. `cookies`
+and `storage` output is never logged; `eval` source is, with string literals
+over 40 chars cut and secret-looking ones replaced. Logging is best effort: it
+never changes a command's output or exit code, and a failed write costs one
+stderr line. `CDPILOT_LOG=0` turns it off; `CDPILOT_LOG_DAYS` (default 14)
+sets how many days are kept. The MCP server exposes it as `browser_log`.
 
 ### Scaling & Workstation Use
 
@@ -705,6 +762,9 @@ print(result.stdout)
 | `CDPILOT_OFFSCREEN` | `0` | Headed but render off-screen — no window steals focus |
 | `CDPILOT_TIMEOUT` | unset | Default `--timeout` in seconds for every command (flag wins, `0` disables); expiry exits 124 |
 | `CDPILOT_NO_AUTOLAUNCH` | `0` | `1` = page commands fail with the old "Is the browser running?" error instead of launching the browser |
+| `CDPILOT_IDLE_CLOSE` | `15` | Minutes without a cdpilot command or page change before a browser cdpilot launched closes itself (fractions allowed, `0` = never; read at launch). Default applies to auto-launch and MCP launches; an explicit CLI `launch` is off unless this is set or `--idle-close <min>` is given |
+| `CDPILOT_LOG` | `1` | `0` = do not write the session log (`cdpilot log`) |
+| `CDPILOT_LOG_DAYS` | `14` | Days of session log to keep; older day files are deleted on the first write of a day (`0` keeps all) |
 
 ## How It Works
 

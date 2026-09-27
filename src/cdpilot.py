@@ -15,6 +15,13 @@ Global options:
   --timeout <seconds>  Abort the command after <seconds> (exit 124). Accepted
                        before or after the command name; 0 disables.
 
+Session log:
+  cdpilot log          Today's commands for this project (time, exit, command,
+                       url, result). --md: Markdown report (pages visited,
+                       actions, errors, files) · --json: raw lines ·
+                       --days N · --path: the log directory. Always on, local,
+                       redacted (typed values, secret-looking args and URL params).
+
 Environment:
   CDP_PORT             CDP debugging port (default: 9222)
   CHROME_BIN           Browser binary path (auto-detected if not set)
@@ -22,6 +29,12 @@ Environment:
   CDPILOT_TIMEOUT      Default for --timeout (the flag wins)
   CDPILOT_NO_AUTOLAUNCH=1  Do not start the browser when a page command
                        finds it not running (print the error instead)
+  CDPILOT_IDLE_CLOSE   Minutes without a cdpilot command or page change before
+                       a browser cdpilot launched closes itself (auto-launch
+                       and MCP: default 15; explicit `launch`: off unless set or
+                       `launch --idle-close <min>`; 0 = never)
+  CDPILOT_LOG=0        Do not write the session log
+  CDPILOT_LOG_DAYS     Days of session log to keep (default: 14; 0 = forever)
 """
 
 __version__ = "0.9.2"
@@ -1277,7 +1290,7 @@ AUTOLAUNCH_SKIP_CMDS = frozenset({
     'status', 'health', 'setup', 'help', '--help', '-h', 'version', '--version', '-v',
     'tabs', 'session', 'sessions', 'projects', 'heal',
     'headless', 'proxy', 'browser', 'extensions', 'ext-install', 'ext-remove',
-    'mcp', 'serve',
+    'mcp', 'serve', 'log',
 })
 # cmd is set by the CLI dispatcher; None (module imported) means never launch.
 _AUTOLAUNCH = {"cmd": None, "attempted": False, "failure": None}
@@ -1307,7 +1320,7 @@ def _autolaunch_if_down():
         # cmd_launch's progress lines would land in the command's stdout,
         # which agents parse — keep them out; errors become the failure reason.
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            cmd_launch()
+            cmd_launch(auto=True)
     except SystemExit as e:
         code = 0 if e.code is None else (e.code if isinstance(e.code, int) else 1)
     except Exception as e:
@@ -1325,6 +1338,405 @@ def _autolaunch_if_down():
 def _print_autolaunch_failure():
     if _AUTOLAUNCH["failure"]:
         print(f"cdpilot: auto-launch failed: {_AUTOLAUNCH['failure']}", file=sys.stderr)
+
+
+# ─── Idle auto-close ───
+# Auto-launch starts browsers, and nothing closed them: after an agent's task
+# the browser kept running (and holding RAM) until someone ran `stop`. Every
+# CLI call is a short-lived process, so no resident cdpilot can notice "idle".
+# Design:
+#   - every command (read-only checks excepted) writes a per-project activity
+#     timestamp, CDPILOT_HOME/projects/<id>/last-activity, when it starts and
+#     when it ends;
+#   - a launch of a browser cdpilot itself started spawns a small detached
+#     watcher (same re-entrant fork as the `watch` daemon) that wakes every
+#     <= 30 s and, once no command ran for N minutes, closes the browser with
+#     _stop_browser_on_port, marks the registry entry stopped and exits;
+#   - on by default only for auto-launch (a page command found the browser
+#     down: nobody asked for a browser to keep) and for any launch from the MCP
+#     server (browser_launch included: agents are the leak). An explicit CLI
+#     `launch` may be a person who then browses by hand, which no cdpilot
+#     command reflects, so it is off unless `launch --idle-close <min>` or
+#     CDPILOT_IDLE_CLOSE asks;
+#   - a visible change counts as use too: each round the watcher compares the
+#     page targets' ids and URLs with the previous round (a person navigating,
+#     a tab opened or closed). Titles are left out on purpose: a page that
+#     rewrites its own title (clock, unread counter) would pin the browser;
+#   - CDPILOT_HOME/idle/<port>.json names the one watcher that owns a port (a
+#     random token); a newer launch on the port replaces it and the old watcher
+#     exits on its next round;
+#   - the launch marker is the browser GUID in /json/version's
+#     webSocketDebuggerUrl (new on every browser run) plus the registry pid.
+#     A browser the user started or cdpilot only attached to never gets a
+#     watcher, and one that replaced ours on the port is never touched: the
+#     watcher exits instead.
+# Why not "close on the next command": the next command may never come, which
+# is the leak. Why not launchd / Task Scheduler / cron: three platform-specific
+# installers for one timer. A CDP client still attached to a page (an in-flight
+# long command, the `watch` daemon, Playwright via connectOverCDP) counts as
+# activity, so a browser in use is not closed under its client.
+IDLE_CLOSE_ENV = "CDPILOT_IDLE_CLOSE"
+IDLE_CLOSE_DEFAULT_MIN = 15.0
+IDLE_WATCHER_FLAG = '--_idle-watcher'  # hidden — used only for the re-entrant fork
+IDLE_POLL_MAX_S = 30.0
+# Read-only checks report the state; they must not keep a browser alive (the
+# `until cdpilot health; do ...` watchdog loop would pin it forever).
+IDLE_PASSIVE_CMDS = frozenset({
+    'status', 'health', 'projects', 'version', '--version', '-v',
+    'help', '--help', '-h', 'setup',
+})
+_IDLE_WARNED = []
+
+
+def _idle_parse_minutes(raw):
+    """'15', '0.2', '0'/'off' -> float minutes; None when not a finite number >= 0."""
+    raw = str(raw).strip()
+    if raw.lower() in ("off", "false", "no"):
+        return 0.0
+    try:
+        val = float(raw)
+    except ValueError:
+        return None
+    return val if 0 <= val < float("inf") else None
+
+
+def _idle_close_minutes(env=None, auto=True, flag=None):
+    """Minutes without a command before a cdpilot-launched browser closes; 0 = off.
+
+    auto=True  (auto-launch): default IDLE_CLOSE_DEFAULT_MIN.
+    auto=False (explicit `launch`): default off.
+    `launch --idle-close <min>` (flag) wins over CDPILOT_IDLE_CLOSE; fractions
+    allowed, `0`/`off` disables. An invalid flag raises ValueError; an invalid
+    env value falls back to the default with one warning per process.
+    """
+    if flag is not None:
+        val = _idle_parse_minutes(flag)
+        if val is None:
+            raise ValueError(f"--idle-close needs minutes >= 0 (0 = off), got {flag!r}")
+        return val
+    default = IDLE_CLOSE_DEFAULT_MIN if auto else 0.0
+    env = os.environ if env is None else env
+    raw = (env.get(IDLE_CLOSE_ENV) or "").strip()
+    if not raw:
+        return default
+    val = _idle_parse_minutes(raw)
+    if val is None:
+        if not _IDLE_WARNED:
+            _IDLE_WARNED.append(raw)
+            # __stderr__: auto-launch captures sys.stderr and drops it on success.
+            print(f"cdpilot: ignoring {IDLE_CLOSE_ENV}={raw!r} (minutes >= 0, 0 = off); "
+                  + (f"using {default:g}" if default else "idle close stays off"),
+                  file=sys.__stderr__ or sys.stderr)
+        return default
+    return val
+
+
+def _idle_close_flag(args):
+    """`launch --idle-close <min>` / `--idle-close=<min>` -> the raw value, or None."""
+    for i, a in enumerate(args):
+        if a.startswith("--idle-close="):
+            return a.split("=", 1)[1]
+        if a == "--idle-close":
+            return args[i + 1] if i + 1 < len(args) else ""
+    return None
+
+
+def _idle_activity_path(project_id=None):
+    return os.path.join(CDPILOT_HOME, "projects", project_id or PROJECT_ID, "last-activity")
+
+
+def _idle_state_path(port):
+    return os.path.join(CDPILOT_HOME, "idle", f"{int(port)}.json")
+
+
+def _idle_write_activity(project_id=None, now=None):
+    """Record "cdpilot used this project's browser now". Best effort: a missed
+    write only shortens one idle window, it must never fail a command."""
+    path = _idle_activity_path(project_id)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w") as f:
+            f.write(f"{time.time() if now is None else now:.3f}\n")
+        os.replace(tmp, path)  # readers never see a half-written value
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _idle_touch_activity(cmd):
+    """Dispatcher hook: this command counts as use, now and when it ends (a
+    20-minute command must not leave a browser that looks 20 minutes idle)."""
+    if cmd in IDLE_PASSIVE_CMDS:
+        return
+    _idle_write_activity()
+    atexit.register(_idle_write_activity)
+
+
+def _idle_read_activity(project_id=None):
+    try:
+        with open(_idle_activity_path(project_id)) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _idle_load_state(port):
+    try:
+        with open(_idle_state_path(port)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _idle_save_state(port, state):
+    path = _idle_state_path(port)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def _idle_clear_state(port, token=None):
+    """Remove the port's watcher record (only if `token` still owns it)."""
+    if token is not None and (_idle_load_state(port) or {}).get("token") != token:
+        return
+    try:
+        os.remove(_idle_state_path(port))
+    except OSError:
+        pass
+
+
+def _idle_should_close(now, last_activity, minutes):
+    """Pure decision: close once `minutes` (> 0) passed since the last activity."""
+    if not minutes or minutes <= 0 or last_activity is None:
+        return False
+    return now - last_activity >= minutes * 60
+
+
+def _idle_owns_browser(state, registry, version):
+    """True only for the exact browser the watcher was started for.
+
+    state    — the watcher record written by `launch`;
+    registry — the project registry (_load_registry());
+    version  — the port's /json/version answer, None when nothing answers.
+    The browser GUID changes on every browser run, so a browser the user
+    started on the port, or one that replaced ours, never matches; the
+    registry pid is the mark `launch` leaves only on browsers it started.
+    """
+    if not state or not version:
+        return False
+    ws_url = version.get("webSocketDebuggerUrl")
+    if not ws_url or ws_url != state.get("browser_ws"):
+        return False
+    entry = (registry or {}).get(state.get("project_id")) or {}
+    return (state.get("browser_pid") is not None
+            and entry.get("pid") == state.get("browser_pid")
+            and str(entry.get("port")) == str(state.get("port")))
+
+
+def _idle_last_activity(state):
+    """Latest of the project's activity stamp and the watcher's start."""
+    stamps = [_idle_read_activity(state.get("project_id")), state.get("started")]
+    stamps = [float(s) for s in stamps if s is not None]
+    return max(stamps) if stamps else None
+
+
+def _idle_page_fingerprint(targets):
+    """Pure: what a person changes — the page targets' (id, url), order-free.
+    No titles: a page can rewrite its own (clock, unread counter) forever.
+    None when the target list is unknown (the read failed)."""
+    if targets is None:
+        return None
+    return tuple(sorted((str(t.get("id") or ""), str(t.get("url") or ""))
+                        for t in targets if t.get("type") == "page"))
+
+
+def _idle_pages_changed(prev, cur):
+    """Pure: a navigation or a tab opened/closed since the last round counts as
+    activity. An unknown side (first round, failed read) does not."""
+    return prev is not None and cur is not None and prev != cur
+
+
+def _idle_page_targets(port):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/json", timeout=3) as resp:
+            data = json.loads(resp.read())
+        return data if isinstance(data, list) else None
+    except Exception:
+        return None
+
+
+def _idle_poll_seconds(minutes):
+    return max(1.0, min(IDLE_POLL_MAX_S, minutes * 60 / 6))
+
+
+def _idle_version(port):
+    try:
+        url = f"http://127.0.0.1:{int(port)}/json/version"
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _idle_client_attached(version):
+    """True while some CDP client holds a page target (Target.getTargets
+    `attached`): an in-flight command, the `watch` daemon, Playwright. The
+    browser-level socket used for the query attaches to no page."""
+    ws_url = (version or {}).get("webSocketDebuggerUrl")
+    if not ws_url:
+        return False
+
+    async def _query():
+        import websockets
+        async with websockets.connect(ws_url, max_size=16 * 1024 * 1024) as ws:
+            await ws.send(json.dumps({"id": 1, "method": "Target.getTargets", "params": {}}))
+            while True:
+                msg = json.loads(await ws.recv())
+                if msg.get("id") == 1:
+                    return (msg.get("result") or {}).get("targetInfos") or []
+
+    try:
+        infos = asyncio.run(asyncio.wait_for(_query(), timeout=10))
+    except Exception:
+        return False  # cannot tell: closing an unresponsive idle browser is the point
+    return any(t.get("attached") and t.get("type") == "page" for t in infos)
+
+
+def _idle_spawn_watcher(browser_pid, port=None, project_id=None, minutes=None):
+    """Start the detached idle watcher for a browser `launch` just started.
+
+    Returns the watcher pid, or None when idle close is off / spawning failed.
+    Detached on both families so it outlives this command, its terminal and
+    the Node launcher: its own session on POSIX, DETACHED_PROCESS (no console)
+    + its own process group (no Ctrl+C from the launching console) on Windows.
+    All three std streams are DEVNULL: an inherited pipe would keep a caller
+    that captures output (the MCP server's subprocess.run) waiting for it.
+    """
+    port = int(port or CDP_PORT)
+    project_id = project_id or PROJECT_ID
+    minutes = _idle_close_minutes() if minutes is None else minutes
+    if minutes <= 0:
+        _idle_clear_state(port)  # an older watcher on this port stands down
+        return None
+    version = cdp_get('/json/version', no_cache=True) or {}
+    token = secrets.token_hex(8)
+    state = {
+        "token": token, "pid": None, "port": port, "project_id": project_id,
+        "browser_pid": browser_pid, "browser_ws": version.get("webSocketDebuggerUrl"),
+        "minutes": minutes, "started": time.time(),
+    }
+    # Written before the fork, so the watcher always finds its own token.
+    _idle_save_state(port, state)
+    env = os.environ.copy()
+    env.update(CDP_PORT=str(port), CDPILOT_PROJECT_ID=project_id,
+               CDPILOT_PROFILE=PROFILE_DIR, CDPILOT_HOME=CDPILOT_HOME)
+    env.pop("CDPILOT_TIMEOUT", None)  # the watcher is meant to run for minutes
+    kwargs = {
+        "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL, "env": env, "close_fds": True,
+        # Not the project dir: on Windows a process's cwd cannot be deleted.
+        "cwd": CDPILOT_HOME,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                                   | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), IDLE_WATCHER_FLAG, str(port), token],
+            **kwargs)
+    except OSError:
+        _idle_clear_state(port, token)
+        return None
+    state["pid"] = proc.pid
+    if (_idle_load_state(port) or {}).get("token") == token:
+        _idle_save_state(port, state)
+    return proc.pid
+
+
+def _idle_watcher_step(port, token, now=None, memo=None):
+    """One watcher round: 'wait', 'exit' (replaced / browser gone / not ours)
+    or 'closed' (idle for the configured minutes, browser stopped).
+    memo carries the previous round's page fingerprint ("pages")."""
+    state = _idle_load_state(port)
+    if not state or state.get("token") != token:
+        return "exit"
+    version = _idle_version(port)
+    if version is None and _pid_alive(state.get("browser_pid")) and not _is_port_free(port):
+        return "wait"  # busy, not gone
+    if not _idle_owns_browser(state, _load_registry(), version):
+        _idle_clear_state(port, token)
+        return "exit"
+    if memo is not None:
+        pages = _idle_page_fingerprint(_idle_page_targets(port))
+        if _idle_pages_changed(memo.get("pages"), pages):
+            _idle_write_activity(state.get("project_id"))
+        if pages is not None:
+            memo["pages"] = pages
+    minutes = float(state.get("minutes") or 0)
+    now = time.time() if now is None else now
+    if not _idle_should_close(now, _idle_last_activity(state), minutes):
+        return "wait"
+    if _idle_client_attached(version):
+        _idle_write_activity(state.get("project_id"))
+        return "wait"
+    if not _idle_should_close(now, _idle_last_activity(state), minutes):
+        return "wait"  # a command started while we asked the browser
+    _stop_browser_on_port(port)
+    registry = _load_registry()
+    entry = registry.get(state.get("project_id"))
+    if entry and entry.get("pid") == state.get("browser_pid"):
+        entry["status"] = "stopped"
+        entry["pid"] = None
+        _save_registry(registry)
+    try:
+        log = os.path.join(CDPILOT_HOME, "projects", state.get("project_id") or "", "idle-close.log")
+        with open(log, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} closed browser on port {port} "
+                    f"after {minutes:g} min without a cdpilot command or page change\n")
+    except OSError:
+        pass
+    _idle_clear_state(port, token)
+    return "closed"
+
+
+def _idle_watcher_entry(args):
+    """Hidden `--_idle-watcher <port> <token>` entry: the detached watcher loop."""
+    try:
+        port, token = int(args[0]), str(args[1])
+    except (IndexError, ValueError):
+        return
+    state = _idle_load_state(port) or {}
+    if state.get("token") != token:
+        return
+    poll = _idle_poll_seconds(float(state.get("minutes") or 0))
+    memo = {"pages": _idle_page_fingerprint(_idle_page_targets(port))}
+    errors = 0
+    while errors < 20:  # a persistent failure must not leave a watcher forever
+        time.sleep(poll)
+        try:
+            if _idle_watcher_step(port, token, memo=memo) != "wait":
+                return
+            errors = 0
+        except Exception:
+            errors += 1  # a transient error (registry mid-write) must not end the watch
+
+
+def _idle_status(port=None, now=None):
+    """(label, seconds_left) for status/health: 'idle close in 12m' / 'idle close off'."""
+    state = _idle_load_state(port or CDP_PORT)
+    minutes = float((state or {}).get("minutes") or 0)
+    if not state or minutes <= 0 or not _pid_alive(state.get("pid")):
+        return "idle close off", None
+    last = _idle_last_activity(state) or time.time()
+    left = max(0.0, minutes * 60 - ((time.time() if now is None else now) - last))
+    return f"idle close in {-(-int(left) // 60)}m", int(left)
 
 
 def get_tabs():
@@ -3249,9 +3661,20 @@ def _minimize_browser_window():
     asyncio.run(_do())
 
 
-def cmd_launch():
-    """Launch the browser with CDP enabled (isolated session — does not touch existing browser)."""
+def cmd_launch(auto=False, idle_close=None):
+    """Launch the browser with CDP enabled (isolated session — does not touch existing browser).
+
+    auto=True: started by a page command (auto-launch) — idle close on by
+    default; so is any launch from the MCP server (CDPILOT_MCP_SESSION=1).
+    idle_close: the `--idle-close <min>` value of an explicit launch.
+    """
     global CHROME_BIN, CDP_PORT, CDP_BASE
+    auto = auto or IS_MCP_SESSION
+    try:
+        idle_minutes = _idle_close_minutes(auto=auto, flag=idle_close)
+    except ValueError as e:
+        print(f"cdpilot: {e}", file=sys.stderr)
+        sys.exit(2)
     if cdp_get('/json/version'):
         proj_label = f' [{PROJECT_ID}]' if PROJECT_ID else ''
         print(f'Browser already running on port {CDP_PORT}{proj_label}.')
@@ -3415,6 +3838,13 @@ def cmd_launch():
         if cdp_get('/json/version'):
             if PROJECT_ID:
                 _register_project(PROJECT_ID, CDP_PORT, PROFILE_DIR, pid=proc.pid)
+                # Only browsers started right here get a watcher (see Idle auto-close).
+                if _idle_spawn_watcher(proc.pid, minutes=idle_minutes):
+                    print(f'  Idle close: after {idle_minutes:g} min without a cdpilot '
+                          f'command or page change ({IDLE_CLOSE_ENV}=0 disables)')
+                elif not auto:
+                    print(f'  Idle close: off (launch --idle-close <min> or '
+                          f'{IDLE_CLOSE_ENV}=<min> turns it on)')
             # Up and registered: the browser is meant to outlive this command,
             # so a --timeout expiring later must not kill it as an orphan.
             _timeout_release_child(proc)
@@ -6434,6 +6864,8 @@ def cmd_health():
       crashes_today  — int, Brave crash dump count from macOS today
       stealth        — bool, current stealth config
       uptime_warning — str|null, hint when browser is alive but very old
+      idle_close     — str, "idle close in <N>m" or "idle close off"
+      idle_close_in_s — int|null, seconds until the idle auto-close
 
     Exit codes: 0 = alive, 2 = down. Designed for shell watchdog loops:
       `until cdpilot health >/dev/null; do cdpilot launch; sleep 2; done`
@@ -6457,6 +6889,8 @@ def cmd_health():
         info['browser'] = ver.get('Browser') or ver.get('browser') or ''
         targets = cdp_get('/json') or []
         info['tabs'] = sum(1 for t in targets if t.get('type') == 'page')
+    info['idle_close'], info['idle_close_in_s'] = (
+        _idle_status() if info['alive'] else ("idle close off", None))
 
     # Today's crash count from macOS DiagnosticReports (Brave only).
     if platform.system() == 'Darwin':
@@ -8605,6 +9039,10 @@ def _api_create_session(opts: dict) -> dict:
         env = os.environ.copy()
         env['CDP_PORT'] = str(port)
         env['CDPILOT_PROJECT_ID'] = proj_id
+        # No idle watcher: this server ends the session (release / DELETE /
+        # shutdown), and its clients drive the browser over raw CDP that
+        # cdpilot never sees, so "no cdpilot command" does not mean idle.
+        env['CDPILOT_IDLE_CLOSE'] = '0'
         subprocess.Popen([py_bin, script, 'launch'], env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -8652,6 +9090,10 @@ def _api_release_session(session_id: str) -> bool:
 
 class BrowserbaseHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass  # quiet
+
+    def parse_request(self):
+        _idle_write_activity()  # every API request is activity (idle auto-close)
+        return super().parse_request()
 
     def _send_json(self, code: int, data):
         body = json.dumps(data).encode()
@@ -12250,6 +12692,8 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_mode", "description": "Get or set the three-tier stealth mode (crawl4ai-style escalation). Tiers from lightest to heaviest fingerprint footprint: 'regular' injects NO anti-fingerprint patch (cleanest, fastest, fewest leaks — the default and best for most sites); 'stealth' injects a light patch (navigator.webdriver, chrome.runtime, permissions only — deliberately omits plugin spoofing which leaks); 'undetected' injects the full patch (light + plugin array + WebGL vendor + Worker patch — highest plausibility on naive checks but highest entropy). Omit 'tier' to read the current mode. Effect applies on the next navigation. Escalate to 'undetected' only for hard anti-bot targets.",
              "inputSchema": {"type": "object", "properties": {"tier": {"type": "string", "enum": ["regular", "stealth", "undetected"], "description": "Tier to set. Omit to get the current tier."}}}},
+            {"name": "browser_log", "description": "Read this project's cdpilot session log (read-only; reading does not add to it). Every cdpilot command and browser_* tool call is recorded locally: command, redacted arguments, exit code, duration, page URL and title, a short result summary, the error line and the files it wrote (screenshots, PDFs). Values typed into pages, secret-looking arguments and token/key/secret URL parameters are redacted before they are written. Call it when a browser task is finished to report what was done and found: format 'md' returns a Markdown report (pages visited, actions, errors, files produced) ready to paste into an issue or PR, 'table' (default) a compact table, 'json' the raw JSON lines. Covers today unless 'days' is given.",
+             "inputSchema": {"type": "object", "properties": {"format": {"type": "string", "enum": ["table", "md", "json"], "description": "Output format (default: table)."}, "days": {"type": "integer", "minimum": 1, "description": "Include the last N days (1 = today, the default)."}}}},
         ]
 
     def _handle_request(self, request):
@@ -12328,17 +12772,28 @@ class MCPServer:
             "browser_watch_query": lambda a: ["watch", "query"] + ([f"--at={a['at']}"] if a.get("at") else []) + ([f"--window={a['window']}"] if a.get("window") else []) + ([f"--last={a['last']}"] if a.get("last") else []) + (["--since-last"] if a.get("since_last") else []) + ([f"--max={a['max']}"] if a.get("max") else []),
             "browser_watch_status": lambda a: ["watch", "status"],
             "browser_mode": lambda a: ["mode"] + ([a["tier"]] if a.get("tier") else []),
+            "browser_log": lambda a: ["log"] + ([f"--{a['format']}"] if a.get("format") in ("md", "json") else []) + ([f"--days={a['days']}"] if a.get("days") else []),
         }
         if tool_name not in tool_map:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}}
 
         cli_args = [a for a in tool_map[tool_name](args) if a]
+        _idle_write_activity()  # a tool call is use of the browser (idle auto-close)
+        # The tool call runs as a CLI process, which writes its own session log
+        # line; the server writes one only when that process never got to.
+        via = f"mcp:{tool_name}"
+        started, t0 = datetime.datetime.now().astimezone(), time.monotonic()
         try:
             env = os.environ.copy()
             env["CDPILOT_MCP_SESSION"] = "1"
+            env[SLOG_VIA_ENV] = via
+            # Both ends in UTF-8: with the locale default a child writing one
+            # code page and a parent reading another raised here, and the
+            # server logged the call a second time.
+            env["PYTHONIOENCODING"] = "utf-8"
             result = subprocess.run(
                 [sys.executable, __file__] + cli_args,
-                capture_output=True, text=True, timeout=30, env=env
+                capture_output=True, encoding="utf-8", errors="replace", timeout=30, env=env
             )
             output = result.stdout.strip()
             errors = result.stderr.strip()
@@ -12351,8 +12806,12 @@ class MCPServer:
                 content.append({"type": "text", "text": "Command executed successfully"})
             return {"jsonrpc": "2.0", "id": req_id, "result": {"content": content, "isError": result.returncode != 0}}
         except subprocess.TimeoutExpired:
+            _slog_record_external(cli_args, TIMEOUT_EXIT_CODE, started, int((time.monotonic() - t0) * 1000),
+                                  "MCP tool call timed out (30s); the command was killed", via)
             return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Error: Command timed out (30s)"}], "isError": True}}
         except Exception as e:
+            _slog_record_external(cli_args, 1, started, int((time.monotonic() - t0) * 1000),
+                                  f"{type(e).__name__}: {e}", via)
             return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Error: {str(e)}"}], "isError": True}}
 
     def run(self):
@@ -13279,7 +13738,7 @@ async def _watch_daemon_run(url, fps, quality, max_width, retention_s,
     # Launch browser if needed (the daemon is forked by `watch start`, a page
     # command, so it follows the same CDPILOT_NO_AUTOLAUNCH switch).
     if not cdp_get("/json/version") and not _autolaunch_disabled():
-        cmd_launch()
+        cmd_launch(auto=True)
 
     ws_url, _ = get_page_ws()
 
@@ -14002,6 +14461,10 @@ def _arm_timeout_watchdog(seconds, cmd):
             os.write(2, message)
         except OSError:
             pass
+        try:  # os._exit skips atexit: write the session log line here
+            _slog_finish(TIMEOUT_EXIT_CODE, message.decode().strip())
+        except Exception:
+            pass
         os._exit(TIMEOUT_EXIT_CODE)
 
     timer = threading.Timer(seconds, _expire)
@@ -14011,9 +14474,842 @@ def _arm_timeout_watchdog(seconds, cmd):
     return timer
 
 
+# ─── Session log ───
+# After an agent (or a person) finished a browser task there was no record of
+# what was done and found: `debug` covers one URL, `trace` only `cdpilot test`
+# runs. Every CLI command now appends one JSON line to
+#   <CDPILOT_HOME>/projects/<project-id>/log/<YYYY-MM-DD>.jsonl
+# (the per-project dir that already holds the profile and heal.jsonl), and
+# `cdpilot log` reads it back as a table, a Markdown report (--md) or the raw
+# lines (--json).
+#
+#   - Best effort: logging never changes a command's output or exit code; a
+#     failure costs at most one stderr line per process.
+#   - No extra CDP round-trip: url/title are the page the dispatcher already
+#     resolved (`_wrapped`), files are paths the command printed and wrote.
+#   - One os.write() per line on an O_APPEND fd, so parallel invocations
+#     interleave whole lines.
+#   - Values typed into pages and anything secret-shaped are redacted by the
+#     pure functions below before anything reaches the disk.
+#   - CDPILOT_LOG=0 turns it off. The first write of a day deletes day files
+#     older than CDPILOT_LOG_DAYS (default 14; 0 keeps everything).
+# `mcp` and `serve` are not logged themselves: every MCP tool call runs as its
+# own CLI process, which logs it (tagged "via": "mcp:<tool>"); the server only
+# writes the line when it had to kill that process.
+SLOG_ENV = "CDPILOT_LOG"
+SLOG_DAYS_ENV = "CDPILOT_LOG_DAYS"
+SLOG_VIA_ENV = "CDPILOT_LOG_VIA"
+SLOG_DEFAULT_DAYS = 14
+SLOG_SUMMARY_CHARS = 200
+SLOG_ERROR_CHARS = 300
+SLOG_ARG_CHARS = 300
+SLOG_JS_LITERAL_CHARS = 40
+SLOG_MAX_FILES = 20
+# Long-running servers (their tool calls are logged), the reader itself
+# (reading the log must not grow it) and help.
+SLOG_SKIP_CMDS = frozenset({'mcp', 'serve', 'log', 'help', '--help', '-h'})
+SLOG_CMD_ALIASES = {'open': 'go', '--version': 'version', '-v': 'version'}
+SLOG_VALUE_CMDS = frozenset({'fill', 'type'})  # <selector> <value...>, flags anywhere
+SLOG_VALUE_CMD_FLAGS = frozenset({'--no-heal'})  # their bare flags; --name=value is kept
+SLOG_LABEL_VALUE_CMDS = frozenset({'smart-fill', 'smart-select', 'select'})  # <label> <value...>
+SLOG_JS_CMDS = frozenset({'eval', 'multi-eval'})
+SLOG_COOKIE_SAFE_SUBS = frozenset({'save', 'load', 'clear', 'auto'})  # print no cookie values
+SLOG_OUTPUT_WITHHELD = "«output not logged: may contain cookie or storage values»"
+SLOG_EVAL_WITHHELD = "«output not logged: the script names a secret-like value»"
+
+# Flag, header and key names that carry secrets.
+_SLOG_SECRET_NAME_RE = _re.compile(
+    r"pass|pwd|token|secret|key|cookie|auth|session|credential|bearer|jwt|otp|signature", _re.I)
+# A bare positional word naming a secret; the NEXT arg is its value.
+_SLOG_SECRET_WORD_RE = _re.compile(
+    r"(?:x-)?[\w-]*(?:password|passwd|pwd|token|secret|api[-_]?key|apikey|authorization"
+    r"|cookie|session[-_]?id|credential|bearer):?", _re.I)
+# URL query / fragment parameter names whose values are masked.
+_SLOG_SECRET_PARAM_RE = _re.compile(
+    r"token|key|secret|pass|pwd|auth|code|session|sig|jwt|otp|credential", _re.I)
+_SLOG_KV_ARG_RE = _re.compile(r"([A-Za-z_][\w.-]*)(\s*[:=]\s*)(.*)", _re.S)
+_SLOG_URL_RE = _re.compile(r"\b(?:https?|wss?|ftp|file)://[^\s\"'<>`]+", _re.I)
+_SLOG_BEARER_RE = _re.compile(r"\b(Bearer|Basic|Token)(\s+)([A-Za-z0-9._~+/=-]{6,})")
+_SLOG_TOKEN_PREFIX_RE = _re.compile(
+    r"sk-[A-Za-z0-9_-]{16,}|sk_(?:live|test)_[A-Za-z0-9]{10,}|gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|github_pat_\w{20,}|xox[abprs]-[\w-]{10,}|AKIA[0-9A-Z]{16}|AIza[\w-]{30,}"
+    r"|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}")
+_SLOG_TEXT_KV_RE = _re.compile(
+    r"\b([\w-]*(?:password|passwd|pwd|token|secret|api[_-]?key|apikey|authorization"
+    r"|session[_-]?id|credential|otp)[\w-]*)(\"?'?\s*[:=]\s*\"?'?)((?!«)[^\s\"'&,;<>]+)", _re.I)
+_SLOG_TEXT_COOKIE_RE = _re.compile(r"\b((?:set-)?cookie[ \t]*[:=][ \t]*)((?![ \t]*«)[^\n]+)", _re.I)
+_SLOG_FILLED_RE = _re.compile(r"(\bFilled\b[^\n=]*=[ \t]*)((?![ \t]*«)[^\n]+)")
+_SLOG_ECHO_RE = _re.compile(r"^(\s*\[\d+\]\s+)([a-z][a-z-]*)([^\n]*)$", _re.M)
+_SLOG_TOKENISH_RE = _re.compile(r"[A-Za-z0-9_\-+/=.~]{20,}")
+_SLOG_UUID_RE = _re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+_SLOG_CDP_ID_RE = _re.compile(r"[0-9A-F]{32}")  # CDP target / browser-context ids
+_SLOG_JS_STR_RE = _re.compile(r"'(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\"|`(?:[^`\\]|\\.)*`", _re.S)
+# Text right before a JS string literal that makes the literal a secret.
+_SLOG_JS_SECRET_CTX_RE = _re.compile(
+    r"(?:\.value|\.cookie|\binnerText|\btextContent|\bdefaultValue"
+    r"|[\w$]*(?:pass|pwd|token|secret|key|auth|session|credential|otp)[\w$]*['\"`]?\]?)"
+    r"\s*(?:=|:|===?|!==?)\s*$"
+    r"|setItem\(\s*(?:'[^']*'|\"[^\"]*\"|`[^`]*`)\s*,\s*$", _re.I)
+_SLOG_ERROR_LINE_RE = _re.compile(
+    r"error|fail|unknown|not found|invalid|cannot|can't|denied|timed out|usage:|exception|"
+    r"traceback", _re.I)
+_SLOG_PATH_RE = _re.compile(
+    r"(?:[A-Za-z]:)?[\w~./\\-]+\.(?:png|jpe?g|webp|gif|pdf|jsonl?|har|mp4|webm|zip|html?|txt|csv)\b",
+    _re.I)
+
+
+def _slog_mark(value):
+    """Placeholder for a redacted value; keeps only its length."""
+    return f"«redacted:{len(value)} chars»"
+
+
+def _slog_clip(text, limit):
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _slog_clip_mark(text, limit):
+    """Cut to `limit` chars with a «+N chars» note, never inside a «…» placeholder."""
+    if len(text) <= limit:
+        return text
+    cut = limit
+    opened = text.rfind("«", 0, cut)
+    if opened != -1 and text.find("»", opened) >= cut:
+        cut = text.find("»", opened) + 1
+    if cut >= len(text):
+        return text
+    return f"{text[:cut]}…«+{len(text) - cut} chars»"
+
+
+def _slog_tokenish(s):
+    """True for a string shaped like an API key or session token (heuristic)."""
+    if len(s) < 20 or any(c.isspace() for c in s):
+        return False
+    if _SLOG_TOKEN_PREFIX_RE.match(s):
+        return True
+    if not _re.fullmatch(r"[A-Za-z0-9_\-+/=.~]+", s):
+        return False
+    if s[0] in "/.~" or _re.search(r"\.[A-Za-z][A-Za-z0-9]{1,4}$", s):
+        return False  # paths, file and host names
+    if _SLOG_CDP_ID_RE.fullmatch(s) or _SLOG_UUID_RE.fullmatch(s):
+        return False  # tab / context ids are not secrets and are useful in the log
+    upper = any(c.isupper() for c in s)
+    lower = any(c.islower() for c in s)
+    digit = any(c.isdigit() for c in s)
+    return (upper and lower and digit) or (len(s) >= 32 and digit and (upper or lower))
+
+
+def _slog_mask_params(qs):
+    """Mask the values of secret-named `k=v` pairs in a query string or fragment."""
+    if not qs or "=" not in qs:
+        return qs
+    from urllib.parse import unquote_plus
+    out = []
+    for part in qs.split("&"):
+        key, sep, val = part.partition("=")
+        if sep and val and _SLOG_SECRET_PARAM_RE.search(unquote_plus(key)):
+            part = f"{key}={_slog_mark(val)}"
+        out.append(part)
+    return "&".join(out)
+
+
+def _slog_mask_url(url):
+    """URL with the userinfo password and secret-named query/fragment values masked.
+
+    A data: URL is a whole document (often a test form with values in it): only
+    its media type is kept. A javascript: URL is redacted like `eval` source.
+    A URL with nothing to mask is returned unchanged, byte for byte.
+    """
+    if not url:
+        return url
+    head = url[:11].lower()
+    if head.startswith("data:"):
+        media, comma, body = url.partition(",")
+        return f"{_slog_clip(media, 80)},{_slog_mark(body)}" if comma else _slog_clip(url, 80)
+    if head.startswith("javascript:"):
+        return url[:11] + _slog_redact_js(url[11:])
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    netloc = parts.netloc
+    if "@" in netloc:
+        userinfo, _, host = netloc.rpartition("@")
+        if ":" in userinfo:
+            user, _, password = userinfo.partition(":")
+            netloc = f"{user}:{_slog_mark(password)}@{host}"
+    query = _slog_mask_params(parts.query)
+    fragment = _slog_mask_params(parts.fragment)
+    if (netloc, query, fragment) == (parts.netloc, parts.query, parts.fragment):
+        return url
+    return urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
+
+
+def _slog_mask_urls(text):
+    return _SLOG_URL_RE.sub(lambda m: _slog_mask_url(m.group(0)), text)
+
+
+def _slog_scrub_values(text, secrets):
+    """Replace echoes of known secret values, including cut-off ones.
+
+    Commands echo what they typed, sometimes truncated ("= <first 50 chars>"),
+    so a match starts at the value's first 8 chars and extends as far as the
+    text keeps agreeing with it. Values under 3 chars are not searched for.
+    """
+    if not text or not secrets:
+        return text
+    for secret in sorted({s for s in secrets if s and len(s) >= 3}, key=len, reverse=True):
+        probe = secret[:8]
+        if probe not in text:
+            continue
+        out, i = [], 0
+        while True:
+            j = text.find(probe, i)
+            if j < 0:
+                out.append(text[i:])
+                break
+            k = len(probe)
+            while k < len(secret) and j + k < len(text) and text[j + k] == secret[k]:
+                k += 1
+            out.append(text[i:j])
+            out.append(_slog_mark(secret))
+            i = j + k
+        text = "".join(out)
+    return text
+
+
+def _slog_scrub_echo(m):
+    """A `run` output line `[3] fill #pw hunter2` is redacted like a command line."""
+    import shlex
+    try:
+        parts = shlex.split(m.group(3))
+    except ValueError:
+        parts = m.group(3).split()
+    redacted, _ = _slog_redact_args(m.group(2), parts)
+    return m.group(1) + " ".join([m.group(2)] + redacted)
+
+
+def _slog_scrub_text(text, secrets=(), echo=True):
+    """Redact free text (command output, error lines, titles, loose args)."""
+    if not text:
+        return text
+    text = _slog_scrub_values(text, secrets)
+    if echo:
+        text = _SLOG_ECHO_RE.sub(_slog_scrub_echo, text)
+    text = _SLOG_FILLED_RE.sub(lambda m: m.group(1) + _slog_mark(m.group(2)), text)
+    text = _SLOG_TEXT_COOKIE_RE.sub(lambda m: m.group(1) + _slog_mark(m.group(2)), text)
+    text = _slog_mask_urls(text)
+    text = _SLOG_BEARER_RE.sub(lambda m: m.group(1) + m.group(2) + _slog_mark(m.group(3)), text)
+    text = _SLOG_TOKEN_PREFIX_RE.sub(lambda m: _slog_mark(m.group(0)), text)
+    text = _SLOG_TEXT_KV_RE.sub(lambda m: m.group(1) + m.group(2) + _slog_mark(m.group(3)), text)
+    return _SLOG_TOKENISH_RE.sub(
+        lambda m: _slog_mark(m.group(0)) if _slog_tokenish(m.group(0)) else m.group(0), text)
+
+
+def _slog_redact_js(src):
+    """Script source for the log: string literals over 40 chars are cut, and a
+    literal that is token-shaped or assigned/compared to a secret-like name
+    (`.value = '…'`, `password: '…'`, `setItem('k', '…')`, `document.cookie = '…'`)
+    is replaced whole. URLs inside literals are masked."""
+    out, last = [], 0
+    for m in _SLOG_JS_STR_RE.finditer(src):
+        quote, body = m.group(0)[0], m.group(0)[1:-1]
+        before = src[max(0, m.start() - 80):m.start()]
+        if body and (_SLOG_JS_SECRET_CTX_RE.search(before) or _slog_tokenish(body)):
+            new_body = _slog_mark(body)
+        else:
+            new_body = _SLOG_TOKEN_PREFIX_RE.sub(lambda t: _slog_mark(t.group(0)),
+                                                 _slog_mask_urls(body))
+            new_body = _slog_clip_mark(new_body, SLOG_JS_LITERAL_CHARS)
+        out.append(src[last:m.start()])
+        out.append(quote + new_body + quote)
+        last = m.end()
+    out.append(src[last:])
+    text = _SLOG_BEARER_RE.sub(lambda t: t.group(1) + t.group(2) + _slog_mark(t.group(3)),
+                               "".join(out))
+    return _slog_clip_mark(text, 2000)
+
+
+def _slog_redact_value(arg, cmd, secrets):
+    """One ordinary positional arg: URL, `key=value`, token, or free text."""
+    if _re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", arg) and (
+            "://" in arg or arg[:11].lower().startswith(("data:", "javascript:"))):
+        return _slog_clip_mark(_slog_mask_url(arg), 500)
+    m = _SLOG_KV_ARG_RE.fullmatch(arg)
+    if m and m.group(3) and (cmd == "cookies" or _SLOG_SECRET_NAME_RE.search(m.group(1))):
+        secrets.append(m.group(3))
+        return m.group(1) + m.group(2) + _slog_mark(m.group(3))
+    if _slog_tokenish(arg):
+        secrets.append(arg)
+        return _slog_mark(arg)
+    return _slog_clip_mark(_slog_scrub_text(arg, echo=False), SLOG_ARG_CHARS)
+
+
+def _slog_redact_args(cmd, args):
+    """Redact one command line for the session log. Pure: no I/O, no state.
+
+    Returns (args, secrets): the args to write, and the raw values taken out,
+    so echoes of them in the command's output can be scrubbed as well.
+      - fill/type <sel> <value>, smart-fill/smart-select <label> <value>,
+        assert-value <sel> <value>, dialog prompt <text>: the value becomes
+        «redacted:N chars» (N = its length);
+      - --password=x / --api-key x / `Authorization: …` / `token=…` style
+        args and flags: the value is redacted; `cookies` never logs a value;
+      - eval/multi-eval/eval-batch/frame eval: the source is kept, string
+        literals over 40 chars are cut and secret-looking literals replaced;
+      - URLs keep everything but secret-named query/fragment values and the
+        userinfo password; token-shaped args are redacted anywhere.
+    """
+    args = ["" if a is None else str(a) for a in (args or [])]
+    out = list(args)
+    done, drop, secrets = set(), set(), []
+
+    def redact_span(idxs):
+        if not idxs:
+            return
+        value = " ".join(args[i] for i in idxs)
+        secrets.append(value)
+        secrets.extend(args[i] for i in idxs)
+        out[idxs[0]] = _slog_mark(value)
+        done.update(idxs)
+        drop.update(idxs[1:])
+
+    if cmd in SLOG_JS_CMDS and args:
+        return [_slog_redact_js(" ".join(args))], secrets
+    if cmd == "frame" and args[:1] == ["eval"] and len(args) > 1:
+        return ["eval", _slog_redact_js(" ".join(args[1:]))], secrets
+    if cmd == "eval-batch" and args:
+        try:
+            exprs = json.loads(args[0])
+        except ValueError:
+            exprs = None
+        if isinstance(exprs, list):
+            red = json.dumps([_slog_redact_js(e) if isinstance(e, str) else e for e in exprs],
+                             ensure_ascii=False)
+        else:
+            red = _slog_redact_js(args[0])
+        return [red] + [_slog_redact_value(a, cmd, secrets) for a in args[1:]], secrets
+
+    if cmd in SLOG_VALUE_CMDS:
+        redact_span([i for i, a in enumerate(args) if not a.startswith("--")][1:])
+        for i, a in enumerate(args):  # an unknown bare --word may be a mistyped value
+            if a.startswith("--") and "=" not in a and a not in SLOG_VALUE_CMD_FLAGS:
+                redact_span([i])
+    elif cmd in SLOG_LABEL_VALUE_CMDS or cmd == "assert-value":
+        redact_span(list(range(1, len(args))))
+    elif cmd == "dialog" and args[:1] == ["prompt"]:
+        redact_span(list(range(1, len(args))))
+    elif cmd == "assert-attr" and len(args) >= 3 and args[1].lower() == "value":
+        redact_span(list(range(2, len(args))))
+
+    for i, arg in enumerate(args):
+        if i in done:
+            continue
+        value_follows = False
+        if arg.startswith("-"):
+            name, eq, val = arg.lstrip("-").partition("=")
+            if _SLOG_SECRET_NAME_RE.search(name):
+                done.add(i)
+                if eq and val:
+                    secrets.append(val)
+                    out[i] = arg[:len(arg) - len(val)] + _slog_mark(val)
+                elif not eq:
+                    value_follows = True
+        elif _SLOG_SECRET_WORD_RE.fullmatch(arg):
+            done.add(i)
+            value_follows = True
+        if value_follows:
+            if i + 1 < len(args) and i + 1 not in done and not args[i + 1].startswith("--"):
+                redact_span([i + 1])
+            continue
+        if i not in done:
+            out[i] = _slog_redact_value(arg, cmd, secrets)
+    return [a for i, a in enumerate(out) if i not in drop], secrets
+
+
+def _slog_summary(cmd, args, stdout, secrets):
+    """First ~200 chars of the command's stdout, redacted, on one line."""
+    if not stdout or not stdout.strip():
+        return None
+    sub = args[0].lower() if args else ""
+    if cmd == "storage" or (cmd == "cookies" and sub not in SLOG_COOKIE_SAFE_SUBS):
+        return SLOG_OUTPUT_WITHHELD
+    if cmd in SLOG_JS_CMDS or cmd == "eval-batch" or (cmd == "frame" and sub == "eval"):
+        if _re.search(r"pass|pwd|token|secret|key|cookie|auth|session|credential|storage",
+                      " ".join(args), _re.I):
+            return SLOG_EVAL_WITHHELD
+    text = _slog_scrub_text(stdout[:4000], secrets)
+    return _slog_clip(" ".join(text.split()), SLOG_SUMMARY_CHARS)
+
+
+def _slog_files(texts, since):
+    """Files the command printed the path of and wrote during this run."""
+    found = []
+    for text in texts:
+        for n, m in enumerate(_SLOG_PATH_RE.finditer(text or "")):
+            if n >= 200 or len(found) >= SLOG_MAX_FILES:
+                break
+            path = os.path.abspath(os.path.expanduser(m.group(0)))
+            if path in found:
+                continue
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) >= since - 2:
+                    found.append(path)
+            except (OSError, ValueError):
+                pass
+    return found
+
+
+def _slog_build_entry(cmd, args, code, duration_ms, started, url=None, title=None,
+                      stdout="", stderr="", error=None, files=(), via=None):
+    """The JSON object written for one command. All free text goes through redaction."""
+    red_args, secrets = _slog_redact_args(cmd, args)
+    if error is None and code not in (0, None):
+        # The headline, not a trailing hint ("Available commands: ...") or a
+        # notice printed before the failure: first error-looking line, else last.
+        lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+        error = next((ln for ln in lines if _SLOG_ERROR_LINE_RE.search(ln)),
+                     lines[-1] if lines else None)
+    entry = {
+        "ts": started.isoformat(timespec="milliseconds"),
+        "cmd": cmd,
+        "args": red_args,
+        "exit": code,
+        "duration_ms": duration_ms,
+        "url": _slog_clip(_slog_scrub_values(_slog_mask_url(url), secrets), 500) if url else None,
+        "title": _slog_clip(_slog_scrub_text(title, secrets), 200) if title else None,
+        "summary": _slog_summary(cmd, args, stdout, secrets),
+        "error": _slog_clip(_slog_scrub_text(error, secrets), SLOG_ERROR_CHARS) if error else None,
+        "files": list(files)[:SLOG_MAX_FILES],
+    }
+    if via:
+        entry["via"] = via
+    return entry
+
+
+def _slog_enabled(env=None):
+    env = os.environ if env is None else env
+    return (env.get(SLOG_ENV) or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _slog_keep_days(env=None):
+    env = os.environ if env is None else env
+    try:
+        return int((env.get(SLOG_DAYS_ENV) or "").strip())
+    except ValueError:
+        return SLOG_DEFAULT_DAYS
+
+
+def _slog_dir():
+    return os.path.join(CDPILOT_HOME, "projects", PROJECT_ID, "log")
+
+
+def _slog_prune(log_dir, today, keep_days):
+    """Delete YYYY-MM-DD.jsonl files dated before today - keep_days. Nothing else."""
+    if keep_days <= 0:
+        return
+    cutoff = today - datetime.timedelta(days=keep_days)
+    for name in os.listdir(log_dir):
+        m = _re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.jsonl", name)
+        if not m:
+            continue
+        try:
+            if datetime.date.fromisoformat(m.group(1)) < cutoff:
+                os.remove(os.path.join(log_dir, name))
+        except (ValueError, OSError):
+            pass
+
+
+def _slog_append(entry, log_dir=None, day=None):
+    """Append one line with a single write on an O_APPEND fd; prune on a day's first write."""
+    log_dir = log_dir or _slog_dir()
+    day = day or datetime.date.today()
+    path = os.path.join(log_dir, f"{day.isoformat()}.jsonl")
+    data = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    os.makedirs(log_dir, mode=0o700, exist_ok=True)
+    first_of_day = not os.path.exists(path)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    if first_of_day:
+        _slog_prune(log_dir, day, _slog_keep_days())
+    return path
+
+
+_SLOG = {"active": False, "warned": False}
+
+
+class _SlogTee:
+    """Pass-through text stream that keeps a bounded copy (head or tail)."""
+
+    def __init__(self, stream, keep, tail=False):
+        self._slog_stream = stream
+        self._slog_keep = keep
+        self._slog_tail = tail
+        self._slog_parts = []
+        self._slog_len = 0
+
+    def write(self, s):
+        n = self._slog_stream.write(s)
+        try:
+            if isinstance(s, str) and s:
+                if self._slog_tail:
+                    self._slog_parts.append(s)
+                    self._slog_len += len(s)
+                    if self._slog_len > 2 * self._slog_keep:
+                        kept = "".join(self._slog_parts)[-self._slog_keep:]
+                        self._slog_parts, self._slog_len = [kept], len(kept)
+                elif self._slog_len < self._slog_keep:
+                    part = s[:self._slog_keep - self._slog_len]
+                    self._slog_parts.append(part)
+                    self._slog_len += len(part)
+        except Exception:
+            pass
+        return n
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def captured(self):
+        text = "".join(self._slog_parts)
+        return text[-self._slog_keep:] if self._slog_tail else text
+
+    def __getattr__(self, name):
+        return getattr(self._slog_stream, name)
+
+
+def _slog_warn(err):
+    """At most one stderr line per process when the log cannot be written."""
+    if _SLOG.get("warned"):
+        return
+    _SLOG["warned"] = True
+    try:
+        stream = getattr(sys.stderr, "_slog_stream", None) or sys.stderr
+        stream.write(f"cdpilot: session log not written ({type(err).__name__}: {err}); "
+                     f"{SLOG_ENV}=0 turns it off\n")
+        stream.flush()
+    except Exception:
+        pass
+
+
+def _slog_sys_exit(status=None):
+    """sys.exit while logging: keep the SystemExit so the exit hook can tell
+    whether it is the one that ended the process (several commands catch
+    SystemExit internally, e.g. auto-launch around cmd_launch)."""
+    exc = SystemExit(status)
+    _SLOG["exit_exc"] = exc
+    raise exc
+
+
+def _slog_excepthook(exc_type, exc, tb):
+    try:
+        _SLOG["forced_code"] = 130 if issubclass(exc_type, KeyboardInterrupt) else 1
+        _SLOG["error"] = f"{exc_type.__name__}: {exc}".strip()
+    except Exception:
+        pass
+    (_SLOG.get("prev_excepthook") or sys.__excepthook__)(exc_type, exc, tb)
+
+
+def _slog_exit_code():
+    """The process exit code: an uncaught exception; else 0 if the __main__
+    block ran to its end (any SystemExit raised on the way was caught inside a
+    command); else the last SystemExit, which is the one that ended the process.
+
+    Not from the SystemExit's traceback: on Python 3.10/3.11 it no longer holds
+    the __main__ frame by the time atexit runs (empty for a sync command, head
+    at asyncio.run for an async one), so every exit logged as 0 there.
+    """
+    if _SLOG.get("forced_code") is not None:
+        return _SLOG["forced_code"]
+    if _SLOG.get("main_done"):
+        return 0
+    exc = _SLOG.get("exit_exc")
+    if exc is None or exc.code is None:
+        return 0
+    return exc.code if isinstance(exc.code, int) else 1
+
+
+def _slog_begin(argv):
+    """Start recording this CLI invocation (argv without the program name)."""
+    try:
+        if not argv or not _slog_enabled():
+            return
+        cmd = SLOG_CMD_ALIASES.get(argv[0], argv[0])
+        if cmd in SLOG_SKIP_CMDS or cmd == WATCH_DAEMON_FLAG:
+            return
+        _SLOG.update(active=True, done=False, cmd=cmd, args=list(argv[1:]),
+                     started=datetime.datetime.now().astimezone(), t0=time.monotonic(),
+                     t0_wall=time.time(), lock=threading.Lock(), url=None, title=None,
+                     via=os.environ.get(SLOG_VIA_ENV) or None, exit_exc=None,
+                     forced_code=None, error=None, stdout=None, stderr=None)
+        if sys.stdout is not None:
+            _SLOG["stdout"] = sys.stdout = _SlogTee(sys.stdout, 8192)
+        if sys.stderr is not None:
+            _SLOG["stderr"] = sys.stderr = _SlogTee(sys.stderr, 4096, tail=True)
+        sys.exit = _slog_sys_exit
+        _SLOG["prev_excepthook"] = sys.excepthook
+        sys.excepthook = _slog_excepthook
+        atexit.register(_slog_finish)
+    except Exception as e:
+        _SLOG["active"] = False
+        _slog_warn(e)
+
+
+def _slog_note_page(page):
+    """Remember the page the dispatcher resolved anyway (no extra round-trip)."""
+    if _SLOG.get("active") and isinstance(page, dict):
+        _SLOG["url"] = page.get("url")
+        _SLOG["title"] = page.get("title")
+
+
+def _slog_finish(forced_code=None, forced_error=None):
+    """Write this invocation's line: at exit, or from the --timeout watchdog."""
+    st = _SLOG
+    if not st.get("active"):
+        return
+    lock = st["lock"]
+    if not lock.acquire(timeout=0.5):
+        return
+    try:
+        if st.get("done"):
+            return
+        st["done"] = True
+        code = forced_code if forced_code is not None else _slog_exit_code()
+        out = st["stdout"].captured() if st.get("stdout") else ""
+        err = st["stderr"].captured() if st.get("stderr") else ""
+        _slog_append(_slog_build_entry(
+            st["cmd"], st["args"], code, int((time.monotonic() - st["t0"]) * 1000),
+            st["started"], url=st.get("url"), title=st.get("title"), stdout=out, stderr=err,
+            error=forced_error or st.get("error"), files=_slog_files((out, err), st["t0_wall"]),
+            via=st.get("via")))
+    except Exception as e:
+        _slog_warn(e)
+    finally:
+        lock.release()
+
+
+def _slog_record_external(argv, code, started, duration_ms, error, via):
+    """Log a command whose own process could not (an MCP tool call killed on timeout)."""
+    if not argv or not _slog_enabled():
+        return
+    try:
+        cmd = SLOG_CMD_ALIASES.get(argv[0], argv[0])
+        _slog_append(_slog_build_entry(cmd, argv[1:], code, duration_ms, started,
+                                       error=error, via=via))
+    except Exception as e:
+        _slog_warn(e)
+
+
+def _slog_read(log_dir, days, today=None):
+    """[(raw_line, entry)] from the last `days` day files, oldest day first."""
+    today = today or datetime.date.today()
+    rows = []
+    for back in range(days - 1, -1, -1):
+        path = os.path.join(log_dir, f"{(today - datetime.timedelta(days=back)).isoformat()}.jsonl")
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.rstrip("\r\n")
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(entry, dict):
+                        rows.append((line, entry))
+        except OSError:
+            continue
+    return rows
+
+
+def _slog_cell(text, width, middle=False):
+    text = " ".join(str(text or "").split())
+    if middle and len(text) > width:  # URLs: keep the host and the end of the path
+        head = width // 3
+        text = text[:head] + "…" + text[len(text) - (width - head - 1):]
+    return _slog_clip(text, width).ljust(width)
+
+
+def _slog_entry_time(entry, with_date):
+    ts = str(entry.get("ts") or "")
+    return f"{ts[5:10]} {ts[11:19]}" if with_date else ts[11:19]
+
+
+def _slog_command_text(entry):
+    return " ".join([str(entry.get("cmd") or "")] + [str(a) for a in entry.get("args") or []])
+
+
+def _slog_failed(entry):
+    return entry.get("exit") not in (0, None)
+
+
+def _slog_format_table(entries, project, days):
+    period = "today" if days == 1 else f"last {days} days"
+    lines = [f"cdpilot log · project {project} · {period} · {len(entries)} command(s)"]
+    if not entries:
+        lines.append("(nothing logged yet)")
+        return "\n".join(lines)
+    tw = 14 if days > 1 else 8
+    lines.append(f"{'TIME':<{tw}}  {'EXIT':>4}  {'COMMAND':<32}  {'URL':<40}  RESULT")
+    for e in entries:
+        result = e.get("summary") or ""
+        if _slog_failed(e) and e.get("error"):
+            result = "! " + str(e["error"])
+        code = "" if e.get("exit") is None else str(e.get("exit"))
+        lines.append(f"{_slog_entry_time(e, days > 1):<{tw}}  {code:>4}  "
+                     f"{_slog_cell(_slog_command_text(e), 32, middle=True)}  "
+                     f"{_slog_cell(e.get('url'), 40, middle=True)}  "
+                     f"{_slog_cell(result, 60).rstrip()}")
+    return "\n".join(lines)
+
+
+def _slog_md(text, table=False):
+    """Inline code for Markdown: no backticks inside; pipes escaped in tables."""
+    text = " ".join(str(text or "").split()).replace("`", "'")
+    return text.replace("|", "\\|") if table else text
+
+
+def _slog_format_md(entries, project, days, today):
+    """Markdown report of a session, to paste into an issue or PR."""
+    with_date = days > 1
+    first = today - datetime.timedelta(days=days - 1)
+    period = today.isoformat() if days == 1 else f"{first.isoformat()} – {today.isoformat()}"
+    failed = [e for e in entries if _slog_failed(e)]
+    pages, seen_urls, files, seen_files = [], set(), [], set()
+    for e in entries:
+        url = e.get("url")
+        if url and url != "about:blank" and url not in seen_urls:
+            seen_urls.add(url)
+            pages.append(e)
+        for path in e.get("files") or []:
+            if path not in seen_files:
+                seen_files.add(path)
+                files.append((path, e))
+    total_s = sum(e.get("duration_ms") or 0 for e in entries) / 1000
+    out = [f"## cdpilot session log — {project}", "",
+           f"{period} · {len(entries)} command(s) · {len(failed)} failed · "
+           f"{len(files)} file(s) · {total_s:.1f}s in commands", "",
+           "### Pages visited", ""]
+    for e in pages:
+        title = f" {_slog_md(e['title'])} —" if e.get("title") else ""
+        out.append(f"- {_slog_entry_time(e, with_date)} ·{title} `{_slog_md(e['url'])}`")
+    if not pages:
+        out.append("_None recorded._")
+    out += ["", "### Actions", ""]
+    if entries:
+        out += ["| # | Time | Command | Exit | ms | Result |", "|---|---|---|---|---|---|"]
+        for n, e in enumerate(entries, 1):
+            via = " (mcp)" if str(e.get("via") or "").startswith("mcp") else ""
+            result = e.get("error") if _slog_failed(e) and e.get("error") else e.get("summary")
+            out.append(f"| {n} | {_slog_entry_time(e, with_date)} | "
+                       f"`{_slog_md(_slog_clip(_slog_command_text(e), 120), True)}`{via} | "
+                       f"{'' if e.get('exit') is None else e.get('exit')} | "
+                       f"{e.get('duration_ms') if e.get('duration_ms') is not None else ''} | "
+                       f"{_slog_md(_slog_clip(str(result or ''), 120), True)} |")
+    else:
+        out.append("_No commands logged._")
+    out += ["", "### Errors", ""]
+    for e in failed:
+        out.append(f"- {_slog_entry_time(e, with_date)} `{_slog_md(_slog_command_text(e))}` "
+                   f"— exit {e.get('exit')}: {_slog_md(e.get('error') or '(no error line)')}")
+    if not failed:
+        out.append("_None._")
+    out += ["", "### Files produced", ""]
+    for path, e in files:
+        out.append(f"- `{_slog_md(path)}` ({e.get('cmd')}, {_slog_entry_time(e, with_date)})")
+    if not files:
+        out.append("_None._")
+    return "\n".join(out)
+
+
+def _slog_print(text):
+    """Print `log` output as UTF-8 even where the pipe encoding is a legacy code
+    page (a PYTHONIOENCODING the user set), so `«redacted»` and page titles
+    survive. Under the MCP server the text layer is kept (the server sets the
+    child to UTF-8 and decodes UTF-8); unencodable characters become '?'
+    instead of crashing."""
+    stream = sys.stdout
+    enc = (getattr(stream, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+    buf = getattr(stream, "buffer", None)
+    if enc != "utf8" and buf is not None and not IS_MCP_SESSION:
+        stream.flush()
+        buf.write((text + "\n").encode("utf-8"))
+        buf.flush()
+        return
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        enc = getattr(stream, "encoding", None) or "ascii"
+        print(text.encode(enc, "replace").decode(enc, "replace"))
+
+
+def cmd_log(*args):
+    """cdpilot log [--md|--json] [--days N] [--path] — this project's session log."""
+    usage = "Usage: cdpilot log [--md|--json] [--days N] [--path]"
+    fmt, days, show_path = "table", 1, False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--md", "--markdown"):
+            fmt = "md"
+        elif a == "--json":
+            fmt = "json"
+        elif a == "--path":
+            show_path = True
+        elif a == "--days" or a.startswith("--days="):
+            if a == "--days":
+                i += 1
+                raw = args[i] if i < len(args) else ""
+            else:
+                raw = a.split("=", 1)[1]
+            days = int(raw) if raw.strip().isdigit() else 0
+            if not 1 <= days <= 366:
+                print(f"cdpilot log: --days expects a number from 1 to 366, got {raw!r}",
+                      file=sys.stderr)
+                sys.exit(1)
+        elif a in ("-h", "--help", "help"):
+            print(usage)
+            return
+        else:
+            print(f"cdpilot log: unknown option {a!r}\n{usage}", file=sys.stderr)
+            sys.exit(1)
+        i += 1
+    log_dir = _slog_dir()
+    if show_path:
+        print(log_dir)
+        return
+    if not _slog_enabled():
+        print(f"cdpilot: the session log is off ({SLOG_ENV}=0); showing what was written before",
+              file=sys.stderr)
+    today = datetime.date.today()
+    rows = _slog_read(log_dir, days, today)
+    if fmt == "json":
+        for raw, _ in rows:
+            _slog_print(raw)
+        return
+    entries = sorted((e for _, e in rows), key=lambda e: str(e.get("ts") or ""))
+    if fmt == "md":
+        _slog_print(_slog_format_md(entries, PROJECT_ID, days, today))
+    else:
+        _slog_print(_slog_format_table(entries, PROJECT_ID, days))
+
+
 # ─── CLI ───
 
 if __name__ == "__main__":
+    # On Windows a pipe (an agent's shell, the MCP server, `> file`) gets the
+    # ANSI code page, so a Turkish page title or an emoji crashed the command
+    # with UnicodeEncodeError. Write UTF-8 unless the user chose an encoding.
+    if os.name == "nt" and not os.environ.get("PYTHONIOENCODING"):
+        for _stream in (sys.stdout, sys.stderr):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError):
+                pass
     try:
         _timeout_s, _argv = _extract_timeout(sys.argv[1:])
     except ValueError as _e:
@@ -14021,6 +15317,8 @@ if __name__ == "__main__":
         sys.exit(2)
     # Downstream code (and anything reading sys.argv) sees argv without it.
     sys.argv = sys.argv[:1] + _argv
+    # Session log: one redacted JSON line per command, written at exit.
+    _slog_begin(_argv)
 
     if len(sys.argv) < 2:
         print(__doc__)
@@ -14060,6 +15358,10 @@ if __name__ == "__main__":
     if cmd == WATCH_DAEMON_FLAG:
         _cmd_watch_daemon_entry()
         sys.exit(0)
+    if cmd == IDLE_WATCHER_FLAG:  # detached idle auto-close watcher (see cmd_launch)
+        _idle_watcher_entry(args)
+        sys.exit(0)
+    _idle_touch_activity(cmd)
 
     _AUTOLAUNCH["cmd"] = cmd
     if _timeout_s is not None:
@@ -14071,7 +15373,7 @@ if __name__ == "__main__":
         _arm_timeout_watchdog(_timeout_s, cmd)
 
     sync_cmds = {
-        'launch': cmd_launch,
+        'launch': lambda: cmd_launch(idle_close=_idle_close_flag(args)),
         'tabs': lambda: cmd_tabs(
             reap='--reap' in args,
             max_tabs=next((int(a.split('=')[1]) for a in args
@@ -14107,6 +15409,7 @@ if __name__ == "__main__":
         'trace': lambda: cmd_trace_dispatch(args),
         'blog': lambda: _dispatch_blog_cmd(args),
         'watch': lambda: _dispatch_watch_cmd(args),
+        'log': lambda: cmd_log(*args),
     }
 
     if cmd == "serve":
@@ -14307,7 +15610,8 @@ if __name__ == "__main__":
             async def _wrapped():
                 ws_url = None
                 try:
-                    ws_url, _ = get_page_ws()
+                    ws_url, _page = get_page_ws()
+                    _slog_note_page(_page)
                     await _control_start(ws_url)
                 except Exception:
                     pass
@@ -14316,7 +15620,13 @@ if __name__ == "__main__":
                 finally:
                     if ws_url:
                         try:
-                            ws_new, _ = get_page_ws()
+                            if _SLOG.get("active"):
+                                # The tab list may still be the pre-command
+                                # one (0.5 s cache); the log wants the page
+                                # the command left behind.
+                                cdp_cache_invalidate()
+                            ws_new, _page = get_page_ws()
+                            _slog_note_page(_page)
                             await _control_end(ws_new)
                         except Exception:
                             if ws_url:
@@ -14332,3 +15642,6 @@ if __name__ == "__main__":
             print(f"Did you mean: {matches[0]}?", file=sys.stderr)
         print(f"\nAvailable commands: {', '.join(all_cmds)}", file=sys.stderr)
         sys.exit(1)
+    # Reached only when no SystemExit or exception ended the command (see
+    # _slog_exit_code): the session log then records exit 0.
+    _SLOG["main_done"] = True
