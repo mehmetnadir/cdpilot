@@ -8,6 +8,9 @@ Chrome DevTools Protocol (CDP). No Puppeteer, no Playwright, no Selenium.
 Usage:
   cdpilot <command> [arguments]
 
+Elements inside iframes (same-origin or cross-origin; nest with >>>):
+  cdpilot click "iframe#card >>> input[name=cardnumber]"   # or --frame <sel|index|url>
+
 Global options:
   --timeout <seconds>  Abort the command after <seconds> (exit 124). Accepted
                        before or after the command name; 0 disables.
@@ -44,6 +47,8 @@ import datetime
 import concurrent.futures
 import tempfile
 import contextlib
+import contextvars
+import functools
 import io
 import threading
 import weakref
@@ -1634,17 +1639,42 @@ def _ws_pool_close_all():
 atexit.register(_ws_pool_close_all)
 
 
+# Frame targeting hooks read by cdp_send (machinery: see _FrameRoute below).
+# _FRAME_ROUTE: the iframe the current command acts in, or None (top page).
+# _CDP_EVENT_SINK: a list that collects CDP events received during a call.
+_FRAME_ROUTE = contextvars.ContextVar("cdpilot_frame_route", default=None)
+_CDP_EVENT_SINK = contextvars.ContextVar("cdpilot_cdp_event_sink", default=None)
+
+
+def _cdp_wire(cmd):
+    """JSON frame for (id, method, params) or (id, method, params, session_id)."""
+    msg = {"id": cmd[0], "method": cmd[1], "params": cmd[2] or {}}
+    if len(cmd) > 3 and cmd[3]:
+        msg["sessionId"] = cmd[3]  # flat Target session (out-of-process iframe)
+    return json.dumps(msg)
+
+
 async def cdp_send(ws_url, commands, timeout=15):
-    """Send multiple CDP commands and collect results."""
+    """Send multiple CDP commands and collect results.
+
+    A command is (id, method, params) or (id, method, params, session_id).
+    While a frame route is active, calls on its page are first rewritten
+    into that frame (see _frame_route_rewrite).
+    """
     import websockets
+
+    _route = _FRAME_ROUTE.get()
+    if _route is not None and not _route.busy and ws_url == _route.root_ws:
+        commands = await _frame_route_rewrite(_route, commands)
+    _sink = _CDP_EVENT_SINK.get()
 
     # ── Non-pooled path (CDPILOT_WS_POOL=0) — identical to original ──
     if not _WS_POOL_ENABLED:
         results = {}
         try:
             async with websockets.connect(ws_url, max_size=100 * 1024 * 1024) as ws:
-                for cmd_id, method, params in commands:
-                    await ws.send(json.dumps({"id": cmd_id, "method": method, "params": params or {}}))
+                for cmd in commands:
+                    await ws.send(_cdp_wire(cmd))
                 pending = {c[0] for c in commands}
                 start = time.time()
                 while pending and (time.time() - start) < timeout:
@@ -1654,6 +1684,8 @@ async def cdp_send(ws_url, commands, timeout=15):
                         if "id" in data and data["id"] in pending:
                             pending.discard(data["id"])
                             results[data["id"]] = data.get("result", data.get("error", {}))
+                        elif _sink is not None and "method" in data:
+                            _sink.append(data)
                     except asyncio.TimeoutError:
                         continue
             return results
@@ -1698,8 +1730,8 @@ async def cdp_send(ws_url, commands, timeout=15):
                 raise
 
         try:
-            for cmd_id, method, params in commands:
-                await ws.send(json.dumps({"id": cmd_id, "method": method, "params": params or {}}))
+            for cmd in commands:
+                await ws.send(_cdp_wire(cmd))
 
             pending = {c[0] for c in commands}
             start = time.time()
@@ -1710,6 +1742,8 @@ async def cdp_send(ws_url, commands, timeout=15):
                     if "id" in data and data["id"] in pending:
                         pending.discard(data["id"])
                         results[data["id"]] = data.get("result", data.get("error", {}))
+                    elif _sink is not None and "method" in data:
+                        _sink.append(data)
                 except asyncio.TimeoutError:
                     continue
 
@@ -1753,8 +1787,8 @@ async def cdp_send(ws_url, commands, timeout=15):
                     raise
                 results2 = {}
                 try:
-                    for cmd_id, method, params in commands:
-                        await ws2.send(json.dumps({"id": cmd_id, "method": method, "params": params or {}}))
+                    for cmd in commands:
+                        await ws2.send(_cdp_wire(cmd))
                     pending2 = {c[0] for c in commands}
                     start2 = time.time()
                     while pending2 and (time.time() - start2) < timeout:
@@ -1764,6 +1798,8 @@ async def cdp_send(ws_url, commands, timeout=15):
                             if "id" in data2 and data2["id"] in pending2:
                                 pending2.discard(data2["id"])
                                 results2[data2["id"]] = data2.get("result", data2.get("error", {}))
+                            elif _sink is not None and "method" in data2:
+                                _sink.append(data2)
                         except asyncio.TimeoutError:
                             continue
                     # Same invariant as the main path: only re-pool on full drain.
@@ -1784,6 +1820,493 @@ async def cdp_send(ws_url, commands, timeout=15):
                     raise
 
             raise
+
+
+# ─── Frame targeting: iframes, including cross-origin (OOPIF) ───
+#
+# Element commands act on the top document unless the selector names a
+# frame chain first ("iframe#card >>> input[name=cardnumber]", nested:
+# "iframe.a >>> iframe.b >>> button") or `--frame <selector|index|url>` is
+# given. contentDocument cannot be used (blocked cross-origin), so each hop
+# is resolved over CDP:
+#   1. find the <iframe> element in the current frame (CSS selector, index,
+#      name/id or src substring); DOM.describeNode gives its child frameId;
+#   2. same-process frame -> its main-world execution context, read from the
+#      Runtime.executionContextCreated events that Runtime.enable replays
+#      (enable + disable back to back: nothing stays subscribed);
+#   3. out-of-process frame (site-isolated cross-origin, e.g. a payment
+#      iframe) -> Target.attachToTarget(targetId=frameId, flatten=True);
+#      every message for that frame then carries the returned sessionId.
+# The resulting _FrameRoute sits in _FRAME_ROUTE for one command. cdp_send
+# sends that command's Runtime/DOM calls into the frame and shifts its
+# Input.dispatchMouseEvent coordinates by the frame's offset in the page:
+# pointer input is dispatched on the page, as a real mouse would be, and the
+# browser hit-tests it into the (possibly out-of-process) frame. Keyboard
+# input needs no translation: it follows focus into the frame.
+
+FRAME_SEP = ">>>"
+FRAME_SEARCH_MAX_FRAMES = 20     # smart-* fallback: frames inspected at most
+FRAME_SEARCH_BUDGET_S = 2.0      # smart-* fallback: wall-clock budget
+# CLI commands that take `--frame` (and `>>>` in their selector / text).
+FRAME_AWARE_CMDS = frozenset({
+    "click", "fill", "type", "submit", "hover", "dblclick", "rightclick",
+    "smart-click", "smart-fill", "smart-select", "frame",
+})
+_FRAME_FLAG = None  # `--frame` value of the current CLI invocation
+
+
+class _FrameError(Exception):
+    """A frame hop could not be resolved (the message is user-facing)."""
+
+
+def _split_frame_chain(text):
+    """Split `text` on `>>>` outside quotes, [...] and (...). Pure."""
+    parts, buf, quote, depth, i, n = [], [], None, 0, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            buf.append(text[i:i + 2])
+            i += 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "[(":
+            depth += 1
+        elif ch in "])":
+            depth = max(0, depth - 1)
+        elif depth == 0 and text.startswith(FRAME_SEP, i):
+            parts.append("".join(buf).strip())
+            buf = []
+            i += len(FRAME_SEP)
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf).strip())
+    return parts
+
+
+def _split_frame_selector(selector, strict=True):
+    """'iframe#a >>> iframe.b >>> button' -> (['iframe#a', 'iframe.b'], 'button').
+
+    Without a separator the selector comes back unchanged with no frames. An
+    empty segment is an error for CSS selectors (strict); text commands pass
+    strict=False so a label such as "Next >>>" stays literal text.
+    """
+    parts = _split_frame_chain(selector)
+    if len(parts) == 1:
+        return [], selector
+    if any(not p for p in parts):
+        if not strict:
+            return [], selector
+        raise ValueError(f"empty frame or element selector around '{FRAME_SEP}' in: {selector}")
+    return parts[:-1], parts[-1]
+
+
+def _parse_frame_hop(hop):
+    """One hop -> {'kind': 'index'|'url'|'auto', 'value': ...}.
+
+    '2' = third <iframe>/<frame> of the document (same order as `frame list`);
+    'url=stripe.com' = src substring only; anything else is tried as a CSS
+    selector, then as a name/id, then as a src substring.
+    """
+    hop = hop.strip()
+    if hop.isdigit():
+        return {"kind": "index", "value": int(hop)}
+    if hop[:4].lower() in ("url=", "url:") and len(hop) > 4:
+        return {"kind": "url", "value": hop[4:]}
+    return {"kind": "auto", "value": hop}
+
+
+def _parse_frame_spec(spec):
+    """`--frame` value -> list of hops (outermost first; `>>>` nests)."""
+    parts = _split_frame_chain(spec or "")
+    if any(not p for p in parts):
+        raise ValueError(f"invalid --frame value: {spec!r}")
+    return [_parse_frame_hop(p) for p in parts]
+
+
+def _extract_frame_flag(args):
+    """Remove `--frame X` / `--frame=X` from argv. Returns (rest, value or None)."""
+    rest, value, i = [], None, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--frame" or a.startswith("--frame="):
+            if a == "--frame":
+                if i + 1 >= len(args):
+                    raise ValueError("--frame needs a value: <selector|index|url-substring>")
+                value, i = args[i + 1], i + 2
+            else:
+                value, i = a.split("=", 1)[1], i + 1
+            if not value.strip():
+                raise ValueError("--frame needs a value: <selector|index|url-substring>")
+            continue
+        rest.append(a)
+        i += 1
+    return rest, value
+
+
+# Frame-owner element for one hop, looked up in the current document.
+_FRAME_OWNER_JS = r"""
+function (kind, value, scroll) {
+  var all = Array.prototype.slice.call(document.querySelectorAll('iframe, frame'));
+  var isFrame = function (e) { return !!e && /^(IFRAME|FRAME)$/.test(e.tagName); };
+  var el = null;
+  if (kind === 'index') {
+    el = all[value] || null;
+  } else {
+    if (kind === 'auto') {
+      var c = null;
+      try { c = document.querySelector(value); } catch (e) {}
+      // A wrapper such as <div id="card-element"> around the iframe counts too.
+      if (c) el = isFrame(c) ? c : c.querySelector('iframe, frame');
+      if (!el) el = all.filter(function (f) { return f.name === value || f.id === value; })[0] || null;
+    }
+    if (!el) el = all.filter(function (f) { return (f.src || '').indexOf(value) !== -1; })[0] || null;
+  }
+  if (el && scroll) { try { el.scrollIntoView({behavior: 'instant', block: 'nearest'}); } catch (e) {} }
+  return el;
+}
+"""
+
+# Frames of the current document, in `--frame <index>` order.
+_FRAME_LIST_JS = r"""
+(function () {
+  return Array.prototype.slice.call(document.querySelectorAll('iframe, frame')).map(function (f, i) {
+    var r = f.getBoundingClientRect(), s = getComputedStyle(f);
+    return {index: i, src: f.src || '(no source)', name: f.name || '', id: f.id || '',
+            visible: r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'};
+  });
+})()
+"""
+
+# Viewport position of an <iframe>'s content box (border + padding skipped).
+_FRAME_BOX_FN = (
+    "function () { var r = this.getBoundingClientRect(), s = getComputedStyle(this);"
+    " return [r.left + this.clientLeft + (parseFloat(s.paddingLeft) || 0),"
+    " r.top + this.clientTop + (parseFloat(s.paddingTop) || 0)]; }"
+)
+
+
+class _FrameRoute:
+    """The frame one command acts in, reached from the page through iframes."""
+
+    def __init__(self, root_ws, sessions=None):
+        self.root_ws = root_ws
+        self.session_id = None     # flat Target session (OOPIF); None = page session
+        self.context_id = None     # execution context there; None = session default
+        self.chain = []            # [(session_id, iframe objectId)], outermost first
+        self.labels = []           # "iframe#card" per hop, for messages
+        self.src = ""              # src of the innermost iframe
+        self.sessions = sessions if sessions is not None else []  # to detach
+        self.offset = (0.0, 0.0)   # frame viewport origin in page coordinates
+        self.dirty = True          # page JS ran since offset was measured
+        self.busy = False          # the route's own CDP traffic is never rewritten
+        self.pool_was = None       # WS-pool flag to restore (owner route only)
+
+    def fork(self):
+        child = _FrameRoute(self.root_ws, self.sessions)
+        child.session_id, child.context_id = self.session_id, self.context_id
+        child.chain, child.labels, child.src = list(self.chain), list(self.labels), self.src
+        return child
+
+    def describe(self):
+        return f" {FRAME_SEP} ".join(self.labels) or "top document"
+
+    def eval_params(self, expression, by_value=True):
+        params = {"expression": expression, "returnByValue": by_value}
+        if self.context_id is not None:
+            params["contextId"] = self.context_id
+        return params
+
+
+async def _frame_cdp(route, commands, timeout=10):
+    """cdp_send for the route's own bookkeeping (explicit sessions, no rewrite)."""
+    route.busy = True
+    try:
+        return await cdp_send(route.root_ws, commands, timeout)
+    finally:
+        route.busy = False
+
+
+async def _frame_list(route):
+    r = await _frame_cdp(route, [(1, "Runtime.evaluate", route.eval_params(_FRAME_LIST_JS),
+                                  route.session_id)])
+    val = r.get(1, {}).get("result", {}).get("value")
+    return val if isinstance(val, list) else []
+
+
+async def _frame_context_for(route, frame_id):
+    """(session_id, context_id) of child frame `frame_id` of route's frame."""
+    sid = route.session_id
+    events = []
+    token = _CDP_EVENT_SINK.set(events)
+    try:
+        await _frame_cdp(route, [(1, "Runtime.enable", {}, sid), (2, "Runtime.disable", {}, sid)])
+    finally:
+        _CDP_EVENT_SINK.reset(token)
+    for ev in events:
+        if ev.get("method") != "Runtime.executionContextCreated" or ev.get("sessionId") != sid:
+            continue
+        ctx = ev.get("params", {}).get("context", {})
+        aux = ctx.get("auxData") or {}
+        if aux.get("frameId") == frame_id and aux.get("isDefault"):
+            return sid, ctx.get("id")
+    # Not in this renderer: an out-of-process iframe is its own target.
+    r = await _frame_cdp(route, [(3, "Target.attachToTarget",
+                                  {"targetId": frame_id, "flatten": True})])
+    new_sid = r.get(3, {}).get("sessionId")
+    if new_sid:
+        route.sessions.append(new_sid)
+        return new_sid, None
+    # Frame without a main world yet (e.g. still about:blank): isolated world.
+    r = await _frame_cdp(route, [(4, "Page.createIsolatedWorld", {
+        "frameId": frame_id, "worldName": "cdpilot", "grantUniveralAccess": True}, sid)])
+    ctx_id = r.get(4, {}).get("executionContextId")
+    if ctx_id:
+        return sid, ctx_id
+    raise _FrameError(f"cannot enter frame {frame_id} (no execution context, no target)")
+
+
+async def _frame_route_push(route, hop, scroll=True):
+    """Descend one hop: route now points at the child frame."""
+    js = f"({_FRAME_OWNER_JS})({json.dumps(hop['kind'])}, {json.dumps(hop['value'])}, {json.dumps(scroll)})"
+    r = await _frame_cdp(route, [(1, "Runtime.evaluate", route.eval_params(js, by_value=False),
+                                  route.session_id)])
+    obj = r.get(1, {}).get("result", {})
+    oid = obj.get("objectId")
+    shown = f"#{hop['value']}" if hop["kind"] == "index" else hop["value"]
+    if not oid:
+        frames = await _frame_list(route)
+        avail = "; ".join(f"[{f['index']}] {f['id'] or f['name'] or f['src'][:60]}" for f in frames)
+        raise _FrameError(f"no iframe matches '{shown}' in {route.describe()}"
+                          + (f" (frames: {avail})" if avail else " (it has no iframes)"))
+    d = await _frame_cdp(route, [(2, "DOM.describeNode", {"objectId": oid}, route.session_id)])
+    node = d.get(2, {}).get("node", {})
+    frame_id = node.get("frameId")
+    if not frame_id:
+        raise _FrameError(f"'{shown}' is not a loaded frame in {route.describe()}")
+    attrs = node.get("attributes") or []
+    src = next((attrs[i + 1] for i in range(0, len(attrs) - 1, 2) if attrs[i] == "src"), "")
+    sid, ctx = await _frame_context_for(route, frame_id)
+    route.chain.append((route.session_id, oid))
+    route.labels.append(obj.get("description") or shown)
+    route.session_id, route.context_id, route.src = sid, ctx, src
+    route.dirty = True
+    return route
+
+
+async def _frame_route_open(ws_url, hops):
+    """Resolve `hops` from the top document; the caller must close the route."""
+    global _WS_POOL_ENABLED
+    route = _FrameRoute(ws_url)
+    # Flat sessions live on one socket: keep the WS pool on while routed.
+    route.pool_was, _WS_POOL_ENABLED = _WS_POOL_ENABLED, True
+    try:
+        for hop in hops:
+            await _frame_route_push(route, hop)
+    except BaseException:
+        await _frame_route_close(route)
+        raise
+    return route
+
+
+async def _frame_route_close(route):
+    """Detach the route's out-of-process sessions; restore the pool flag."""
+    global _WS_POOL_ENABLED
+    sessions = list(route.sessions)
+    del route.sessions[:]
+    if sessions:
+        try:
+            await _frame_cdp(route, [(10 + i, "Target.detachFromTarget", {"sessionId": s})
+                                     for i, s in enumerate(sessions)], timeout=5)
+        except Exception:
+            pass
+    if route.pool_was is not None:
+        _WS_POOL_ENABLED, route.pool_was = route.pool_was, None
+
+
+async def _frame_route_refresh_offset(route):
+    """Measure where the frame's viewport sits in page coordinates."""
+    if not route.chain:
+        route.offset, route.dirty = (0.0, 0.0), False
+        return route.offset
+    cmds = [(7000 + i, "Runtime.callFunctionOn", {
+        "objectId": oid, "functionDeclaration": _FRAME_BOX_FN, "returnByValue": True}, sid)
+        for i, (sid, oid) in enumerate(route.chain)]
+    r = await _frame_cdp(route, cmds)
+    x = y = 0.0
+    for i in range(len(route.chain)):
+        v = r.get(7000 + i, {}).get("result", {}).get("value")
+        if not (isinstance(v, list) and len(v) == 2):
+            raise _FrameError(f"frame '{route.labels[i]}' went away (detached or navigated)")
+        x, y = x + v[0], y + v[1]
+    route.offset, route.dirty = (x, y), False
+    return route.offset
+
+
+async def _frame_route_rewrite(route, commands):
+    """Point one cdp_send batch at the route's frame (see the section comment)."""
+    out = []
+    for cmd in commands:
+        if len(cmd) > 3:  # explicit session: the caller already chose
+            out.append(cmd)
+            continue
+        cmd_id, method, params = cmd
+        if method.startswith(("Runtime.", "DOM.")):
+            params = dict(params or {})
+            if (method == "Runtime.evaluate" and route.context_id is not None
+                    and "contextId" not in params and "uniqueContextId" not in params):
+                params["contextId"] = route.context_id
+            if method.startswith("Runtime."):
+                route.dirty = True  # page JS may scroll the frame
+            out.append((cmd_id, method, params, route.session_id))
+        elif method == "Input.dispatchMouseEvent" and route.chain and "x" in (params or {}):
+            if route.dirty:
+                await _frame_route_refresh_offset(route)
+            params = dict(params)
+            params["x"] = params["x"] + route.offset[0]
+            params["y"] = params.get("y", 0) + route.offset[1]
+            out.append((cmd_id, method, params))
+        else:
+            out.append(cmd)
+    return out
+
+
+def _frame_aware(kind="css"):
+    """Run an element command inside the frame named by `>>>` / `--frame`.
+
+    kind="css": the first argument is a selector; kind="text": a smart-*
+    label, where a stray `>>>` (e.g. "Next >>>") stays literal text.
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(target, *args, **kwargs):
+            if _FRAME_ROUTE.get() is not None or not isinstance(target, str):
+                return await fn(target, *args, **kwargs)
+            try:
+                names, inner = _split_frame_selector(target, strict=(kind == "css"))
+                hops = _parse_frame_spec(_FRAME_FLAG) if _FRAME_FLAG else []
+                hops += [_parse_frame_hop(n) for n in names]
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(2)
+            if not hops:
+                return await fn(target, *args, **kwargs)
+            ws_url, _ = get_page_ws()
+            try:
+                route = await _frame_route_open(ws_url, hops)
+            except _FrameError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            token = _FRAME_ROUTE.set(route)
+            try:
+                return await fn(inner, *args, **kwargs)
+            except _FrameError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            finally:
+                _FRAME_ROUTE.reset(token)
+                await _frame_route_close(route)
+        wrapper.frame_aware = kind
+        return wrapper
+    return deco
+
+
+def _smart_found(raw):
+    try:
+        return bool(json.loads(raw).get("found"))
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+SMART_STRONG_SCORE = 60  # smart-click: text contained in the element (not a word hit)
+
+
+async def _smart_eval_once(ws_url, js):
+    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+    return r.get(1, {}).get("result", {}).get("value", "")
+
+
+async def _smart_eval(ws_url, js, label):
+    """Run a smart-* finder script; if the page has no match, search its frames.
+
+    The finder both locates and acts, so running it inside the first frame
+    that matches completes the command there. Order: a real text match in the
+    page, then in its frames (breadth-first, bounded), then the page again
+    with the old rules (smart-click's weak partial-word hits). Explicit
+    targeting (`>>>`, `--frame`) skips all that: the finder runs in that frame.
+    """
+    if _FRAME_ROUTE.get() is not None:
+        return await _smart_eval_once(ws_url, js)
+    strict = f"(function () {{ var __cdpilotMinScore = {SMART_STRONG_SCORE}; return ({js}); }})()"
+    raw = await _smart_eval_once(ws_url, strict)
+    if _smart_found(raw):
+        return raw
+    hit = await _frame_search(ws_url, strict, label)
+    if hit is not None:
+        return hit
+    return await _smart_eval_once(ws_url, js)
+
+
+async def _frame_search(ws_url, js, label, max_frames=FRAME_SEARCH_MAX_FRAMES,
+                        budget_s=FRAME_SEARCH_BUDGET_S):
+    """Breadth-first: run `js` in each visible frame until one reports found."""
+    global _WS_POOL_ENABLED
+    deadline = time.monotonic() + budget_s
+    root = _FrameRoute(ws_url)
+    root.pool_was, _WS_POOL_ENABLED = _WS_POOL_ENABLED, True
+    queue, seen = [root], 0
+    try:
+        while queue and seen < max_frames and time.monotonic() < deadline:
+            parent = queue.pop(0)
+            try:
+                kids = [f["index"] for f in await _frame_list(parent) if f.get("visible")]
+            except _FrameError:
+                continue
+            for idx in kids:
+                if seen >= max_frames or time.monotonic() >= deadline:
+                    break
+                seen += 1
+                child = parent.fork()
+                try:
+                    await _frame_route_push(child, {"kind": "index", "value": idx}, scroll=False)
+                except _FrameError:
+                    continue
+                token = _FRAME_ROUTE.set(child)
+                try:
+                    r = await cdp_send(ws_url, [(1, "Runtime.evaluate",
+                                                 {"expression": js, "returnByValue": True})])
+                finally:
+                    _FRAME_ROUTE.reset(token)
+                raw = r.get(1, {}).get("result", {}).get("value", "")
+                if _smart_found(raw):
+                    print(f"{label}: matched inside frame {child.describe()}"
+                          + (f" ({child.src[:100]})" if child.src else ""), file=sys.stderr)
+                    return await _frame_shift_point(child, raw)
+                queue.append(child)
+        return None
+    finally:
+        await _frame_route_close(root)
+
+
+async def _frame_shift_point(route, raw):
+    """Translate a finder's frame-local x/y into page coordinates."""
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
+    if (isinstance(data, dict) and isinstance(data.get("x"), (int, float))
+            and isinstance(data.get("y"), (int, float))):
+        try:
+            ox, oy = await _frame_route_refresh_offset(route)
+        except _FrameError:
+            return raw
+        data["x"], data["y"] = data["x"] + ox, data["y"] + oy
+        return json.dumps(data)
+    return raw
 
 
 async def navigate_collect(ws_url, url, network=False, console=False, glow=True):
@@ -3826,6 +4349,7 @@ def _log_heal(cmd, inp, tried, duration_ms, no_heal=False):
         f.write(json.dumps(entry) + "\n")
 
 
+@_frame_aware("css")
 async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
     if selector.startswith("@") and selector[1:].isdigit():
         return await cmd_click_ref(selector)
@@ -3900,6 +4424,7 @@ async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
         print(r2.get(1, {}).get("result", {}).get("value", "?"))
 
 
+@_frame_aware("css")
 async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
     ws, _ = get_page_ws()
     if entropy is None:
@@ -3983,6 +4508,7 @@ async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
         print(r2.get(1, {}).get("result", {}).get("value", "?"))
 
 
+@_frame_aware("css")
 async def cmd_submit(selector="form", ladder=None, no_heal=False):
     ws, _ = get_page_ws()
     t0 = time.time()
@@ -8872,6 +9398,7 @@ async def cmd_observe():
 
 # ─── Smart Commands (LLM-free intelligence) ───
 
+@_frame_aware("text")
 async def cmd_smart_click(text):
     """Click element by visible text — fuzzy matching, no CSS selector needed.
 
@@ -8999,6 +9526,10 @@ async def cmd_smart_click(text):
 
       candidates.sort(function(a, b) {{ return b.score - a.score; }});
       var best = candidates[0];
+      // _smart_eval first asks for a real text match (page, then frames):
+      // a weak partial-word hit then reports its score instead of clicking.
+      var minScore = (typeof __cdpilotMinScore === 'number') ? __cdpilotMinScore : 0;
+      if (best.score < minScore) return JSON.stringify({{found: false, weakScore: best.score}});
       best.el.scrollIntoView({{block: 'center'}});
       var rect = best.el.getBoundingClientRect();
       best.el.click();
@@ -9015,8 +9546,7 @@ async def cmd_smart_click(text):
       }});
     }})()
     """
-    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-    raw = r.get(1, {}).get("result", {}).get("value", "")
+    raw = await _smart_eval(ws_url, js, "smart-click")
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
@@ -9246,6 +9776,7 @@ async def cmd_dismiss(repeat=None):
         print(f'Total dismissed: {total_clicked}')
 
 
+@_frame_aware("text")
 async def cmd_smart_fill(text, value):
     """Fill input by label/placeholder text — no CSS selector needed.
 
@@ -9389,8 +9920,7 @@ async def cmd_smart_fill(text, value):
       }});
     }})()
     """
-    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-    raw = r.get(1, {}).get("result", {}).get("value", "")
+    raw = await _smart_eval(ws_url, js, "smart-fill")
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
@@ -9405,6 +9935,7 @@ async def cmd_smart_fill(text, value):
     print(f'Filled: {data["tag"].upper()}[{data["type"]}] "{ident}" = {value} (score:{data["score"]})')
 
 
+@_frame_aware("text")
 async def cmd_smart_select(text, option_text):
     """Select dropdown option by label text — no CSS selector needed.
 
@@ -9493,8 +10024,7 @@ async def cmd_smart_select(text, option_text):
       return JSON.stringify({{found: true, optionFound: true, selected: match.text, value: match.value}});
     }})()
     """
-    r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-    raw = r.get(1, {}).get("result", {}).get("value", "")
+    raw = await _smart_eval(ws_url, js, "smart-select")
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
@@ -11168,6 +11698,7 @@ def cmd_heal_stats():
 
 # ─── 3. Advanced Input Commands ───
 
+@_frame_aware("css")
 async def cmd_hover(selector, ladder=None, no_heal=False, entropy=None):
     ws_url, _ = get_page_ws()
     if entropy is None:
@@ -11198,6 +11729,7 @@ async def cmd_hover(selector, ladder=None, no_heal=False, entropy=None):
     print(f"Hover: {selector} ({x}, {y})")
 
 
+@_frame_aware("css")
 async def cmd_dblclick(selector):
     """Double-click the specified element."""
     ws_url, _ = get_page_ws()
@@ -11213,6 +11745,7 @@ async def cmd_dblclick(selector):
     print(f"Double-clicked: {selector}")
 
 
+@_frame_aware("css")
 async def cmd_rightclick(selector):
     """Right-click the specified element."""
     ws_url, _ = get_page_ws()
@@ -11355,28 +11888,52 @@ async def cmd_scroll_to(selector, entropy=None):
 # ─── 4. iframe / Shadow DOM ───
 
 async def cmd_frame(subcmd, *subcmd_args):
-    """iframe and Shadow DOM access."""
-    ws_url, _ = get_page_ws()
+    """iframe and Shadow DOM access.
 
+    `list`, `eval` and `shadow` take `--frame <selector|index|url-substring>`
+    (nest with `>>>`): eval then runs in that frame's own page context (main
+    world), same-origin or cross-origin; without it they act on the top page.
+    """
+    ws_url, _ = get_page_ws()
+    try:
+        subcmd_args, flag = _extract_frame_flag(list(subcmd_args))
+        spec = flag or _FRAME_FLAG
+        hops = _parse_frame_spec(spec) if spec else []
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+    route = None
+    if hops and subcmd in ("list", "eval", "shadow"):
+        try:
+            route = await _frame_route_open(ws_url, hops)
+        except _FrameError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    token = _FRAME_ROUTE.set(route) if route else None
+    try:
+        await _cmd_frame_run(ws_url, subcmd, subcmd_args, route)
+    finally:
+        if route:
+            _FRAME_ROUTE.reset(token)
+            await _frame_route_close(route)
+
+
+async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
     if subcmd == "list":
-        js = """(function(){
-            var iframes = document.querySelectorAll('iframe');
-            return Array.from(iframes).map(function(f, i){
-                return {index: i, src: f.src || '(no source)', name: f.name || '', id: f.id || ''};
-            });
-        })()"""
-        res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+        res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": _FRAME_LIST_JS, "returnByValue": True})])
         frames = res.get(1, {}).get("result", {}).get("value", [])
+        where = f"in {route.describe()}" if route else "on page"
         if not frames:
-            print("No iframes found on page.")
+            print(f"No iframes found {where}.")
         else:
-            print(f"iframes ({len(frames)}):")
+            print(f"iframes ({len(frames)}):" if not route else f"iframes {where} ({len(frames)}):")
             for f in frames:
-                print(f"  [{f['index']}] src={f['src'][:80]} name={f['name']} id={f['id']}")
+                hidden = "" if f.get("visible", True) else " (hidden)"
+                print(f"  [{f['index']}] src={f['src'][:80]} name={f['name']} id={f['id']}{hidden}")
 
     elif subcmd == "eval":
         if not subcmd_args:
-            print("Usage: frame eval <js>")
+            print("Usage: frame eval [--frame <selector|index|url>] <js>")
             sys.exit(1)
         js_code = " ".join(subcmd_args)
         res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js_code, "returnByValue": True})])
@@ -11397,7 +11954,7 @@ async def cmd_frame(subcmd, *subcmd_args):
         print(val or "(empty)")
 
     else:
-        print("Usage: frame [list|eval <js>|shadow <selector>]")
+        print("Usage: frame [list|eval <js>|shadow <selector>] [--frame <selector|index|url>]")
         sys.exit(1)
 
 
@@ -11599,9 +12156,9 @@ class MCPServer:
             {"name": "browser_screenshot", "description": "Capture a screenshot of the current browser viewport. Supports element-level cropping to save tokens (capture only a specific element instead of full page). Use JPEG format with quality parameter for smaller files (~5x smaller than PNG). Prefer element cropping + JPEG for token-efficient AI workflows.",
              "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Output file path (e.g. /tmp/screenshot.png). Extension determines format: .png, .jpg, .webp", "default": "screenshot.png"}, "element": {"type": "string", "description": "CSS selector to capture only that element (crops to bounding box). Saves ~3-7x tokens vs full page."}, "quality": {"type": "number", "description": "JPEG quality 1-100 (only for .jpg files). Lower = smaller file = fewer tokens. Default: 80"}}}},
             {"name": "browser_click", "description": "Click an element on the page identified by CSS selector. Auto-waits up to 5 seconds for the element to appear (MutationObserver). Scrolls the element into view before clicking. Returns the tag name and text of the clicked element.",
-             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element to click (e.g. '#submit-btn', '.nav a', 'button[type=submit]')"}}, "required": ["selector"]}},
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element to click (e.g. '#submit-btn', '.nav a', 'button[type=submit]'). Inside an iframe (cross-origin too): 'iframe#card >>> button#pay'"}}, "required": ["selector"]}},
             {"name": "browser_type", "description": "Type text into an input or textarea element. Uses React-compatible value setting (native setter + input/change events). Auto-waits up to 5 seconds for the element. Use browser_fill as an alias.",
-             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the input element"}, "text": {"type": "string", "description": "Text value to type into the element"}}, "required": ["selector", "text"]}},
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the input element. Inside an iframe (cross-origin too): 'iframe#card >>> input[name=cardnumber]'"}, "text": {"type": "string", "description": "Text value to type into the element"}}, "required": ["selector", "text"]}},
             {"name": "browser_content", "description": "Get the visible text content of the current page (document.body.innerText). Returns up to 10000 characters. Use this to read page content without HTML markup. Prefer browser_a11y for structured navigation data.",
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_html", "description": "Get the full HTML source of the current page (document.documentElement.outerHTML). Returns up to 50000 characters. Use sparingly — prefer browser_content or browser_a11y for most tasks as they return smaller, more useful data.",
@@ -11619,7 +12176,7 @@ class MCPServer:
             {"name": "browser_a11y", "description": "Get the accessibility tree of the current page as structured data. Returns interactive elements with @N references that can be used with browser_click. This is the PREFERRED way to understand page structure — uses ~500 tokens vs ~250K for screenshots. Use 'summary' mode for a compact view.",
              "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["full", "summary"], "description": "Output detail level: 'full' for complete tree, 'summary' for interactive elements only", "default": "full"}}}},
             {"name": "browser_fill", "description": "Set an input element's value using React-compatible method (native descriptor setter + input/change events). Auto-waits up to 5 seconds for the element. Works with regular inputs, textareas, and React controlled components.",
-             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the input element"}, "value": {"type": "string", "description": "Value to set in the input field"}}, "required": ["selector", "value"]}},
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the input element. Inside an iframe (cross-origin too): 'iframe#card >>> input[name=cardnumber]'"}, "value": {"type": "string", "description": "Value to set in the input field"}}, "required": ["selector", "value"]}},
             {"name": "browser_launch", "description": "Launch an isolated browser instance with Chrome DevTools Protocol enabled. Uses existing Brave/Chrome/Chromium installation — no browser download needed. Creates an isolated profile directory so your personal browser data is never touched.",
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_close", "description": "Smart close: shut down every tab cdpilot opened during this automation, then close the whole browser application gracefully ONLY if no user-opened tabs remain. If the user has their own tabs open in the same browser, those are left untouched and the browser stays open. Use this to clean up after automation. Set force=true to close the browser even when user tabs remain; set keep_browser=true to only close cdpilot's tabs and never quit the browser.",
@@ -13485,6 +14042,17 @@ if __name__ == "__main__":
     # measured sessions). `open` has no other meaning here, so alias it.
     if cmd == 'open':
         cmd = 'go'
+
+    # `--frame <selector|index|url-substring>` runs an element command inside
+    # an iframe; same as writing the selector as "<frame> >>> <selector>".
+    if cmd in FRAME_AWARE_CMDS:
+        try:
+            args, _FRAME_FLAG = _extract_frame_flag(args)
+            if _FRAME_FLAG is not None:
+                _parse_frame_spec(_FRAME_FLAG)
+        except ValueError as _e:
+            print(f"cdpilot: {_e}", file=sys.stderr)
+            sys.exit(2)
 
     # Hidden re-entrant entry for the watch daemon. `cdpilot watch start`
     # forks this process with the flag so the screencast consumer runs in

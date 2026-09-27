@@ -144,6 +144,47 @@ cdpilot scroll-to <selector>  # Scroll element into view
 cdpilot drag <from> <to>      # Drag and drop
 ```
 
+### Element targeting inside iframes
+
+Card forms (Stripe/iyzico-style), embedded login widgets and the reCAPTCHA
+checkbox live inside `<iframe>`s. Name the frame chain before the element
+selector with `>>>`, or pass `--frame`:
+
+```bash
+# Payment-style page: the card fields are inside <iframe id="card" title="Secure card payment">
+cdpilot fill  "iframe#card >>> input[name=cardnumber]" "4242424242424242"
+cdpilot type  --frame "#card" "input[name=cvc]" "123"
+cdpilot click "iframe[title='Secure card payment'] >>> button#pay-btn"
+
+# Nested frames: outermost first
+cdpilot click "iframe.checkout >>> iframe.card >>> button"
+
+# --frame <selector|index|url-substring>, nestable with >>>
+cdpilot click --frame 0 "button.submit"                   # first iframe (same order as `frame list`)
+cdpilot fill  --frame "url=js.stripe.com" "input[name=cardnumber]" "4242424242424242"
+cdpilot frame list --frame "#card"                        # iframes inside that frame
+cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's own page context
+```
+
+- Works for `click`, `fill`, `type`, `submit`, `hover`, `dblclick`, `rightclick`,
+  `smart-click`, `smart-fill`, `smart-select` and `frame list|eval|shadow`.
+- A frame hop is a CSS selector (an element *wrapping* an iframe, such as
+  `#card-element`, also works), a 0-based index, a `name`/`id`, or a `src`
+  substring (`url=` forces the substring match). `>>>` inside quotes or
+  `[...]` is literal.
+- Same-origin **and cross-origin** frames work, including out-of-process
+  iframes (site isolation): cdpilot resolves each hop over CDP
+  (`DOM.describeNode` → frame id → the frame's execution context, or
+  `Target.attachToTarget` with a flat session for an out-of-process frame),
+  never through `contentDocument`, which the browser blocks cross-origin.
+- Real mouse input (`hover`, `dblclick`, `rightclick`, `--entropy=on` clicks)
+  is dispatched at page coordinates: the frame's offset in the page is added
+  automatically, so the browser hit-tests into the right frame.
+- `smart-click` / `smart-fill` / `smart-select` fall back automatically: when
+  the text is not found in the page they search its visible frames
+  breadth-first (at most 20 frames / 2 s) and report the match on stderr:
+  `smart-click: matched inside frame iframe#card (https://…)`.
+
 ### Debugging
 
 ```bash
@@ -308,7 +349,8 @@ cdpilot storage               # localStorage contents
 cdpilot upload <sel> <file>   # Upload file to input
 cdpilot multi-eval <js>       # Execute JS in all tabs
 cdpilot headless [on|off]     # Toggle headless mode
-cdpilot frame list            # List iframes
+cdpilot frame list            # List iframes (index = --frame <index>)
+cdpilot frame eval --frame <f> <js>  # Run JS inside an iframe (cross-origin too)
 cdpilot dialog auto-accept    # Auto-accept dialogs
 cdpilot permission grant geo  # Grant geolocation
 ```
@@ -823,10 +865,10 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] **Data extraction** (`extract`) — structured DOM data in text, JSON, or list format
 - [x] **Page observation** (`observe`) — list all interactive elements with available actions
 - [x] **Script runner** (`run`) — execute `.cdp` script files with pass/fail reporting
+- [x] **iframe targeting** — `"iframe#card >>> input"` / `--frame` for element commands, same-origin and cross-origin (out-of-process) frames; smart commands search frames automatically
 
 ### Coming Soon
 
-- [ ] **iframe** support — interact with elements inside iframes (Shadow DOM traversal already shipped in smart commands)
 - [ ] **Multi-instance pool** (`CDPILOT_POOL_SIZE`) — N independent browser processes with least-loaded dispatch
 - [ ] **Session recording & replay** — record browser sessions and replay them deterministically
 - [ ] **Stealth mode** *(Pro)* — human-like mouse/typing, anti-fingerprint, CAPTCHA solving
