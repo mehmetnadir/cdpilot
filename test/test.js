@@ -110,6 +110,9 @@ test('setup detects python websockets', () => {
         // os.homedir() reads USERPROFILE first on Windows — override both
         // so this test isolates HOME on every CI platform.
         USERPROFILE: fakeUserHome,
+        // An explicit CDPILOT_PROFILE (a caller isolating its run) would put
+        // the profile elsewhere; this test is about the default location.
+        CDPILOT_PROFILE: '',
       },
     });
 
