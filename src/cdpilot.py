@@ -18,6 +18,7 @@ Global options:
   --timeout <seconds>  Abort the command after <seconds> (exit 124). Accepted
                        before or after the command name; 0 disables.
 
+
 Session log:
   cdpilot log          Today's commands for this project (time, exit, command,
                        url, result). --md: Markdown report (pages visited,
@@ -57,6 +58,13 @@ pip install cryptography):
                        and Signature-Agent to every request the browser makes
                        (tabs, popups, iframes, workers), until `stop`
   cdpilot bot-auth status      Agent URL, keyid, signer on/off
+
+Exit codes: 0 ok, 1 error, 124 --timeout; exit 3 from click / smart-click
+  (and batch / run containing one):
+  pressed, release missed the target, not clicked (a real mouse click whose
+  target moved or got covered under the press; see the stderr note). A target
+  the page replaced or navigated away from on mousedown prints
+  "Pressed (the page replaced or left it ...)" and exits 0.
 """
 
 __version__ = "0.9.3"
@@ -4509,26 +4517,68 @@ def _blocker_restore_on_exit(budget_s=BLOCKER_EXIT_RESTORE_S):
 
 
 def _hit_failure(route, results, base, n, released=False):
-    """Why the hit-test in `results` (ids base..base+n-1) failed, as note text, or None.
+    """Why the hit-test in `results` (ids base..base+n-1) failed: (note text,
+    kind), or None.
 
     Checks are ordered like route.chain, then the target. released: the
-    repeat of the check sent with mouseReleased.
+    repeat of the check sent with mouseReleased. kind: "moved" (something
+    else is on top: covered, or it moved away), "gone" (removed from its
+    document; with the release also a failed call: its page navigated away),
+    "unknown" (with the release: no reply in time, so nothing is known).
     """
     for i in range(n):
-        v = results.get(base + i, {}).get("result", {}).get("value")
+        reply = results.get(base + i)
+        v = reply.get("result", {}).get("value") if isinstance(reply, dict) else None
         if v == "":
             continue
+        if released and reply is None:  # a missing reply is not a navigation
+            return ("could not be checked when the mouse button was released (no reply from"
+                    " the page in time)", "unknown")
         if v == "-" or (v is None and released):  # removed, or its page navigated away
             return ("was gone by the time the mouse button was released (the page replaced"
-                    " or left it)" if released else "is no longer in the page")
+                    " or left it)" if released else "is no longer in the page", "gone")
         if v == "!":
             what = (f"is inside {route.labels[i]}, which has pointer-events: none"
                     if i < len(route.chain) else "has pointer-events: none")
-            return what + (" by the time the mouse button was released" if released else "")
+            return what + (" by the time the mouse button was released" if released else ""), "moved"
         v = v if isinstance(v, str) and v else "(unknown)"
         if released:
-            return f"was no longer under the mouse when the button was released ({v} was)"
-        return f"is covered by {v} at the click point"
+            return f"was no longer under the mouse when the button was released ({v} was)", "moved"
+        return f"is covered by {v} at the click point", "moved"
+    return None
+
+
+# A real click whose release did not land on the target is not clicked again
+# by script (it could click twice); the command says so instead of
+# "Clicked". "moved" and "unknown" end the command with exit code 3
+# ("pressed, the release missed the target, not clicked"; 1 stays "error"),
+# "gone" (the page replaced the target or navigated on mousedown, which is
+# usually what the click was for) with 0. MCP maps both to isError: false
+# plus a first line {"clicked": false, "reason": ...}; batch and run record
+# the step and end with 3.
+CLICK_MISSED_EXIT_CODE = 3
+PRESSED_PREFIX = {
+    "moved": "Pressed (released elsewhere, not clicked): ",
+    "unknown": "Pressed (release not confirmed, not clicked): ",
+    "gone": "Pressed (the page replaced or left it, not clicked): ",
+}
+_CLICK_MISSES = []  # reasons of this process's real clicks that were not clicked
+
+
+def _click_missed_exit():
+    """Exit 3 when a click of this command was pressed but not clicked
+    ("moved" / "unknown"); a "gone" one exits 0."""
+    if any(r != "gone" for r in _CLICK_MISSES):
+        sys.exit(CLICK_MISSED_EXIT_CODE)
+
+
+def _pressed_status(stdout):
+    """{"clicked": false, "reason": ...} when `stdout` reports a press that
+    was not clicked, else None (for MCP callers)."""
+    for line in (stdout or "").splitlines():
+        for reason, prefix in PRESSED_PREFIX.items():
+            if line.startswith(prefix):
+                return {"clicked": False, "reason": reason}
     return None
 
 
@@ -4661,11 +4711,13 @@ async def _pointer_click(route, target_oid, label, humanize=False):
     the page for a route without hops) with real mouse input, if it is hit.
 
     Returns (how, x, y): how is "mouse"; "script" when the hit-test before
-    the press failed and el.click() clicked it; "missed" when the press and
-    release were sent but the release did not land on the target (no script
-    click then: the page already got a trusted mousedown/mouseup, and on a
-    menu that opens on mousedown a native click on a common ancestor, so
-    el.click() would click twice). A stderr note says why. x, y is the click
+    the press failed and el.click() clicked it; "moved", "gone" or
+    "unknown" (see _hit_failure) when the press and release were sent but
+    the release did not land on the target (no script click then: the page
+    already got a trusted mousedown/mouseup, and on a menu that opens on
+    mousedown a native click on a common ancestor, so el.click() would
+    click twice). A stderr note says why. A target no longer in the page
+    before the press raises _FrameError (nothing is clicked). x, y is the click
     point in page coordinates. humanize: --entropy=on's approach, jitter and
     pauses. The button is held like a person's press (_press_hold_s). The
     hit-test runs before the press and again, in one batch with the
@@ -4688,7 +4740,7 @@ async def _pointer_click(route, target_oid, label, humanize=False):
         ly += rnd.uniform(-1, 1) * min(2, max(0, c[3] / 2 - 1))
     pts = _frame_points(boxes, lx, ly)
     px, py = round(pts[0][0]), round(pts[0][1])
-    why = None
+    why = missed = None
     token = _FRAME_ROUTE.set(None)  # page coordinates from here: no rewriting
     try:
         if humanize:
@@ -4703,6 +4755,8 @@ async def _pointer_click(route, target_oid, label, humanize=False):
                     for i, ((s, oid), (x, y)) in enumerate(zip(route.chain + [(sid, target_oid)], pts))]
             n = len(pts)
             why = _hit_failure(route, await _frame_cdp(route, checks(10)), 10, n)
+            if why is not None and why[1] == "gone":  # a detached node: el.click() does nothing
+                raise _FrameError(f"{label}: the target is no longer in the page")
             if why is None:
                 press = {"x": px, "y": py, "button": "left", "clickCount": 1}
                 # The last move on its own: Chrome stamps it on arrival, so the
@@ -4733,20 +4787,20 @@ async def _pointer_click(route, target_oid, label, humanize=False):
                         await _release_open_press(lambda c: _frame_cdp(route, [
                             (i, m, prm, None) for i, m, prm in c], timeout=2),
                             root, _PRESS_OPEN.get(root))
-                why = _hit_failure(route, r, 30, n, released=True)
-                if why is not None:
-                    why = (why, "missed")
+                missed = _hit_failure(route, r, 30, n, released=True)
         finally:
             if opened:
                 await _blocker_pointer(route, "")
     finally:
         _FRAME_ROUTE.reset(token)
-    if isinstance(why, tuple):  # the trusted press and release were sent
-        print(f"note: {label} {why[0]}; the press and release reached the page, so no"
-              " script click (it could click twice)", file=sys.stderr)
-        return "missed", px, py
+    if missed is not None:  # the trusted press and release were sent
+        text, kind = missed
+        sent = "were sent" if kind == "unknown" else "reached the page"
+        print(f"note: {label} {text}; the press and release {sent}, so no script click"
+              " (it could click twice)", file=sys.stderr)
+        return kind, px, py
     if why is not None:
-        print(f"note: {label} {why}; used a script click", file=sys.stderr)
+        print(f"note: {label} {why[0]}; used a script click", file=sys.stderr)
         await _frame_cdp(route, [(1, "Runtime.callFunctionOn", {
             "objectId": target_oid, "functionDeclaration": _SCRIPT_CLICK_FN}, sid)])
         return "script", px, py
@@ -6955,9 +7009,15 @@ async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
             res = info.get("res", "?")
             if info.get("box"):
                 where = f"{route.describe()} {FRAME_SEP} {selector}" if route.chain else selector
-                how, _, _ = await _pointer_click(route, oid, where, humanize=bool(entropy))
-                if how == "missed" and res.startswith("Clicked: "):
-                    res = "Pressed (released elsewhere, not clicked): " + res[len("Clicked: "):]
+                try:
+                    how, _, _ = await _pointer_click(route, oid, where, humanize=bool(entropy))
+                except _FrameError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    sys.exit(1)
+                if how in PRESSED_PREFIX:
+                    _CLICK_MISSES.append(how)
+                    if res.startswith("Clicked: "):
+                        res = PRESSED_PREFIX[how] + res[len("Clicked: "):]
             else:
                 await _frame_cdp(route, [(3, "Runtime.callFunctionOn", {
                     "objectId": oid, "functionDeclaration": _SCRIPT_CLICK_FN}, sid)])
@@ -7138,6 +7198,7 @@ async def cmd_batch():
     for item in data:
         cmd_name = item.get("cmd", "")
         cmd_args = item.get("args", [])
+        misses = len(_CLICK_MISSES)
         try:
             if cmd_name == "go":
                 await cmd_go(cmd_args[0] if cmd_args else "")
@@ -7158,13 +7219,20 @@ async def cmd_batch():
             else:
                 results.append({"cmd": cmd_name, "status": "error", "error": f"Unsupported command: {cmd_name}"})
                 continue
-            results.append({"cmd": cmd_name, "status": "ok"})
+            if len(_CLICK_MISSES) > misses:  # pressed, not clicked: the batch goes on
+                reason = _CLICK_MISSES[-1]
+                results.append({"cmd": cmd_name, "status": "ok" if reason == "gone" else "not_clicked",
+                                "clicked": False, "reason": reason})
+            else:
+                results.append({"cmd": cmd_name, "status": "ok"})
         except SystemExit:
             results.append({"cmd": cmd_name, "status": "error", "error": "Command exited with error"})
         except Exception as exc:
             results.append({"cmd": cmd_name, "status": "error", "error": str(exc)})
 
     print(json.dumps(results, indent=2, ensure_ascii=False))
+    # A step pressed but not clicked ("not_clicked") ends the batch with exit 3
+    # (main: _click_missed_exit), after every step ran.
 
 
 async def cmd_network(url=None):
@@ -12183,8 +12251,11 @@ async def cmd_smart_click(text):
                 _mark_owned_tab(t.get("id"))
     except Exception:
         pass
-    verb = "Pressed (released elsewhere, not clicked)" if data.get("via") == "missed" else "Clicked"
-    print(f'{verb}: {data["tag"].upper()} "{data["text"]}" (score:{data["score"]})')
+    verb = "Clicked: "
+    if data.get("via") in PRESSED_PREFIX:
+        _CLICK_MISSES.append(data["via"])
+        verb = PRESSED_PREFIX[data["via"]]
+    print(f'{verb}{data["tag"].upper()} "{data["text"]}" (score:{data["score"]})')
     if data.get("alternatives"):
         print(f'  Also found: {", ".join(data["alternatives"])}')
 
@@ -12691,6 +12762,7 @@ async def cmd_run_script(script_path):
     import shlex
     passed = 0
     failed = 0
+    not_clicked = 0
     for line_num, line in enumerate(lines, 1):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -12713,7 +12785,12 @@ async def cmd_run_script(script_path):
             if output:
                 for out_line in output.split("\n"):
                     print(f"     {out_line}")
-            if result.returncode != 0:
+            if result.returncode == CLICK_MISSED_EXIT_CODE:
+                # Pressed, the release missed the target: not an error, not a click.
+                err = result.stderr.strip()
+                print(f"     NOT CLICKED (exit {CLICK_MISSED_EXIT_CODE})" + (f": {err}" if err else ""))
+                not_clicked += 1
+            elif result.returncode != 0:
                 err = result.stderr.strip()
                 if err:
                     print(f"     ERROR: {err}")
@@ -12726,7 +12803,10 @@ async def cmd_run_script(script_path):
 
     print(f"\n{'─' * 40}")
     print(f"Script: {script_path}")
-    print(f"Result: {passed} passed, {failed} failed, {passed + failed} total")
+    extra = f", {not_clicked} not clicked" if not_clicked else ""
+    print(f"Result: {passed} passed, {failed} failed{extra}, {passed + failed + not_clicked} total")
+    if not_clicked:
+        sys.exit(CLICK_MISSED_EXIT_CODE)
 
 
 # ─── Testing Commands ───
@@ -15370,7 +15450,7 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"url": {"type": "string", "description": "Full URL to navigate to (must include https://)"}}, "required": ["url"]}},
             {"name": "browser_screenshot", "description": "Capture a screenshot of the current browser viewport. Supports element-level cropping to save tokens (capture only a specific element instead of full page). Use JPEG format with quality parameter for smaller files (~5x smaller than PNG). Prefer element cropping + JPEG for token-efficient AI workflows.",
              "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Output file path (e.g. /tmp/screenshot.png). Extension determines format: .png, .jpg, .webp", "default": "screenshot.png"}, "element": {"type": "string", "description": "CSS selector to capture only that element (crops to bounding box). Saves ~3-7x tokens vs full page."}, "quality": {"type": "number", "description": "JPEG quality 1-100 (only for .jpg files). Lower = smaller file = fewer tokens. Default: 80"}}}},
-            {"name": "browser_click", "description": "Click an element on the page identified by CSS selector. Auto-waits up to 5 seconds for the element to appear (MutationObserver). Scrolls the element into view before clicking. Returns the tag name and text of the clicked element.",
+            {"name": "browser_click", "description": "Click an element on the page identified by CSS selector. Auto-waits up to 5 seconds for the element to appear (MutationObserver). Scrolls the element into view before clicking. Returns the tag name and text of the clicked element. When a real mouse click (inside a frame, or with entropy) was pressed but the page changed under the press so the release missed the target, nothing is clicked again by script and the first line is JSON {\"clicked\": false, \"reason\": \"moved\"|\"gone\"|\"unknown\"} (isError stays false): the page may already have reacted to the press, so check it before retrying.",
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element to click (e.g. '#submit-btn', '.nav a', 'button[type=submit]'). Inside an iframe (cross-origin too): 'iframe#card >>> button#pay'"}}, "required": ["selector"]}},
             {"name": "browser_type", "description": "Type text into an input or textarea element. Uses React-compatible value setting (native setter + input/change events). Auto-waits up to 5 seconds for the element. Use browser_fill as an alias.",
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the input element. Inside an iframe (cross-origin too): 'iframe#card >>> input[name=cardnumber]'"}, "text": {"type": "string", "description": "Text value to type into the element"}}, "required": ["selector", "text"]}},
@@ -15576,13 +15656,21 @@ class MCPServer:
             output = result.stdout.strip()
             errors = result.stderr.strip()
             content = []
+            # A click pressed but not clicked is no error (a retry could
+            # click twice): a machine-readable first line tells the agent.
+            status = _pressed_status(output)
+            if result.returncode == CLICK_MISSED_EXIT_CODE and status is None:
+                status = {"clicked": False, "reason": "moved"}
+            if status is not None:
+                content.append({"type": "text", "text": json.dumps(status)})
             if output:
                 content.append({"type": "text", "text": output})
             if errors:
                 content.append({"type": "text", "text": f"stderr: {errors}"})
             if not content:
                 content.append({"type": "text", "text": "Command executed successfully"})
-            return {"jsonrpc": "2.0", "id": req_id, "result": {"content": content, "isError": result.returncode != 0}}
+            return {"jsonrpc": "2.0", "id": req_id, "result": {
+                "content": content, "isError": result.returncode not in (0, CLICK_MISSED_EXIT_CODE)}}
         except subprocess.TimeoutExpired:
             _slog_record_external(cli_args, TIMEOUT_EXIT_CODE, started, int((time.monotonic() - t0) * 1000),
                                   "MCP tool call timed out (30s); the command was killed", via)
@@ -18520,6 +18608,7 @@ if __name__ == "__main__":
             print(f"Did you mean: {matches[0]}?", file=sys.stderr)
         print(f"\nAvailable commands: {', '.join(all_cmds)}", file=sys.stderr)
         sys.exit(1)
+    _click_missed_exit()  # pressed, not clicked: exit 3 (after the command's cleanup)
     # Reached only when no SystemExit or exception ended the command (see
     # _slog_exit_code): the session log then records exit 0.
     _SLOG["main_done"] = True

@@ -4122,18 +4122,87 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     const r = fake('press_hold');
     const tail = '; the press and release reached the page, so no script click (it could click twice)\n';
     const gone = 'was gone by the time the mouse button was released (the page replaced or left it)';
-    for (const [key, why] of [
-      ['moved', 'was no longer under the mouse when the button was released (div#wrap was)'],
-      ['removed', gone], ['navigated', gone]]) {
+    const moved = 'Pressed (released elsewhere, not clicked): BUTTON #btn\n';
+    const replaced = 'Pressed (the page replaced or left it, not clicked): BUTTON #btn\n';
+    for (const [key, why, line] of [
+      ['moved', 'was no longer under the mouse when the button was released (div#wrap was)', moved],
+      ['removed', gone, replaced], ['navigated', gone, replaced]]) {
       for (const tag of ['default', 'instant']) {
         const k = r[`${tag}_${key}`];
         assert.deepStrictEqual(k.res, ['ok', null], `${tag} ${key}: ${k.stderr}`);
         if (tag === 'default') heldOk(k.press, key);
         assert.deepStrictEqual(k.clicks, [], `${tag} ${key}: no script click`);
         assert.strictEqual(k.stderr, `note: iframe#card >>> #btn ${why}${tail}`, `${tag} ${key}`);
-        assert.strictEqual(k.stdout, 'Pressed (released elsewhere, not clicked): BUTTON #btn\n', `${tag} ${key}`);
+        assert.strictEqual(k.stdout, line, `${tag} ${key}`);
         assert.deepStrictEqual(k.blocker, ['none', ''], `${tag} ${key}: blocker restored`);
       }
+    }
+  });
+
+  test('click outcome (fake CDP): release missed -> exit 3 ("moved"); target replaced / page left -> exit 0 ("gone")', () => {
+    // #30 script-clicked a target that moved; the held press made that a
+    // double click, so it is not clicked now, and exit 3 keeps `click && next`
+    // from going on as if it had been (1 stays "error").
+    const r = fake('click_outcome');
+    const m = r.moved;
+    assert.deepStrictEqual([m.res, m.exit, m.misses, m.clicks], [['ok', null], 3, ['moved'], []]);
+    assert.strictEqual(m.stdout, 'Pressed (released elsewhere, not clicked): BUTTON #btn\n');
+    for (const key of ['gone', 'navigated']) {
+      const g = r[key];
+      assert.deepStrictEqual([g.res, g.exit, g.misses, g.clicks], [['ok', null], 0, ['gone'], []], key);
+      assert.strictEqual(g.stdout, 'Pressed (the page replaced or left it, not clicked): BUTTON #btn\n', key);
+      assert.strictEqual(g.pressed.length + g.released.length, 2, `${key}: one press, one release`);
+    }
+    const c = r.clicked;
+    assert.deepStrictEqual([c.res, c.exit, c.misses, c.stdout], [['ok', null], 0, [], 'Clicked: BUTTON #btn\n']);
+  });
+
+  test('click outcome (fake CDP): no reply to the release check is "unknown" (exit 3), not "gone"', () => {
+    const u = fake('click_outcome').no_reply;
+    assert.deepStrictEqual([u.res, u.exit, u.misses, u.clicks], [['ok', null], 3, ['unknown'], []]);
+    assert.strictEqual(u.stdout, 'Pressed (release not confirmed, not clicked): BUTTON #btn\n');
+    assert.strictEqual(u.stderr, 'note: iframe#card >>> #btn could not be checked when the mouse button was released'
+      + ' (no reply from the page in time); the press and release were sent, so no script click (it could click twice)\n');
+    assert.deepStrictEqual(u.blocker, ['none', '']);
+  });
+
+  test('click outcome (fake CDP): a target detached before the press is an error (exit 1), no press, no script click', () => {
+    const d = fake('click_outcome').detached;
+    assert.deepStrictEqual(d.res, ['exit', 1]);
+    assert.strictEqual(d.stderr, 'Error: iframe#card >>> #btn: the target is no longer in the page\n');
+    assert.deepStrictEqual([d.clicks, d.pressed, d.stdout, d.misses], [[], [], '', []]);
+    assert.deepStrictEqual(d.blocker, ['none', ''], 'blocker restored');
+  });
+
+  test('click outcome (fake CDP): batch runs every step, records the not-clicked one, and exits 3', () => {
+    const b = fake('click_outcome').batch;
+    assert.deepStrictEqual(b.res, ['ok', null], 'no SystemExit mid-batch');
+    assert.deepStrictEqual(b.steps, [{ cmd: 'click', status: 'not_clicked', clicked: false, reason: 'moved' },
+      { cmd: 'eval', status: 'ok' }]);
+    assert.strictEqual(b.exit, 3);
+  });
+
+  test('click outcome (fake CDP): MCP: exit 3 and "gone" are not errors; a JSON first line says clicked: false', () => {
+    const r = fake('click_outcome').mcp;
+    for (const [key, reason] of [['moved', 'moved'], ['gone', 'gone'], ['unknown', 'unknown']]) {
+      assert.strictEqual(r[key].isError, false, key);
+      assert.deepStrictEqual(JSON.parse(r[key].content[0].text), { clicked: false, reason }, key);
+      assert(/^Pressed \(/.test(r[key].content[1].text), key);
+    }
+    assert.deepStrictEqual(r.clicked, { content: [{ type: 'text', text: 'Clicked: BUTTON Pay' }], isError: false });
+    assert.strictEqual(r.error.isError, true, 'exit 1 is still an error');
+    assert(!/clicked/.test(r.error.content[0].text), 'no status line for an error');
+  });
+
+  test('click outcome: exit 3 is documented (help in src and bin, README, CHANGELOG)', () => {
+    const root = path.join(__dirname, '..');
+    const bin = fs.readFileSync(path.join(root, 'bin', 'cdpilot.js'), 'utf8');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    const unreleased = changelog.slice(changelog.indexOf('## [Unreleased]'), changelog.indexOf('## [0.9.3]'));
+    for (const [name, text] of [['src help', PY_CONTENT.slice(0, PY_CONTENT.indexOf('__version__ = '))], ['bin help', bin], ['README', readme],
+      ['CHANGELOG [Unreleased]', unreleased]]) {
+      assert(/exit 3/i.test(text) && /release missed the target, not clicked/.test(text), `${name} documents exit 3`);
     }
   });
 
@@ -4414,7 +4483,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       stop();
       throw err;
     }
-    e2e = { c, cShow, p1, p2, stop, trace };
+    e2e = { c, cShow, p1, p2, stop, trace, env };
   });
   const ok = (r, re, what) => assert(re.test(r.stdout + r.stderr),
     `${what}: exit ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
@@ -4631,11 +4700,13 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
         const label = prefix ? 'iframe#card >>> ' : '';
         const m = c('click', `${prefix}#menu-btn`, ...flags);
         ok(m, /^Pressed \(released elsewhere, not clicked\): BUTTON Menu/m, `menu ${url}`);
+        assert.strictEqual(m.status, 3, `menu: exit 3 (pressed, release missed the target): ${m.stderr}`);
         assert(!/Clicked/.test(m.stdout), m.stdout);
         assert(m.stderr.includes(`note: ${label}#menu-btn was no longer under the mouse when the button was released`)
           && m.stderr.includes(tail), m.stderr);
         const s = c('click', `${prefix}#spa-btn`, ...flags);
-        ok(s, /^Pressed \(released elsewhere, not clicked\): BUTTON Next page/m, `spa ${url}`);
+        ok(s, /^Pressed \(the page replaced or left it, not clicked\): BUTTON Next page/m, `spa ${url}`);
+        assert.strictEqual(s.status, 0, `spa: the page reacted, exit 0: ${s.stderr}`);
         assert(s.stderr.includes(`note: ${label}#spa-btn was gone by the time the mouse button was released`), s.stderr);
         // The release landed on the menu item; the browser's own click went
         // to div#wrap once; nothing was clicked again by script.
@@ -4722,6 +4793,26 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       }
     });
 
+    test('frames e2e: run and batch go on after a click that was pressed but not clicked, and end with exit 3', () => {
+      const { c, p1, env } = needE2E();
+      const url = `http://127.0.0.1:${p1}/moving.html`;
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-run-'));
+      const script = path.join(dir, 'jump.cdp');
+      fs.writeFileSync(script, `go ${url}\nclick #jump --entropy=on\neval document.body.dataset.log\n`);
+      const r = c('run', script);
+      assert.strictEqual(r.status, 3, `run: exit 3: ${r.stdout}${r.stderr}`);
+      assert(/NOT CLICKED \(exit 3\): note: #jump was no longer under the mouse/.test(r.stdout), r.stdout);
+      assert(/jump-down;/.test(r.stdout), 'the step after it ran');
+      assert(/Result: 2 passed, 0 failed, 1 not clicked, 3 total/.test(r.stdout), r.stdout);
+      c('go', `http://127.0.0.1:${p1}/top.html?child=moving.html`);
+      const b = spawnSync(process.execPath, [CLI, 'batch'], { encoding: 'utf-8', timeout: 60000, env,
+        input: JSON.stringify([{ cmd: 'click', args: ['#card >>> #jump'] }, { cmd: 'eval', args: ['1 + 1'] }]) });
+      assert.strictEqual(b.status, 3, `batch: exit 3: ${b.stdout}${b.stderr}`);
+      const steps = JSON.parse(b.stdout.slice(b.stdout.indexOf('[')));
+      assert.deepStrictEqual(steps, [{ cmd: 'click', status: 'not_clicked', clicked: false, reason: 'moved' },
+        { cmd: 'eval', status: 'ok' }]);
+    });
+
     test('frames e2e: a target that moves on mousedown: note, no script click; pointer-events: none: script click + note', () => {
       const { c, p1 } = needE2E();
       const cases = [
@@ -4734,6 +4825,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
         const label = prefix ? 'iframe#card >>> ' : '';
         const j = c('click', `${prefix}#jump`, ...flags);
         ok(j, /Pressed \(released elsewhere, not clicked\): BUTTON/, `jump ${url}`);
+        assert.strictEqual(j.status, 3, `jump: exit 3: ${j.stderr}`);
         assert(j.stderr.includes(`note: ${label}#jump was no longer under the mouse when the button was released`)
           && j.stderr.includes('so no script click'), j.stderr);
         const g = c('click', `${prefix}#ghost`, ...flags);
