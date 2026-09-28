@@ -26,13 +26,20 @@ function test(name, fn) {
   }
 }
 
+// One private home for run(): without it every run() wrote last-activity (and
+// a profile dir) under the real ~/.cdpilot/projects/<cwd project>/. The Node
+// launcher ignores CDPILOT_HOME when it derives the profile path, so
+// CDPILOT_PROFILE is set too.
+const RUN_HOME = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-run-'));
+
 function run(args = '') {
   return execSync(`node ${CLI} ${args} 2>&1`, {
     timeout: 10000,
     encoding: 'utf-8',
-    // CDP_PORT avoids a conflict with a real browser; this helper does not
-    // isolate CDPILOT_HOME, so keep its commands out of the real session log.
-    env: { ...process.env, CDP_PORT: '19222', CDPILOT_LOG: '0' },
+    // CDP_PORT avoids a conflict with a real browser; CDPILOT_LOG=0 keeps its
+    // commands out of the session log.
+    env: { ...process.env, CDP_PORT: '19222', CDPILOT_LOG: '0',
+           CDPILOT_HOME: RUN_HOME, CDPILOT_PROFILE: path.join(RUN_HOME, 'profile') },
   });
 }
 
@@ -5234,6 +5241,11 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   const { spawnSync, spawn, execFileSync } = require('child_process');
   const os = require('os');
   const PY_BIN = process.platform === 'win32' ? 'python' : 'python3';
+  const FAKE_CDP = path.join(__dirname, 'connect_fake_cdp.py');
+  const LEFT_RUNNING = 'connected browser left running; run `cdpilot disconnect` to forget it';
+  const GONE = 'your connected browser is gone; run `cdpilot connect` again or `cdpilot disconnect`';
+  // Every CDP call that closes a browser or its tabs, as the fake records it.
+  const CLOSERS = ['Browser.close', 'Target.closeTarget', 'Page.close'];
 
   function freePort() {
     const r = spawnSync(PY_BIN, ['-c',
@@ -5243,9 +5255,97 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     return r.stdout.trim();
   }
 
+  function mkHome() {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-connect-test-'));
+  }
+
+  function sleep(s) { spawnSync(PY_BIN, ['-c', `import time; time.sleep(${s})`]); }
+
+  // Alive = the process exists and is not a zombie (a child node has not
+  // reaped yet still answers kill(pid, 0), which would hide a kill).
+  function procAlive(pid) {
+    if (process.platform === 'win32') {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    }
+    const r = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf-8' });
+    const stat = (r.stdout || '').trim();
+    return stat !== '' && !stat.startsWith('Z');
+  }
+
+  function cdpAnswers(port) {
+    const r = spawnSync(PY_BIN, ['-c',
+      `import urllib.request; urllib.request.urlopen("http://127.0.0.1:${port}/json/version", timeout=2)`],
+      { encoding: 'utf-8', timeout: 10000 });
+    return r.status === 0;
+  }
+
+  // A stand-in for the user's own browser: test/connect_fake_cdp.py on a random
+  // free port, carrying --remote-debugging-port=<port> like a real browser (so a
+  // missing guard in cdpilot's kill path would find and signal it).
+  function startFake(mode = 'full', guid = 'guid-user') {
+    const dir = mkHome();
+    const port = freePort();
+    const log = path.join(dir, 'fake-cdp.jsonl');
+    const proc = spawn(PY_BIN, [FAKE_CDP, port, log, mode, guid, `--remote-debugging-port=${port}`],
+      { stdio: 'ignore' });
+    for (let i = 0; i < 50 && !(fs.existsSync(log) && fs.readFileSync(log, 'utf-8').includes('"ready"')); i++) {
+      sleep(0.1);
+    }
+    if (!fs.existsSync(log)) {
+      try { proc.kill('SIGKILL'); } catch {}
+      throw new Error(`fake CDP on ${port} did not start`);
+    }
+    const entries = () => fs.readFileSync(log, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    return {
+      port, log, pid: proc.pid, guid,
+      entries,
+      methods: () => entries().filter((e) => e.method).map((e) => e.method),
+      closers: () => entries().filter((e) => CLOSERS.includes(e.method)
+        || (e.http || '').startsWith('/json/close')),
+      alive: () => procAlive(proc.pid) && (mode !== 'full' || cdpAnswers(port)),
+      stop: () => { try { proc.kill('SIGKILL'); } catch {} },
+    };
+  }
+
+  function writeRegistry(home, projects) {
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, 'registry.json'), JSON.stringify({ version: 1, projects }));
+  }
+
+  function readRegistry(home) {
+    return JSON.parse(fs.readFileSync(path.join(home, 'registry.json'), 'utf-8')).projects;
+  }
+
+  function externalEntry(port, name = 'TestBrowser') {
+    return {
+      cwd: process.cwd(), port: parseInt(port, 10), profile_dir: '/nonexistent/profile',
+      pid: null, created: '2026-01-01T00:00:00', last_used: '2026-01-01T00:00:00',
+      status: 'connected', external: true, browser_name: name,
+    };
+  }
+
+  // Fully isolated env: registry, profile, port, project, no browser to launch.
+  function isoEnv(home, port, projectId, extra = {}) {
+    const env = {
+      ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: String(port), CDPILOT_PROJECT_ID: projectId, CDPILOT_LOG: '0',
+      CHROME_BIN: '/no/such/browser', ...extra,
+    };
+    for (const k of ['CDPILOT_TARGET', 'CDPILOT_NO_AUTOLAUNCH', 'CDPILOT_MODE', 'CDPILOT_STEALTH',
+      'CDPILOT_SHOW', 'CDPILOT_MCP_SESSION', 'CDPILOT_BROWSER_SEARCH_ROOT']) {
+      if (!(k in extra)) delete env[k];
+    }
+    return env;
+  }
+
+  function cli(args, env, timeout = 60000) {
+    return spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf-8', timeout, env });
+  }
+
   // ── Unit: _parse_devtools_active_port ──
 
   test('connect: _parse_devtools_active_port parses valid 2-line content', () => {
+    const home = mkHome();
     const r = spawnSync(PY_BIN, ['-c', [
       'import sys; sys.path.insert(0, "src")',
       'from cdpilot import _parse_devtools_active_port',
@@ -5254,13 +5354,14 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       'assert ws_path == "/devtools/browser/abc-def-123", f"ws_path: {ws_path}"',
       'print("OK")',
     ].join('\n')], { encoding: 'utf-8', timeout: 10000, cwd: path.join(__dirname, '..'),
-      env: { ...process.env, CDP_PORT: '19999', CDPILOT_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-test-')) }
+      env: { ...process.env, CDP_PORT: '19999', CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile') }
     });
     assert.strictEqual(r.status, 0, `parse valid: ${r.stderr}`);
     assert(r.stdout.includes('OK'), r.stdout);
   });
 
   test('connect: _parse_devtools_active_port rejects single-line content', () => {
+    const home = mkHome();
     const r = spawnSync(PY_BIN, ['-c', [
       'import sys; sys.path.insert(0, "src")',
       'from cdpilot import _parse_devtools_active_port',
@@ -5271,13 +5372,14 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       '    assert "need 2 lines" in str(e), str(e)',
       '    print("OK")',
     ].join('\n')], { encoding: 'utf-8', timeout: 10000, cwd: path.join(__dirname, '..'),
-      env: { ...process.env, CDP_PORT: '19999', CDPILOT_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-test-')) }
+      env: { ...process.env, CDP_PORT: '19999', CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile') }
     });
     assert.strictEqual(r.status, 0, `parse single-line: ${r.stderr}`);
     assert(r.stdout.includes('OK'), r.stdout);
   });
 
   test('connect: _parse_devtools_active_port rejects port out of range', () => {
+    const home = mkHome();
     const r = spawnSync(PY_BIN, ['-c', [
       'import sys; sys.path.insert(0, "src")',
       'from cdpilot import _parse_devtools_active_port',
@@ -5288,7 +5390,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       '    assert "out of range" in str(e), str(e)',
       '    print("OK")',
     ].join('\n')], { encoding: 'utf-8', timeout: 10000, cwd: path.join(__dirname, '..'),
-      env: { ...process.env, CDP_PORT: '19999', CDPILOT_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-test-')) }
+      env: { ...process.env, CDP_PORT: '19999', CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile') }
     });
     assert.strictEqual(r.status, 0, `parse out-of-range: ${r.stderr}`);
     assert(r.stdout.includes('OK'), r.stdout);
@@ -5297,34 +5399,32 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   // ── Unit: remote address rejection (exit 2) ──
 
   test('connect: remote address exits 2', () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-connect-test-'));
+    const home = mkHome();
     const r = spawnSync(process.execPath, [CLI, 'connect', 'ws://192.168.1.5:9222/devtools/browser/abc'], {
       encoding: 'utf-8', timeout: 10000,
-      env: { ...process.env, CDPILOT_HOME: home, CDP_PORT: '19999', CDPILOT_LOG: '0' },
+      env: { ...process.env, CDPILOT_HOME: home, CDP_PORT: '19999', CDPILOT_LOG: '0',
+             CDPILOT_PROFILE: path.join(home, 'profile') },
     });
     assert.strictEqual(r.status, 2, `exit: ${r.status}, stderr: ${r.stderr}`);
     assert(/only 127\.0\.0\.1/.test(r.stdout + r.stderr), 'should mention localhost');
   });
 
-  // ── Unit: external registry — stop doesn't kill ──
-
-  test('connect: stop on external registry disconnects without killing', () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-connect-test-'));
+  test('connect: [::1] is rejected with exit 2 (the old allow-list entry could never match)', () => {
+    const home = mkHome();
     const port = freePort();
-    // Write a fake external registry entry
-    const regDir = home;
-    fs.mkdirSync(regDir, { recursive: true });
-    const registry = {
-      version: 1,
-      projects: {
-        'test-proj': {
-          cwd: process.cwd(), port: parseInt(port), profile_dir: path.join(home, 'profile'),
-          pid: null, created: '2026-01-01T00:00:00', last_used: '2026-01-01T00:00:00',
-          status: 'running', external: true, browser_name: 'TestBrowser',
-        }
-      }
-    };
-    fs.writeFileSync(path.join(home, 'registry.json'), JSON.stringify(registry));
+    const r = cli(['connect', `ws://[::1]:${port}/devtools/browser/abc`], isoEnv(home, port, 'v6'));
+    assert.strictEqual(r.status, 2, `exit: ${r.status}, stderr: ${r.stderr}`);
+    assert(/got '\[::1\]'/.test(r.stderr), `must name the host it refused: ${r.stderr}`);
+    assert(!/'\[::1\]'/.test(PY_CONTENT.match(/def _validate_localhost[\s\S]*?\n\n\n/)[0]
+      .split('if host not in')[1].split('\n')[0]), '[::1] must not be in the allow-list');
+  });
+
+  // ── Unit: external registry — stop keeps the browser AND the entry ──
+
+  test('connect: stop on external registry leaves the browser running and keeps the entry', () => {
+    const home = mkHome();
+    const port = freePort();
+    writeRegistry(home, { 'test-proj': externalEntry(port) });
     const r = spawnSync(process.execPath, [CLI, 'stop'], {
       encoding: 'utf-8', timeout: 10000,
       env: { ...process.env, CDPILOT_HOME: home, CDP_PORT: port,
@@ -5332,32 +5432,29 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
              CDPILOT_PROJECT_ID: 'test-proj', CDPILOT_LOG: '0' },
     });
     assert.strictEqual(r.status, 0, `stop exit: ${r.status}, stderr: ${r.stderr}`);
-    assert(/Disconnected.*TestBrowser/.test(r.stdout + r.stderr),
-      `should say disconnected: ${r.stdout}`);
-    assert(/your browser keeps running/.test(r.stdout + r.stderr),
-      `should say keeps running: ${r.stdout}`);
-    // Registry should be cleared
-    const reg2 = JSON.parse(fs.readFileSync(path.join(home, 'registry.json'), 'utf-8'));
-    assert(!reg2.projects['test-proj'], 'registry entry should be removed');
+    assert((r.stdout + r.stderr).includes(LEFT_RUNNING), `should say left running: ${r.stdout}`);
+    // Decision B: only `disconnect` removes an external entry.
+    const reg2 = readRegistry(home);
+    assert(reg2['test-proj'] && reg2['test-proj'].external, 'registry entry must be kept');
+  });
+
+  test('connect: disconnect is the only command that forgets the external entry', () => {
+    const home = mkHome();
+    const port = freePort();
+    writeRegistry(home, { 'test-proj': externalEntry(port, 'TestBrowser') });
+    const r = cli(['disconnect'], isoEnv(home, port, 'test-proj'));
+    assert.strictEqual(r.status, 0, `disconnect exit: ${r.status}, stderr: ${r.stderr}`);
+    assert(/Disconnected.*TestBrowser/.test(r.stdout), `should say disconnected: ${r.stdout}`);
+    assert(/your browser keeps running/.test(r.stdout), `should say keeps running: ${r.stdout}`);
+    assert(!readRegistry(home)['test-proj'], 'disconnect must remove the entry');
   });
 
   // ── Unit: autolaunch refuses when external browser is gone ──
 
   test('connect: autolaunch refuses when external browser is registered but gone', () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-connect-test-'));
+    const home = mkHome();
     const port = freePort();
-    const registry = {
-      version: 1,
-      projects: {
-        'test-ext': {
-          cwd: process.cwd(), port: parseInt(port), profile_dir: path.join(home, 'profile'),
-          pid: null, created: '2026-01-01T00:00:00', last_used: '2026-01-01T00:00:00',
-          status: 'running', external: true, browser_name: 'GoneChrome',
-        }
-      }
-    };
-    fs.mkdirSync(home, { recursive: true });
-    fs.writeFileSync(path.join(home, 'registry.json'), JSON.stringify(registry));
+    writeRegistry(home, { 'test-ext': externalEntry(port, 'GoneChrome') });
     const r = spawnSync(process.execPath, [CLI, 'content'], {
       encoding: 'utf-8', timeout: 15000,
       env: { ...process.env, CDPILOT_HOME: home, CDP_PORT: port,
@@ -5370,19 +5467,225 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       `should say browser is gone: ${r.stderr}`);
   });
 
-  // ── Unit: --auto with fake DevToolsActivePort via CDPILOT_BROWSER_SEARCH_ROOT ──
+  for (const args of [['content'], ['go', 'https://example.com/'], ['tabs'], ['new-tab'],
+    ['launch']]) {
+    test(`external guard: gone connected browser → \`${args.join(' ')}\` exits 1, never launches`, () => {
+      const home = mkHome();
+      const port = freePort();
+      writeRegistry(home, { gone: externalEntry(port, 'GoneChrome') });
+      // CHROME_BIN points nowhere: any launch attempt would print "Cannot start
+      // browser '/no/such/browser'" (directly or as the auto-launch failure).
+      const r = cli(args, isoEnv(home, port, 'gone'), 30000);
+      const out = r.stdout + r.stderr;
+      assert.strictEqual(r.status, 1, `exit ${r.status}: ${out}`);
+      assert(out.includes(GONE), `must say the connected browser is gone: ${out}`);
+      assert(!/no\/such\/browser|Launching browser|auto-launch|launched it/.test(out),
+        `must not try to launch a browser: ${out}`);
+      assert.deepStrictEqual(readRegistry(home).gone, externalEntry(port, 'GoneChrome'),
+        'the external entry must be left exactly as it was');
+    });
+  }
+
+  test('external guard: `projects` and a port allocation keep a gone external entry', () => {
+    const home = mkHome();
+    const port = freePort();  // nothing listens: the old cleanup called this entry dead
+    writeRegistry(home, { gone: externalEntry(port) });
+    const p = cli(['projects'], isoEnv(home, freePort(), 'someone-else'));
+    assert.strictEqual(p.status, 0, `projects: ${p.stdout}${p.stderr}`);
+    assert(/gone\s+\d+\s+\S+\s+gone\s+\(ext\)/.test(p.stdout), `projects must list it as gone: ${p.stdout}`);
+    assert(readRegistry(home).gone, '`projects` must not prune the external entry');
+    // Port allocation (every new project runs it) over a private random range.
+    const lo = parseInt(freePort(), 10);
+    const r = spawnSync(PY_BIN, ['-c', [
+      'import json, sys',
+      `sys.path.insert(0, ${JSON.stringify(path.join(__dirname, '..', 'src'))})`,
+      'import cdpilot as m',
+      `m.CDPILOT_PORT_RANGE_START, m.CDPILOT_PORT_RANGE_END = ${lo}, ${lo + 3}`,
+      'print("PORT", m._allocate_port("new-project"))',
+      'print("LEFT", json.dumps(sorted(m._cleanup_registry())))',
+    ].join('\n')], { encoding: 'utf-8', timeout: 20000,
+      env: isoEnv(home, freePort(), 'importer') });
+    assert.strictEqual(r.status, 0, `allocate: ${r.stdout}${r.stderr}`);
+    assert(/LEFT \["gone"\]/.test(r.stdout), `cleanup must keep the external entry: ${r.stdout}`);
+    assert(readRegistry(home).gone, 'a port allocation must not prune the external entry');
+  });
+
+  // ── Behaviour: no destructive command reaches a connected browser ──
+
+  const DESTRUCTIVE = [
+    ['close'], ['close', '--force'], ['stop'], ['stop', '--smart'], ['stop', '--smart', '--force'],
+    ['project-stop', 'ext-proj'], ['stop-all'], ['session-close'], ['tabs', '--reap', '--all'],
+    ['close-tab'],
+  ];
+  for (const args of DESTRUCTIVE) {
+    test(`external guard: \`${args.join(' ')}\` leaves a connected browser alive, sends no close`, () => {
+      const fake = startFake();
+      try {
+        const home = mkHome();
+        writeRegistry(home, { 'ext-proj': externalEntry(fake.port) });
+        const r = cli(args, isoEnv(home, fake.port, 'ext-proj'));
+        const out = r.stdout + r.stderr;
+        assert.strictEqual(r.status, 0, `exit ${r.status}: ${out}`);
+        assert(out.includes(LEFT_RUNNING), `must say it left the browser running: ${out}`);
+        assert.deepStrictEqual(fake.closers(), [], `no close may reach the browser: ${out}`);
+        assert(fake.alive(), `the connected browser (pid ${fake.pid}) must still be running`);
+        assert(readRegistry(home)['ext-proj'].external, 'the external entry must be kept');
+      } finally { fake.stop(); }
+    });
+  }
+
+  test('external guard: `wipe` is refused on a connected browser (cookies, storage, tabs)', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { 'ext-proj': externalEntry(fake.port) });
+      const r = cli(['wipe', '--all'], isoEnv(home, fake.port, 'ext-proj'));
+      assert.strictEqual(r.status, 1, `exit ${r.status}: ${r.stdout}${r.stderr}`);
+      assert(/wipe refused/.test(r.stderr), r.stderr);
+      const sent = fake.methods();
+      assert(!sent.some((m) => /deleteCookies|clearDataForOrigin|closeTarget/.test(m)),
+        `nothing may be cleared: ${sent}`);
+      assert(fake.alive(), 'the connected browser must still be running');
+    } finally { fake.stop(); }
+  });
+
+  test('external guard: MCP browser_close {force:true} leaves a connected browser alive', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { 'ext-proj': externalEntry(fake.port) });
+      const input = [
+        { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+        { jsonrpc: '2.0', id: 2, method: 'tools/call',
+          params: { name: 'browser_close', arguments: { force: true } } },
+        { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'browser_launch', arguments: {} } },
+      ].map((m) => JSON.stringify(m)).join('\n') + '\n';
+      const r = spawnSync(PY_BIN, [PY_PATH, 'mcp'], { encoding: 'utf-8', timeout: 90000, input,
+        env: isoEnv(home, fake.port, 'ext-proj') });
+      const replies = r.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      const text = (id) => JSON.stringify((replies.find((x) => x.id === id) || {}).result || {});
+      assert(text(2).includes(LEFT_RUNNING), `browser_close must only disconnect: ${r.stdout}${r.stderr}`);
+      assert(/Connected browser in use/.test(text(3)), `browser_launch must not launch: ${text(3)}`);
+      assert.deepStrictEqual(fake.closers(), [], 'no close may reach the browser');
+      assert(fake.alive(), 'the connected browser must still be running');
+    } finally { fake.stop(); }
+  });
+
+  test('external guard: idle watcher, serve teardown and the stop helpers never close a connected browser', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      // The entry even carries the fake's pid, so the watcher's ownership test
+      // alone would accept it: only the external guard keeps it from closing.
+      writeRegistry(home, { ext: { ...externalEntry(fake.port), pid: fake.pid } });
+      const r = spawnSync(PY_BIN, ['-c', [
+        'import json, sys, time',
+        `sys.path.insert(0, ${JSON.stringify(path.join(__dirname, '..', 'src'))})`,
+        'import cdpilot as m',
+        `P, FPID = ${fake.port}, ${fake.pid}`,
+        'ver = m._idle_version(P)',
+        'state = {"token": "t1", "pid": None, "port": P, "project_id": "ext", "browser_pid": FPID,',
+        '         "browser_ws": ver["webSocketDebuggerUrl"], "minutes": 0.01, "started": time.time() - 3600}',
+        'm._idle_save_state(P, state)',
+        'out = {"owns": m._idle_owns_browser(state, m._load_registry(), ver)}',
+        'out["step"] = m._idle_watcher_step(P, "t1", now=time.time() + 3600)',
+        'm._api_session_store["sess_x"] = {"id": "sess_x", "port": P}',
+        'out["release"] = m._api_release_session("sess_x")',
+        'out["stop"] = m._stop_browser_on_port(P, verbose=True)',
+        'out["cdp_close"] = m._cdp_browser_close(P)',
+        'print("RESULT=" + json.dumps(out))',
+      ].join('\n')], { encoding: 'utf-8', timeout: 60000,
+        env: isoEnv(home, freePort(), 'importer') });
+      const line = (r.stdout || '').split('\n').find((l) => l.startsWith('RESULT='));
+      assert(line, `no result: ${r.stdout}${r.stderr}`);
+      const res = JSON.parse(line.slice(7));
+      assert.strictEqual(res.owns, true, 'precondition: without the guard the watcher would own it');
+      assert.strictEqual(res.step, 'exit', `the idle watcher must stand down: ${line}`);
+      assert.strictEqual(res.stop, false, `_stop_browser_on_port must stop nothing: ${line}`);
+      assert.strictEqual(res.cdp_close, false, `_cdp_browser_close must send nothing: ${line}`);
+      assert.deepStrictEqual(fake.closers(), [], 'no close may reach the browser');
+      assert(fake.alive(), 'the connected browser must still be running');
+      assert(readRegistry(home).ext.external, 'the external entry must be kept');
+    } finally { fake.stop(); }
+  });
+
+  test('external guard: harness control — a cdpilot-owned entry DOES get Browser.close', () => {
+    // Proves the fake records what the guard is supposed to prevent.
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { own: { ...externalEntry(fake.port), external: undefined,
+        status: 'running', browser_name: undefined } });
+      const r = cli(['close', '--force'], isoEnv(home, fake.port, 'own'));
+      assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`);
+      assert(fake.methods().includes('Browser.close'), `control must see Browser.close: ${fake.methods()}`);
+    } finally { fake.stop(); }
+  });
+
+  test('external guard: no stealth/glow/input blocker into a connected browser (mode.json stealth, MCP)', () => {
+    const run = (external) => {
+      const fake = startFake();
+      try {
+        const home = mkHome();
+        const entry = external ? externalEntry(fake.port)
+          : { ...externalEntry(fake.port), external: undefined, status: 'running' };
+        writeRegistry(home, { proj: entry });
+        fs.mkdirSync(path.join(home, 'profile'), { recursive: true });
+        fs.writeFileSync(path.join(home, 'profile', 'mode.json'), JSON.stringify({ tier: 'stealth' }));
+        const r = cli(['go', 'https://example.com/'],
+          isoEnv(home, fake.port, 'proj', { CDPILOT_MCP_SESSION: '1' }));
+        assert.strictEqual(r.status, 0, `go exit ${r.status}: ${r.stdout}${r.stderr}`);
+        const entries = fake.entries().filter((e) => e.method);
+        return {
+          methods: entries.map((e) => e.method),
+          tags: [...new Set(entries.flatMap((e) => e.tags || []))].sort(),
+        };
+      } finally { fake.stop(); }
+    };
+    const ext = run(true);
+    assert(ext.methods.includes('Page.navigate'), `go must still navigate: ${ext.methods}`);
+    assert(!ext.methods.includes('Page.addScriptToEvaluateOnNewDocument'),
+      `no addScriptToEvaluateOnNewDocument into a connected browser: ${ext.methods}`);
+    assert(!ext.methods.includes('Emulation.setUserAgentOverride'), 'no UA override');
+    assert.deepStrictEqual(ext.tags, [], `no stealth/glow/input-blocker script: ${ext.tags}`);
+    // Control: the same go into a cdpilot-launched browser injects all three.
+    const own = run(false);
+    assert(own.methods.includes('Page.addScriptToEvaluateOnNewDocument'), `control: ${own.methods}`);
+    assert.deepStrictEqual(own.tags, ['glow', 'input-blocker', 'stealth'], `control tags: ${own.tags}`);
+  });
+
+  test('external guard: connect refuses over a live cdpilot-launched browser (no orphan)', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      const own = { ...externalEntry(fake.port), external: undefined, browser_name: undefined,
+        pid: fake.pid, status: 'running' };
+      writeRegistry(home, { mine: own });
+      const r = cli(['connect', String(fake.port)], isoEnv(home, fake.port, 'mine'));
+      assert.strictEqual(r.status, 1, `exit ${r.status}: ${r.stdout}${r.stderr}`);
+      assert(/stop it first \(`cdpilot stop`\) or use another project/i.test(r.stderr), r.stderr);
+      // Another project may not take over that browser's port either.
+      const r2 = cli(['connect', String(fake.port)], isoEnv(home, freePort(), 'other'));
+      assert.strictEqual(r2.status, 1, `other project: ${r2.stdout}${r2.stderr}`);
+      const reg = readRegistry(home);
+      assert.strictEqual(reg.mine.pid, fake.pid, 'the cdpilot browser keeps its pid (not orphaned)');
+      assert(!reg.mine.external && !reg.other, `registry must be unchanged: ${JSON.stringify(reg)}`);
+    } finally { fake.stop(); }
+  });
+
+  // ── connect --auto ──
 
   test('connect: --auto finds DevToolsActivePort via CDPILOT_BROWSER_SEARCH_ROOT', () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-connect-test-'));
+    const home = mkHome();
     const searchRoot = path.join(home, 'browsers');
     const chromeDir = path.join(searchRoot, 'FakeChrome');
     fs.mkdirSync(chromeDir, { recursive: true });
-    // We need a real CDP port to probe. Start a headless Chrome for this.
-    // Instead, test that the parsing works with a port that doesn't answer — it should fail gracefully.
+    // A port nothing listens on: the file is found, the browser is not.
     fs.writeFileSync(path.join(chromeDir, 'DevToolsActivePort'), '19998\n/devtools/browser/fake-uuid\n');
     const r = spawnSync(process.execPath, [CLI, 'connect', '--auto'], {
       encoding: 'utf-8', timeout: 10000,
       env: { ...process.env, CDPILOT_HOME: home, CDP_PORT: '19999',
+             CDPILOT_PROFILE: path.join(home, 'profile'),
              CDPILOT_BROWSER_SEARCH_ROOT: searchRoot, CDPILOT_LOG: '0' },
     });
     // It finds the file but CDP won't be responding, so it should fail gracefully
@@ -5390,6 +5693,112 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert(/FakeChrome.*port 19998.*not responding/.test(r.stdout + r.stderr)
            || /CDP not responding/.test(r.stdout + r.stderr),
       `should mention FakeChrome or not responding: ${r.stderr}`);
+  });
+
+  test('connect --auto: skips stale files (dead port, other GUID) and connects to the live one', () => {
+    const other = startFake('full', 'guid-someone-else');
+    const live = startFake('full', 'guid-live');
+    try {
+      const home = mkHome();
+      const root = path.join(home, 'browsers');
+      const put = (name, port, guid) => {
+        fs.mkdirSync(path.join(root, name), { recursive: true });
+        fs.writeFileSync(path.join(root, name, 'DevToolsActivePort'), `${port}\n/devtools/browser/${guid}\n`);
+      };
+      put('A-dead', freePort(), 'guid-dead');           // nothing listens any more
+      put('B-reused', other.port, 'guid-left-over');     // port now another browser's
+      put('C-live', live.port, 'guid-live');
+      const r = cli(['connect', '--auto'], isoEnv(home, freePort(), 'auto',
+        { CDPILOT_BROWSER_SEARCH_ROOT: root }));
+      assert.strictEqual(r.status, 0, `exit ${r.status}: ${r.stdout}${r.stderr}`);
+      assert(new RegExp(`Connected to FakeChrome.* on port ${live.port}`).test(r.stdout), r.stdout);
+      assert(/skipped A-dead .*not responding/.test(r.stderr), r.stderr);
+      assert(/skipped B-reused .*another browser answers there/.test(r.stderr), r.stderr);
+      const entry = readRegistry(home).auto;
+      assert(entry.external && entry.port === parseInt(live.port, 10), JSON.stringify(entry));
+      assert.deepStrictEqual(other.methods(), [], 'the stale candidate gets no CDP command');
+    } finally { other.stop(); live.stop(); }
+  });
+
+  test('connect --auto: chrome://inspect ws-only endpoint → unsupported message, exit 2', () => {
+    const ws = startFake('ws-only', 'guid-inspect');
+    try {
+      const home = mkHome();
+      const root = path.join(home, 'browsers');
+      fs.mkdirSync(path.join(root, 'Chrome'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'Chrome', 'DevToolsActivePort'),
+        `${ws.port}\n/devtools/browser/guid-inspect\n`);
+      const r = cli(['connect', '--auto'], isoEnv(home, freePort(), 'inspect',
+        { CDPILOT_BROWSER_SEARCH_ROOT: root }));
+      assert.strictEqual(r.status, 2, `exit ${r.status}: ${r.stdout}${r.stderr}`);
+      assert(/chrome:\/\/inspect remote-debugging mode/.test(r.stderr), r.stderr);
+      assert(/does not support that mode yet/.test(r.stderr), r.stderr);
+      for (const os_ of ['macOS', 'Linux', 'Windows']) {
+        assert(new RegExp(`${os_}:.*--remote-debugging-port=\\d+ --user-data-dir=`).test(r.stderr),
+          `exact ${os_} command expected: ${r.stderr}`);
+      }
+      assert(!fs.existsSync(path.join(home, 'registry.json')) || !readRegistry(home).inspect,
+        'nothing may be registered');
+      assert(ws.entries().some((e) => e.ws_open), 'the WebSocket path must have been probed');
+      assert.deepStrictEqual(ws.methods(), [], 'the probe sends no CDP command');
+    } finally { ws.stop(); }
+  });
+
+  // ── Tripwire: every destructive call site goes through the guard ──
+
+  test('external guard: tripwire — Browser.close / kill / tab-close call sites are all known', () => {
+    // A static check, on purpose, next to the behaviour tests above: a NEW
+    // function that closes a browser, closes tabs or signals a process fails
+    // here until it is either guarded by _is_external() or listed as not
+    // touching a browser.
+    assert(/def _refuse_external[\s\S]*?if _is_external\(\):[\s\S]*?sys\.exit\(1\)/.test(PY_CONTENT),
+      '_refuse_external must check _is_external() and exit');
+    const GUARDED = [  // must call _is_external( themselves
+      '_idle_watcher_step', '_cleanup_idle_sessions', 'cmd_wipe', '_close_target', '_reap_tabs',
+      '_browser_close_graceful', 'cmd_close', 'cmd_session_close', 'cmd_close_tab',
+      '_cdp_browser_close', '_stop_browser_on_port', 'cmd_stop', 'cmd_project_stop', 'cmd_stop_all',
+    ];
+    const VIA_GUARDED_HELPER = {  // reach a browser only through a guarded helper
+      _api_create_session: /_stop_browser_on_port\(/, _api_release_session: /_stop_browser_on_port\(|Browser\.close/,
+    };
+    const NOT_A_BROWSER = [  // signal 0 probes / cdpilot's own helper processes
+      '_pid_alive', '_watch_pid_alive', '_watch_daemon_run', 'cmd_watch_start', 'cmd_watch_stop',
+      '_arm_timeout_watchdog',
+    ];
+    const PAT = /Browser\.close|os\.kill\(|taskkill|Target\.closeTarget|\/json\/close|Page\.close|_stop_browser_on_port\(|_cdp_browser_close\(|_browser_close_graceful\(|_close_target\(|\.kill\(\)|\.terminate\(\)|SIGKILL|SIGTERM/;
+    const lines = PY_CONTENT.split('\n');
+    const bodies = {};
+    const hits = {};
+    let cur = '<module>';
+    for (const line of lines) {
+      const m = line.match(/^(?:async\s+)?def\s+(\w+)|^class\s+(\w+)/);
+      if (m) cur = m[1] || m[2];
+      else if (/^[A-Za-z_]/.test(line)) cur = '<module>';
+      bodies[cur] = (bodies[cur] || '') + line + '\n';
+      if (/^\s*#/.test(line)) continue;
+      if (PAT.test(line)) (hits[cur] = hits[cur] || []).push(line.trim());
+    }
+    const known = new Set([...GUARDED, ...Object.keys(VIA_GUARDED_HELPER), ...NOT_A_BROWSER]);
+    const unknown = Object.keys(hits).filter((f) => !known.has(f));
+    assert.deepStrictEqual(unknown, [],
+      `new destructive call site(s) outside the guarded helpers: ${unknown.map((f) => `${f}: ${hits[f][0]}`).join(' | ')}`);
+    for (const f of GUARDED) {
+      assert(bodies[f], `guarded function ${f} is gone — update the tripwire`);
+      assert(/_is_external\(|_refuse_external\(/.test(bodies[f]),
+        `${f} must call _is_external() (or _refuse_external()) before closing/killing`);
+    }
+    for (const [f, allowed] of Object.entries(VIA_GUARDED_HELPER)) {
+      for (const h of hits[f] || []) {
+        assert(allowed.test(h), `${f} may only reach a browser via a guarded helper: ${h}`);
+      }
+    }
+    // The helpers that actually send Browser.close / signal: the guard comes first.
+    for (const f of ['_stop_browser_on_port', '_cdp_browser_close', '_browser_close_graceful']) {
+      const body = bodies[f];
+      const guard = body.search(/_is_external\(/);
+      const act = body.search(/\n\s+(?!#)[^\n]*(Browser\.close"|_cdp_browser_close\(port\)|os\.kill\()/);
+      assert(guard > 0 && (act < 0 || guard < act), `${f}: _is_external() must run before it acts`);
+    }
   });
 
   // ── Unit: connect wired into dispatch, documented ──
@@ -5418,7 +5827,67 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       'python __doc__ must document CDPILOT_BROWSER_SEARCH_ROOT');
   });
 
+  test('connect: README and CHANGELOG say what the code does', () => {
+    const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+    const sec = readme.split('### Use your own browser')[1].split('\n### ')[0];
+    assert(!/--mode stealth/.test(sec), 'README: there is no --mode stealth flag');
+    assert(!/Chrome\/131/.test(sec), 'README: no Chrome/131 in a Chrome 144+ flow');
+    assert(!/fingerprint stays untouched|not applied automatically/.test(sec),
+      'README: old claims about stealth must be gone');
+    assert(/not supported yet[\s\S]{0,40}chrome:\/\/inspect|chrome:\/\/inspect[\s\S]*not (yet )?supported/i.test(sec),
+      'README must say the chrome://inspect mode is not supported yet');
+    assert(/--remote-debugging-port=\d+ --user-data-dir=/.test(sec),
+      'README must show the supported --remote-debugging-port + --user-data-dir start');
+    assert(/visible window|headless/i.test(sec), 'README must mention the no-connect path (own visible window)');
+    assert(/Risks/i.test(sec), 'README must list the risks');
+    const changelog = fs.readFileSync(path.join(__dirname, '..', 'CHANGELOG.md'), 'utf8');
+    const unreleased = changelog.split(/^## \[/m)[1] || '';
+    assert(!/Chrome 144\+ with remote debugging enabled via `chrome:\/\/inspect/.test(unreleased),
+      'CHANGELOG must not promise chrome://inspect support');
+    assert(!/Stealth injections are NOT applied automatically/.test(unreleased),
+      'CHANGELOG: stale stealth claim');
+  });
+
   // ── E2E: connect to a headless Chrome started by the test itself ──
+
+  function findBrowserBin() {
+    const candidates = [
+      process.env.CHROME_BIN,
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+      '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable',
+      '/usr/bin/chromium', '/usr/bin/chromium-browser',
+    ].filter(Boolean);
+    return candidates.find((c) => fs.existsSync(c)) || null;
+  }
+
+  function startHeadless(browserBin, cdpPort, userDataDir) {
+    const chrome = spawn(browserBin, [
+      `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${userDataDir}`,
+      '--headless=new', '--no-first-run', '--no-default-browser-check',
+      '--disable-background-networking', '--remote-allow-origins=*', 'about:blank',
+    ], { stdio: 'ignore', detached: true });
+    chrome.unref();
+    let wsPath = '';
+    for (let i = 0; i < 60 && !wsPath; i++) {
+      try {
+        const vr = execFileSync(PY_BIN, ['-c',
+          `import json, urllib.request; d = json.loads(urllib.request.urlopen("http://127.0.0.1:${cdpPort}/json/version", timeout=1).read()); print(d.get("webSocketDebuggerUrl",""))`
+        ], { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+        if (vr.trim()) wsPath = new URL(vr.trim()).pathname;
+      } catch {}
+      if (!wsPath) sleep(0.25);
+    }
+    const stop = () => {
+      // The whole detached group: the browser and its helpers.
+      try { process.kill(-chrome.pid, 'SIGTERM'); } catch {}
+      sleep(0.5);
+      try { process.kill(-chrome.pid, 'SIGKILL'); } catch {}
+    };
+    if (!wsPath) { stop(); throw new Error('Chrome did not start in time'); }
+    return { chrome, pid: chrome.pid, wsPath, stop };
+  }
 
   if (process.env.CDPILOT_E2E !== '1') {
     console.log('  - skipped: connect e2e (set CDPILOT_E2E=1)');
@@ -5426,84 +5895,27 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     let e2eConnect = null;
 
     test('connect e2e: start a headless Chrome and connect to it', () => {
-      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-connect-e2e-'));
+      const home = mkHome();
       const userDataDir = path.join(home, 'chrome-profile');
       fs.mkdirSync(userDataDir, { recursive: true });
       const cdpPort = freePort();
-
-      // Find a browser binary (use the same logic as cdpilot setup)
-      const setupOut = spawnSync(process.execPath, [CLI, 'setup'], {
-        encoding: 'utf-8', timeout: 10000,
-        env: { ...process.env, CDPILOT_HOME: home, CDP_PORT: cdpPort },
-      });
-      const browserMatch = (setupOut.stdout + setupOut.stderr).match(/Browser:\s+(.+)/);
-      let browserBin = null;
-      if (browserMatch) {
-        // setup says "Browser: /path/to/chrome"
-        browserBin = browserMatch[1].trim();
-      }
-      if (!browserBin) {
-        // Fallback: try common paths
-        const candidates = [
-          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-          '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-          '/usr/bin/google-chrome',
-          '/usr/bin/chromium-browser',
-        ];
-        for (const c of candidates) {
-          if (fs.existsSync(c)) { browserBin = c; break; }
-        }
-      }
-      assert(browserBin, `No browser found for e2e connect test (setup: ${setupOut.stdout})`);
+      const browserBin = findBrowserBin();
+      assert(browserBin, 'No browser found for e2e connect test');
 
       // Start the browser ourselves (NOT via cdpilot) with --user-data-dir and --remote-debugging-port
-      const chromeArgs = [
-        `--remote-debugging-port=${cdpPort}`,
-        `--user-data-dir=${userDataDir}`,
-        '--headless=new',
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-background-networking',
-        '--remote-allow-origins=*',
-        'about:blank',
-      ];
-      const chrome = spawn(browserBin, chromeArgs, {
-        stdio: 'ignore', detached: true,
-      });
-      chrome.unref();
-
-      const env = {
-        ...process.env, CDPILOT_HOME: home, CDP_PORT: String(cdpPort),
-        CDPILOT_PROFILE: path.join(home, 'cdpilot-profile'),
-        CHROME_HEADLESS: '1', CDPILOT_LOG: '0',
-      };
-      delete env.CDPILOT_TARGET;
-
+      const browser = startHeadless(browserBin, cdpPort, userDataDir);
+      const env = isoEnv(home, cdpPort, 'connect-e2e', { CDPILOT_PROFILE: path.join(home, 'cdpilot-profile') });
       const c = (...cArgs) => spawnSync(process.execPath, [CLI, ...cArgs], {
         encoding: 'utf-8', timeout: 60000, env,
       });
-
-      // Wait for Chrome to be ready
-      let ready = false;
-      for (let i = 0; i < 40; i++) {
-        try {
-          execFileSync(PY_BIN, ['-c',
-            `import urllib.request; urllib.request.urlopen("http://127.0.0.1:${cdpPort}/json/version", timeout=1)`
-          ], { timeout: 5000 });
-          ready = true;
-          break;
-        } catch { /* not ready yet */ }
-        spawnSync('sleep', ['0.25']);
-      }
-      if (!ready) {
-        try { chrome.kill(); } catch {}
-        throw new Error('Chrome did not start in time');
-      }
-
-      e2eConnect = { c, chrome, cdpPort, home, env, pid: chrome.pid };
+      e2eConnect = { c, browser, cdpPort, home, env, pid: browser.pid };
     });
 
     const needConnect = () => { assert(e2eConnect, 'connect e2e setup failed'); return e2eConnect; };
+    const browserAlive = () => {
+      const { pid, cdpPort } = needConnect();
+      return procAlive(pid) && cdpAnswers(cdpPort);
+    };
 
     try {
       test('connect e2e: connect <port> registers external browser', () => {
@@ -5528,95 +5940,67 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
         assert(/clicked/.test(title.stdout), `title should be clicked: ${title.stdout}`);
       });
 
-      test('connect e2e: stop disconnects without killing the browser process', () => {
-        const { c, pid } = needConnect();
-        const r = c('stop');
-        assert.strictEqual(r.status, 0, `stop exit: ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+      for (const args of [['close', '--force'], ['stop', '--smart', '--force'],
+        ['project-stop', 'connect-e2e'], ['stop'], ['stop-all']]) {
+        test(`connect e2e: \`${args.join(' ')}\` leaves the connected Chrome running`, () => {
+          const { c } = needConnect();
+          const r = c(...args);
+          assert.strictEqual(r.status, 0, `${args.join(' ')} exit: ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+          assert((r.stdout + r.stderr).includes(LEFT_RUNNING), `should say left running: ${r.stdout}${r.stderr}`);
+          sleep(1);  // a Browser.close would have ended it by now
+          assert(browserAlive(), `Chrome must still be running after ${args.join(' ')}`);
+          const t = c('content');
+          assert.strictEqual(t.status, 0, `still connected after ${args.join(' ')}: ${t.stdout}${t.stderr}`);
+        });
+      }
+
+      test('connect e2e: disconnect forgets the browser, which keeps running', () => {
+        const { c, home } = needConnect();
+        const r = c('disconnect');
+        assert.strictEqual(r.status, 0, `disconnect exit: ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
         assert(/Disconnected/.test(r.stdout + r.stderr), `should say Disconnected: ${r.stdout}`);
         assert(/keeps running/.test(r.stdout + r.stderr), `should say keeps running: ${r.stdout}`);
-        // The browser process should STILL be alive
-        let alive = false;
-        try { process.kill(pid, 0); alive = true; } catch {}
-        assert(alive, 'browser process should still be alive after stop');
+        assert(!readRegistry(home)['connect-e2e'], 'entry must be gone after disconnect');
+        assert(browserAlive(), 'browser process should still be alive after disconnect');
       });
     } finally {
-      if (e2eConnect) {
-        try { e2eConnect.chrome.kill('SIGTERM'); } catch {}
-        // Wait briefly for cleanup
-        spawnSync('sleep', ['0.5']);
-        try { e2eConnect.chrome.kill('SIGKILL'); } catch {}
-      }
+      if (e2eConnect) e2eConnect.browser.stop();
     }
 
-    // ── E2E: --auto with fake DevToolsActivePort pointing at the test's Chrome ──
+    // ── E2E: --auto with a DevToolsActivePort pointing at the test's Chrome ──
 
     test('connect e2e: --auto finds DevToolsActivePort written by test', () => {
-      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-connect-auto-e2e-'));
+      const home = mkHome();
       const userDataDir = path.join(home, 'chrome-profile');
       fs.mkdirSync(userDataDir, { recursive: true });
       const cdpPort = freePort();
-
-      // Find browser
-      let browserBin = null;
-      const candidates = [
-        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-        '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-        '/usr/bin/google-chrome', '/usr/bin/chromium-browser',
-      ];
-      for (const c of candidates) {
-        if (fs.existsSync(c)) { browserBin = c; break; }
-      }
+      const browserBin = findBrowserBin();
       if (!browserBin) {
         console.log('  - skipped: connect --auto e2e (no browser found)');
         return;
       }
-
-      const chrome = spawn(browserBin, [
-        `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${userDataDir}`,
-        '--headless=new', '--no-first-run', '--no-default-browser-check',
-        '--disable-background-networking', '--remote-allow-origins=*', 'about:blank',
-      ], { stdio: 'ignore', detached: true });
-      chrome.unref();
-
+      const browser = startHeadless(browserBin, cdpPort, userDataDir);
       try {
-        // Wait for Chrome
-        let ready = false, wsPath = '';
-        for (let i = 0; i < 40; i++) {
-          try {
-            const vr = execFileSync(PY_BIN, ['-c',
-              `import json, urllib.request; d = json.loads(urllib.request.urlopen("http://127.0.0.1:${cdpPort}/json/version", timeout=1).read()); print(d.get("webSocketDebuggerUrl",""))`
-            ], { encoding: 'utf-8', timeout: 5000 });
-            if (vr.trim()) {
-              wsPath = new URL(vr.trim()).pathname;
-              ready = true;
-              break;
-            }
-          } catch {}
-          spawnSync('sleep', ['0.25']);
-        }
-        assert(ready, 'Chrome did not start for --auto test');
-
-        // Write a fake DevToolsActivePort in a search root
+        // Chrome wrote its own DevToolsActivePort into the profile: use that
+        // dir as a search root entry, plus a stale file next to it.
         const searchRoot = path.join(home, 'browsers');
+        fs.mkdirSync(path.join(searchRoot, 'AStale'), { recursive: true });
+        fs.writeFileSync(path.join(searchRoot, 'AStale', 'DevToolsActivePort'),
+          `${freePort()}\n/devtools/browser/left-over\n`);
         const browserDir = path.join(searchRoot, 'TestChrome');
         fs.mkdirSync(browserDir, { recursive: true });
+        const own = path.join(userDataDir, 'DevToolsActivePort');
         fs.writeFileSync(path.join(browserDir, 'DevToolsActivePort'),
-          `${cdpPort}\n${wsPath}\n`);
-
-        const env = {
-          ...process.env, CDPILOT_HOME: home, CDP_PORT: String(cdpPort),
-          CDPILOT_BROWSER_SEARCH_ROOT: searchRoot, CDPILOT_LOG: '0',
-        };
-        const r = spawnSync(process.execPath, [CLI, 'connect', '--auto'], {
-          encoding: 'utf-8', timeout: 15000, env,
-        });
+          fs.existsSync(own) ? fs.readFileSync(own, 'utf-8') : `${cdpPort}\n${browser.wsPath}\n`);
+        const r = cli(['connect', '--auto'], isoEnv(home, freePort(), 'auto-e2e',
+          { CDPILOT_BROWSER_SEARCH_ROOT: searchRoot }), 15000);
         assert.strictEqual(r.status, 0, `--auto exit: ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
         assert(/Connected to/.test(r.stdout), `should say Connected: ${r.stdout}`);
         assert(/will never close/.test(r.stdout), `should say never close: ${r.stdout}`);
+        assert(/skipped AStale/.test(r.stderr), `stale file must be skipped: ${r.stderr}`);
+        assert.strictEqual(readRegistry(home)['auto-e2e'].port, parseInt(cdpPort, 10));
       } finally {
-        try { chrome.kill('SIGTERM'); } catch {}
-        spawnSync('sleep', ['0.5']);
-        try { chrome.kill('SIGKILL'); } catch {}
+        browser.stop();
       }
     });
   }
