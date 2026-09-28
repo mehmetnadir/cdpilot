@@ -1,0 +1,74 @@
+<!doctype html>
+<!--
+  iframe fixture — payment-style form loaded inside top.html.
+  ?nested=<url>  src of iframe#nested (default: nested.html, same origin).
+  Every interaction is recorded in <body data-log> so any JS world
+  (main or isolated) can read it back.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>cdpilot frames: inner</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 8px; }
+    label { display: block; margin: 4px 0; }
+    iframe { width: 460px; height: 150px; border: 3px solid #888; }
+  </style>
+</head>
+<body data-log="">
+  <form id="pay" onsubmit="return false">
+    <label for="cc">Card number</label>
+    <input id="cc" name="cardnumber" autocomplete="off">
+    <label for="cvc">Security code</label>
+    <input id="cvc" name="cvc" autocomplete="off">
+    <label for="country">Country</label>
+    <select id="country" name="country">
+      <option value="">Choose</option>
+      <option value="TR">Turkey</option>
+      <option value="DE">Germany</option>
+    </select>
+    <button id="pay-btn" type="button">Pay now</button>
+  </form>
+  <p id="status">idle</p>
+  <iframe id="nested" title="Nested frame"></iframe>
+  <script>
+    window.FRAME_NAME = 'inner';
+    function log(s) { document.body.dataset.log += s + ';'; }
+    document.getElementById('pay-btn').addEventListener('click', function (e) {
+      document.getElementById('status').textContent = 'paid';
+      log('pay-click:' + (e.isTrusted ? 'trusted' : 'script'));
+    });
+    document.getElementById('pay-btn').addEventListener('mouseover', function (e) {
+      log('pay-hover:' + (e.isTrusted ? 'trusted' : 'script'));
+    });
+    ['cc', 'cvc'].forEach(function (id) {
+      var el = document.getElementById(id);
+      el.addEventListener('input', function () { log(id + '-input'); });
+      el.addEventListener('keydown', function (e) {
+        if (e.isTrusted) log(id + '-key');
+      });
+    });
+    document.getElementById('country').addEventListener('change', function (e) {
+      log('country=' + e.target.value);
+    });
+    // hover / dblclick / rightclick, kept apart from data-log: data-mouse.
+    ['mouseover', 'dblclick', 'contextmenu'].forEach(function (type) {
+      document.getElementById('pay-btn').addEventListener(type, function (e) {
+        document.body.dataset.mouse = (document.body.dataset.mouse || '') + 'pay-' + type + ':'
+          + (e.isTrusted ? 'trusted' : 'script') + ';';
+      });
+    });
+    var q = new URLSearchParams(location.search);
+    document.getElementById('nested').src = q.get('nested') || 'nested.html';
+  </script>
+<script>
+['mousemove','mousedown','mouseup','click'].forEach(function (t) {
+  window.addEventListener(t, function (e) {
+    var d = e.target && e.target.tagName ? e.target.tagName + (e.target.id ? '#' + e.target.id : '') : '?';
+    document.documentElement.dataset.diag = (document.documentElement.dataset.diag || '') + t + ':' + d + ':'
+      + (e.isTrusted ? 'T' : 'S') + '@' + Math.round(e.clientX) + ',' + Math.round(e.clientY) + ' sy' + Math.round(scrollY) + ';';
+  }, true);
+});
+</script>
+</body>
+</html>
