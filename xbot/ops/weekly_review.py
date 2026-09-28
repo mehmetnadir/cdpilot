@@ -12,11 +12,14 @@ derler, srv21 Claude CLI ile gelecek haftanın 7-günlük backlog'unu ÜRETİR:
 
 Çıktı:
   ~/cdpilot-twitter-data/state/weekly/YYYY-WW.json (weekly review artifact)
-  Telegram'a 7-günlük plan kartı (✅ Onayla / 💬 Revize / ⏭ Geç)
+  ntfy'ye "Onay bekliyor: haftalık plan" bildirimi (plan metni gövdede).
 
-Onaylanırsa: 7 ayrı strategy artifact'ı (state/strategy/YYYY-MM-DD.json) yazılır.
-daily_strategist sabah çalışırken artifact mevcutsa Claude'u tekrar çağırmaz, hazır
-öneriyi alıp Telegram'a sunar (CDPILOT_STRATEGIST_FORCE=1 değilse).
+Plan Nadir'in kararıdır, otonom onaylanmaz: artifact "awaiting_decision"
+kalır. Telegram onay döngüsü 2026-09-28'de kaldırıldı; onay yolu (CLI ya da
+başka bir kanal) açık karar — o güne kadar daily_strategist her sabah kendi
+önerisini üretmeye devam eder. Onaylanırsa 7 ayrı strategy artifact'ı
+(state/strategy/YYYY-MM-DD.json, "weekly_preapproved") yazılır ve
+daily_strategist sabah onları kullanır.
 
 DOCTRINE.md §3 Faz A item 2.
 """
@@ -34,6 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import bot_home  # noqa: E402
+import _notify  # noqa: E402
 
 DATA = bot_home()
 XBOT = Path(__file__).resolve().parent.parent
@@ -404,50 +408,15 @@ def _render_card_text(plan: dict, context: dict) -> str:
             lines.append(f"   🧠 {why}")
         lines.append("")
 
-    lines += [
-        "👇 Karar ver:",
-        "✅ Onayla → 7 strateji günlük olarak hazırlanır, her sabah Telegram'a düşer",
-        "💬 Revize → bu mesaja reply'la not yaz, tekrar üretilir",
-        "⏭ Geç → bu hafta plan yok, sabah strategist tek tek karar versin",
-    ]
     return "\n".join(lines)
 
 
-def _send_to_telegram(card_text: str, week_id: str) -> dict:
-    sys.path.insert(0, str(Path(__file__).parent))
-    import telegram_bridge as tb  # type: ignore
-
-    env = tb._load_env()
-    if not env.get("TELEGRAM_CHAT_ID"):
-        _log("TELEGRAM_CHAT_ID missing")
-        return {"_error": "no_chat_id"}
-
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "✅ Onayla (7-gün)", "callback_data": f"weekgo:{week_id}"},
-            {"text": "💬 Revize", "callback_data": f"weekrev:{week_id}"},
-            {"text": "⏭ Geç", "callback_data": f"weekskip:{week_id}"},
-        ]]
-    }
-
-    if len(card_text) > 3800:
-        card_text = card_text[:3800] + "\n…(kısaltıldı)"
-
-    result = tb._api(env, "sendMessage", {
-        "chat_id": int(env["TELEGRAM_CHAT_ID"]),
-        "text": card_text,
-        "disable_web_page_preview": True,
-        "reply_markup": keyboard,
-    })
-
-    msg_id = result.get("message_id")
-    if msg_id:
-        tb._register_pending(msg_id, {
-            "id": f"weekly-{week_id}",
-            "kind": "weekly",
-            "week_id": week_id,
-        })
-    return result
+def _send_waiting_notice(card_text: str, week_id: str) -> dict:
+    """The weekly plan waits for Nadir — ntfy notice, nothing is compiled."""
+    ok = _notify.notify_waiting(f"haftalık plan {week_id}", reason=card_text[:3000],
+                                context_url=f"https://x.com/{_notify.HANDLE}",
+                                compose=False)
+    return {"notified": ok}
 
 
 def run(send: bool = True) -> dict:
@@ -488,21 +457,22 @@ def run(send: bool = True) -> dict:
     if plan.get("_error"):
         if send:
             try:
-                _send_to_telegram(f"⚠️ Weekly Strategist hatası: {plan.get('_error')}", week_id)
-            except Exception as e:
-                _log(f"telegram error notification failed: {e}")
+                _notify.notify("Haftalık plan hatası",
+                               f"Weekly strategist: {plan.get('_error')}",
+                               priority="yuksek", tags=["warning"])
+            except Exception as e:  # noqa: BLE001
+                _log(f"ntfy error notification failed: {e!r}")
         return {"status": "error", "path": str(out_path), "error": plan["_error"]}
 
     if send:
         try:
             card = _render_card_text(plan, context)
-            tg_result = _send_to_telegram(card, week_id)
-            artifact["telegram_message_id"] = tg_result.get("message_id")
-            artifact["approval_status"] = "awaiting_telegram"
+            _send_waiting_notice(card, week_id)
+            artifact["approval_status"] = "awaiting_decision"
             out_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2))
         except Exception as e:
-            _log(f"telegram send failed: {e}")
-            return {"status": "telegram_fail", "path": str(out_path), "error": str(e)}
+            _log(f"waiting notice failed: {e}")
+            return {"status": "notify_fail", "path": str(out_path), "error": str(e)}
 
     return {"status": "ok", "path": str(out_path)}
 

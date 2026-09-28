@@ -3,14 +3,13 @@
 
 Günlük 09:00 ve 17:00 cycle'da çalışır. discovery_scan çıktısını okur
 (HN/GitHub/arXiv/X search), srv21 Claude CLI ile bizim niş için en relevant
-3 trend'i seçer, her birine "ne yapalım" önerisiyle Telegram'a butonlu kart atar.
+3 trend'i seçer. CDPILOT_AUTO_POST on (canlı): trend tweet'i doğrudan kuyruğa
+girer. off: ntfy'ye "Onay bekliyor" bildirimi (dokununca X yazma ekranı açılır).
 
 Çıktı:
   ~/cdpilot-twitter-data/state/trends/YYYY-MM-DD-HH.json (trend artifact)
-  Telegram'a 3 kart (her trend için):
-    📝 Tweet at → strategist seed olarak ekle
-    💬 Tartışmaya katıl → reply drafter ile cevap üret (X search trendi ise)
-    ⏭ Geç
+  AUTO_POST on: queue/trend-<id>-<n>.json (poster atınca ntfy'ye linkli bildirim)
+  AUTO_POST off: ntfy "Onay bekliyor" bildirimi, kuyruğa bir şey girmez
 
 DOCTRINE.md §3 Faz A item 3.
 """
@@ -276,35 +275,16 @@ def _send_card(sel: dict, idx: int, total: int, trend_id: str) -> dict:
     if tb.auto_post_enabled():
         return _auto_queue_card(sel, idx, trend_id)
 
-    env = tb._load_env()
-    if not env.get("TELEGRAM_CHAT_ID"):
-        return {"_error": "no_chat_id"}
-
-    action = sel.get("suggested_action", "tweet")
-    cb_id = f"{trend_id}-{idx}"
-    buttons = [
-        [{"text": "📝 Tweet at", "callback_data": f"trendtweet:{cb_id}"}],
-    ]
-    if action in ("reply", "both") and sel.get("url", "").startswith("https://x.com"):
-        buttons[0].insert(0, {"text": "💬 Cevap yaz", "callback_data": f"trendreply:{cb_id}"})
-    buttons.append([{"text": "⏭ Geç", "callback_data": f"trendskip:{cb_id}"}])
-
-    card = _render_card(sel, idx, total)
-    result = tb._api(env, "sendMessage", {
-        "chat_id": int(env["TELEGRAM_CHAT_ID"]),
-        "text": card,
-        "disable_web_page_preview": True,
-        "reply_markup": {"inline_keyboard": buttons},
-    })
-    msg_id = result.get("message_id")
-    if msg_id:
-        tb._register_pending(msg_id, {
-            "id": f"trend-{cb_id}",
-            "kind": "trend",
-            "trend_id": trend_id,
-            "selection": sel,
-        })
-    return result
+    # AUTO_POST off: the trend tweet waits for Nadir (ntfy notice; tap opens
+    # X's composer prefilled with the angle). Nothing is queued.
+    import _notify  # type: ignore
+    draft = _trend_to_draft(sel, trend_id, idx) or {}
+    ok = _notify.notify_waiting(
+        f"trend {idx}/{total}", draft.get("text", ""),
+        reason=_render_card(sel, idx, total)[:1500],
+        context_url=sel.get("url") or None, compose=bool(draft.get("text")),
+    )
+    return {"notified": ok}
 
 
 def run(send: bool = True) -> dict:
@@ -346,7 +326,7 @@ def run(send: bool = True) -> dict:
             try:
                 _send_card(sel, i, len(selections), stamp)
                 sent += 1
-                time.sleep(1.2)  # spacing so Telegram doesn't rate-limit
+                time.sleep(1.2)  # gentle spacing between cards
             except Exception as e:
                 _log(f"send card {i} failed: {e}")
         return {"status": "ok", "path": str(out_path), "sent": sent, "total": len(selections)}

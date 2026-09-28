@@ -531,7 +531,7 @@ def run_replies(pain_candidates: list[dict], dry_run: bool = False) -> dict:
         }
 
         sys.path.insert(0, str(Path(__file__).parent))
-        import telegram_bridge as tb  # type: ignore
+        import telegram_bridge as tb  # type: ignore  # queue helpers only, no Telegram
         if tb.auto_post_enabled():
             tb.auto_queue_draft(draft, idx=idx)
             stats["queued"] += 1
@@ -647,8 +647,32 @@ def run_digest() -> dict:
     missing_note = f"Eksik: {top_missing[0][0]} ({top_missing[0][1]['count']})" if top_missing else "Eksik: yok"
     summary = (f"Haftalık sorun özeti: {digest['total']} kayıt, "
                f"%{digest['first_person_ratio'] * 100:.0f} first-person. {missing_note}.")
-    _notify.push(summary, priority="dusuk", tag="chart")
+    _notify.notify("Haftalık sorun özeti", summary, priority="dusuk", tags=["chart"])
     return {"status": "ok", "path": str(path), "digest": digest}
+
+
+def notify_hits(pain_candidates: list[dict], stats: dict) -> bool:
+    """One routine push per run with first-person pain hits (tap = top hit).
+
+    Replies are sent by the poster, which pushes each one with its link; this
+    covers the hits themselves — including the ones the daily cap left alone.
+    """
+    if not pain_candidates:
+        return False
+    lines = [f"@{c.get('author')}: {(c.get('text') or '')[:90]}"
+             for c in pain_candidates[:5]]
+    if len(pain_candidates) > 5:
+        lines.append(f"… +{len(pain_candidates) - 5}")
+    queued = stats.get("queued", 0) + stats.get("drafts_written", 0)
+    note = f"{queued} yanıt kuyrukta"
+    if queued < len(pain_candidates):
+        note += f", günlük sınır {DAILY_REPLY_CAP} / reddedilen {stats.get('rejected', 0)}"
+    return _notify.notify(
+        f"Pain hunter: {len(pain_candidates)} sorun", note + "\n" + "\n".join(lines),
+        url=pain_candidates[0].get("url"), priority="dusuk", tags=["mag"],
+        actions=[{"label": "2. sorun", "url": pain_candidates[1].get("url")}]
+        if len(pain_candidates) > 1 and pain_candidates[1].get("url") else None,
+    )
 
 
 # ── search (network — never exercised by tests) ──
@@ -745,6 +769,11 @@ async def main_async(dry_run: bool = False) -> dict:
                        if c["classification"].get("first_person_pain")]
     pain_candidates.sort(key=lambda c: c.get("created_ts", 0), reverse=True)
     reply_stats = run_replies(pain_candidates, dry_run=dry_run)
+    if not dry_run:
+        try:
+            notify_hits(pain_candidates, reply_stats)
+        except Exception as e:  # noqa: BLE001
+            _log(f"ntfy hits push failed: {e!r}")
 
     return {
         "status": "rate_limited" if rate_limited else "ok",

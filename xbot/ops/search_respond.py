@@ -10,8 +10,8 @@ içeren tweet'leri X üzerinde arar:
   - + 6 niş pattern
 
 Bulunan adaylardan yüksek-takipçi (5k+) + son 24h + soru içeren maks 3 tanesini
-seçer, her birine reply_drafter ile cool ton'da cevap taslağı üretir, Telegram'a
-butonlu kart atar (💬 Cevap at / 💛 Like / ⏭ Geç).
+seçer, her birine reply_drafter ile cool ton'da cevap taslağı üretir;
+AUTO_POST on ise kuyruğa atar, off ise ntfy'ye "Onay bekliyor" bildirimi gönderir.
 
 X search'i twikit'te şu an drift'li (ClientTransaction key issue) — graceful
 zero-result, twikit düzelir düzelmez otomatik akmaya başlar.
@@ -252,61 +252,15 @@ def _send_card(c: dict, ai_draft: str | None, idx: int, total: int) -> dict:
             return _auto_queue_reply(c, ai_draft.strip(), idx)
         return {"status": "auto_skip_no_draft", "tweet_id": c.get("tweet_id")}
 
-    env = tb._load_env()
-    if not env.get("TELEGRAM_CHAT_ID"):
-        return {"_error": "no_chat_id"}
-
-    text_lines = [
-        f"🔎 SORU ADAYI {idx}/{total} — @{c['author']} ({c['author_followers']:,} takipçi)",
-        f"⏰ {c['hours_old']}h önce  ·  ❤️ {c['likes']}  ·  💬 {c['replies']}  ·  skor {_score(c)}",
-        f"🔗 {c['url']}",
-        f"🔍 Sorgu: \"{c['query']}\"",
-        "",
-        "📥 Soru:",
-        c["text"],
-        "",
-    ]
-    if ai_draft:
-        text_lines += [
-            "✨ AI Cevap Taslağı:",
-            ai_draft,
-            "",
-        ]
-    text_lines.append("👇 Karar ver:")
-
-    cb_id = f"search-{c['tweet_id']}"
-    buttons_row = []
-    if ai_draft:
-        buttons_row.append({"text": "✨ AI cevap at", "callback_data": f"aireply:{cb_id}"})
-    buttons_row.append({"text": "💬 Manuel yaz", "callback_data": f"replywrite:{cb_id}"})
-    keyboard = {
-        "inline_keyboard": [
-            buttons_row,
-            [
-                {"text": "💛 Like", "callback_data": f"likemention:{cb_id}"},
-                {"text": "⏭ Geç", "callback_data": f"mskip:{cb_id}"},
-            ],
-        ]
-    }
-
-    result = tb._api(env, "sendMessage", {
-        "chat_id": int(env["TELEGRAM_CHAT_ID"]),
-        "text": "\n".join(text_lines),
-        "disable_web_page_preview": True,
-        "reply_markup": keyboard,
-    })
-    msg_id = result.get("message_id")
-    if msg_id:
-        tb._register_pending(msg_id, {
-            "id": cb_id,
-            "kind": "incoming-reply",  # reuse handler — same target_url/author/ai_draft shape
-            "tweet_id": c["tweet_id"],
-            "target_url": c["url"],
-            "author": c["author"],
-            "ai_draft": ai_draft or "",
-            "source": "search_respond",
-        })
-    return result
+    # AUTO_POST off: the reply waits for Nadir (ntfy notice; tap opens X's
+    # composer as a reply with the AI draft prefilled). Nothing is queued.
+    import _notify  # type: ignore
+    ok = _notify.notify_waiting(
+        f"yanıt @{c['author']} ({idx}/{total})", (ai_draft or "").strip(),
+        reason=f"Soru: {c['text'][:300]}", reply_to_url=c["url"],
+        compose=bool(ai_draft and ai_draft.strip()),
+    )
+    return {"notified": ok}
 
 
 async def main_async(send: bool = True) -> dict:
