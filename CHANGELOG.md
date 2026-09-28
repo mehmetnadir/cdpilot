@@ -13,6 +13,10 @@ All notable changes to cdpilot will be documented in this file.
   - **Security**: tool invocation runs the page's own JavaScript — documented in README and `--help`. `tools call` argument values whose JSON keys contain `password`, `token`, `secret`, or `key` are redacted in the session log (`«redacted:N chars»`).
   - **Test fixture**: `test/fixtures/webmcp/shop.html` — a self-contained page with an imperative tool (`add_to_cart`) and a declarative form tool (`subscribe_newsletter`). Browserless tests validate the hook/polyfill logic and argument validation; e2e tests launch a headless browser, serve the fixture on localhost, and exercise `tools list` + `tools call` + error paths.
 
+### Fixed
+- **Frame commands no longer send `Runtime.enable`.** To find an iframe's execution context, 0.9.3 briefly enabled the Runtime domain (enable + disable) and read the replayed `executionContextCreated` events. `Runtime.enable` is the best-known CDP automation signal (Cloudflare Turnstile and DataDome watch its side effects), and Turnstile itself runs in an iframe, so the trace landed exactly where detection runs. cdpilot now never sends it: a same-process frame's main world comes from `DOM.resolveNode` on the frame's document (`DOM.describeNode` → `contentDocument`; no `DOM.enable`), with the context id checked by an identity test; an out-of-process frame is used through its flat session's default context, which is its main world. `frame eval --frame` still sees the frame's page globals. If neither path works, cdpilot falls back to an isolated world (same DOM, no page JS globals) and `frame eval` says so on stderr.
+- **`CDPILOT_CDP_TRACE=<file>`** (debug aid) appends the name of every CDP method cdpilot sends through its CDP client, one per line; params are never written.
+
 ## [0.9.3] - 2026-09-28
 
 ### Added
