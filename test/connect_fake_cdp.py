@@ -50,13 +50,13 @@ def page_json(p):
 
 def http_reply(conn, status, body):
     data = json.dumps(body).encode() if body is not None else b""
-    reason = {200: "OK", 404: "Not Found"}.get(status, "OK")
+    reason = {200: "OK", 404: "Not Found", 405: "Method Not Allowed"}.get(status, "OK")
     conn.sendall((f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n"
                   f"Content-Length: {len(data)}\r\nConnection: close\r\n\r\n").encode() + data)
 
 
-def handle_http(conn, path):
-    log({"http": path})
+def handle_http(conn, path, verb="GET"):
+    log({"http": path, "verb": verb})
     if MODE == "ws-only":
         return http_reply(conn, 404, None)
     base = path.split("?", 1)[0]
@@ -69,12 +69,18 @@ def handle_http(conn, path):
         with LOCK:
             return http_reply(conn, 200, [page_json(p) for p in PAGES])
     if base == "/json/new":
+        if verb != "PUT":  # current Chrome: "Using unsafe HTTP verb GET to invoke /json/new"
+            return http_reply(conn, 405, None)
         with LOCK:
             SEQ[0] += 1
             p = {"id": f"PAGE{SEQ[0]}", "type": "page", "url": "about:blank", "title": ""}
             PAGES.append(p)
         return http_reply(conn, 200, page_json(p))
-    if base.startswith("/json/close/") or base.startswith("/json/activate/"):
+    if base.startswith("/json/close/"):
+        with LOCK:
+            PAGES[:] = [x for x in PAGES if x["id"] != base.rsplit("/", 1)[1]]
+        return http_reply(conn, 200, None)
+    if base.startswith("/json/activate/"):
         return http_reply(conn, 200, None)
     return http_reply(conn, 404, None)
 
@@ -155,9 +161,13 @@ def answer(msg, path):
         with LOCK:
             SEQ[0] += 1
             new = {"id": f"PAGE{SEQ[0]}", "type": "page", "url": p.get("url") or "about:blank",
-                   "title": ""}
+                   "title": "", "background": bool(p.get("background"))}
             PAGES.append(new)
         result = {"targetId": new["id"]}
+    elif method == "Target.closeTarget":
+        with LOCK:
+            PAGES[:] = [x for x in PAGES if x["id"] != p.get("targetId")]
+        result = {"success": True}
     elif method == "Page.addScriptToEvaluateOnNewDocument":
         result = {"identifier": "1"}
     elif method == "Target.getTargets":
@@ -224,7 +234,7 @@ def serve_one(conn):
         if headers.get("upgrade", "").lower() == "websocket":
             handle_ws(conn, path, headers)
         else:
-            handle_http(conn, path)
+            handle_http(conn, path, parts[0])
     except Exception:
         pass
     finally:

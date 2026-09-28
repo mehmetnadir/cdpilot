@@ -774,10 +774,13 @@ cdpilot disconnect            # forget it; the browser keeps running
 
 Since Chrome 136, `--remote-debugging-port` is ignored on the default profile,
 so the separate `--user-data-dir` is required. `connect --auto` reads the
-DevToolsActivePort file of each known profile directory (Chrome
-stable/beta/dev/canary, Chromium, Brave, Vivaldi, Edge), skips files left over
-from a browser that is gone or was replaced on that port (the browser id in the
-file must match), and connects to the first live one.
+DevToolsActivePort file of each known profile directory (`~/cdpilot-chrome`
+from the command above, Chrome stable/beta/dev/canary, Chromium, Brave,
+Vivaldi, Edge), skips files left over from a browser that is gone or was
+replaced on that port (the browser id in the file must match), and connects to
+the first live one. It asks over HTTP only; a WebSocket probe (which Chrome's
+chrome://inspect mode may answer with a permission prompt) is sent only when no
+live browser was found.
 
 **Not supported yet: Chrome's `chrome://inspect/#remote-debugging` toggle**
 (Chrome 144+, your everyday logged-in profile). In that mode Chrome answers
@@ -789,14 +792,18 @@ and exits with code 2 and the start command above instead of half-working.
 **What cdpilot does with a connected browser:**
 
 - Page commands (`go`, `click`, `fill`, `shot`, …) run in a tab cdpilot opens
-  for itself (`Target.createTarget`) on the first page command, and keep using
-  that tab. Your own tabs are never navigated or typed into; only a command that
-  names a tab touches it (`switch-tab`, `close-tab <index|id>`, `CDPILOT_TARGET`,
-  and `multi-eval`, which runs its script in every open tab).
-- It never closes or kills it. `close`, `close --force`, `stop`,
+  for itself in the background (`Target.createTarget`, so your tab keeps the
+  focus) on the first page command, and keep using that tab. `close`,
+  `session-close` and the idle session cleanup close only such tabs, the ones
+  cdpilot opened in this browser run, never the last one. Your own tabs are
+  never navigated or typed into; only a command that names a tab touches it
+  (`switch-tab`, `close-tab <index|id>`, `CDPILOT_TARGET`, and `multi-eval`,
+  which runs its script in every open tab).
+- It never closes or kills the browser. `close`, `close --force`, `stop`,
   `stop --smart [--force]`, `project-stop`, `stop-all`, `session-close` and MCP
-  `browser_close` only print "connected browser left running; run
-  `cdpilot disconnect` to forget it". The idle auto-close never touches it,
+  `browser_close` close at most cdpilot's own tabs (above) and print
+  "connected browser left running; run `cdpilot disconnect` to forget it".
+  The idle auto-close never touches it,
   `tabs --reap` closes nothing, `wipe` and `permission` are refused,
   `context close` only destroys a context `context create` made, and `launch` /
   MCP `browser_launch` start nothing.
@@ -812,7 +819,12 @@ and exits with code 2 and the start command above instead of half-working.
   browser in its place.
 - `connect` refuses when this project already has a browser cdpilot launched
   ("stop it first (`cdpilot stop`) or use another project"), and only
-  `127.0.0.1` / `localhost` is accepted (anything else exits 2).
+  `127.0.0.1` / `localhost` is accepted (anything else exits 2). `disconnect`
+  also stops this project's `watch` daemon.
+- cdpilot treats a browser as its own only with proof: the browser id it
+  recorded at `launch` (or, for older entries, a live recorded pid that holds
+  the debug port). A busy port is not proof, so a leftover registry entry never
+  makes `stop` / `close` touch your own Chrome on port 9222.
 
 **Risks:**
 
@@ -823,8 +835,8 @@ and exits with code 2 and the start command above instead of half-working.
   runs, not just to cdpilot. Close the browser when you are done.
 - Sites can tell automation more easily: cdpilot applies no stealth to a
   connected browser.
-- cdpilot's tab opens in the foreground of your browser window, and an agent
-  may still act in one of your tabs when it names it (`switch-tab`,
+- cdpilot's tab sits next to yours in the same window, and an agent may
+  still act in one of your tabs when it names it (`switch-tab`,
   `close-tab <n>`, `multi-eval`).
 
 ### WebMCP tools (opt-in)
