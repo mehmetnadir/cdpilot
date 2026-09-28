@@ -42,6 +42,10 @@ pip install cryptography):
   cdpilot bot-auth init --agent-url https://your-domain.com   Ed25519 key, 0600
   cdpilot bot-auth directory   JWKS to serve at https://your-domain.com
                        /.well-known/http-message-signatures-directory
+  cdpilot bot-auth directory --headers   The same, with the Signature and
+                       Signature-Input headers that response must carry
+  cdpilot bot-auth format [legacy|dict]  Signature-Agent wire format
+                       (default legacy: the one Cloudflare verifies)
   cdpilot launch --bot-auth    A signer helper adds Signature, Signature-Input
                        and Signature-Agent to every request the browser makes
                        (tabs, popups, iframes, workers), until `stop`
@@ -1698,8 +1702,12 @@ def _idle_watcher_step(port, token, now=None, memo=None):
     if not _idle_should_close(now, _idle_last_activity(state), minutes):
         return "wait"
     # The Web Bot Auth signer is attached to every page by design, so while it
-    # runs "a client is attached" says nothing; commands and page changes still count.
-    if _idle_client_attached(version) and not _bot_auth_active(port):
+    # runs "a page is attached" says nothing: count the CDP clients other than
+    # the signer instead (watch, Playwright, an in-flight command).
+    signer = _bot_auth_helper_state(port, version) if _bot_auth_load_state(port) else None
+    attached = (_bot_auth_other_clients(port, signer) if signer
+                else _idle_client_attached(version))
+    if attached:
         _idle_write_activity(state.get("project_id"))
         return "wait"
     if not _idle_should_close(now, _idle_last_activity(state), minutes):
@@ -1765,14 +1773,22 @@ def _idle_status(port=None, now=None):
 # Spec: draft-meunier-web-bot-auth-architecture-05 (§4.2) and
 # draft-meunier-http-message-signatures-directory-05, as implemented by the
 # reference library github.com/cloudflare/web-bot-auth (test vectors
-# web_bot_auth_architecture_v2.json). Per request:
-#   Signature-Agent: sig1="https://agent.example"      (sf-dictionary, §4.1)
-#   Signature-Input: sig1=("@authority" "signature-agent";key="sig1")
+# web_bot_auth_architecture_v2.json). Per request, in the default "legacy"
+# Signature-Agent format (draft-05 A.2.3; the one Cloudflare's verifier
+# accepts — it rejects the dictionary form):
+#   Signature-Agent: "https://agent.example"            (sf-string)
+#   Signature-Input: sig1=("@authority" "signature-agent")
 #       ;created=…;keyid="<RFC 7638 thumbprint>";alg="ed25519";expires=…
 #       ;nonce="<64 random bytes, base64>";tag="web-bot-auth"
 #   Signature: sig1=:<base64 Ed25519 signature over the signature base>:
+# Opt-in "dict" format (`bot-auth format dict`, draft-05 §4.1):
+#   Signature-Agent: sig1="https://agent.example", covered as
+#   "signature-agent";key="sig1".
 # The key directory (JWKS) lives at
 #   https://agent.example/.well-known/http-message-signatures-directory
+# and its response is itself signed (`bot-auth directory --headers`):
+#   ("@authority";req), tag="http-message-signatures-directory", one
+#   signature per key.
 #
 # Who signs: a detached helper (`--_bot-auth-signer`, same self-fork and
 # detach as the idle watcher) started by `launch --bot-auth`. It holds ONE
@@ -1784,8 +1800,17 @@ def _idle_status(port=None, now=None):
 # ends it, and state lives in CDPILOT_HOME/bot-auth/signers/<port>.json.
 #
 # Optional dependency: `cryptography` (Ed25519). Imported only inside
-# functions; without it the bot-auth commands print an install hint and
-# exit 2 and every other command is unaffected.
+# functions, always inside try/except ImportError; without it the bot-auth
+# commands print an install hint and exit 2 and every other command is
+# unaffected.
+#
+# Trust in the signer state file: a pid alone proves nothing (pids are
+# reused). The state is trusted, and its pid signalled, only when that
+# process's command line is `--_bot-auth-signer <port> <token>` (Windows:
+# its creation time matches the one the signer recorded) and the browser's
+# /json/version still names the browser the signer attached to. Otherwise
+# the state is stale: the file is dropped, a `<port>.stale` marker makes
+# `status` and `go` warn until `launch --bot-auth` or `stop`.
 
 BOT_AUTH_DIR = os.path.join(CDPILOT_HOME, 'bot-auth')
 BOT_AUTH_PRIVATE_KEY_FILE = os.path.join(BOT_AUTH_DIR, 'ed25519.key')
@@ -1793,9 +1818,13 @@ BOT_AUTH_CONFIG_FILE = os.path.join(BOT_AUTH_DIR, 'config.json')
 BOT_AUTH_SIGNERS_DIR = os.path.join(BOT_AUTH_DIR, 'signers')
 BOT_AUTH_ENV = 'CDPILOT_BOT_AUTH'
 BOT_AUTH_SIGNER_FLAG = '--_bot-auth-signer'  # hidden — the re-entrant fork
+BOT_AUTH_LABEL_FLAG = '--_bot-auth-label'    # hidden — status line for bin/cdpilot.js
 BOT_AUTH_LABEL = 'sig1'           # signature label = Signature-Agent member key (§4.2.1)
 BOT_AUTH_TAG = 'web-bot-auth'
+BOT_AUTH_DIRECTORY_TAG = 'http-message-signatures-directory'
+BOT_AUTH_AGENT_FORMATS = ('legacy', 'dict')  # Signature-Agent wire format; legacy = default
 BOT_AUTH_TTL_S = 300              # expires - created; the draft allows up to 24 h
+BOT_AUTH_DIRECTORY_TTL_S = 86400  # a directory signature is pasted into server config
 BOT_AUTH_NONCE_BYTES = 64         # §4.2.2 RECOMMENDED; the reference library requires 64
 BOT_AUTH_DIRECTORY_PATH = '/.well-known/http-message-signatures-directory'
 BOT_AUTH_DIRECTORY_MEDIA_TYPE = 'application/http-message-signatures-directory+json'
@@ -1870,7 +1899,13 @@ def _bot_auth_write_private(path, data):
     os.replace(tmp, path)
 
 
-def _bot_auth_generate_keypair(agent_url, force=False):
+def _bot_auth_agent_format(config):
+    """The configured Signature-Agent format: 'legacy' (default) or 'dict'."""
+    fmt = str((config or {}).get("agent_format") or "legacy").lower()
+    return fmt if fmt in BOT_AUTH_AGENT_FORMATS else "legacy"
+
+
+def _bot_auth_generate_keypair(agent_url, force=False, agent_format="legacy"):
     """Create the Ed25519 key (0600) and config; print the next steps (never the key)."""
     _ed, _ser = _bot_auth_require_crypto()
     if os.path.exists(BOT_AUTH_PRIVATE_KEY_FILE) and not force:
@@ -1890,18 +1925,25 @@ def _bot_auth_generate_keypair(agent_url, force=False):
         encryption_algorithm=_ser.NoEncryption())
     _bot_auth_write_private(BOT_AUTH_PRIVATE_KEY_FILE, pem)
     jwk = _bot_auth_public_jwk(private_key)
-    config = {"agent_url": agent_url, "keyid": jwk["kid"], "created_at": int(time.time())}
-    _bot_auth_write_private(BOT_AUTH_CONFIG_FILE,
-                            (json.dumps(config, indent=2) + "\n").encode("utf-8"))
+    config = {"agent_url": agent_url, "keyid": jwk["kid"], "created_at": int(time.time()),
+              "agent_format": agent_format}
+    _bot_auth_write_config(config)
     print("Generated an Ed25519 key for Web Bot Auth.")
     print(f"  agent URL : {agent_url}")
     print(f"  keyid     : {jwk['kid']}")
+    print(f"  format    : Signature-Agent {agent_format}")
     print(f"  key file  : {BOT_AUTH_PRIVATE_KEY_FILE} (0600, never printed)")
     print("Next:")
-    print("  1. cdpilot bot-auth directory > http-message-signatures-directory")
-    print(f"  2. Serve it at {agent_url.rstrip('/')}{BOT_AUTH_DIRECTORY_PATH}")
-    print(f"     with Content-Type: {BOT_AUTH_DIRECTORY_MEDIA_TYPE}")
+    print("  1. cdpilot bot-auth directory --headers")
+    print(f"  2. Serve the JSON body it prints at {agent_url.rstrip('/')}{BOT_AUTH_DIRECTORY_PATH}")
+    print("     with the Content-Type, Signature-Input and Signature headers it prints")
+    print("     (Cloudflare checks that signature; it expires, re-run to refresh it)")
     print("  3. cdpilot launch --bot-auth   (or CDPILOT_BOT_AUTH=1)")
+
+
+def _bot_auth_write_config(config):
+    _bot_auth_write_private(BOT_AUTH_CONFIG_FILE,
+                            (json.dumps(config, indent=2) + "\n").encode("utf-8"))
 
 
 def _bot_auth_load_private_key():
@@ -1931,8 +1973,8 @@ def _bot_auth_load_private_key():
 
 def _bot_auth_public_jwk(private_key):
     """Public JWK of an Ed25519 private key, kid = RFC 7638 thumbprint."""
-    from cryptography.hazmat.primitives import serialization as _ser
-    raw = private_key.public_key().public_bytes(
+    _ed, _ser = _bot_auth_require_crypto()
+    raw =private_key.public_key().public_bytes(
         encoding=_ser.Encoding.Raw, format=_ser.PublicFormat.Raw)
     x = _b64url(raw)
     return {"kty": "OKP", "crv": "Ed25519", "kid": _bot_auth_jwk_thumbprint_raw(x),
@@ -1967,14 +2009,17 @@ _BOT_AUTH_COMPONENT_RE = _re.compile(
     r'"([^"\\]+)"((?:;[a-z*][a-z0-9_.*-]*(?:=(?:"[^"\\]*"|[A-Za-z0-9_.*:/+=-]+))?)*)')
 
 
-def _bot_auth_signature_base(method, authority, path, agent_url, params_str):
+def _bot_auth_signature_base(method, authority, path, agent_url, params_str, headers=None):
     """RFC 9421 §2.5 signature base for the covered components in params_str.
 
     params_str is the Signature-Input member value: `(<components>);<params>`.
-    Supported components: "@authority", "@method", "@path", "signature-agent"
-    (legacy sf-string header) and "signature-agent";key="<label>" (the
-    sf-dictionary member, whose value is the sf-string of agent_url). Each
-    line is `"<name>"<params>: <value>`, LF-separated, ending with the
+    Supported components: "@authority" (also "@authority";req, the request's
+    authority when a response is signed, RFC 9421 §2.4), "@method", "@path",
+    "signature-agent" (legacy sf-string header) and
+    "signature-agent";key="<label>" (the sf-dictionary member, whose value is
+    the sf-string of agent_url), and any other header named in `headers`
+    ({lowercase name: value}, e.g. "content-digest"). Each line is
+    `"<name>"<params>: <value>`, LF-separated, ending with the
     "@signature-params" line (no trailing LF). Unknown components raise.
     """
     m = _re.match(r'^\(([^)]*)\)', params_str)
@@ -1982,7 +2027,7 @@ def _bot_auth_signature_base(method, authority, path, agent_url, params_str):
         raise ValueError("signature params must start with a component list")
     lines = []
     for name, params in _BOT_AUTH_COMPONENT_RE.findall(m.group(1)):
-        if name == "@authority" and not params:
+        if name == "@authority" and params in ("", ";req"):
             value = authority
         elif name == "@method" and not params:
             value = method
@@ -1992,6 +2037,8 @@ def _bot_auth_signature_base(method, authority, path, agent_url, params_str):
             if not agent_url:
                 raise ValueError("signature-agent is covered but there is no agent URL")
             value = f'"{agent_url}"'
+        elif not name.startswith("@") and not params and name in (headers or {}):
+            value = headers[name]
         else:
             raise ValueError(f"unsupported covered component {name}{params}")
         lines.append(f'"{name}"{params}: {value}')
@@ -2000,16 +2047,23 @@ def _bot_auth_signature_base(method, authority, path, agent_url, params_str):
 
 
 def _bot_auth_sign_request(method, url, agent_url, private_key, keyid, now=None, nonce=None,
-                           label=BOT_AUTH_LABEL, expires=None, agent_key=None):
+                           label=BOT_AUTH_LABEL, expires=None, agent_key=None,
+                           agent_format="legacy"):
     """The Web Bot Auth headers for one request, as {name: value}.
 
-    Covered components ("@authority" "signature-agent";key="<agent_key>"),
-    the draft §4.2.1 set (agent_key defaults to the label, as RECOMMENDED);
-    only ("@authority") and no Signature-Agent when agent_url is None.
-    Parameter order follows the reference implementation. `now`, `nonce`,
-    `expires`, `label` and `agent_key` exist so the draft's test vectors can
-    be reproduced byte for byte; the signer uses the defaults.
+    agent_format "legacy" (default): covered ("@authority" "signature-agent")
+    and `Signature-Agent: "<agent_url>"` (draft-05 A.2.3), the form
+    Cloudflare's verifier accepts. "dict": covered
+    ("@authority" "signature-agent";key="<agent_key>") and
+    `Signature-Agent: <agent_key>="<agent_url>"`, the draft §4.2.1 set
+    (agent_key defaults to the label, as RECOMMENDED). Only ("@authority")
+    and no Signature-Agent when agent_url is None. Parameter order follows
+    the reference implementation. `now`, `nonce`, `expires`, `label` and
+    `agent_key` exist so the draft's test vectors can be reproduced byte for
+    byte; the signer uses the defaults.
     """
+    if agent_format not in BOT_AUTH_AGENT_FORMATS:
+        raise ValueError(f"unknown Signature-Agent format {agent_format!r}")
     authority = _bot_auth_authority(url)
     if not authority:
         raise ValueError("request URL has no host")
@@ -2018,7 +2072,12 @@ def _bot_auth_sign_request(method, url, agent_url, private_key, keyid, now=None,
     if nonce is None:
         nonce = base64.b64encode(os.urandom(BOT_AUTH_NONCE_BYTES)).decode("ascii")
     agent_key = agent_key or label
-    covered = f'"@authority" "signature-agent";key="{agent_key}"' if agent_url else '"@authority"'
+    if not agent_url:
+        covered = '"@authority"'
+    elif agent_format == "dict":
+        covered = f'"@authority" "signature-agent";key="{agent_key}"'
+    else:
+        covered = '"@authority" "signature-agent"'
     params = (f'({covered});created={created};keyid="{keyid}";alg="ed25519"'
               f';expires={expires};nonce="{nonce}";tag="{BOT_AUTH_TAG}"')
     base = _bot_auth_signature_base(method, authority, None, agent_url, params)
@@ -2028,7 +2087,58 @@ def _bot_auth_sign_request(method, url, agent_url, private_key, keyid, now=None,
         "Signature": f"{label}=:{signature}:",
     }
     if agent_url:
-        headers["Signature-Agent"] = f'{agent_key}="{agent_url}"'
+        headers["Signature-Agent"] = (f'{agent_key}="{agent_url}"' if agent_format == "dict"
+                                      else f'"{agent_url}"')
+    return headers
+
+
+def _bot_auth_content_digest(body):
+    """RFC 9530 Content-Digest (sha-256) of the exact response body bytes."""
+    return "sha-256=:" + base64.b64encode(hashlib.sha256(body).digest()).decode("ascii") + ":"
+
+
+def _bot_auth_directory_headers(keys, authority, now=None, ttl=BOT_AUTH_DIRECTORY_TTL_S,
+                                expires=None, nonce=None, labels=None, body=None,
+                                content_digest=False):
+    """Signature / Signature-Input for the directory RESPONSE, as {name: value}.
+
+    keys: [(private_key, keyid)], one signature per key (Cloudflare requires
+    one per key in the directory). Covered ("@authority";req) — the Host the
+    directory was fetched with — plus "content-digest" when content_digest
+    is set (then `body`, the exact bytes served, is required and a
+    Content-Digest header is returned too). tag="http-message-signatures-
+    directory"; labels default to sig1, sig2, … Parameter order follows the
+    reference implementation; nonce=False leaves the nonce out (the
+    reference vector has none), None draws 64 random bytes per key.
+    """
+    if not authority:
+        raise ValueError("the directory signature needs the authority (host) it is served on")
+    created = int(time.time() if now is None else now)
+    expires = created + int(ttl) if expires is None else int(expires)
+    out_input, out_sig, headers = [], [], {}
+    comps = '"@authority";req'
+    if content_digest:
+        if body is None:
+            raise ValueError("content-digest needs the response body")
+        headers["Content-Digest"] = _bot_auth_content_digest(body)
+        comps += ' "content-digest"'
+    for i, (private_key, keyid) in enumerate(keys):
+        label = labels[i] if labels else f"sig{i + 1}"
+        n = nonce
+        if n is None:
+            n = base64.b64encode(os.urandom(BOT_AUTH_NONCE_BYTES)).decode("ascii")
+        params = f'({comps});created={created};keyid="{keyid}";alg="ed25519";expires={expires}'
+        if n:
+            params += f';nonce="{n}"'
+        params += f';tag="{BOT_AUTH_DIRECTORY_TAG}"'
+        base = _bot_auth_signature_base(
+            "GET", authority, None, None, params,
+            headers={"content-digest": headers["Content-Digest"]} if content_digest else None)
+        sig = base64.b64encode(private_key.sign(base)).decode("ascii")
+        out_input.append(f"{label}={params}")
+        out_sig.append(f"{label}=:{sig}:")
+    headers["Signature-Input"] = ", ".join(out_input)
+    headers["Signature"] = ", ".join(out_sig)
     return headers
 
 
@@ -2082,38 +2192,282 @@ def _bot_auth_save_state(port, state):
 
 
 def _bot_auth_clear_state(port, token=None):
-    """Remove the state file (only our own when `token` is given)."""
+    """Remove the state file (only our own when `token` is given); True if removed."""
     state = _bot_auth_load_state(port)
     if state is None or (token is not None and state.get("token") != token):
-        return
+        return False
     try:
         os.remove(_bot_auth_state_path(port))
+        return True
+    except OSError:
+        return False
+
+
+def _bot_auth_stale_marker_path(port):
+    """Present while signing was set up on `port` but its signer died or went stale."""
+    return os.path.join(BOT_AUTH_SIGNERS_DIR, f"{int(port)}.stale")
+
+
+def _bot_auth_clear_stale_marker(port):
+    try:
+        os.remove(_bot_auth_stale_marker_path(port))
     except OSError:
         pass
 
 
-def _bot_auth_helper_state(port=None):
-    """The running signer's state for `port` (default CDP_PORT), else None."""
-    state = _bot_auth_load_state(port or CDP_PORT)
-    if state and state.get("ready") and _pid_alive(state.get("pid")):
-        return state
+def _bot_auth_drop_stale(port, state, reason):
+    """Drop a state file that no longer describes a live signer, and leave the
+    marker that makes status/go warn until `launch --bot-auth` or `stop`."""
+    if not _bot_auth_clear_state(port, state.get("token")):
+        return  # someone else replaced or removed it meanwhile
+    try:
+        os.makedirs(BOT_AUTH_SIGNERS_DIR, exist_ok=True)
+        with open(_bot_auth_stale_marker_path(port), "w") as f:
+            f.write(json.dumps({"reason": reason, "t": time.time()}) + "\n")
+    except OSError:
+        pass
+    _bot_auth_log(port, f"signer state dropped: {reason}")
+
+
+def _proc_create_time(pid):
+    """Windows: creation time (FILETIME ticks) of `pid`, else None. A pid reused
+    by another program has another creation time. None on POSIX."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+                return None
+            return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def _proc_command_line(pid):
+    """POSIX: the command line of `pid` (argv joined by spaces), else None."""
+    if os.name == "nt":
+        return None
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            raw = f.read()
+        if raw:
+            return raw.rstrip(b"\0").replace(b"\0", b" ").decode("utf-8", "replace")
+    except (OSError, ValueError):
+        pass
+    try:
+        r = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(int(pid))],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return (r.stdout or "").strip() or None
+
+
+def _bot_auth_pid_is_signer(state, port):
+    """True only while the state's pid is still OUR signer, so it may be trusted
+    or signalled. POSIX: its command line has `--_bot-auth-signer <port>
+    <token>`. Windows: its creation time equals the one the signer recorded;
+    without one, False (an unverifiable pid is never trusted or signalled)."""
+    pid, token = state.get("pid"), state.get("token")
+    if not pid or not token or not _pid_alive(pid):
+        return False
+    if os.name == "nt":
+        ctime = state.get("pid_ctime")
+        return ctime is not None and _proc_create_time(pid) == ctime
+    cmd = _proc_command_line(pid)
+    return bool(cmd) and f" {BOT_AUTH_SIGNER_FLAG} {int(port)} {token} " in f" {cmd} "
+
+
+_BOT_AUTH_UNSET = object()
+# Not proof of staleness: a spawn in progress, a browser that does not answer now.
+_BOT_AUTH_SOFT_REASONS = ("pending", "unreachable")
+
+
+def _bot_auth_stale_reason(state, port, version=_BOT_AUTH_UNSET):
+    """None while `state` describes a live signer of the browser now on `port`,
+    else why not. `version`: that browser's /json/version (fetched if unset)."""
+    if not state.get("ready"):
+        if time.time() - float(state.get("started") or 0) <= BOT_AUTH_READY_TIMEOUT_S + 5:
+            return "pending"
+        return "the signer never became ready"
+    if not _pid_alive(state.get("pid")):
+        return "the signer process is gone"
+    if not _bot_auth_pid_is_signer(state, port):
+        return "the recorded pid is not this port's signer (pid reused)"
+    if version is _BOT_AUTH_UNSET:
+        version = _idle_version(port)
+    if not version:
+        return "unreachable"
+    ws = version.get("webSocketDebuggerUrl")
+    if not ws or ws != state.get("browser_ws"):
+        return "the browser on this port is not the one the signer attached to"
     return None
 
 
-def _bot_auth_active(port=None):
-    """True while a signer helper serves the browser on `port`."""
+def _bot_auth_helper_state(port=None, version=_BOT_AUTH_UNSET):
+    """The running, verified signer's state for `port` (default CDP_PORT), else
+    None. A state that is definitely stale is dropped here."""
+    port = int(port or CDP_PORT)
+    state = _bot_auth_load_state(port)
+    if not state:
+        return None
+    reason = _bot_auth_stale_reason(state, port, version)
+    if reason is None:
+        return state
+    if reason not in _BOT_AUTH_SOFT_REASONS:
+        _bot_auth_drop_stale(port, state, reason)
+    return None
+
+
+def _bot_auth_active(port=None, version=_BOT_AUTH_UNSET):
+    """True while a verified signer helper serves the browser on `port`."""
     try:
-        return _bot_auth_helper_state(port) is not None
+        return _bot_auth_helper_state(port, version) is not None
     except Exception:
         return False
 
 
-def _bot_auth_status_label(port=None):
+def _bot_auth_status_label(port=None, version=_BOT_AUTH_UNSET):
     """'bot-auth: on (keyid …)' while the signer runs, else 'bot-auth: off'."""
-    state = _bot_auth_helper_state(port)
+    state = _bot_auth_helper_state(port, version)
     if state:
         return f"bot-auth: on (keyid {state.get('keyid', '?')})"
     return "bot-auth: off"
+
+
+BOT_AUTH_STALE_WARNING = ("bot-auth: signer not running, requests go out unsigned — "
+                          "run `cdpilot launch --bot-auth` again")
+
+
+def _bot_auth_warn_if_stale(port=None, version=_BOT_AUTH_UNSET):
+    """One stderr line when signing was set up on `port` but its signer is dead
+    or stale (state file present but not verified, or the stale marker)."""
+    port = int(port or CDP_PORT)
+    try:
+        if _bot_auth_load_state(port) is not None:
+            _bot_auth_helper_state(port, version)  # drops a stale state, leaves the marker
+        if os.path.exists(_bot_auth_stale_marker_path(port)):
+            print(BOT_AUTH_STALE_WARNING, file=sys.stderr)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _cdp_client_pids(port):
+    """Pids holding a TCP connection TO the CDP port (clients: a cdpilot
+    command, `watch`, Playwright, the signer), or None when it cannot be
+    told. Per OS the tool that answers fast: `netstat -anv` on macOS (lsof
+    there scans every process and took >30 s), `ss -tnp` on Linux (lsof as a
+    fallback), `netstat -ano` on Windows."""
+    port = int(port)
+
+    def run(argv):
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        return r.stdout if r.returncode == 0 else None
+
+    try:
+        if os.name == "nt":
+            out = run(["netstat", "-ano", "-p", "TCP"])
+            return None if out is None else _cdp_client_pids_netstat(out, port)
+        if sys.platform == "darwin":
+            out = run(["netstat", "-anv", "-p", "tcp"])
+            return None if out is None else _cdp_client_pids_bsd_netstat(out, port)
+        try:
+            out = run(["ss", "-tnp"])
+            if out is not None:
+                return _cdp_client_pids_ss(out, port)
+        except OSError:
+            pass
+        r = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:ESTABLISHED", "-F", "pn"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode not in (0, 1):  # lsof exits 1 when nothing matches
+            return None
+        return _cdp_client_pids_lsof(r.stdout, port)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _cdp_client_pids_bsd_netstat(text, port):
+    """Client pids from macOS `netstat -anv -p tcp`: foreign address
+    `<ip>.<port>`, the owner in the `process:pid` column."""
+    pids = set()
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 6 or not parts[0].startswith("tcp") or parts[5] != "ESTABLISHED":
+            continue
+        if parts[4].rsplit(".", 1)[-1] != str(port):
+            continue
+        m = _re.search(r"\S:(\d+)(?=\s|$)", " ".join(parts[6:]))
+        if m and int(m.group(1)) > 0:
+            pids.add(int(m.group(1)))
+    return pids
+
+
+def _cdp_client_pids_ss(text, port):
+    """Client pids from Linux `ss -tnp`: peer `<ip>:<port>`, `pid=` in users:(…)."""
+    pids = set()
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0] != "ESTAB" or parts[4].rsplit(":", 1)[-1] != str(port):
+            continue
+        pids.update(int(p) for p in _re.findall(r"pid=(\d+)", line))
+    return pids
+
+
+def _cdp_client_pids_lsof(text, port):
+    """Client pids from `lsof -F pn`: a name `local->remote` whose remote port is `port`."""
+    pids, pid = set(), None
+    for line in (text or "").splitlines():
+        if line.startswith("p"):
+            try:
+                pid = int(line[1:])
+            except ValueError:
+                pid = None
+        elif line.startswith("n") and pid is not None and "->" in line:
+            remote = line[1:].split("->", 1)[1].split(" ", 1)[0]
+            if remote.rsplit(":", 1)[-1] == str(port):
+                pids.add(pid)
+    return pids
+
+
+def _cdp_client_pids_netstat(text, port):
+    """Client pids from `netstat -ano -p TCP`: foreign address on `port`. The
+    state column is localized, so it is not read; pid 0 (TIME_WAIT) is skipped."""
+    pids = set()
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[2].rsplit(":", 1)[-1] == str(port):
+            try:
+                pid = int(parts[-1])
+            except ValueError:
+                continue
+            if pid > 0:
+                pids.add(pid)
+    return pids
+
+
+def _bot_auth_other_clients(port, signer_state):
+    """True while a CDP client other than the signer (and this process) is
+    connected: the signer attaches to every page, so Target.getTargets'
+    `attached` says nothing while it runs. Unknown (no lsof/netstat) = False."""
+    pids = _cdp_client_pids(port)
+    if not pids:
+        return False
+    pids.discard(os.getpid())
+    try:
+        pids.discard(int((signer_state or {}).get("pid")))
+    except (TypeError, ValueError):
+        pass
+    return bool(pids)
 
 
 def _bot_auth_log(port, line):
@@ -2125,12 +2479,64 @@ def _bot_auth_log(port, line):
         pass
 
 
+def _bot_auth_lock_path(port):
+    return os.path.join(BOT_AUTH_SIGNERS_DIR, f"{int(port)}.lock")
+
+
+def _bot_auth_acquire_lock(port, timeout):
+    """Exclusive spawn lock for `port` (O_EXCL file with our pid): two
+    `launch --bot-auth` must not start two signers or clear each other's
+    state. A lock whose holder died, or older than a spawn can take, is taken
+    over. False on timeout."""
+    path = _bot_auth_lock_path(port)
+    os.makedirs(BOT_AUTH_SIGNERS_DIR, exist_ok=True)
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                with open(path) as f:
+                    holder = json.load(f)
+            except (OSError, ValueError):
+                holder = {}  # being written: judge by age only
+            try:
+                age = time.time() - os.path.getmtime(path)
+            except OSError:
+                continue  # released meanwhile
+            pid = holder.get("pid") if isinstance(holder, dict) else None
+            if (pid is not None and not _pid_alive(pid)) or age > BOT_AUTH_READY_TIMEOUT_S + 5:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            elif time.time() >= deadline:
+                return False
+            time.sleep(0.05)
+            continue
+        with os.fdopen(fd, "w") as f:
+            json.dump({"pid": os.getpid(), "t": time.time()}, f)
+        return True
+
+
+def _bot_auth_release_lock(port):
+    path = _bot_auth_lock_path(port)
+    try:
+        with open(path) as f:
+            holder = json.load(f)
+        if isinstance(holder, dict) and holder.get("pid") == os.getpid():
+            os.remove(path)
+    except (OSError, ValueError):
+        pass
+
+
 def _bot_auth_spawn_helper(port=None, browser_pid=None, config=None):
     """Start the detached signer for the browser on `port`; wait until it has
     auto-attached, so the next command's first request is already signed.
 
-    Same detach as _idle_spawn_watcher (own session on POSIX, DETACHED_PROCESS
-    + own process group on Windows, all std streams DEVNULL). Returns
+    A verified running signer is reused. The spawn itself runs under the
+    per-port lock, and the state is re-checked once the lock is held: a
+    concurrent `launch --bot-auth` that won just gets reused. Returns
     (pid, None) or (None, reason).
     """
     port = int(port or CDP_PORT)
@@ -2139,6 +2545,24 @@ def _bot_auth_spawn_helper(port=None, browser_pid=None, config=None):
         return running.get("pid"), None
     if config is None:
         config = _bot_auth_load_private_key()[1]  # fail here, not in the child
+    if not _bot_auth_acquire_lock(port, BOT_AUTH_READY_TIMEOUT_S + 5):
+        running = _bot_auth_helper_state(port)
+        if running:
+            return running.get("pid"), None
+        return None, "another launch --bot-auth is starting a signer on this port"
+    try:
+        running = _bot_auth_helper_state(port)
+        if running:
+            return running.get("pid"), None
+        return _bot_auth_spawn_locked(port, browser_pid, config)
+    finally:
+        _bot_auth_release_lock(port)
+
+
+def _bot_auth_spawn_locked(port, browser_pid, config):
+    """The spawn proper (lock held). Same detach as _idle_spawn_watcher (own
+    session on POSIX, DETACHED_PROCESS + own process group on Windows, all
+    std streams DEVNULL)."""
     version = cdp_get('/json/version', no_cache=True) or {}
     token = secrets.token_hex(8)
     _bot_auth_save_state(port, {
@@ -2146,6 +2570,7 @@ def _bot_auth_spawn_helper(port=None, browser_pid=None, config=None):
         "project_id": PROJECT_ID, "browser_pid": browser_pid,
         "browser_ws": version.get("webSocketDebuggerUrl"),
         "keyid": config["keyid"], "agent_url": config.get("agent_url"),
+        "agent_format": _bot_auth_agent_format(config),
         "started": time.time(),
     })
     env = os.environ.copy()
@@ -2175,6 +2600,7 @@ def _bot_auth_spawn_helper(port=None, browser_pid=None, config=None):
         if state.get("token") != token:
             break
         if state.get("ready"):
+            _bot_auth_clear_stale_marker(port)
             return proc.pid, None
         if proc.poll() is not None:
             break
@@ -2189,19 +2615,23 @@ def _bot_auth_spawn_helper(port=None, browser_pid=None, config=None):
 
 def _bot_auth_stop_helper(port=None, wait_s=3.0):
     """End the signer for `port`: it exits by itself when the browser closes;
-    otherwise SIGTERM (TerminateProcess on Windows). Clears its state."""
+    otherwise SIGTERM (TerminateProcess on Windows). The pid is signalled only
+    while _bot_auth_pid_is_signer holds: a stale state file whose pid was
+    reused by another program never makes `stop` kill that program. Clears
+    the state and the stale marker."""
     port = int(port or CDP_PORT)
+    _bot_auth_clear_stale_marker(port)
     state = _bot_auth_load_state(port)
     if not state:
         return False
-    pid = state.get("pid")
     deadline = time.time() + wait_s
-    while pid and _pid_alive(pid) and time.time() < deadline:
+    while _bot_auth_pid_is_signer(state, port) and time.time() < deadline:
         time.sleep(0.1)
-    if pid and _pid_alive(pid):
+    if _bot_auth_pid_is_signer(state, port):
+        pid = int(state["pid"])
         try:
             import signal
-            os.kill(int(pid), signal.SIGTERM)
+            os.kill(pid, signal.SIGTERM)
         except (OSError, ValueError):
             pass
         deadline = time.time() + 2
@@ -2318,6 +2748,7 @@ def _bot_auth_signer_entry(args):
         _bot_auth_clear_state(port, token)
         return
     agent_url, keyid = config["agent_url"], config["keyid"]
+    agent_format = _bot_auth_agent_format(config)
     ws_url = state.get("browser_ws") or (_idle_version(port) or {}).get("webSocketDebuggerUrl")
     if not ws_url:
         _bot_auth_log(port, "signer not started: no browser on this port")
@@ -2325,7 +2756,8 @@ def _bot_auth_signer_entry(args):
         return
 
     def sign(method, url):
-        return _bot_auth_sign_request(method, url, agent_url, private_key, keyid)
+        return _bot_auth_sign_request(method, url, agent_url, private_key, keyid,
+                                      agent_format=agent_format)
 
     def on_ready(error):
         if error:
@@ -2333,7 +2765,11 @@ def _bot_auth_signer_entry(args):
             return
         cur = _bot_auth_load_state(port) or {}
         if cur.get("token") == token:
-            cur.update(pid=os.getpid(), ready=True)
+            # pid_ctime lets Windows tell this signer from a later process that
+            # reuses its pid; browser_ws, the browser it serves (see
+            # _bot_auth_stale_reason).
+            cur.update(pid=os.getpid(), ready=True, browser_ws=ws_url,
+                       pid_ctime=_proc_create_time(os.getpid()), agent_format=agent_format)
             _bot_auth_save_state(port, cur)
 
     async def main():
@@ -2362,47 +2798,136 @@ def _bot_auth_start_for_launch(port, browser_pid=None, config=None):
     if pid:
         state = _bot_auth_helper_state(port) or {}
         print(f"  Bot Auth: signing every request as {state.get('agent_url', '?')} "
-              f"(keyid {state.get('keyid', '?')})")
+              f"(keyid {state.get('keyid', '?')}, Signature-Agent "
+              f"{state.get('agent_format') or 'legacy'})")
         return True
     print(f"cdpilot: Bot Auth: {err}", file=sys.stderr)
     return False
 
 
+def _bot_auth_parse_opts(args, flags, valued):
+    """Tiny option parser for the bot-auth subcommands: ({name: value}, [positional]).
+    `--name value` and `--name=value` for `valued`; bare `--name` for `flags`."""
+    opts, rest, i = {}, [], 0
+    while i < len(args):
+        a = args[i]
+        name, eq, val = a.partition("=")
+        if name in valued:
+            if eq:
+                opts[name] = val
+            elif i + 1 < len(args):
+                opts[name], i = args[i + 1], i + 1
+            else:
+                raise ValueError(f"{name} needs a value")
+        elif a in flags:
+            opts[a] = True
+        elif a.startswith("--"):
+            raise ValueError(f"unknown option {a}")
+        else:
+            rest.append(a)
+        i += 1
+    return opts, rest
+
+
+def _bot_auth_check_format(fmt):
+    if fmt not in BOT_AUTH_AGENT_FORMATS:
+        print(f"cdpilot: Signature-Agent format must be one of {', '.join(BOT_AUTH_AGENT_FORMATS)} "
+              f"(got {fmt!r})", file=sys.stderr)
+        sys.exit(2)
+    return fmt
+
+
+def _bot_auth_cmd_directory(opts):
+    """`bot-auth directory [--headers [--authority host] [--ttl s] [--content-digest]] [--json]`."""
+    private_key, config = _bot_auth_load_private_key()
+    body_obj = {"keys": [_bot_auth_public_jwk(private_key)]}
+    headers_wanted = opts.get("--headers") or opts.get("--content-digest")
+    if not headers_wanted:
+        if opts.get("--json"):
+            print(json.dumps({"headers": {"Content-Type": BOT_AUTH_DIRECTORY_MEDIA_TYPE},
+                              "body": json.dumps(body_obj, indent=2)}, indent=2))
+        else:
+            print(json.dumps(body_obj, indent=2))
+        return
+    authority = opts.get("--authority")
+    if authority:
+        authority = _bot_auth_authority(authority if "://" in authority else f"https://{authority}")
+    else:
+        authority = _bot_auth_authority(config.get("agent_url") or "")
+    if not authority:
+        print("cdpilot: no authority: pass --authority <host> (the Host the directory is "
+              "served on)", file=sys.stderr)
+        sys.exit(2)
+    try:
+        ttl = int(opts.get("--ttl", BOT_AUTH_DIRECTORY_TTL_S))
+        if ttl <= 0:
+            raise ValueError
+    except ValueError:
+        print("cdpilot: --ttl must be a positive number of seconds", file=sys.stderr)
+        sys.exit(2)
+    body = json.dumps(body_obj, indent=2) + "\n"
+    signed = _bot_auth_directory_headers(
+        [(private_key, config["keyid"])], authority, ttl=ttl, body=body.encode("utf-8"),
+        content_digest=bool(opts.get("--content-digest")))
+    headers = {"Content-Type": BOT_AUTH_DIRECTORY_MEDIA_TYPE, **signed}
+    if opts.get("--json"):
+        print(json.dumps({"authority": authority, "headers": headers, "body": body}, indent=2))
+        return
+    for k, v in headers.items():
+        print(f"{k}: {v}")
+    print()
+    sys.stdout.write(body)
+    print(f"cdpilot: serve the body above at https://{authority}{BOT_AUTH_DIRECTORY_PATH} with "
+          f"these headers; the signature expires in {ttl} s (--ttl), then run this again",
+          file=sys.stderr)
+
+
 def cmd_bot_auth(subcmd=None, *args):
-    """CLI: cdpilot bot-auth <init|status|directory>."""
-    usage = ("Usage: cdpilot bot-auth <init|status|directory>\n"
-             "  init --agent-url https://your-domain.com [--force]\n"
+    """CLI: cdpilot bot-auth <init|status|directory|format>."""
+    usage = ("Usage: cdpilot bot-auth <init|status|directory|format>\n"
+             "  init --agent-url https://your-domain.com [--agent-format legacy|dict] [--force]\n"
              "                  Generate the Ed25519 key (0600) in CDPILOT_HOME/bot-auth/\n"
-             "  status          Key, keyid, agent URL and whether the signer is running\n"
-             f"  directory       Print the JWKS to serve at {BOT_AUTH_DIRECTORY_PATH}")
+             "  status          Key, keyid, agent URL, format and whether the signer is running\n"
+             f"  directory       Print the JWKS to serve at {BOT_AUTH_DIRECTORY_PATH}\n"
+             "  directory --headers [--authority <host>] [--ttl <s>] [--content-digest] [--json]\n"
+             "                  The same with the Signature / Signature-Input headers the\n"
+             "                  directory response must carry (\"@authority\";req,\n"
+             f"                  tag=\"{BOT_AUTH_DIRECTORY_TAG}\", one per key; default\n"
+             f"                  authority: the agent URL's host, ttl {BOT_AUTH_DIRECTORY_TTL_S} s)\n"
+             "  format [legacy|dict]\n"
+             "                  Signature-Agent wire format. legacy (default): \"https://…\",\n"
+             "                  covered as \"signature-agent\" — what Cloudflare verifies.\n"
+             "                  dict: sig1=\"https://…\", covered as \"signature-agent\";key=\"sig1\"\n"
+             "                  (draft-05 §4.1). Takes effect at the next launch --bot-auth.")
     if not subcmd or subcmd in ("-h", "--help", "help"):
         print(usage)
         sys.exit(0 if subcmd else 1)
+    try:
+        if subcmd == "init":
+            opts, rest = _bot_auth_parse_opts(args, {"--force"}, {"--agent-url", "--agent-format"})
+        elif subcmd == "directory":
+            opts, rest = _bot_auth_parse_opts(
+                args, {"--headers", "--content-digest", "--json"}, {"--authority", "--ttl"})
+        else:
+            opts, rest = _bot_auth_parse_opts(args, set(), set())
+    except ValueError as e:
+        print(f"cdpilot: bot-auth {subcmd}: {e}\n{usage}", file=sys.stderr)
+        sys.exit(2)
     if subcmd == "init":
-        agent_url, force, i = None, False, 0
-        while i < len(args):
-            a = args[i]
-            if a == "--agent-url" and i + 1 < len(args):
-                agent_url, i = args[i + 1], i + 2
-                continue
-            if a.startswith("--agent-url="):
-                agent_url = a.split("=", 1)[1]
-            elif a == "--force":
-                force = True
-            elif not agent_url and not a.startswith("-"):
-                agent_url = a
-            i += 1
+        agent_url = opts.get("--agent-url") or (rest[0] if rest else None)
         _bot_auth_require_crypto()
         if not agent_url:
             print("Usage: cdpilot bot-auth init --agent-url https://your-domain.com",
                   file=sys.stderr)
             sys.exit(1)
+        agent_format = _bot_auth_check_format(opts.get("--agent-format", "legacy"))
         agent_url = agent_url.rstrip("/")
         problem = _bot_auth_check_agent_url(agent_url)
         if problem:
             print(f"cdpilot: {problem}", file=sys.stderr)
             sys.exit(1)
-        _bot_auth_generate_keypair(agent_url, force=force)
+        _bot_auth_generate_keypair(agent_url, force=bool(opts.get("--force")),
+                                   agent_format=agent_format)
     elif subcmd == "status":
         _bot_auth_require_crypto()
         if not os.path.exists(BOT_AUTH_PRIVATE_KEY_FILE):
@@ -2411,13 +2936,24 @@ def cmd_bot_auth(subcmd=None, *args):
             print(_bot_auth_status_label())
             return
         _key, config = _bot_auth_load_private_key()
+        _bot_auth_warn_if_stale(CDP_PORT)
         print("Bot Auth: configured")
         print(f"  agent URL : {config.get('agent_url', '?')}")
         print(f"  keyid     : {config['keyid']}")
+        print(f"  format    : Signature-Agent {_bot_auth_agent_format(config)}")
         print(f"  directory : {config.get('agent_url', '').rstrip('/')}{BOT_AUTH_DIRECTORY_PATH}")
         print(f"  {_bot_auth_status_label()} (port {CDP_PORT})")
     elif subcmd == "directory":
-        print(json.dumps(_bot_auth_build_directory(), indent=2))
+        _bot_auth_cmd_directory(opts)
+    elif subcmd == "format":
+        _key, config = _bot_auth_load_private_key()
+        if not rest:
+            print(f"Signature-Agent format: {_bot_auth_agent_format(config)}")
+            return
+        config["agent_format"] = _bot_auth_check_format(rest[0])
+        _bot_auth_write_config(config)
+        print(f"Signature-Agent format: {config['agent_format']} "
+              "(takes effect at the next launch --bot-auth)")
     else:
         print(f"cdpilot: unknown bot-auth subcommand: {subcmd}\n{usage}", file=sys.stderr)
         sys.exit(2)
@@ -5122,9 +5658,15 @@ def cmd_launch(auto=False, idle_close=None):
                     pass
             proj_label = f' [{PROJECT_ID}]' if PROJECT_ID else ''
             print(f'CDP ready! (port {CDP_PORT}){proj_label}')
+            # A new browser: an older "signer went stale" warning is about the
+            # previous one (signing again, if asked, clears it once ready).
+            _bot_auth_clear_stale_marker(CDP_PORT)
             if bot_auth and not _bot_auth_start_for_launch(CDP_PORT, proc.pid, bot_auth_config):
-                # Asked for a signed browser: do not leave an unsigned one behind.
-                _stop_browser_on_port(CDP_PORT)
+                # Asked for a signed browser: do not leave an unsigned one behind
+                # — unless a concurrent `launch --bot-auth` won the race and its
+                # live, verified signer serves this browser: never stop that one.
+                if not _bot_auth_active(CDP_PORT):
+                    _stop_browser_on_port(CDP_PORT)
                 sys.exit(1)
             return
     print('Failed to start CDP (timeout).', file=sys.stderr)
@@ -5158,6 +5700,7 @@ async def cmd_go(url):
     # Mark this tab as cdpilot-owned so a later `close` knows it can shut it.
     if isinstance(page, dict):
         _mark_owned_tab(page.get("id"))
+    _bot_auth_warn_if_stale(CDP_PORT)  # signing was set up but its signer died
 
     try:
         from urllib.parse import urlparse
@@ -15892,8 +16435,20 @@ _SLOG_TEXT_KV_RE = _re.compile(
 _SLOG_TEXT_COOKIE_RE = _re.compile(r"\b((?:set-)?cookie[ \t]*[:=][ \t]*)((?![ \t]*«)[^\n]+)", _re.I)
 # Web Bot Auth request headers seen in output (network dumps, eval of headers):
 # a signature is replayable until it expires, so it is not logged.
-_SLOG_TEXT_SIGNATURE_RE = _re.compile(
-    r"\b(signature(?:-input)?[\"']?[ \t]*[:=][ \t]*)((?![ \t]*«)[^\n]+)", _re.I)
+# Only real header lines are masked, never prose like "invalid signature: …":
+# the value must start like an sf-dictionary member (`sig1=…`), and the name
+# must be a header line (line start) or a quoted key in a header dump
+# ({"Signature": "…"} or CDP's {"name": "Signature", "value": "…"}).
+_SLOG_SIG_VALUE = r"[A-Za-z*][\w.*-]*="
+_SLOG_TEXT_SIGNATURE_RES = (
+    _re.compile(r"^([ \t]*[\"']?signature(?:-input)?[\"']?[ \t]*:[ \t]*)"
+                r"((?![ \t]*«)" + _SLOG_SIG_VALUE + r"[^\n]*)", _re.I | _re.M),
+    _re.compile(r"([\"']signature(?:-input)?[\"'][ \t]*:[ \t]*([\"']))"
+                r"((?!«)" + _SLOG_SIG_VALUE + r"(?:(?!\2)[^\\\n]|\\.)*)", _re.I),
+    _re.compile(r"([\"']name[\"'][ \t]*:[ \t]*[\"']signature(?:-input)?[\"'][ \t]*,[ \t]*"
+                r"[\"']value[\"'][ \t]*:[ \t]*([\"']))"
+                r"((?!«)" + _SLOG_SIG_VALUE + r"(?:(?!\2)[^\\\n]|\\.)*)", _re.I),
+)
 _SLOG_FILLED_RE = _re.compile(r"(\bFilled\b[^\n=]*=[ \t]*)((?![ \t]*«)[^\n]+)")
 _SLOG_ECHO_RE = _re.compile(r"^(\s*\[\d+\]\s+)([a-z][a-z-]*)([^\n]*)$", _re.M)
 _SLOG_TOKENISH_RE = _re.compile(r"[A-Za-z0-9_\-+/=.~]{20,}")
@@ -16054,7 +16609,8 @@ def _slog_scrub_text(text, secrets=(), echo=True):
         text = _SLOG_ECHO_RE.sub(_slog_scrub_echo, text)
     text = _SLOG_FILLED_RE.sub(lambda m: m.group(1) + _slog_mark(m.group(2)), text)
     text = _SLOG_TEXT_COOKIE_RE.sub(lambda m: m.group(1) + _slog_mark(m.group(2)), text)
-    text = _SLOG_TEXT_SIGNATURE_RE.sub(lambda m: m.group(1) + _slog_mark(m.group(2)), text)
+    for sig_re in _SLOG_TEXT_SIGNATURE_RES:
+        text = sig_re.sub(lambda m: m.group(1) + _slog_mark(m.group(m.lastindex)), text)
     text = _slog_mask_urls(text)
     text = _SLOG_BEARER_RE.sub(lambda m: m.group(1) + m.group(2) + _slog_mark(m.group(3)), text)
     text = _SLOG_TOKEN_PREFIX_RE.sub(lambda m: _slog_mark(m.group(0)), text)
@@ -16395,7 +16951,8 @@ def _slog_begin(argv):
         if not argv or not _slog_enabled():
             return
         cmd = SLOG_CMD_ALIASES.get(argv[0], argv[0])
-        if cmd in SLOG_SKIP_CMDS or cmd in (WATCH_DAEMON_FLAG, BOT_AUTH_SIGNER_FLAG):
+        if cmd in SLOG_SKIP_CMDS or cmd in (WATCH_DAEMON_FLAG, BOT_AUTH_SIGNER_FLAG,
+                                            BOT_AUTH_LABEL_FLAG):
             return
         _SLOG.update(active=True, done=False, cmd=cmd, args=list(argv[1:]),
                      started=datetime.datetime.now().astimezone(), t0=time.monotonic(),
@@ -16720,6 +17277,10 @@ if __name__ == "__main__":
         sys.exit(0)
     if cmd == BOT_AUTH_SIGNER_FLAG:  # detached bot-auth request signer
         _bot_auth_signer_entry(args)
+        sys.exit(0)
+    if cmd == BOT_AUTH_LABEL_FLAG:  # the `bot-auth:` line of bin/cdpilot.js status
+        _bot_auth_warn_if_stale(CDP_PORT)
+        print(_bot_auth_status_label(CDP_PORT))
         sys.exit(0)
     _idle_touch_activity(cmd)
 

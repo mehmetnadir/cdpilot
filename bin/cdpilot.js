@@ -5,7 +5,7 @@
  * Entry point: detects Python, finds browser, delegates to cdpilot.py
  */
 
-const { execSync, spawn } = require('child_process');
+const { execSync, spawn, spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -291,24 +291,28 @@ function idleCloseLabel(port) {
   }
 }
 
-// Web Bot Auth signer, from the file src/cdpilot.py keeps (see
-// _bot_auth_helper_state there): CDPILOT_HOME/bot-auth/signers/<port>.json
-// names the signer pid and the public keyid; "on" only while that pid lives.
+// Web Bot Auth signer line. Without a signer state file or stale marker in
+// CDPILOT_HOME/bot-auth/signers/ the answer is "off" without starting Python.
+// Otherwise Python decides (hidden --_bot-auth-label, see
+// _bot_auth_helper_state there): a pid alone proves nothing, the signer is
+// "on" only if that pid's command line is this port's signer and the browser
+// is still the one it attached to; a dead or stale signer also prints the
+// one-line "requests go out unsigned" warning on stderr.
 function botAuthLabel(port) {
   const home = process.env.CDPILOT_HOME || path.join(os.homedir(), '.cdpilot');
-  try {
-    const file = path.join(home, 'bot-auth', 'signers', `${port}.json`);
-    const st = JSON.parse(fs.readFileSync(file, 'utf-8'));
-    if (!st.ready || !st.pid) return 'bot-auth: off';
-    try {
-      process.kill(st.pid, 0); // existence probe; safe on Windows in Node
-    } catch (e) {
-      if (e.code !== 'EPERM') return 'bot-auth: off';
-    }
-    return `bot-auth: on (keyid ${st.keyid || '?'})`;
-  } catch {
+  const dir = path.join(home, 'bot-auth', 'signers');
+  if (!fs.existsSync(path.join(dir, `${port}.json`)) && !fs.existsSync(path.join(dir, `${port}.stale`))) {
     return 'bot-auth: off';
   }
+  const python = findPython();
+  if (!python) return 'bot-auth: off';
+  const r = spawnSync(python, [SCRIPT, '--_bot-auth-label'], {
+    encoding: 'utf-8', timeout: 20000,
+    env: { ...process.env, CDP_PORT: String(port), CDPILOT_LOG: '0' },
+  });
+  if (r.stderr) process.stderr.write(r.stderr);
+  const line = (r.stdout || '').trim().split('\n').pop();
+  return /^bot-auth: /.test(line || '') ? line : 'bot-auth: off';
 }
 
 // ── Version ──
@@ -485,6 +489,12 @@ function showHelp() {
                        Generate an Ed25519 key (0600, never printed) in CDPILOT_HOME/bot-auth/
     bot-auth directory Print the JWKS to serve at
                        https://your-domain.com/.well-known/http-message-signatures-directory
+    bot-auth directory --headers [--authority <host>] [--ttl <s>] [--content-digest] [--json]
+                       The same plus the Signature / Signature-Input headers that
+                       response must carry (Cloudflare checks them; one per key)
+    bot-auth format [legacy|dict]
+                       Signature-Agent format. legacy (default): "https://…",
+                       what Cloudflare verifies; dict: sig1="https://…" (draft-05)
     bot-auth status    Agent URL, keyid, and whether the signer is running
     launch --bot-auth  Launch with a signer that adds Signature, Signature-Input and
                        Signature-Agent to EVERY request the browser makes (new tabs,

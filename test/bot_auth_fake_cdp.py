@@ -22,7 +22,9 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -73,6 +75,33 @@ DRAFT_TEXT_VECTORS = [
      ';tag="web-bot-auth"',
      "jdq0SqOwHdyHr9+r5jw3iYZH6aNGKijYp/EstF4RQTQdi5N5YYKrD+mCT1HA1nZDsi6nJKuHxUi/5Syp3rLWBA=="),
 ]
+
+
+# draft-05 A.2.3, the LEGACY Signature-Agent form (the one Cloudflare's
+# verifier accepts), as full headers: cdpilot's default wire format.
+DRAFT_A23_HEADERS = {
+    "Signature-Agent": '"https://signature-agent.test"',
+    "Signature-Input": 'sig2=' + DRAFT_TEXT_VECTORS[1][2],
+    "Signature": 'sig2=:' + DRAFT_TEXT_VECTORS[1][3] + ':',
+}
+DRAFT_A23_NONCE = "e8N7S2MFd/qrd6T2R3tdfAuuANngKI7LFtKYI/vowzk4lAZYadIX6wW25MwG7DCT9RUKAJ0qVkU0mEeLElW1qg=="
+# cloudflare/web-bot-auth packages/web-bot-auth/test/test_data/
+# web_bot_auth_directory_response_v1.json: the signed directory response.
+DIRECTORY_VECTOR = {
+    "authority": "signature-agent.test",
+    "body": '{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U",'
+            '"x":"JrQLj5P_89iXES9-vFgrIy29clF9CC_oPPsw3c5D0bs","use":"sig"}]}',
+    "content_digest": "sha-256=:CADMT2aBdV/rqQr/NIru64ERQkCobVvllA4V0fLFDu0=:",
+    "signature": "binding0=:yiHq0TXrbpzbmlttAQMpYoAufitFJUWuNsakB7QQMoN0EHbo5o51bZRVR8az/ptTWCwllix9clrKXfGKwdPzBg==:",
+    "signature_input": 'binding0=("@authority";req "content-digest");created=1735689600'
+                       ';keyid="poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U";alg="ed25519"'
+                       ';expires=4889289600;tag="http-message-signatures-directory"',
+    "signature_base": '"@authority";req: signature-agent.test\n'
+                      '"content-digest": sha-256=:CADMT2aBdV/rqQr/NIru64ERQkCobVvllA4V0fLFDu0=:\n'
+                      '"@signature-params": ("@authority";req "content-digest");created=1735689600'
+                      ';keyid="poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U";alg="ed25519"'
+                      ';expires=4889289600;tag="http-message-signatures-directory"',
+}
 
 
 def have_crypto():
@@ -137,6 +166,18 @@ def sc_vectors(mod):
                 + (f'"signature-agent";key="{v["agent_key"]}": "{v["agent"]}"\n' if v["agent"] else "")
                 + f'"@signature-params": {params}')
         out[v["label"] + "_base"] = base == want
+    a23_params = DRAFT_TEXT_VECTORS[1][2]
+    out["draft_a23_legacy_base"] = mod._bot_auth_signature_base(
+        "GET", "example.com", "/", "https://signature-agent.test", a23_params).decode() == (
+        '"@authority": example.com\n"signature-agent": "https://signature-agent.test"\n'
+        f'"@signature-params": {a23_params}')
+    dparams = DIRECTORY_VECTOR["signature_input"].split("=", 1)[1]
+    out["directory_base"] = mod._bot_auth_signature_base(
+        "GET", DIRECTORY_VECTOR["authority"], None, None, dparams,
+        headers={"content-digest": DIRECTORY_VECTOR["content_digest"]}
+    ).decode() == DIRECTORY_VECTOR["signature_base"]
+    out["directory_content_digest"] = mod._bot_auth_content_digest(
+        DIRECTORY_VECTOR["body"].encode()) == DIRECTORY_VECTOR["content_digest"]
     a22_params = DRAFT_A22_BASE.rsplit('"@signature-params": ', 1)[1]
     out["draft_a22_base"] = mod._bot_auth_signature_base(
         "GET", "example.com", "/", "https://signature-agent.test", a22_params).decode() == DRAFT_A22_BASE
@@ -151,11 +192,24 @@ def sc_vectors(mod):
         h = mod._bot_auth_sign_request(
             "GET", "https://example.com/path/to/resource", v["agent"], key, VECTOR_KEYID,
             now=1735689600, expires=4889289600, nonce=v["nonce"], label=v["label"],
-            agent_key=v["agent_key"])
+            agent_key=v["agent_key"], agent_format="dict")
         out[v["label"] + "_headers"] = (
             h.get("Signature-Input") == v["signature_input"]
             and h.get("Signature") == v["signature"]
             and h.get("Signature-Agent") == v.get("signature_agent"))
+    # The default format IS the legacy one: A.2.3 byte for byte, no format argument.
+    h = mod._bot_auth_sign_request(
+        "GET", "https://example.com/", "https://signature-agent.test", key, VECTOR_KEYID,
+        now=1735689600, expires=1735693200, nonce=DRAFT_A23_NONCE, label="sig2")
+    out["draft_a23_legacy_headers"] = h == DRAFT_A23_HEADERS
+    # The reference directory-response vector, byte for byte.
+    d = mod._bot_auth_directory_headers(
+        [(key, VECTOR_KEYID)], DIRECTORY_VECTOR["authority"], now=1735689600,
+        expires=4889289600, nonce=False, labels=["binding0"],
+        body=DIRECTORY_VECTOR["body"].encode(), content_digest=True)
+    out["directory_vector"] = (d.get("Signature-Input") == DIRECTORY_VECTOR["signature_input"]
+                               and d.get("Signature") == DIRECTORY_VECTOR["signature"]
+                               and d.get("Content-Digest") == DIRECTORY_VECTOR["content_digest"])
     return out
 
 
@@ -244,9 +298,9 @@ def sc_helper_real_signature(mod):
     urls = ["https://example.com/", "http://127.0.0.1:8080/api?x=1", "https://Shop.Example:8443/c",
             "https://example.com:443/default-port"]
 
-    async def body():
+    async def body(signer_fn):
         ws = FakeSocket()
-        task = asyncio.ensure_future(mod._BotAuthSigner(ws, sign).run())
+        task = asyncio.ensure_future(mod._BotAuthSigner(ws, signer_fn).run())
         for i, u in enumerate(urls):
             ws.push(paused(f"R{i}", u, method="POST" if i == 1 else "GET"))
         await ws.settle()
@@ -254,20 +308,61 @@ def sc_helper_real_signature(mod):
         await asyncio.wait_for(task, 2)
         return [m for m in ws.sent if m.get("method") == "Fetch.continueRequest"]
 
-    results = []
-    for u, m in zip(urls, asyncio.run(body())):
+    results, agents = [], []
+    for u, m in zip(urls, asyncio.run(body(sign))):
         headers = {h["name"]: h["value"] for h in m["params"]["headers"]}
         headers["Host"] = mod._bot_auth_authority(u)  # what the browser sends as Host
+        agents.append(headers.get("Signature-Agent"))
         results.append(bot_auth_server.verify("GET", headers, {"keys": [jwk]}))
     # Tampering is caught: the same headers for another host fail.
     tampered = dict(headers, Host="evil.example")
+
+    def sign_dict(method, url):
+        return mod._bot_auth_sign_request(method, url, agent, key, jwk["kid"], agent_format="dict")
+    dict_results = []
+    for u, m in zip(urls, asyncio.run(body(sign_dict))):
+        h = {x["name"]: x["value"] for x in m["params"]["headers"]}
+        h["Host"] = mod._bot_auth_authority(u)
+        dict_results.append([bot_auth_server.verify("GET", h, {"keys": [jwk]}, agent_format="dict")[0],
+                             bot_auth_server.verify("GET", h, {"keys": [jwk]})[0]])
     times = []
     for _ in range(300):
         t0 = time.perf_counter()
         sign("GET", "https://example.com/some/path?q=1")
         times.append((time.perf_counter() - t0) * 1000)
     return {"verified": results, "tampered": bot_auth_server.verify("GET", tampered, {"keys": [jwk]}),
+            "agents": agents, "dict": dict_results,
             "median_ms": round(statistics.median(times), 4)}
+
+
+def sc_directory(mod):
+    """`bot-auth directory --headers` output verifies with the fixture's
+    independent directory verifier; another Host, a later clock or an
+    edited body do not."""
+    if not have_crypto():
+        return {"skipped": "cryptography not installed"}
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    key = ed25519.Ed25519PrivateKey.generate()
+    jwk = mod._bot_auth_public_jwk(key)
+    body = json.dumps({"keys": [jwk]}, indent=2) + "\n"
+    h = mod._bot_auth_directory_headers([(key, jwk["kid"])], "agent.example", now=time.time())
+    hd = mod._bot_auth_directory_headers([(key, jwk["kid"])], "agent.example", now=time.time(),
+                                         body=body.encode(), content_digest=True)
+    key2 = ed25519.Ed25519PrivateKey.generate()
+    jwk2 = mod._bot_auth_public_jwk(key2)
+    body2 = json.dumps({"keys": [jwk, jwk2]})
+    h2 = mod._bot_auth_directory_headers([(key, jwk["kid"]), (key2, jwk2["kid"])], "agent.example")
+    return {
+        "input": h["Signature-Input"],
+        "ok": bot_auth_server.verify_directory(h, "agent.example", body),
+        "ok_digest": bot_auth_server.verify_directory(hd, "agent.example", body),
+        "other_host": bot_auth_server.verify_directory(h, "evil.example", body)[0],
+        "expired": bot_auth_server.verify_directory(h, "agent.example", body,
+                                                    now=time.time() + 2 * 86400)[0],
+        "edited_body": bot_auth_server.verify_directory(hd, "agent.example", body + " ")[0],
+        "two_keys": bot_auth_server.verify_directory(h2, "agent.example", body2),
+        "two_keys_one_signed": bot_auth_server.verify_directory(h, "agent.example", body2)[0],
+    }
 
 
 def sc_navigate_skips_stealth(mod):
@@ -347,31 +442,159 @@ def sc_conflict_and_log(mod):
             '"Signature-Input": "sig1=(\\"@authority\\");created=1;keyid=\\"abc\\""\n'
             'Bot Auth: signing every request as https://agent.test')
     scrubbed = mod._slog_scrub_text(text)
+    prose = ("error: invalid signature: the token was not accepted\n"
+             "Digital signature: present on the PDF")
+    dump = ('{"Accept": "*/*", "Signature": "sig1=:QKN4fTdIYfh8abc:"}\n'
+            "[{'name': 'Signature-Input', 'value': 'sig1=(\"@authority\");created=7'}]")
+    dumped = mod._slog_scrub_text(dump)
     out["slog"] = {"signature_masked": "QKN4fTdIYfh8" not in scrubbed,
                    "input_masked": "created=1" not in scrubbed,
-                   "status_kept": "Bot Auth: signing every request" in scrubbed}
+                   "status_kept": "Bot Auth: signing every request" in scrubbed,
+                   "prose_kept": mod._slog_scrub_text(prose) == prose,
+                   "dump_masked": "QKN4fTdIYfh8" not in dumped and "created=7" not in dumped
+                   and '"Accept": "*/*"' in dumped}
     return out
 
 
+def _sleeper(extra=()):
+    """A live process that is NOT a signer (or, with `extra`, whose command line says it is)."""
+    argv = ([sys.executable, "-c", "import time; time.sleep(60)", *extra] if extra or os.name == "nt"
+            else ["sleep", "60"])
+    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+
+
 def sc_state(mod):
-    """Helper state: on/off label, liveness by pid, stop clears it."""
-    port = 45123
+    """Signer state trust: on only for a pid whose command line is this port's
+    signer AND the browser it attached to; a reused pid, another token, a
+    restarted browser or a dead pid is stale (file dropped, marker left, one
+    warning); stop never signals a pid that is not our signer."""
+    port = 58690
+    ws = "ws://127.0.0.1:58690/devtools/browser/fake-1"
+    mod._idle_version = lambda p: {"webSocketDebuggerUrl": ws}  # the browser now on the port
     mod._bot_auth_clear_state(port)
-    off = mod._bot_auth_status_label(port)
-    mod._bot_auth_save_state(port, {"token": "t", "pid": os.getpid(), "ready": True,
-                                    "keyid": "KID123", "port": port})
-    on = mod._bot_auth_status_label(port)
-    active = mod._bot_auth_active(port)
-    mod._bot_auth_save_state(port, {"token": "t", "pid": 2 ** 22 + 12345, "ready": True,
-                                    "keyid": "KID123", "port": port})
-    dead = mod._bot_auth_status_label(port)
-    stopped = mod._bot_auth_stop_helper(port, wait_s=0)
-    return {"off": off, "on": on, "active": active, "dead_pid": dead, "stopped": stopped,
-            "state_after_stop": mod._bot_auth_load_state(port)}
+    mod._bot_auth_clear_stale_marker(port)
+    marker = lambda: os.path.exists(mod._bot_auth_stale_marker_path(port))  # noqa: E731
+    out = {"off": mod._bot_auth_status_label(port)}
+    signer = _sleeper((mod.BOT_AUTH_SIGNER_FLAG, str(port), "t"))
+    sleeper = _sleeper()
+
+    def save(pid, token="t", browser_ws=ws, ctime=True):
+        mod._bot_auth_save_state(port, {
+            "token": token, "pid": pid, "ready": True, "keyid": "KID123", "port": port,
+            "browser_ws": browser_ws, "pid_ctime": mod._proc_create_time(pid) if ctime else None})
+
+    try:
+        save(signer.pid)
+        out["on"] = mod._bot_auth_status_label(port)
+        out["active"] = mod._bot_auth_active(port)
+        out["kept_while_on"] = mod._bot_auth_load_state(port) is not None and not marker()
+        save(signer.pid, token="other")
+        out["other_token"] = [mod._bot_auth_status_label(port), mod._bot_auth_load_state(port), marker()]
+        mod._bot_auth_clear_stale_marker(port)
+        save(signer.pid, browser_ws="ws://127.0.0.1:58690/devtools/browser/fake-0")
+        out["browser_restarted"] = [mod._bot_auth_status_label(port), mod._bot_auth_load_state(port),
+                                    marker()]
+        mod._bot_auth_clear_stale_marker(port)
+        save(sleeper.pid, ctime=False)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            warned = mod._bot_auth_warn_if_stale(port)
+            warned_again = mod._bot_auth_warn_if_stale(port)
+        out["reused_pid"] = [mod._bot_auth_status_label(port), mod._bot_auth_load_state(port), marker()]
+        out["warning"] = [warned, warned_again, err.getvalue()]
+        save(sleeper.pid, ctime=False)
+        out["stop_reused"] = mod._bot_auth_stop_helper(port, wait_s=0.5)
+        out["sleeper_alive_after_stop"] = sleeper.poll() is None
+        out["marker_after_stop"] = marker()
+        save(signer.pid)
+        mod._bot_auth_stop_helper(port, wait_s=0)
+        deadline = time.time() + 5
+        while signer.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        out["real_signer_stopped"] = signer.poll() is not None
+        save(2 ** 22 + 12345)
+        out["dead_pid"] = mod._bot_auth_status_label(port)
+        save(sleeper.pid, ctime=False)
+        mod._bot_auth_stop_helper(port, wait_s=0)
+        out["state_after_stop"] = mod._bot_auth_load_state(port)
+    finally:
+        for p in (signer, sleeper):
+            try:
+                p.kill()
+                p.wait(5)
+            except Exception:
+                pass
+    return out
 
 
-SCENARIOS = [sc_vectors, sc_thumbprint, sc_helper, sc_helper_real_signature,
-             sc_navigate_skips_stealth, sc_conflict_and_log, sc_state]
+def sc_clients(mod):
+    """Idle close while the signer runs counts CDP clients by socket owner:
+    parsers for lsof -F pn and netstat -ano, and one live connection."""
+    lsof = ("p101\nf5\nn127.0.0.1:52000->127.0.0.1:58600\n"
+            "p202\nf7\nn127.0.0.1:58600->127.0.0.1:52000\n"      # the browser's side
+            "p303\nf9\nn[::1]:52011->[::1]:58600\n"
+            "p404\nf3\nn127.0.0.1:52100->127.0.0.1:586001\n")   # another port
+    netstat = ("\nActive Connections\n\n  Proto  Local Address  Foreign Address  State  PID\n"
+               "  TCP    127.0.0.1:52000  127.0.0.1:58600  ESTABLISHED  101\n"
+               "  TCP    127.0.0.1:58600  127.0.0.1:52000  ESTABLISHED  202\n"
+               "  TCP    127.0.0.1:52001  127.0.0.1:58600  HERGESTELLT  303\n"
+               "  TCP    127.0.0.1:52002  127.0.0.1:58600  TIME_WAIT  0\n"
+               "  TCP    0.0.0.0:58600    0.0.0.0:0        LISTENING  202\n")
+    bsd = ("Proto Recv-Q Send-Q  Local Address  Foreign Address  (state)  rxbytes txbytes rhiwat "
+           "shiwat process:pid state options\n"
+           "tcp4 0 0 127.0.0.1.58600 127.0.0.1.52000 ESTABLISHED 0 0 1 1 Chrome:202 00002 0\n"
+           "tcp4 0 0 127.0.0.1.52000 127.0.0.1.58600 ESTABLISHED 0 0 1 1 Python:101 00002 0\n"
+           "tcp6 0 0 ::1.52011 ::1.58600 ESTABLISHED 0 0 1 1 Google Chrome H:303 00002 0\n"
+           "tcp4 0 0 127.0.0.1.52012 127.0.0.1.58600 TIME_WAIT 0 0 1 1 -:0 00002 0\n"
+           "tcp4 0 0 127.0.0.1.58600 *.* LISTEN 0 0 1 1 Chrome:202 00002 0\n")
+    ss = ("State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"
+          'ESTAB 0 0 127.0.0.1:52000 127.0.0.1:58600 users:(("python3",pid=101,fd=3))\n'
+          'ESTAB 0 0 127.0.0.1:58600 127.0.0.1:52000 users:(("chrome",pid=202,fd=9))\n'
+          'ESTAB 0 0 [::1]:52011 [::1]:58600 users:(("node",pid=303,fd=20))\n')
+    out = {"lsof": sorted(mod._cdp_client_pids_lsof(lsof, 58600)),
+           "netstat": sorted(mod._cdp_client_pids_netstat(netstat, 58600)),
+           "bsd_netstat": sorted(mod._cdp_client_pids_bsd_netstat(bsd, 58600)),
+           "ss": sorted(mod._cdp_client_pids_ss(ss, 58600))}
+    srv, port = None, None
+    for p in range(58650, 58700):
+        try:
+            srv = socket.socket()
+            srv.bind(("127.0.0.1", p))
+            srv.listen(5)
+            port = p
+            break
+        except OSError:
+            srv.close()
+            srv = None
+    if srv is None:
+        out["live"] = "no free port in 58650-58699"
+        return out
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import socket, sys, time; s = socket.create_connection(('127.0.0.1', "
+         f"{port})); print('up', flush=True); time.sleep(30)"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        conn, _ = srv.accept()
+        child.stdout.readline()
+        pids = mod._cdp_client_pids(port)
+        out["live"] = {
+            "tool": pids is not None,
+            "child_seen": pids is not None and child.pid in pids,
+            "server_side_not_counted": pids is None or os.getpid() not in pids,
+            "other_than_child": mod._bot_auth_other_clients(port, {"pid": child.pid}),
+            "other_than_signer": mod._bot_auth_other_clients(port, {"pid": 1}),
+        }
+        conn.close()
+    finally:
+        child.kill()
+        child.wait(5)
+        srv.close()
+    return out
+
+
+SCENARIOS = [sc_vectors, sc_thumbprint, sc_helper, sc_helper_real_signature, sc_directory,
+             sc_navigate_skips_stealth, sc_conflict_and_log, sc_state, sc_clients]
 
 
 def main():
