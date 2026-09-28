@@ -43,7 +43,9 @@ class _FakeClient:
 
 
 def _setup_poster(monkeypatch, tmp_path, auto_post: str = "on"):
-  """Fresh poster_twikit module rooted at tmp_path with telegram/claude mocked."""
+  """Fresh poster_twikit module rooted at tmp_path with ntfy/claude mocked.
+
+  `notes` holds "title\ntext\nurl" for every phone push the poster made."""
   monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
   monkeypatch.setenv("CDPILOT_AUTO_POST", auto_post)
   sys.modules.pop("poster_twikit", None)
@@ -53,7 +55,9 @@ def _setup_poster(monkeypatch, tmp_path, auto_post: str = "on"):
   pt.COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
   pt.COOKIES_PATH.write_text("{}")
   notes: list[str] = []
-  monkeypatch.setattr(pt, "_telegram_notify", lambda t: notes.append(t))
+  monkeypatch.setattr(pt, "_phone_notify",
+                      lambda title, text="", url=None, **k:
+                      notes.append(f"{title}\n{text}\n{url}"))
   monkeypatch.setattr(pt, "_tr_summary", lambda t: "TR özet")
   monkeypatch.setattr(pt, "_humanized_gap", lambda *a, **k: 0.0)
   monkeypatch.setattr(pt, "_in_quiet_hours", lambda ts: False)
@@ -153,7 +157,7 @@ def test_thread_midchain_failure_persists_partial_then_resumes(monkeypatch, tmp_
   assert part["last_posted_index"] == 0
   assert "boom" in part["error"]
   assert not (pt.FAILED_DIR / "th-1.json").exists()
-  assert any("kısmi" in n for n in notes)
+  assert any("yarım" in n for n in notes)
 
   # Second run RESUMES: no re-post of the root, chain continues off 1001
   fake2 = _FakeClient(base=2000)
@@ -232,7 +236,7 @@ def test_stale_reply_archived_not_posted(monkeypatch, tmp_path):
   arch = json.loads((pt.ARCHIVE_DIR / "r-1.json").read_text())
   assert arch["status"] == "stale"
   assert arch["archived_at"] > 0
-  assert any("bayat" in n and "arşivlendi" in n for n in notes)
+  assert any("bayat" in n.lower() and "arşivlendi" in n for n in notes)
   assert not pt.AUTO_REPLY_COUNT_FILE.exists()  # archive ≠ auto-post
 
 

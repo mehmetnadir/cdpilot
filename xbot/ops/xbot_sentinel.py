@@ -22,9 +22,12 @@ Kontroller:
       boyunca her cevaba aynı canned cümleyi yazdı ve hiçbir şey uyarmadı)
 
 Aksiyonlar:
-  - Anomali → Telegram'a direkt sendMessage (bridge'e import YOK — bridge'in
-    kendisi arızalıyken de haber verebilmeli) + alerts/sentinel-*.txt dosyası
-    (mac-scripts/check-alerts-mac.sh 15dk'da bir bunları macOS bildirimine çevirir).
+  - Anomali → ntfy `bekci` (ops/_notify.py; kendi sunucu olmazsa bildir'in
+    ntfy.sh yedeği) + alerts/sentinel-*.txt dosyası (mac-scripts/check-alerts-mac.sh
+    15dk'da bir bunları macOS bildirimine çevirir). Telegram yedeği 2026-09-28'de
+    kaldırıldı: srv21'den Telegram'a ağ yok ("Network is unreachable") ve o kanalı
+    kimse okumuyordu; Telegram yedeği yalnız crisis_check'te kaldı.
+  - Her koşuda bekleyen rutin ntfy özeti (burst sınırı) gönderilir.
   - Aynı alarm 6h içinde tekrarlanmaz (state/sentinel-state.json dedupe).
   - 09:00-09:59 TR arasındaki ilk koşuda günlük özet (alarm olmasa da).
   - `--report` bayrağı: alarm göndermeden tabloyu stdout'a basar (uzaktan durum
@@ -39,8 +42,6 @@ import os
 import subprocess
 import sys
 import time
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -50,7 +51,6 @@ BOT = Path(os.environ.get("CDPILOT_BOT_HOME", "/opt/cdpilot-twitter-bot"))
 STATE_FILE = BOT / "state" / "sentinel-state.json"
 ALERTS_DIR = BOT / "alerts"
 LOG_FILE = BOT / "logs" / "sentinel.log"
-TELEGRAM_ENV = Path(os.environ.get("CDPILOT_TELEGRAM_ENV", str(BOT / "telegram.env")))
 
 QUEUE_ROT_H = 3
 # One working tab is the target; 20 leaves room for other projects sharing the
@@ -82,29 +82,6 @@ def _load_state() -> dict:
 def _save_state(s: dict) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=2))
-
-
-def _telegram(text: str) -> bool:
-    """Direct Bot API call — deliberately independent of telegram_bridge."""
-    try:
-        env: dict[str, str] = {}
-        for raw in TELEGRAM_ENV.read_text().splitlines():
-            raw = raw.strip()
-            if raw and not raw.startswith("#") and "=" in raw:
-                k, v = raw.split("=", 1)
-                env[k] = v
-        token, chat = env.get("TELEGRAM_BOT_TOKEN"), env.get("TELEGRAM_CHAT_ID")
-        if not token or not chat:
-            _log("telegram env incomplete — alert not sent")
-            return False
-        data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage", data=data)
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return r.status == 200
-    except Exception as e:
-        _log(f"telegram send failed: {e!r}")
-        return False
 
 
 def _journal_last(unit: str, pattern: str) -> float:
@@ -304,7 +281,7 @@ def main() -> None:
         text = f"🚨 xbot sentinel [{cid}]\n{msg}"
         ALERTS_DIR.mkdir(parents=True, exist_ok=True)
         (ALERTS_DIR / f"sentinel-{cid}-{time.strftime('%Y%m%d-%H%M')}.txt").write_text(text + "\n")
-        if _notify.push(text) or _telegram(text):
+        if _notify.push(text):
             state["alerted"][cid] = now
             sent += 1
 
@@ -313,10 +290,14 @@ def main() -> None:
     today = time.strftime("%Y-%m-%d", tr)
     if tr.tm_hour == 9 and state.get("digest_date") != today:
         d = digest()
-        if _notify.push(d, priority="dusuk", tag="clipboard") or _telegram(d):
+        if _notify.push(d, priority="dusuk", tag="clipboard"):
             state["digest_date"] = today
 
     _save_state(state)
+    try:
+        _notify.flush_digest()
+    except Exception as e:  # noqa: BLE001
+        _log(f"ntfy digest flush failed: {e!r}")
     _log(f"checks={len(fails)} alarms_sent={sent}")
 
 

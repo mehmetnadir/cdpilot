@@ -8,8 +8,9 @@ Saate göre uygun adımları çalıştırır:
   22:00 → mention_scraper + daily_analytics (gece kapanış)
 
 Tüm vakitlerde poster_twikit zaten launchd cron'unda 5 dk'da bir çalışır
-(bu script'ten bağımsız). Bu orchestrator sadece "veri toplama" görevini yapar;
-draft generation Claude/Cowork tarafında, Telegram'a manuel batch-seq çağrısı ile.
+(bu script'ten bağımsız). Bildirimler ntfy'den gider (ops/_notify.py): rutin
+etkinlik `cdpilot-x`, alarmlar `bekci`. Telegram onay döngüsü 2026-09-28'de
+kaldırıldı; beğeni/takip/yanıt mevcut sınırlar içinde otonom.
 
 Kullanım:
   python run_cycle.py morning   # 08:30 (mention + discovery)

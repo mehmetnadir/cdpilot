@@ -1276,10 +1276,10 @@ def test_auto_post_strategist_no_card_direct_queue(monkeypatch, tmp_path):
     tb.QUEUE_DIR = tmp_path / "queue"
     import daily_strategist as ds  # type: ignore
 
-    # If a card were sent, _send_to_telegram would be invoked → make it explode.
+    # If the strategy were held for approval, the waiting notice would fire.
     def _boom(*a, **k):
-        raise AssertionError("approval card must NOT be sent in AUTO_POST mode")
-    monkeypatch.setattr(ds, "_send_to_telegram", _boom)
+        raise AssertionError("waiting notice must NOT be sent in AUTO_POST mode")
+    monkeypatch.setattr(ds, "_send_waiting_notice", _boom)
 
     artifact = {
         "id": "2026-06-01",
@@ -1303,8 +1303,9 @@ def test_auto_post_strategist_no_card_direct_queue(monkeypatch, tmp_path):
     assert "raw CDP" in item["text"]
 
 
-def test_auto_post_off_keeps_awaiting_telegram(monkeypatch, tmp_path):
-    """AUTO_POST=off → legacy approval flow: artifact status awaiting_telegram."""
+def test_auto_post_off_holds_for_decision_via_ntfy(monkeypatch, tmp_path, _no_real_push):
+    """AUTO_POST=off → nothing queued; strategy waits (awaiting_decision) and an
+    ntfy notice goes out whose Click opens X's composer with the draft."""
     monkeypatch.setenv("CDPILOT_XBOT_DATA", str(tmp_path))
     monkeypatch.setenv("CDPILOT_AUTO_POST", "off")
     monkeypatch.setenv("CDPILOT_STRATEGIST_FORCE", "1")
@@ -1328,18 +1329,15 @@ def test_auto_post_off_keeps_awaiting_telegram(monkeypatch, tmp_path):
         "reply_bait": "q?", "image": {"needed": False}, "url_in_reply": None,
         "reasoning": "because",
     })
-    captured = {}
-
-    def _fake_send(card, sid):
-        captured["sent"] = True
-        return {"message_id": 7}
-    monkeypatch.setattr(ds, "_send_to_telegram", _fake_send)
-
     res = ds.run(send=True)
     assert res["status"] == "ok"
-    assert captured.get("sent") is True  # card WAS sent in legacy mode
     artifact = json.loads(Path(res["path"]).read_text())
-    assert artifact["approval_status"] == "awaiting_telegram"
+    assert artifact["approval_status"] == "awaiting_decision"
+    assert not (tmp_path / "queue").exists() or not list((tmp_path / "queue").glob("*.json"))
+    notice = _no_real_push.payloads[-1]
+    assert notice["title"].startswith("Onay bekliyor")
+    assert notice["topic"] == "cdpilot-x"
+    assert notice["click"].startswith("https://x.com/intent/post?text=hook+text")
 
 
 def test_auto_post_queue_preserves_hot_zone_timing(monkeypatch, tmp_path):
@@ -1374,21 +1372,17 @@ def test_post_notify_sends_link_and_tr_summary(monkeypatch, tmp_path):
     sys.modules.pop("poster_twikit", None)
     import poster_twikit as pt  # type: ignore
     sent = {}
-    monkeypatch.setattr(pt, "_telegram_notify", lambda text: sent.setdefault("text", text))
-    monkeypatch.setattr(pt, "_tr_summary", lambda text: "Türkçe özet cümlesi.")
+    monkeypatch.setattr(pt, "_phone_notify",
+                        lambda title, text="", url=None, **k:
+                        sent.update(title=title, text=text, url=url, **k))
 
     item = {"id": "t-1", "kind": "tweet", "text": "raw CDP > playwright",
             "tweet_url": "https://x.com/cdpilot_dev/status/123"}
-    # Mimic poster's success-notify block
-    kind_label = {"tweet": "Tweet atıldı", "reply": "Cevap atıldı",
-                  "quote": "Alıntı atıldı"}.get(item["kind"], "Tweet atıldı")
-    summary = pt._tr_summary(item["text"])
-    summary_line = f"\n\n📝 TR özet: {summary}" if summary else ""
-    pt._telegram_notify(f"✅ {kind_label}\n{item['tweet_url']}{summary_line}")
+    pt._notify_done(item, "tweet", {"ok": True}, "Türkçe özet cümlesi.")
 
-    assert "https://x.com/cdpilot_dev/status/123" in sent["text"]
-    assert "TR özet: Türkçe özet cümlesi." in sent["text"]
-    assert "Tweet atıldı" in sent["text"]
+    assert sent["url"] == "https://x.com/cdpilot_dev/status/123"  # tap opens it
+    assert sent["text"] == "Türkçe özet cümlesi."
+    assert sent["title"] == "Tweet atıldı"
 
 
 def test_tr_summary_uses_claude_cli(monkeypatch):
@@ -1438,7 +1432,7 @@ def test_crisis_freeze_blocks_auto_post(monkeypatch, tmp_path):
             "status": "pending", "scheduled_time": 1}
     (pt.QUEUE_DIR / "frozen-1.json").write_text(json.dumps(item))
     posted = {}
-    monkeypatch.setattr(pt, "_telegram_notify", lambda t: posted.setdefault("notify", t))
+    monkeypatch.setattr(pt, "_phone_notify", lambda *a, **k: posted.setdefault("notify", a))
 
     asyncio.run(pt.main_async())
     # Item stays in queue (not posted), no posted file created.
