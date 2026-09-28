@@ -3856,6 +3856,27 @@ _FRAME_CDP_SEQ = [1000000]  # _frame_cdp ids: unique per process, never reused
 _TWO_PAGE_FRAMES_JS = ("new Promise(function (r) { requestAnimationFrame(function () {"
                        " requestAnimationFrame(r); }); setTimeout(r, 100); })")
 FRAME_SETTLE_TIMEOUT_S = 0.3
+# The wait is a bet on timing: its 100 ms timer and the cap end it whether or
+# not the browser's copy has caught up. When it has not, the press lands on
+# the <iframe> element in the top page while every hit-test (run in the
+# pages, which are up to date) passes, and nothing is clicked (seen on a CI
+# runner; locally, with the wait left out, 6 of 40 presses went astray when
+# the move and press went out together, and 1 of 40 moves still does with
+# the move sent on its own). So for a target in another renderer the move
+# before the press is a probe: _mouse_reaches sends it until the target gets
+# it (a listener on the target's document or shadow root, capture phase,
+# removed after), a settle wait between tries.
+_MOUSE_PROBE_FN = """function () {
+  var el = this, root = el.getRootNode ? el.getRootNode() : el.ownerDocument, seen = false;
+  function h(e) { if (e.isTrusted && e.composedPath().indexOf(el) >= 0) seen = true; }
+  root.addEventListener('mousemove', h, true);
+  return function (stop) {
+    if (stop) root.removeEventListener('mousemove', h, true);
+    return seen;
+  };
+}"""
+_MOUSE_PROBE_READ_FN = "function (stop) { return this(stop); }"
+MOUSE_PROBE_TRIES = 4
 # The isolated-world fallback note: once per process, i.e. once per CLI
 # command (MCP tool calls run the CLI as a subprocess too).
 _FRAME_ISOLATED_NOTED = [False]
@@ -4381,6 +4402,56 @@ async def _frame_route_settle(route):
         await _frame_cdp(route, [(1, "Runtime.evaluate", {
             "expression": _TWO_PAGE_FRAMES_JS, "awaitPromise": True, "returnByValue": True,
             "contextId": ctx}, sid)], timeout=FRAME_SETTLE_TIMEOUT_S)
+
+
+async def _mouse_reaches(route, target_oid, x, y):
+    """Move the mouse to page point (x, y) until the target gets the move.
+
+    False if it never does in MOUSE_PROBE_TRIES tries (see _MOUSE_PROBE_FN).
+    A target in the top page's renderer (no session) needs no probe: True.
+    Explicit sessions (not rewritten).
+    """
+    sid = route.session_id
+    if sid is None:
+        return True
+    # The listener goes in cdpilot's isolated world: a page that wraps
+    # addEventListener or composedPath in its own world never sees the probe.
+    # Resolving there fails (old browser, fake CDP): the target's own world.
+    probe_oid = target_oid
+    ctx = await _frame_world(route, sid, route.frame_id)
+    if ctx is not None:
+        r = await _frame_cdp(route, [(43, "DOM.describeNode", {"objectId": target_oid}, sid)])
+        backend = r.get(43, {}).get("node", {}).get("backendNodeId")
+        if backend:
+            r = await _frame_cdp(route, [(44, "DOM.resolveNode", {
+                "backendNodeId": backend, "executionContextId": ctx}, sid)])
+            probe_oid = r.get(44, {}).get("object", {}).get("objectId") or target_oid
+    r = await _frame_cdp(route, [(40, "Runtime.callFunctionOn", {
+        "objectId": probe_oid, "functionDeclaration": _MOUSE_PROBE_FN}, sid)])
+    probe = r.get(40, {}).get("result", {}).get("objectId")
+    if not probe:  # no listener: click as before
+        return True
+
+    async def seen(stop=False):
+        r = await _frame_cdp(route, [(42, "Runtime.callFunctionOn", {
+            "objectId": probe, "functionDeclaration": _MOUSE_PROBE_READ_FN,
+            "arguments": [{"value": stop}], "returnByValue": True}, sid)])
+        return r.get(42, {}).get("result", {}).get("value") is True
+    ok = False
+    try:
+        for _ in range(MOUSE_PROBE_TRIES):
+            await _frame_cdp(route, [
+                (41, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}, None)])
+            if await seen():
+                ok = True
+                break
+            await _frame_route_settle(route)  # the move may wait for a drawn frame
+            if await seen():
+                ok = True
+                break
+    finally:
+        ok = await seen(stop=True) or ok
+    return ok
 
 
 async def _frame_route_rewrite(route, commands):
@@ -5057,6 +5128,9 @@ async def _pointer_click(route, target_oid, label, humanize=False):
             why = _hit_failure(route, await _frame_cdp(route, checks(10)), 10, n)
             if why is not None and why[1] == "gone":  # a detached node: el.click() does nothing
                 raise _FrameError(f"{label}: the target is no longer in the page")
+            if why is None and not await _mouse_reaches(route, target_oid, px, py):
+                why = ("got no mouse input at the click point (the browser sent it elsewhere)",
+                       "moved")
             if why is None:
                 press = {"x": px, "y": py, "button": "left", "clickCount": 1}
                 # The last move on its own: Chrome stamps it on arrival, so the
