@@ -6244,8 +6244,18 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     const dir = path.join(home, 'bot-auth', 'signers');
     fs.mkdirSync(dir, { recursive: true });
     const state = path.join(dir, `${port}.json`);
-    fs.writeFileSync(state, JSON.stringify({ token, pid: proc.pid, ready: true, port: parseInt(port, 10),
-      browser_ws: browserWs, keyid: 'k', started: Date.now() / 1000 }));
+    // Written by Python: Windows proves a signer by its creation time, a
+    // 64-bit FILETIME a JS number would round (the real signer records it).
+    const w = spawnSync(PY_BIN, ['-c', [
+      'import json, sys, time', `sys.path.insert(0, ${JSON.stringify(path.join(__dirname, '..', 'src'))})`,
+      'import cdpilot', `pid = ${proc.pid}`,
+      `state = {"token": ${JSON.stringify(token)}, "pid": pid, "pid_ctime": cdpilot._proc_create_time(pid),`,
+      `         "ready": True, "port": ${parseInt(port, 10)}, "browser_ws": ${JSON.stringify(browserWs)},`,
+      '         "keyid": "k", "started": time.time()}',
+      'assert sys.platform != "win32" or state["pid_ctime"] is not None, "no creation time"',
+      `json.dump(state, open(${JSON.stringify(state)}, "w"))`,
+    ].join('\n')], { encoding: 'utf-8', timeout: 20000, env: isoEnv(home, port, 'signer') });
+    assert.strictEqual(w.status, 0, `stand-in signer state: ${w.stdout}${w.stderr}`);
     sleep(0.3);
     return { pid: proc.pid, state, stop: () => { try { proc.kill('SIGKILL'); } catch {} } };
   }
@@ -6913,7 +6923,12 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       const userUrl = 'data:text/html,<title>USER-MAIL</title><textarea id="draft"></textarea>';
       const browser = startHeadless(browserBin, cdpPort, userDataDir, userUrl);
       try {
-        const user = userTab(cdpPort, 'document.getElementById("draft").value = "unsaved draft 7"; document.title');
+        // /json can list the tab before its title is set: wait for both.
+        let user = null;
+        for (let i = 0; i < 20 && !(user && user.title === 'USER-MAIL'); i++) {
+          if (i) sleep(0.25);
+          user = userTab(cdpPort, 'document.getElementById("draft").value = "unsaved draft 7"; document.title');
+        }
         assert(user && user.title === 'USER-MAIL', `user tab not ready: ${JSON.stringify(user)}`);
         const env = isoEnv(home, cdpPort, 'stale-e2e', { CDPILOT_PROFILE: path.join(home, 'cdpilot-profile') });
         const stale = [
