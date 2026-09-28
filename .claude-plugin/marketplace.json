@@ -1,0 +1,31 @@
+{
+  "name": "cdpilot",
+  "description": "Zero-dependency browser automation CLI — MCP server and skill for cdpilot",
+  "owner": {
+    "name": "Mehmet Nadir",
+    "url": "https://github.com/mehmetnadir"
+  },
+  "plugins": [
+    {
+      "name": "cdpilot",
+      "source": "./plugins/cdpilot",
+      "description": "Zero-dependency browser automation over raw CDP — 70+ commands, friction ladder, stealth, MCP server. No Puppeteer/Playwright/Selenium.",
+      "version": "0.9.3",
+      "author": {
+        "name": "Mehmet Nadir",
+        "url": "https://github.com/mehmetnadir"
+      },
+      "homepage": "https://cdpilot.ndr.ist",
+      "repository": "https://github.com/mehmetnadir/cdpilot",
+      "license": "MIT",
+      "keywords": [
+        "browser-automation",
+        "cdp",
+        "chrome-devtools-protocol",
+        "mcp",
+        "ai-agent",
+        "web-scraping"
+      ]
+    }
+  ]
+}

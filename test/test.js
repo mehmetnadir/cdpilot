@@ -3426,16 +3426,129 @@ test('close: CLI smoke — `stop --smart` with no browser is a graceful no-op', 
 // bin/cdpilot.js said Python 3.8+ while the code needs 3.10+, and the MCP
 // Registry rejects a server.json whose version differs from the npm package.
 
-test('metadata: version is identical in package.json, cdpilot.py and server.json', () => {
+test('metadata: version is identical in package.json, cdpilot.py, server.json, marketplace.json, plugin.json and manifest.json', () => {
   const root = path.join(__dirname, '..');
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   const py = fs.readFileSync(path.join(root, 'src', 'cdpilot.py'), 'utf8');
   const server = JSON.parse(fs.readFileSync(path.join(root, 'server.json'), 'utf8'));
+  const marketplace = JSON.parse(fs.readFileSync(path.join(root, '.claude-plugin', 'marketplace.json'), 'utf8'));
+  const plugin = JSON.parse(fs.readFileSync(
+    path.join(root, 'plugins', 'cdpilot', '.claude-plugin', 'plugin.json'), 'utf8'));
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'));
   const pyVersion = (py.match(/^__version__ = "([^"]+)"/m) || [])[1];
   assert.strictEqual(pyVersion, pkg.version, 'src/cdpilot.py __version__ must match package.json');
   assert.strictEqual(server.version, pkg.version, 'server.json version must match package.json');
   assert.strictEqual(server.packages[0].version, pkg.version,
     'server.json packages[0].version must match package.json');
+  assert.strictEqual(marketplace.plugins[0].version, pkg.version,
+    '.claude-plugin/marketplace.json plugins[0].version must match package.json');
+  assert.strictEqual(plugin.version, pkg.version,
+    'plugins/cdpilot/.claude-plugin/plugin.json version must match package.json');
+  assert.strictEqual(manifest.version, pkg.version,
+    'manifest.json (MCP Bundle) version must match package.json');
+});
+
+// ── Claude Code plugin marketplace (2026-09-28) ──
+// Schema: https://code.claude.com/docs/en/plugin-marketplaces and
+// https://code.claude.com/docs/en/plugins/manifest-reference (`claude plugin
+// validate` checked these pass locally; kept here so a later edit can't
+// silently break the marketplace/plugin entry without a red test).
+
+test('plugin marketplace: marketplace.json parses and has required fields', () => {
+  const root = path.join(__dirname, '..');
+  const marketplace = JSON.parse(fs.readFileSync(path.join(root, '.claude-plugin', 'marketplace.json'), 'utf8'));
+  assert(typeof marketplace.name === 'string' && marketplace.name.length > 0, 'marketplace.json needs a name');
+  assert(marketplace.owner && typeof marketplace.owner.name === 'string', 'marketplace.json needs owner.name');
+  assert(Array.isArray(marketplace.plugins) && marketplace.plugins.length > 0,
+    'marketplace.json needs a non-empty plugins array');
+  const entry = marketplace.plugins[0];
+  assert.strictEqual(entry.name, 'cdpilot', 'plugin entry name must be cdpilot');
+  assert.strictEqual(entry.source, './plugins/cdpilot', 'plugin entry source must point at plugins/cdpilot');
+  assert(!entry.source.includes('..'), 'plugin entry source must not contain ".." (fails claude plugin validate)');
+  assert(fs.existsSync(path.join(root, 'plugins', 'cdpilot')), 'the plugin entry source directory must exist');
+});
+
+test('plugin marketplace: plugin.json name matches its marketplace entry name', () => {
+  // "Keep the entry name and the manifest name the same" — a mismatch makes
+  // `claude plugin install <manifest-name>@<marketplace>` fail with
+  // `Plugin "<manifest-name>" not found in marketplace "<marketplace>"`.
+  const root = path.join(__dirname, '..');
+  const plugin = JSON.parse(fs.readFileSync(
+    path.join(root, 'plugins', 'cdpilot', '.claude-plugin', 'plugin.json'), 'utf8'));
+  const marketplace = JSON.parse(fs.readFileSync(path.join(root, '.claude-plugin', 'marketplace.json'), 'utf8'));
+  assert.strictEqual(plugin.name, marketplace.plugins[0].name,
+    'plugin.json name must equal the marketplace entry name');
+  assert(typeof plugin.description === 'string' && plugin.description.length > 0, 'plugin.json needs a description');
+});
+
+test('plugin marketplace: cdpilot MCP server is declared via .mcp.json at the plugin root', () => {
+  const root = path.join(__dirname, '..');
+  const mcpConfigPath = path.join(root, 'plugins', 'cdpilot', '.mcp.json');
+  assert(fs.existsSync(mcpConfigPath), 'plugins/cdpilot/.mcp.json must exist (standard layout, auto-loaded)');
+  const mcpConfig = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf8'));
+  assert(mcpConfig.mcpServers && mcpConfig.mcpServers.cdpilot, '.mcp.json must declare an mcpServers.cdpilot entry');
+  assert.strictEqual(mcpConfig.mcpServers.cdpilot.command, 'npx');
+  assert.deepStrictEqual(mcpConfig.mcpServers.cdpilot.args, ['cdpilot', 'mcp'],
+    'must match the "Claude Code (MCP)" example already in the README');
+});
+
+test('plugin marketplace: skill exists and only documents commands the README already has', () => {
+  const root = path.join(__dirname, '..');
+  const skillPath = path.join(root, 'plugins', 'cdpilot', 'skills', 'cdpilot', 'SKILL.md');
+  assert(fs.existsSync(skillPath), 'plugins/cdpilot/skills/cdpilot/SKILL.md must exist');
+  const skill = fs.readFileSync(skillPath, 'utf8');
+  assert(/^---\nname: cdpilot\n/.test(skill), 'SKILL.md must start with a frontmatter name: cdpilot');
+  const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+  const commandBlock = skill.match(/## Core commands[\s\S]*?```bash\n([\s\S]*?)```/);
+  assert(commandBlock, 'SKILL.md must have a fenced "Core commands" code block');
+  const commands = [...commandBlock[1].matchAll(/^cdpilot (\S+)/gm)].map((m) => m[1]);
+  assert(commands.length > 0, 'the Core commands block must list at least one command');
+  for (const cmd of commands) {
+    const escaped = cmd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    assert(new RegExp(`cdpilot ${escaped}\\b`).test(readme),
+      `SKILL.md lists "cdpilot ${cmd}" but the README doesn't document it — no invented commands`);
+  }
+});
+
+// ── MCP Bundle / manifest.json (2026-09-28) ──
+// Schema: https://github.com/modelcontextprotocol/mcpb/blob/main/MANIFEST.md
+// (validated locally with `npx @anthropic-ai/mcpb validate manifest.json`
+// and a full `npm run build:mcpb` pack).
+
+test('mcpb: manifest.json parses and has the required MCPB fields', () => {
+  const root = path.join(__dirname, '..');
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'));
+  assert.strictEqual(manifest.manifest_version, '0.3');
+  assert.strictEqual(manifest.name, 'cdpilot');
+  assert(typeof manifest.description === 'string' && manifest.description.length > 0,
+    'manifest.json needs a description');
+  assert(manifest.author && typeof manifest.author.name === 'string', 'manifest.json needs author.name');
+  assert(manifest.server && manifest.server.type === 'node', 'manifest.json server.type must be node');
+  assert.strictEqual(manifest.server.entry_point, 'bin/cdpilot.js');
+  assert(fs.existsSync(path.join(root, manifest.server.entry_point)),
+    'manifest.json server.entry_point must point at a file that exists');
+  assert.strictEqual(manifest.server.mcp_config.command, 'node');
+  assert(Array.isArray(manifest.server.mcp_config.args) && manifest.server.mcp_config.args.includes('mcp'),
+    'manifest.json mcp_config.args must run the mcp subcommand');
+  assert(manifest.server.mcp_config.args[0].includes('${__dirname}'),
+    'the entry-point arg must use the ${__dirname} placeholder the mcpb host substitutes at install time');
+});
+
+test('mcpb: .mcpbignore exists so a build does not ship dev/demo files', () => {
+  const root = path.join(__dirname, '..');
+  const ignorePath = path.join(root, '.mcpbignore');
+  assert(fs.existsSync(ignorePath), '.mcpbignore must exist');
+  const ignore = fs.readFileSync(ignorePath, 'utf8');
+  for (const mustIgnore of ['test/', '.github/', 'cdpilot-demo.gif', 'cdpilot-video.mp4']) {
+    assert(ignore.includes(mustIgnore), `.mcpbignore must exclude ${mustIgnore}`);
+  }
+});
+
+test('mcpb: build script exists and npm run build:mcpb is wired to it', () => {
+  const root = path.join(__dirname, '..');
+  assert(fs.existsSync(path.join(root, 'scripts', 'build-mcpb.sh')), 'scripts/build-mcpb.sh must exist');
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  assert.strictEqual(pkg.scripts['build:mcpb'], 'bash scripts/build-mcpb.sh');
 });
 
 test('claims: README panel numbers are tied to a measurement file that backs them', () => {
