@@ -489,7 +489,9 @@ def sc_state(mod):
         out["on"] = mod._bot_auth_status_label(port)
         out["active"] = mod._bot_auth_active(port)
         out["kept_while_on"] = mod._bot_auth_load_state(port) is not None and not marker()
-        save(signer.pid, token="other")
+        # POSIX tells tokens apart by command line; Windows only by the creation
+        # time the signer recorded, which a state from elsewhere does not carry.
+        save(signer.pid, token="other", ctime=os.name != "nt")
         out["other_token"] = [mod._bot_auth_status_label(port), mod._bot_auth_load_state(port), marker()]
         mod._bot_auth_clear_stale_marker(port)
         save(signer.pid, browser_ws="ws://127.0.0.1:58690/devtools/browser/fake-0")

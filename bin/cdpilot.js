@@ -243,8 +243,9 @@ function runStatus() {
           console.log(`  Browser: ${info.Browser || 'Unknown'}`);
           console.log(`  Protocol: ${info['Protocol-Version'] || 'Unknown'}`);
           console.log(`  WebSocket: ${info.webSocketDebuggerUrl || 'N/A'}`);
-          console.log(`  ${idleCloseLabel(port)}`);
-          console.log(`  ${botAuthLabel(port)}\n`);
+          const extra = [webmcpLabel(config.profileDir), botAuthLabel(port)].filter(Boolean);
+          console.log(`  ${idleCloseLabel(port)}${extra.length ? '' : '\n'}`);
+          extra.forEach((l, i) => console.log(`  ${l}${i === extra.length - 1 ? '\n' : ''}`));
         } catch {
           console.log('  ✓ CDP responding but version info unavailable\n');
         }
@@ -252,6 +253,8 @@ function runStatus() {
     });
     req.on('error', () => {
       console.log('  ❌ No browser connected on this port.');
+      const webmcp = webmcpLabel(config.profileDir);
+      if (webmcp) console.log(`  ${webmcp}`);
       console.log('  Run: cdpilot launch\n');
     });
     req.on('timeout', () => {
@@ -291,8 +294,32 @@ function idleCloseLabel(port) {
   }
 }
 
-// Web Bot Auth signer line. Without a signer state file or stale marker in
-// CDPILOT_HOME/bot-auth/signers/ the answer is "off" without starting Python.
+// This project's WebMCP mode, as src/cdpilot.py reads it (get_webmcp_config):
+// CDPILOT_WEBMCP=1|0 wins, else <profile>/webmcp.json written by
+// `launch --webmcp` / `launch --no-webmcp`.
+function webmcpMode(profileDir) {
+  const raw = (process.env.CDPILOT_WEBMCP || '').trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return { on: true, from: 'CDPILOT_WEBMCP' };
+  if (['0', 'false', 'no', 'off'].includes(raw)) return { on: false, from: 'CDPILOT_WEBMCP' };
+  try {
+    const st = JSON.parse(fs.readFileSync(path.join(profileDir, 'webmcp.json'), 'utf-8'));
+    return { on: st.webmcp === true, from: 'launch --webmcp' };
+  } catch {
+    return { on: false, from: null };
+  }
+}
+
+// Printed by `status` only while the mode is on (the default output is unchanged).
+function webmcpLabel(profileDir) {
+  const m = webmcpMode(profileDir);
+  if (!m.on) return null;
+  return `WebMCP: on (${m.from}; browsers start with --enable-features=WebMCP)`;
+}
+
+// Web Bot Auth signer line, printed by `status` only when bot-auth is set up
+// (a key in CDPILOT_HOME/bot-auth/, or signer state for this port), so the
+// default output is unchanged. With no signer state file or stale marker in
+// CDPILOT_HOME/bot-auth/signers/ it is "off" without starting Python.
 // Otherwise Python decides (hidden --_bot-auth-label, see
 // _bot_auth_helper_state there): a pid alone proves nothing, the signer is
 // "on" only if that pid's command line is this port's signer and the browser
@@ -301,9 +328,8 @@ function idleCloseLabel(port) {
 function botAuthLabel(port) {
   const home = process.env.CDPILOT_HOME || path.join(os.homedir(), '.cdpilot');
   const dir = path.join(home, 'bot-auth', 'signers');
-  if (!fs.existsSync(path.join(dir, `${port}.json`)) && !fs.existsSync(path.join(dir, `${port}.stale`))) {
-    return 'bot-auth: off';
-  }
+  const signer = fs.existsSync(path.join(dir, `${port}.json`)) || fs.existsSync(path.join(dir, `${port}.stale`));
+  if (!signer) return fs.existsSync(path.join(home, 'bot-auth', 'config.json')) ? 'bot-auth: off' : null;
   const python = findPython();
   if (!python) return 'bot-auth: off';
   const r = spawnSync(python, [SCRIPT, '--_bot-auth-label'], {
@@ -388,10 +414,14 @@ function showHelp() {
 
   SETUP
     setup              Auto-detect browser, create isolated profile
-    launch [--idle-close <min>] [--bot-auth]  Start browser with CDP enabled
-                       (--idle-close or CDPILOT_IDLE_CLOSE: close it after <min> idle
-                       minutes; --bot-auth: sign every request, see WEB BOT AUTH)
-    status             Check browser connection (idle close, bot-auth signer)
+    launch [--idle-close <min>] [--webmcp|--no-webmcp] [--bot-auth]
+                       Start browser with CDP enabled (--idle-close or
+                       CDPILOT_IDLE_CLOSE: close it after <min> idle minutes;
+                       --webmcp: this project's browsers start with WebMCP on,
+                       saved until --no-webmcp; see WEBMCP below; --bot-auth:
+                       sign every request, see WEB BOT AUTH)
+    status             Check browser connection (idle close; WebMCP and the
+                       bot-auth signer when set up)
     stop [--smart]     Stop browser (--smart = close owned tabs, quit if empty)
     close [--force|--keep]  Smart close: close cdpilot's tabs; quit browser only
                        if no user tabs remain (--force quits anyway, --keep never quits)
@@ -523,6 +553,17 @@ function showHelp() {
                        Typed values, secret-looking args and token/key/secret URL
                        params are redacted. CDPILOT_LOG=0 turns it off;
                        CDPILOT_LOG_DAYS (default 14) sets how many days are kept.
+
+  WEBMCP (tools a page registers on document.modelContext; needs launch --webmcp)
+    tools list [--json] The page's tools from getTools(): imperative, <form
+                        toolname> and same-origin iframe tools, with title,
+                        annotations, inputSchema. None: says why (WebMCP off,
+                        insecure page, old browser, none registered); exit 0.
+    tools call <name> [json-args | --arg k=v ...] [--frame <url-part>]
+                        Check args against inputSchema, run executeTool() with
+                        an abort signal (--timeout, default 20s), print the
+                        result. Bad args / tool error: exit 1; timeout: 124.
+                        Runs the page's own code: its result is untrusted.
 
   WATCH (continuous screencast for AI video understanding)
     watch start <url>  Begin JPEG screencast at N fps to a disk ring buffer

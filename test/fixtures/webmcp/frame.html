@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>WebMCP fixture: same-origin frame</title>
+</head>
+<body>
+  <p id="frame-status">frame ready</p>
+  <script>
+    if (window.isSecureContext && document.modelContext) {
+      document.modelContext.registerTool({
+        name: 'frame_echo',
+        description: 'Echo a text back from the same-origin iframe',
+        inputSchema: {
+          type: 'object',
+          properties: { text: { type: 'string', description: 'Text to echo' } },
+          required: ['text']
+        },
+        execute: async function(input, options) {
+          document.getElementById('frame-status').textContent = 'echoed: ' + input.text;
+          return { echo: input.text, from: new URLSearchParams(location.search).get('who') || 'frame' };
+        }
+      });
+    }
+  </script>
+</body>
+</html>

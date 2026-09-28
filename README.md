@@ -864,6 +864,61 @@ never changes a command's output or exit code, and a failed write costs one
 stderr line. `CDPILOT_LOG=0` turns it off; `CDPILOT_LOG_DAYS` (default 14)
 sets how many days are kept. The MCP server exposes it as `browser_log`.
 
+### WebMCP tools (opt-in)
+
+[WebMCP](https://webmachinelearning.github.io/webmcp/) lets a page register
+"tools" on `document.modelContext`: imperatively with `registerTool()`, or
+declaratively with `<form toolname tooldescription>` (inputs described by
+`toolparamdescription`). cdpilot lists and calls them through the browser's own
+API, `getTools()` and `executeTool()`. In Chrome the API is behind
+`chrome://flags/#enable-webmcp-testing` (Chromium 146+), so start the browser
+with it:
+
+```bash
+cdpilot launch --webmcp        # saved for this project: later launches (auto-launch too) keep it
+cdpilot go https://example.com/shop
+cdpilot tools list             # name, title, description, annotations, input schema
+cdpilot tools list --json
+cdpilot tools call add_to_cart '{"sku":"A1","qty":2}'
+cdpilot tools call add_to_cart --arg sku=A1 --arg qty=2
+cdpilot launch --no-webmcp     # turn it off again (applies at the next start)
+```
+
+- `launch --webmcp` adds `--enable-features=WebMCP` to the browser's command
+  line and saves the mode next to the stealth mode (`webmcp.json` in the
+  project profile); `CDPILOT_WEBMCP=1|0` overrides it. `cdpilot status` shows a
+  WebMCP line while the mode is on.
+  Chrome reads feature flags only at startup: a browser that is already running
+  keeps its flags until `cdpilot stop`.
+- `tools list` shows the tools of the page and of its same-origin iframes
+  (with the frame URL), marks form tools and whether the form submits itself
+  (`toolautosubmit`), and shows `title` and the `readOnlyHint` /
+  `consequentialHint` / `untrustedContentHint` annotations. Nothing is injected
+  into the page: the list is the browser's registry at that moment, so it
+  follows reloads and navigations. Both commands run in cdpilot's own isolated
+  world (no `Runtime.enable`), so a page script that wraps `getTools()` /
+  `executeTool()` cannot add tools, change results or see the calls; only if
+  that world cannot see `document.modelContext` does cdpilot use the page's
+  main world, and it says so on stderr. With no tools it says why (WebMCP not
+  enabled in the running browser, not a secure context, browser too old,
+  document not origin-keyed, or the page registered none) and exits 0.
+- `tools call` checks the arguments against the tool's `inputSchema` first
+  (`required`, `type` — `true` is not an integer —, `enum`, `const`, nested
+  `properties` and `items`; other keywords are left to the page) and exits 1
+  on a mismatch, an unknown tool or a tool error. It passes an `AbortSignal`
+  and aborts it when `--timeout` (default 20 s) runs out, then exits 124.
+  A form tool without `toolautosubmit` waits for a person to submit the form.
+  When several frames register the same name, `--frame <url-part>` picks one
+  (an exact frame URL wins); without it the top document's tool is used, and
+  if there is none the call stops and lists the frames.
+- MCP: `browser_site_tools` and `browser_site_tool_call` are listed only while
+  the project's WebMCP mode is on (or `CDPILOT_WEBMCP=1` for the server).
+
+> **Security**: `tools call` runs the page's own code, and tool names,
+> descriptions and results are page content: treat them as untrusted.
+> Arguments and results are written to the session log with secret-named
+> fields (password, token, key, secret, auth, ...) redacted at any depth.
+
 ### Scaling & Workstation Use
 
 ```bash
