@@ -1,0 +1,25 @@
+<!doctype html>
+<!-- iframe fixture — third level, loaded inside inner.html. -->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>cdpilot frames: nested</title>
+  <style>body { font: 14px system-ui, sans-serif; margin: 8px; }</style>
+</head>
+<body data-log="">
+  <button id="deep-btn" type="button">Deep button</button>
+  <input id="deep" name="deep" placeholder="Deep field">
+  <p id="status">idle</p>
+  <script>
+    window.FRAME_NAME = 'nested';
+    function log(s) { document.body.dataset.log += s + ';'; }
+    document.getElementById('deep-btn').addEventListener('click', function (e) {
+      document.getElementById('status').textContent = 'deep clicked';
+      log('deep-click:' + (e.isTrusted ? 'trusted' : 'script'));
+    });
+    document.getElementById('deep').addEventListener('input', function () {
+      log('deep-input');
+    });
+  </script>
+</body>
+</html>
