@@ -6,6 +6,13 @@
  */
 
 const { execSync, spawn, spawnSync } = require('child_process');
+
+// Output the launcher prints itself (help, status) must survive process.exit():
+// on macOS a piped stdout is asynchronous, and exiting right after a write
+// longer than the pipe buffer (8 KB) cut --help off mid-text.
+for (const stream of [process.stdout, process.stderr]) {
+  if (stream._handle && typeof stream._handle.setBlocking === 'function') stream._handle.setBlocking(true);
+}
 const path = require('path');
 const fs = require('fs');
 const os = require('os');

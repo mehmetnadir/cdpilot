@@ -6399,7 +6399,7 @@ print("ok")
       '    except OSError: pass',
       '    finally: s.close()',
       '    if got: break',
-      'print(json.dumps(got))'].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
+      'print(json.dumps(got))'].join('\n')], { encoding: 'utf-8', timeout: 30000 }).trim());
     const srv = spawn(PYB, ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
     const home = path.join(root, 'home');
     const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(root, 'profile'),
@@ -6407,11 +6407,15 @@ print("ok")
     for (const k of ['CDPILOT_WEBMCP', 'CDPILOT_BOT_AUTH', 'CDPILOT_TIMEOUT']) delete env[k];
     const status = () => spawnSync(process.execPath, [CLI, 'status'], { encoding: 'utf-8', timeout: 30000, env });
     try {
-      execFileSync(PYB, ['-c', [
-        'import time, urllib.request',
-        'for _ in range(100):',
-        `    try: urllib.request.urlopen("http://127.0.0.1:${port}/json/version", timeout=1); break`,
-        '    except Exception: time.sleep(0.1)'].join('\n')], { timeout: 20000 });
+      // Bounded by its own deadline (a slow CI runner must fail with a reason, not ETIMEDOUT).
+      const up = spawnSync(PYB, ['-c', [
+        'import sys, time, urllib.request',
+        'deadline = time.time() + 30',
+        'while time.time() < deadline:',
+        `    try: urllib.request.urlopen("http://127.0.0.1:${port}/json/version", timeout=3).read(); sys.exit(0)`,
+        '    except Exception: time.sleep(0.2)',
+        'sys.exit(3)'].join('\n')], { encoding: 'utf-8', timeout: 60000 });
+      assert.strictEqual(up.status, 0, `stand-in /json/version on ${port} never answered: ${up.stderr}`);
       const plain = `\n  cdpilot status (port ${port})\n\n  ✓ Connected\n  Browser: Chrome/150.0.0.0\n`
         + `  Protocol: 1.3\n  WebSocket: ${ws}\n  idle close off\n\n`;
       assert.strictEqual(status().stdout, plain, 'no bot-auth set up: status output unchanged');
