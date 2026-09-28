@@ -3465,6 +3465,584 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
   }
 });
 
+// ── iframe targeting (#1) ──
+// `click "iframe#card >>> input"` / `--frame <f>` for element commands, over
+// CDP (flat sessions for out-of-process frames), never contentDocument.
+// Parsers run as pure Python; the resolver, pool, frame search and `frame`
+// command run against a fake CDP page (test/frames_fake_cdp.py: the real
+// cdpilot.py with only the websocket replaced); the browser path is the
+// opt-in e2e test at the end (CDPILOT_E2E=1) plus test/fixtures/frames/.
+(function() {
+  const { execFileSync, spawn, spawnSync } = require('child_process');
+  const os = require('os');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const FRAME_SEP_LINE = (PY_CONTENT.match(/^FRAME_SEP = ".*"$/m) || [])[0];
+
+  function pyFuncs(names) {
+    const fns = names.map((n) => extractPyFunc(PY_CONTENT, n));
+    fns.forEach((f, i) => assert(f, `${names[i]} must be extractable`));
+    assert(FRAME_SEP_LINE, 'FRAME_SEP constant must exist');
+    return FRAME_SEP_LINE + '\n\n' + fns.join('\n\n');
+  }
+
+  function pyCases(src, cases) {
+    return JSON.parse(execFileSync(PYB, ['-c', src], {
+      input: JSON.stringify(cases.map((c) => c[0])), encoding: 'utf-8', timeout: 10000,
+    }).trim());
+  }
+
+  let fakeResults = null;
+  function fake(name) {
+    if (!fakeResults) {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-frames-fake-'));
+      const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+        CDP_PORT: '19224', CDPILOT_LOG: '0' };
+      for (const k of ['CDPILOT_WS_POOL', 'CDPILOT_TARGET', 'CDPILOT_TIMEOUT']) delete env[k];
+      const out = execFileSync(PYB, [path.join(__dirname, 'frames_fake_cdp.py'), PY_PATH], {
+        encoding: 'utf-8', timeout: 60000, env,
+      });
+      fakeResults = JSON.parse(out.trim().split('\n').pop());
+    }
+    const r = fakeResults[name];
+    assert(r, `fake-CDP scenario ${name} missing`);
+    assert(!r.error, `fake-CDP scenario ${name} crashed:\n${r.error}`);
+    return r;
+  }
+
+  test('frames: >>> chain parser (nesting, quotes, brackets, escapes, empty segments = no chain)', () => {
+    const src = pyFuncs(['_split_frame_chain', '_frame_selector_hops']) + `
+import json, sys
+print(json.dumps([_frame_selector_hops(t) for t in json.load(sys.stdin)]))
+`;
+    const cases = [
+      ['iframe#card >>> input[name=cardnumber]', [['iframe#card'], 'input[name=cardnumber]']],
+      ['iframe.a >>> iframe.b >>> button', [['iframe.a', 'iframe.b'], 'button']],
+      ['iframe[title="a >>> b"] >>> button', [['iframe[title="a >>> b"]'], 'button']],
+      ["iframe[title='x>>>y'] >>> #b", [["iframe[title='x>>>y']"], '#b']],
+      ['iframe[title=a>>>b] >>> #b', [['iframe[title=a>>>b]'], '#b']],
+      ['  iframe  >>>  button  ', [['iframe'], 'button']],
+      ['Home >>> Products', [['Home'], 'Products']],
+      ['div:not(.a >>> .b)', null],
+      ['#a\\>>> b', null],
+      ['button.primary', null],
+      ['Next >>>', null],
+      [' >>> button', null],
+      ['a >>> >>> b', null],
+    ];
+    const got = pyCases(src, cases);
+    cases.forEach((c, i) => assert.deepStrictEqual(got[i], c[1], `hops ${JSON.stringify(c[0])}`));
+  });
+
+  test('frames: literal-fallback decision — a >>> whose first hop is no iframe stays the old selector', () => {
+    const src = 'import re as _re\n' + pyFuncs(['_split_frame_chain', '_frame_selector_hops', '_parse_frame_hop',
+      '_frame_hop_is_selector', '_frame_chain_candidate', '_frame_selector_plan']) + `
+import json, sys
+print(json.dumps([_frame_selector_plan(*c) for c in json.load(sys.stdin)]))
+`;
+    const note = (hop) => `note: '${hop}' matched no iframe; used the selector as written`;
+    const cases = [
+      [['Next >>>', false], [[], 'Next >>>', null]],
+      [['Next >>>', true], [[], 'Next >>>', null]],
+      [['button.primary', false], [[], 'button.primary', null]],
+      [['Home >>> Products', false], [[], 'Home >>> Products', note('Home')]],
+      [['#nope >>> #x', false], [[], '#nope >>> #x', note('#nope')]],
+      [['Page 1 of 3 >>> Next page', false], [[], 'Page 1 of 3 >>> Next page', note('Page 1 of 3')]],
+      [['iframe#card >>> input', true], [[{ kind: 'sel', value: 'iframe#card' }], 'input', null]],
+      [['#card >>> 1 >>> url=stripe >>> #b', true],
+        [[{ kind: 'sel', value: '#card' }, { kind: 'index', value: 1 }, { kind: 'url', value: 'stripe' }], '#b', null]],
+      // smart-* text: a first hop of plain words is never a frame (querySelector("Main")
+      // would find <main> and step into an iframe inside it), even if it wraps one.
+      [['Main >>> Settings', true, 'text'], [[], 'Main >>> Settings', null]],
+      [['main >>> Settings', true, 'text'], [[], 'main >>> Settings', null]],
+      [['Page 1 of 3 >>> Next page', true, 'text'], [[], 'Page 1 of 3 >>> Next page', null]],
+      [['Frameworks >>> React', true, 'text'], [[], 'Frameworks >>> React', null]],
+      [['Main >>> Settings', true, 'css'], [[{ kind: 'sel', value: 'Main' }], 'Settings', null]],
+      [['iframe >>> Pay now', true, 'text'], [[{ kind: 'sel', value: 'iframe' }], 'Pay now', null]],
+      [['frame[name=f] >>> Pay now', true, 'text'], [[{ kind: 'sel', value: 'frame[name=f]' }], 'Pay now', null]],
+      [['#card-element >>> Pay now', true, 'text'], [[{ kind: 'sel', value: '#card-element' }], 'Pay now', null]],
+      [['.widget >>> Pay now', false, 'text'], [[], '.widget >>> Pay now', note('.widget')]],
+      [['url=stripe >>> Pay now', true, 'text'], [[{ kind: 'url', value: 'stripe' }], 'Pay now', null]],
+    ];
+    const got = pyCases(src, cases);
+    cases.forEach((c, i) => assert.deepStrictEqual(got[i], c[1], `plan ${JSON.stringify(c[0])}`));
+  });
+
+  test('frames: --frame flag extraction and hop kinds (index / url= / auto for --frame, sel for >>>)', () => {
+    const src = pyFuncs(['_split_frame_chain', '_parse_frame_hop', '_parse_frame_spec', '_extract_frame_flag']) + `
+import json, sys
+def run(kind, arg):
+    try:
+        if kind == 'hop':
+            return _parse_frame_hop(arg)
+        if kind == 'implicit':
+            return _parse_frame_hop(arg, implicit=True)
+        if kind == 'spec':
+            return _parse_frame_spec(arg)
+        rest, value = _extract_frame_flag(arg)
+        return [rest, value]
+    except ValueError:
+        return 'ERR'
+print(json.dumps([run(k, a) for k, a in json.load(sys.stdin)]))
+`;
+    const cases = [
+      [['hop', '2'], { kind: 'index', value: 2 }],
+      [['hop', ' 0 '], { kind: 'index', value: 0 }],
+      [['hop', 'url=js.stripe.com'], { kind: 'url', value: 'js.stripe.com' }],
+      [['hop', 'URL:localhost:8762'], { kind: 'url', value: 'localhost:8762' }],
+      [['hop', '#card'], { kind: 'auto', value: '#card' }],
+      [['hop', 'card-frame'], { kind: 'auto', value: 'card-frame' }],
+      [['implicit', 'card-frame'], { kind: 'sel', value: 'card-frame' }],
+      [['implicit', '3'], { kind: 'index', value: 3 }],
+      [['spec', '0 >>> iframe[name="x >>> y"]'],
+        [{ kind: 'index', value: 0 }, { kind: 'auto', value: 'iframe[name="x >>> y"]' }]],
+      [['spec', 'a >>> '], 'ERR'],
+      [['spec', ''], 'ERR'],
+      [['flag', ['--frame', '#card', 'button']], [['button'], '#card']],
+      [['flag', ['button', '--frame=2', '--no-heal']], [['button', '--no-heal'], '2']],
+      [['flag', ['a', 'b']], [['a', 'b'], null]],
+      [['flag', ['--framex', 'a']], [['--framex', 'a'], null]],
+      [['flag', ['a', '--frame']], 'ERR'],
+      [['flag', ['--frame=', 'a']], 'ERR'],
+      [['flag', ['--frame', ' ', 'a']], 'ERR'],
+    ];
+    const got = pyCases(src, cases);
+    cases.forEach((c, i) => assert.deepStrictEqual(got[i], c[1], `${JSON.stringify(c[0])}`));
+  });
+
+  test('frames: rewrite sends Runtime/DOM into the frame and shifts mouse x/y by the frame offset', () => {
+    const src = extractPyFunc(PY_CONTENT, '_frame_route_rewrite');
+    assert(src, '_frame_route_rewrite must be extractable');
+    const out = execFileSync(PYB, ['-c', src + `
+
+import asyncio, json
+class Route:
+    context_id, session_id, chain, dirty, offset = 42, 'S1', [('p', 'o')], True, (0.0, 0.0)
+calls = []
+async def _frame_route_refresh_offset(route):
+    calls.append(1)
+    route.offset, route.dirty = (100.0, 1000.0), False
+    return route.offset
+cmds = [
+    (1, 'Runtime.evaluate', {'expression': '1'}),
+    (2, 'DOM.describeNode', {'objectId': 'o'}),
+    (3, 'Input.dispatchMouseEvent', {'type': 'mousePressed', 'x': 10, 'y': 20}),
+    (4, 'Input.dispatchMouseEvent', {'type': 'mouseReleased', 'x': 10, 'y': 20}),
+    (5, 'Input.dispatchKeyEvent', {'type': 'keyDown', 'key': 'a'}),
+    (6, 'Page.navigate', {'url': 'about:blank'}),
+    (7, 'Runtime.evaluate', {'expression': '2', 'contextId': 99}),
+    (8, 'Runtime.evaluate', {'expression': '3'}, 'EXPLICIT'),
+    (9, 'Input.dispatchMouseEvent', {'type': 'mouseMoved', 'x': 5, 'y': 5}),
+]
+res = asyncio.run(_frame_route_rewrite(Route(), cmds))
+print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
+`], { encoding: 'utf-8', timeout: 10000 });
+    const r = JSON.parse(out.trim());
+    assert.deepStrictEqual(r.out, [
+      [1, 'Runtime.evaluate', { expression: '1', contextId: 42 }, 'S1'],
+      [2, 'DOM.describeNode', { objectId: 'o' }, 'S1'],
+      [3, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: 110, y: 1020 }],
+      [4, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: 110, y: 1020 }],
+      [5, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a' }],
+      [6, 'Page.navigate', { url: 'about:blank' }],
+      [7, 'Runtime.evaluate', { expression: '2', contextId: 99 }, 'S1'],
+      [8, 'Runtime.evaluate', { expression: '3' }, 'EXPLICIT'],
+      [9, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 105, y: 1005 }],
+    ]);
+    assert.strictEqual(r.refreshes, 2, 'offset re-measured once per page-JS run before mouse input, not per event');
+    assert.deepStrictEqual(r.orig, { type: 'mousePressed', x: 10, y: 20 }, "caller's params must not be mutated");
+  });
+
+  test('frames (fake CDP): element and smart-* commands are frame-aware; search limits 20 frames / 2 s', () => {
+    const r = fake('commands');
+    for (const fn of ['cmd_click', 'cmd_fill', 'cmd_submit', 'cmd_hover', 'cmd_dblclick', 'cmd_rightclick']) {
+      assert.strictEqual(r.kinds[fn], 'css', `${fn} must resolve >>> / --frame as a selector`);
+    }
+    for (const fn of ['cmd_smart_click', 'cmd_smart_fill', 'cmd_smart_select']) {
+      assert.strictEqual(r.kinds[fn], 'text', `${fn} must resolve >>> / --frame before its text`);
+    }
+    assert.deepStrictEqual(r.cli, ['click', 'dblclick', 'fill', 'frame', 'hover', 'rightclick', 'smart-click',
+      'smart-fill', 'smart-select', 'submit', 'type']);
+    assert.deepStrictEqual(r.limits, [20, 2.0, 60]);
+  });
+
+  test('frames (fake CDP): >>> and --frame reach same-process, nested and out-of-process frames', () => {
+    const r = fake('routing');
+    assert.deepStrictEqual(r.css.res, ['ok', 'card|#btn']);
+    assert.strictEqual(r.css.context, r.contexts.card, 'Runtime.evaluate must carry the frame context id');
+    assert.deepStrictEqual(r.css.mouse, ['mousePressed', 101, 1002], 'mouse x/y shifted by the frame offset');
+    assert.deepStrictEqual(r.nested.res, ['ok', 'nested|#deep']);
+    assert.strictEqual(r.nested.context, r.contexts.nested);
+    assert.deepStrictEqual(r.nested.mouse, ['mousePressed', 111, 1022], 'nested offsets add up');
+    assert.deepStrictEqual(r.oopif.res, ['ok', 'pay|#cc']);
+    assert.strictEqual(r.oopif.session, 'S-pay', 'out-of-process frame: flat session id on the message');
+    assert.deepStrictEqual(r.oopif.mouse, ['mousePressed', 6, 9]);
+    assert.deepStrictEqual(r.flag_index.res, ['ok', 'pay|#cc'], '--frame 1');
+    assert.deepStrictEqual(r.flag_src.res, ['ok', 'pay|#cc'], '--frame takes a bare src substring');
+    assert.deepStrictEqual(r.arrow_src_word.res, ['ok', 'top|pay.html >>> #cc'],
+      'a >>> hop never matches by src substring (url= does): the string stays literal');
+    assert.deepStrictEqual(r.attached, ['pay', 'pay', 'pay']);
+    assert.deepStrictEqual(r.detached, ['S-pay', 'S-pay', 'S-pay'], 'every flat session is detached');
+    assert.deepStrictEqual(r.open_sessions, []);
+    assert.strictEqual(r.stderr, '');
+  });
+
+  test('frames (fake CDP): "Next >>>", "Home >>> Products" run as written; failure adds the note line', () => {
+    const r = fake('literal');
+    assert.deepStrictEqual(r.next.res, ['ok', 'top|Next >>>']);
+    assert.deepStrictEqual(r.next.messages, ['Runtime.evaluate', 'Input.dispatchMouseEvent'],
+      'an empty segment: no frame lookup at all, only the command itself');
+    assert.deepStrictEqual(r.home.res, ['ok', 'top|Home >>> Products']);
+    assert.deepStrictEqual(r.page_of.res, ['ok', 'top|Page 1 of 3 >>> Next page']);
+    assert.strictEqual(r.home.stderr + r.page_of.stderr, '', 'no note when the literal selector works');
+    assert.deepStrictEqual(r.fail_nope.res, ['exit', 1], 'exit code of the command itself');
+    assert.strictEqual(r.fail_nope.stderr, "Error: selector '#nope >>> #x' not resolved.\n"
+      + "note: '#nope' matched no iframe; used the selector as written\n");
+    assert.deepStrictEqual(r.fail_plain.res, ['exit', 1]);
+    assert(!/note:/.test(r.fail_plain.stderr), 'no note when no frame was looked for');
+    assert(r.seen.every((s) => !s.routed), 'literal strings never run inside a frame');
+    assert.deepStrictEqual(r.flag_strict.res, ['exit', 1], '--frame stays strict');
+    assert.strictEqual(r.flag_strict.stderr, "Error: no iframe matches '#nope' in top document (frames: [0] card; [1] pay)\n");
+    assert.deepStrictEqual(r.later_hop_strict.res, ['exit', 1], 'after a real first hop the chain is strict');
+    assert(/no iframe matches '#missing' in iframe#card/.test(r.later_hop_strict.stderr), r.later_hop_strict.stderr);
+  });
+
+  test('frames (fake CDP): smart-click "Main >>> Settings" stays literal text (no frame lookup)', () => {
+    const r = fake('text_hops');
+    for (const key of ['text_main', 'text_main_lower', 'text_page_of']) {
+      assert.deepStrictEqual(r[key].messages, ['Runtime.evaluate', 'Input.dispatchMouseEvent'],
+        `${key}: the command alone, no frame lookup`);
+      assert.strictEqual(r[key].stderr, '', key);
+    }
+    assert.deepStrictEqual(r.text_main.res, ['ok', 'top|Main >>> Settings'], 'the page, with the whole text');
+    assert.deepStrictEqual(r.text_selector.res, ['ok', 'card|Pay now'], 'iframe#card >>> text still routes');
+    assert.deepStrictEqual(r.text_url.res, ['ok', 'card|Pay now'], 'url= >>> text still routes');
+    assert.deepStrictEqual(r.css_wrapper.res, ['ok', 'card|#btn'], 'css kind: "main" is a selector');
+  });
+
+  test('frames (fake CDP): a hop that wraps an iframe works, with one stderr note', () => {
+    const r = fake('text_hops');
+    const note = (hop) => `note: '${hop}' is not an iframe; using the iframe inside it\n`;
+    assert.deepStrictEqual(r.text_wrapper.res, ['ok', 'card|Pay now']);
+    assert.strictEqual(r.text_wrapper.stderr, note('#card-element'));
+    assert.strictEqual(r.css_wrapper.stderr, note('main'));
+    assert.deepStrictEqual(r.flag_wrapper.res, ['ok', 'card|#btn']);
+    assert.strictEqual(r.flag_wrapper.stderr, note('#card-element'), '--frame too');
+    assert.strictEqual(r.css_frame.stderr, '', 'no note when the hop is the iframe itself');
+    assert.strictEqual(r.text_selector.stderr, '');
+  });
+
+  test('frames (fake CDP): CDPILOT_WS_POOL=0 is restored after an exception, SystemExit and cancellation', () => {
+    const r = fake('pool_restore');
+    assert.deepStrictEqual(r.pool_inside, [true, true, true, false],
+      'pool pinned on inside a route (flat sessions share one socket), already restored for a literal command');
+    for (const [key, res] of [['exception', ['raise', 'RuntimeError']], ['system_exit', ['exit', 3]],
+      ['frame_error', ['exit', 1]], ['cancel_in_close', ['raise', 'CancelledError']],
+      ['literal', ['ok', 'top|Home >>> Products']]]) {
+      const c = r[key];
+      assert.deepStrictEqual(c.res, res, `${key}: outcome passes through unchanged`);
+      assert.strictEqual(c.pool_after, false, `${key}: pool flag must be restored to off`);
+      assert.strictEqual(c.pooled_after, false, `${key}: the socket opened for the route must leave the pool`);
+      assert(c.sockets >= 1 && c.all_closed, `${key}: every socket must be closed (${c.sockets})`);
+    }
+  });
+
+  test('frames (fake CDP): smart-* order — page real match, disabled-only, frames, then page weak match', () => {
+    const r = fake('smart_order');
+    const c = r.c_page_real;
+    assert.deepStrictEqual(c.finder, [['top', 'strict']], 'page: one find-and-act script');
+    assert.deepStrictEqual(c.acts, [['top', 'strict']]);
+    assert.strictEqual(c.frame_lists, 0, 'enabled real page match: no frame search');
+    assert.deepStrictEqual(c.res, { found: true, x: 9, y: 9 });
+    const d = r.d_disabled_only;
+    assert.deepStrictEqual(d.finder, [['top', 'strict'], ['top', 'loose']],
+      'only disabled real matches: the old page rules (their error), no frame search');
+    assert.strictEqual(d.frame_lists, 0);
+    assert.deepStrictEqual(d.res, { found: false, disabled: 1 });
+    assert.deepStrictEqual(d.acts, []);
+    const e = r.e_frame_real;
+    assert.deepStrictEqual(e.finder, [['top', 'strict'], ['card', 'probe'], ['card', 'strict']],
+      'weak page match: frames probed (find only), then the finder acts in the chosen frame');
+    assert.deepStrictEqual(e.acts, [['card', 'strict']], 'exactly one action');
+    assert.deepStrictEqual(e.res, { found: true, x: 105, y: 1006 }, 'frame x/y returned in page coordinates');
+    assert.strictEqual(e.stderr, 'smart-x: matched inside frame iframe#card (http://a.test/inner.html)\n');
+    const n = r.e_nothing;
+    assert.deepStrictEqual(n.finder, [['top', 'strict'], ['card', 'probe'], ['xo', 'probe'], ['pay', 'probe'],
+      ['top', 'loose']], 'no frame match: back to the page weak match');
+    assert.deepStrictEqual(n.acts, [['top', 'loose']], 'frames were only probed');
+    assert.deepStrictEqual(n.res, { found: true, x: 1, y: 1, weak: true });
+    assert.deepStrictEqual(n.open_sessions, [], 'search sessions detached');
+    const all = r.e_oopif_all;
+    assert.deepStrictEqual(all.attached, ['pay'], 'smart-click searches out-of-process frames too');
+    assert.deepStrictEqual(all.res, { found: true, x: 10, y: 13 });
+    assert.deepStrictEqual(all.acts, [['pay', 'strict']]);
+  });
+
+  test('frames (fake CDP): the chosen frame no longer matching at act time gives its not-found result', () => {
+    const r = fake('smart_order').act_changed;
+    assert.deepStrictEqual(r.finder, [['top', 'strict'], ['card', 'probe'], ['card', 'strict']],
+      'no page fallback after a frame was chosen');
+    assert.deepStrictEqual(r.acts, []);
+    assert.deepStrictEqual(r.res, { found: false, weakScore: 20 }, 'the command prints its normal not-found error');
+  });
+
+  test('frames (fake CDP): smart-fill/select auto search enters same-origin frames only', () => {
+    const r = fake('smart_order');
+    const same = r.fill_same_origin;
+    assert.deepStrictEqual(same.finder, [['top', 'strict'], ['card', 'probe'], ['card', 'strict']]);
+    assert.deepStrictEqual(same.acts, [['card', 'strict']]);
+    assert.deepStrictEqual(same.res, { found: true, x: 105, y: 1006 });
+    const cross = r.fill_cross_origin;
+    assert.deepStrictEqual(cross.attached, [], 'never attaches to an out-of-process (cross-site) frame');
+    assert.deepStrictEqual(cross.finder, [['top', 'strict'], ['card', 'probe'], ['xo', 'guarded'], ['top', 'loose']],
+      'a same-process cross-origin frame is skipped by the origin guard before the finder runs');
+    assert.deepStrictEqual(cross.res, { found: false }, 'the old not-found result from the page');
+    assert.strictEqual(cross.stderr, '');
+  });
+
+  test('frames (fake CDP): a slow frame call gets the remaining budget as its timeout', () => {
+    const r = fake('budget');
+    const d = r.direct;
+    assert.strictEqual(d.hit, null);
+    assert.strictEqual(d.stderr, 'smart-x: frame search stopped after 0.5s (1 of 3 frames)\n');
+    assert(d.elapsed >= 0.45 && d.elapsed < 1.5, `budget 0.5 s, took ${d.elapsed}`);
+    assert(d.calls.every((c) => c.timeout <= 0.5), `every call capped at the budget: ${JSON.stringify(d.calls)}`);
+    const slow = d.calls.filter((c) => c.finder);
+    assert.strictEqual(slow.length, 1);
+    // <= not <: Windows' monotonic clock ticks every ~16 ms, so no time may have
+    // passed yet and the time left is the whole budget.
+    assert(slow[0].timeout >= 0.1 && slow[0].timeout <= 0.5, `slow call timeout = time left: ${slow[0].timeout}`);
+    assert.strictEqual(d.socket_kept, true, 'a timed-out search call keeps the shared socket');
+    assert.deepStrictEqual(d.finder, [['slow', 'probe']], 'the slow frame only ever gets the side-effect-free probe');
+    assert.deepStrictEqual(d.acts, []);
+    const g = r.default_budget;
+    assert.strictEqual(g.stderr, 'smart-x: frame search stopped after 2s (1 of 3 frames)\n');
+    assert(g.elapsed >= 1.9 && g.elapsed < 3.5, `default budget 2 s, took ${g.elapsed}`);
+    assert(g.max_search_timeout <= 2.0, `search calls capped at 2 s: ${g.max_search_timeout}`);
+    assert.deepStrictEqual(g.finder, [['top', 'strict'], ['slow', 'probe'], ['top', 'loose']]);
+    assert.deepStrictEqual(g.acts, [['top', 'loose']], 'exactly one action overall');
+    assert.deepStrictEqual(g.res, { found: true, x: 1, y: 1, weak: true }, 'falls back to the page');
+  });
+
+  test('frames (fake CDP): a probe cut off by the budget acts nowhere; the page fallback is the one action', () => {
+    const r = fake('probe_timeout');
+    // The slow frame holds a real match: were its script the act-mode finder,
+    // it would click/type after the call gave up, and the page would act too.
+    for (const key of ['click', 'fill_same_origin']) {
+      const c = r[key];
+      assert.deepStrictEqual(c.finder, [['top', 'strict'], ['slow', 'probe'], ['top', 'loose']], key);
+      assert.strictEqual(c.stderr, 'smart-x: frame search stopped after 0.5s (1 of 2 frames)\n', key);
+      assert(c.elapsed < 1.5, `${key}: ${c.elapsed}`);
+    }
+    assert.deepStrictEqual(r.click.acts, [['top', 'loose']], 'smart-click: only the page weak match is clicked');
+    assert.deepStrictEqual(r.fill_same_origin.acts, [], 'smart-fill: nothing typed; the old not-found result');
+    assert.deepStrictEqual(r.fill_same_origin.res, { found: false });
+  });
+
+  test('frames (fake CDP): a frame-call timeout keeps the pooled socket; a plain cdp_send timeout drops it', () => {
+    const r = fake('keep_socket');
+    assert.strictEqual(r.kept, true, 'flat sessions live on the socket: keep it');
+    assert.strictEqual(r.again, 'top|again', 'and it still answers');
+    assert.strictEqual(r.sockets, 1);
+    assert(r.frame_elapsed < 1.5, `timeout=0.3 must not wait a 2 s recv slice: ${r.frame_elapsed}`);
+    assert(r.dropped && r.closed, 'ordinary calls keep the old rule: drop and close after a timeout');
+    assert(r.plain_elapsed >= 0.3 && r.plain_elapsed < 3, `plain call: old flat 2 s recv wait: ${r.plain_elapsed}`);
+  });
+
+  test('frames (fake CDP): plain cdp_send still reads a reply that lands just after its timeout', () => {
+    // `wait "#nope" 15` answers from a 15 s page timer, at 15.0x s: the old
+    // flat 2 s recv wait read it; a wait trimmed to the timeout dropped it.
+    const r = fake('late_reply');
+    assert.strictEqual(r.plain.value, 'top|late', `reply 0.1 s after timeout=0.3 must be read (${r.plain.elapsed}s)`);
+    assert.strictEqual(r.frame.value, null, 'frame-search calls stop at their timeout');
+    assert(r.frame.elapsed < 0.39, `frame call: ${r.frame.elapsed}`);
+  });
+
+  test('frames (fake CDP): frame list keeps its old output; --frame lists and evals inside the frame', () => {
+    const r = fake('frame_list');
+    assert.strictEqual(r.top.stdout, 'iframes (2):\n  [0] src=about:blank name= id=hidden-frame\n'
+      + '  [1] src=http://a.test/inner.html name=card-frame id=card\n');
+    assert.strictEqual(r.inside.stdout, 'iframes in iframe#card (2):\n  [0] src=http://a.test/nested.html name= id=nested\n'
+      + '  [1] src=(no source) name= id=ghost (hidden)\n');
+    assert.strictEqual(r.eval_inside.stdout, 'Result: card|z\n');
+    assert.strictEqual(r.eval_top.stdout, 'Result: top|z\n');
+  });
+
+  test('frames: CLI rejects --frame without a value (exit 2, before any browser work)', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-frames-test-'));
+    const r = spawnSync(process.execPath, [CLI, 'click', 'button', '--frame'], {
+      encoding: 'utf-8', timeout: 30000,
+      env: { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+        CDP_PORT: '19223', CHROME_BIN: path.join(home, 'no-such-browser'), CDPILOT_NO_AUTOLAUNCH: '1' },
+    });
+    assert.strictEqual(r.status, 2, `exit ${r.status}, stderr: ${r.stderr}`);
+    assert(/--frame needs a value/.test(r.stderr), `stderr: ${r.stderr}`);
+  });
+
+  test('frames: docs — README section, CHANGELOG [Unreleased], help text in src and bin', () => {
+    const root = path.join(__dirname, '..');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    const section = (readme.split('### Element targeting inside iframes')[1] || '').split('\n### ')[0];
+    assert(section, 'README needs the element-targeting section');
+    for (const s of ['iframe#card >>> input[name=cardnumber]', '--frame', 'matched no iframe; used the selector as written',
+      "page's own origin", 'frame search stopped after 2s', 'is not an iframe; using the iframe inside it']) {
+      assert(section.includes(s), `README iframe section must mention ${s}`);
+    }
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    const unreleased = (changelog.match(/## \[Unreleased\]([\s\S]*?)\n## \[/) || [])[1] || '';
+    for (const s of ['--frame', 'matched no iframe', "page's own origin", 'frame search stopped after 2s',
+      'is not an iframe; using the iframe inside it']) {
+      assert(unreleased.includes(s), `CHANGELOG [Unreleased] must describe ${s}`);
+    }
+    const doc = (PY_CONTENT.match(/^"""([\s\S]*?)"""/m) || [])[1] || '';
+    assert(doc.includes('>>>') && doc.includes('--frame'), 'python --help docstring must document frames');
+    const bin = fs.readFileSync(CLI, 'utf8');
+    assert(bin.includes('iframe#card >>> input[name=cardnumber]') && bin.includes('--frame'),
+      'bin help must document frames');
+  });
+
+  // Real browser, headless, isolated CDPILOT_HOME + free ports. Opt-in
+  // locally; the CI `e2e` job runs it against the runner's Chrome.
+  if (process.env.CDPILOT_E2E !== '1') {
+    console.log('  - skipped: frames e2e (set CDPILOT_E2E=1 to run it against a headless browser)');
+    return;
+  }
+  const fixtures = path.join(__dirname, 'fixtures', 'frames');
+  let e2e = null;
+  test('frames e2e: headless browser and two fixture origins start', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-frames-e2e-'));
+    const [cdpPort, p1, p2] = JSON.parse(execFileSync(PYB, ['-c', [
+      'import json, socket', 'ss = [socket.socket() for _ in range(3)]',
+      '[s.bind(("127.0.0.1", 0)) for s in ss]',
+      'print(json.dumps([s.getsockname()[1] for s in ss]))', '[s.close() for s in ss]',
+    ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
+    const servers = [p1, p2].map((p) => spawn(PYB, ['-m', 'http.server', String(p), '--bind', '127.0.0.1'],
+      { cwd: fixtures, stdio: 'ignore' }));
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1' };
+    delete env.CDPILOT_TARGET;
+    const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf-8', timeout: 60000, env });
+    const stop = () => {
+      c('stop');
+      servers.forEach((s) => { try { s.kill(); } catch (err) { /* already gone */ } });
+    };
+    try {
+      execFileSync(PYB, ['-c', [
+        'import time, urllib.request',
+        `urls = ["http://127.0.0.1:${p1}/top.html", "http://127.0.0.1:${p2}/widget.html"]`,
+        'for u in urls:',
+        '    for _ in range(50):',
+        '        try: urllib.request.urlopen(u, timeout=1); break',
+        '        except Exception: time.sleep(0.1)',
+      ].join('\n')], { timeout: 20000 });
+      const r = c('launch');
+      assert(/CDP ready/.test(r.stdout + r.stderr), `launch: ${r.stdout}${r.stderr}`);
+    } catch (err) {
+      stop();
+      throw err;
+    }
+    e2e = { c, p1, p2, stop };
+  });
+  const ok = (r, re, what) => assert(re.test(r.stdout + r.stderr),
+    `${what}: exit ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+  const needE2E = () => { assert(e2e, 'browser setup failed'); return e2e; };
+  try {
+    test('frames e2e: click/fill/type/smart-click in same-origin and cross-origin (OOPIF) iframes', () => {
+      const { c, p1, p2 } = needE2E();
+      const child = `http://localhost:${p2}/inner.html?nested=http://127.0.0.1:${p1}/nested.html`;
+      for (const url of [`http://127.0.0.1:${p1}/top.html`,
+        `http://127.0.0.1:${p1}/top.html?child=${encodeURIComponent(child)}`]) {
+        c('go', url);
+        ok(c('click', '#card >>> #pay-btn'), /Clicked: BUTTON Pay now/, `click ${url}`);
+        ok(c('fill', 'iframe#card >>> input[name=cardnumber]', '4242'), /Filled: INPUT = 4242/, 'fill');
+        ok(c('type', '--frame', 'card-frame', '#cvc', '123'), /Filled: INPUT = 123/, 'type --frame');
+        ok(c('click', '#card >>> #nested >>> #deep-btn', '--entropy=on'), /Clicked: BUTTON Deep button/, 'nested');
+        ok(c('smart-click', 'Deep button'), /matched inside frame iframe#card >>> iframe#nested/, 'smart-click');
+        ok(c('frame', 'eval', '--frame', '#card', "[window.FRAME_NAME, document.querySelector('#status').textContent,"
+          + " document.querySelector('#cc').value, document.querySelector('#cvc').value].join('|')"),
+        /Result: inner\|paid\|4242\|123/, 'frame eval');
+        ok(c('frame', 'eval', '--frame', '#card >>> #nested', 'document.body.dataset.log'),
+          /deep-click:trusted/, 'page-coordinate click landed in the nested frame');
+      }
+    });
+
+    // smart.html: page "Sign&nbsp;up" link, DISABLED Submit, "Next >>>" button;
+    // widget.html (cross-origin here): newsletter button, enabled Submit, Email.
+    const crossPage = (p1, p2) => `http://127.0.0.1:${p1}/smart.html?child=`
+      + encodeURIComponent(`http://localhost:${p2}/widget.html`);
+    const frameLog = (c) => c('frame', 'eval', '--frame', '#child', 'document.body.dataset.log').stdout;
+
+    test('frames e2e: smart-click takes the page match (&nbsp;, disabled-only) over a cross-origin frame', () => {
+      const { c, p1, p2 } = needE2E();
+      c('go', crossPage(p1, p2));
+      const r = c('smart-click', 'Sign up');
+      // The label is printed as the page has it (NBSP); scoring collapsed it.
+      ok(r, /Clicked: A "Sign\sup" \(score:100\)/, 'page link "Sign&nbsp;up" is an exact match');
+      assert(!/matched inside frame/.test(r.stderr), `no frame search: ${r.stderr}`);
+      ok(c('eval', 'document.body.dataset.log'), /signup;/, 'page link clicked');
+      const s = c('smart-click', 'Submit');
+      assert.strictEqual(s.status, 1, `disabled-only page match must exit 1: ${s.stdout}${s.stderr}`);
+      ok(s, /no enabled element matches "Submit" \(1 disabled match\(es\) skipped\)/, 'old disabled message');
+      const log = frameLog(c);
+      assert(!/newsletter|submit/.test(log), `nothing in the frame was clicked: ${log}`);
+    });
+
+    test('frames e2e: text containing >>> stays literal; a missing first hop adds the note line', () => {
+      const { c, p1, p2 } = needE2E();
+      c('go', crossPage(p1, p2));
+      ok(c('click', 'Next >>>'), /Clicked: BUTTON Next >>>/, 'click "Next >>>"');
+      ok(c('eval', 'document.body.dataset.log'), /next;/, 'the page button was clicked');
+      const r = c('click', '#nope >>> #x');
+      assert.strictEqual(r.status, 1, `exit ${r.status}`);
+      assert(r.stderr.includes("note: '#nope' matched no iframe; used the selector as written"), r.stderr);
+    });
+
+    test('frames e2e: smart-click "Main >>> Settings" is page text; a wrapper hop works with a note', () => {
+      const { c, p1, p2 } = needE2E();
+      c('go', crossPage(p1, p2));
+      // iframe#child sits inside <main id="widget-box">, and the widget has a
+      // "Settings" button: querySelector("Main") must not route there.
+      const t = c('smart-click', 'Main >>> Settings');
+      ok(t, /Clicked: A "Main >>> Settings" \(score:100\)/, 'page link');
+      assert(!/note:|matched inside frame/.test(t.stderr), t.stderr);
+      ok(c('eval', 'document.body.dataset.log'), /crumb;/, 'the page link was clicked');
+      assert(!/settings/.test(frameLog(c)), 'nothing clicked in the frame');
+      const w = c('click', '#widget-box >>> #settings');
+      ok(w, /Clicked: BUTTON Settings/, 'wrapper hop');
+      assert(w.stderr.includes("note: '#widget-box' is not an iframe; using the iframe inside it"), w.stderr);
+      assert(/settings;/.test(frameLog(c)), 'clicked inside the frame');
+    });
+
+    test('frames e2e: smart-fill auto search stays same-origin; >>> / --frame reach a cross-origin frame', () => {
+      const { c, p1, p2 } = needE2E();
+      c('go', crossPage(p1, p2));
+      const value = () => c('frame', 'eval', '--frame', '#child', "document.getElementById('email').value").stdout;
+      const miss = c('smart-fill', 'Email', 'auto@x.test');
+      assert.strictEqual(miss.status, 1, `cross-origin frame must not be auto-filled: ${miss.stdout}${miss.stderr}`);
+      ok(miss, /No input found matching: "Email"/, 'old not-found path');
+      assert(/Result: \s*$/.test(value()), `frame field untouched: ${value()}`);
+      ok(c('smart-fill', '--frame', '#child', 'Email', 'flag@x.test'), /Filled: .* = flag@x\.test/, '--frame');
+      assert(/Result: flag@x\.test/.test(value()), value());
+      ok(c('smart-fill', 'iframe#child >>> Email', 'arrow@x.test'), /Filled: .* = arrow@x\.test/, '>>>');
+      assert(/Result: arrow@x\.test/.test(value()), value());
+      c('go', `http://127.0.0.1:${p1}/smart.html`);  // widget.html on the page's own origin
+      const same = c('smart-fill', 'Email', 'same@x.test');
+      ok(same, /Filled: .* = same@x\.test/, 'same-origin frame is searched');
+      assert(/smart-fill: matched inside frame iframe#child/.test(same.stderr), same.stderr);
+      assert(/Result: same@x\.test/.test(value()), value());
+    });
+
+    test('frames e2e: frame list without --frame prints the old output', () => {
+      const { c, p1, p2 } = needE2E();
+      c('go', crossPage(p1, p2));
+      const r = c('frame', 'list');
+      assert.strictEqual(r.stdout.trimEnd(), ['iframes (2):', '  [0] src=about:blank name= id=hidden-frame',
+        `  [1] src=http://localhost:${p2}/widget.html name= id=child`].join('\n'));
+    });
+  } finally {
+    if (e2e) e2e.stop();
+  }
+})();
+
 // ── Connection resilience: auto-launch, global --timeout, `open` alias ──
 // Measured on ~1,225 real agent sessions: "CDP connection error. Is the
 // browser running?" 292x, a hung command with no way to bound it 171x

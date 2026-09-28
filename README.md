@@ -144,6 +144,76 @@ cdpilot scroll-to <selector>  # Scroll element into view
 cdpilot drag <from> <to>      # Drag and drop
 ```
 
+### Element targeting inside iframes
+
+Card forms (Stripe/iyzico-style), embedded login widgets and the reCAPTCHA
+checkbox live inside `<iframe>`s. Name the frame chain before the element
+selector with `>>>`, or pass `--frame`:
+
+```bash
+# Payment-style page: the card fields are inside <iframe id="card" title="Secure card payment">
+cdpilot fill  "iframe#card >>> input[name=cardnumber]" "4242424242424242"
+cdpilot type  --frame "#card" "input[name=cvc]" "123"
+cdpilot click "iframe[title='Secure card payment'] >>> button#pay-btn"
+
+# Nested frames: outermost first
+cdpilot click "iframe.checkout >>> iframe.card >>> button"
+
+# --frame <selector|index|url-substring>, nestable with >>>
+cdpilot click --frame 0 "button.submit"                   # first iframe (same order as `frame list`)
+cdpilot fill  --frame "url=js.stripe.com" "input[name=cardnumber]" "4242424242424242"
+cdpilot frame list --frame "#card"                        # iframes inside that frame
+cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's own page context
+```
+
+- Works for `click`, `fill`, `type`, `submit`, `hover`, `dblclick`, `rightclick`,
+  `smart-click`, `smart-fill`, `smart-select` and `frame list|eval|shadow`.
+- A frame hop is a CSS selector, a 0-based index, a `name`/`id`, or
+  `url=<src substring>`. `--frame` also takes a bare `src` substring.
+  `>>>` inside quotes or `[...]` is literal. A selector that matches an
+  element *wrapping* an iframe (Stripe's `#card-element`) enters the iframe
+  inside it and says so on stderr:
+  `note: '#card-element' is not an iframe; using the iframe inside it`.
+- Selectors and texts that already contain `>>>` keep working: when the part
+  before the first `>>>` finds no iframe in the page, or a segment is empty
+  (`click "Next >>>"`), the whole string is used as written, exactly as
+  before. If that fails too, one stderr line explains:
+  `note: 'Home' matched no iframe; used the selector as written`.
+  `--frame` never falls back: a frame it cannot find is an error (exit 1).
+- For `smart-click` / `smart-fill` / `smart-select` the part before the first
+  `>>>` is a frame only if it looks like a selector (it has `#`, `.` or `[`,
+  or starts with an `iframe`/`frame` tag) or is `url=…`; words stay text.
+  `smart-click "Main >>> Settings"` clicks the page's "Main >>> Settings"
+  link even when a `<main>` element holds an iframe. For a frame index or a
+  bare name use `--frame`.
+- Same-origin **and cross-origin** frames work, including out-of-process
+  iframes (site isolation): cdpilot resolves each hop over CDP
+  (`DOM.describeNode` → frame id → the frame's execution context, or
+  `Target.attachToTarget` with a flat session for an out-of-process frame),
+  never through `contentDocument`, which the browser blocks cross-origin.
+- Real mouse input (`hover`, `dblclick`, `rightclick`, `--entropy=on` clicks)
+  is dispatched at page coordinates: the frame's offset in the page is added
+  automatically, so the browser hit-tests into the right frame.
+- `smart-click` / `smart-fill` / `smart-select` look in the page first and
+  compare texts with whitespace collapsed (`&nbsp;` and line breaks count as
+  one space). An enabled page element whose text or label contains the whole
+  query is used. If the page's only such elements are disabled, the command
+  fails as before (`no enabled element matches …`) without looking in frames.
+  Otherwise the visible frames are searched breadth-first for a whole-query
+  match (at most 20 frames, and 2 s for all of the search's CDP calls) and the
+  match is reported on stderr:
+  `smart-click: matched inside frame iframe#card (https://…)`. The search only
+  looks (no click, no typing); the command then acts once, in the chosen
+  frame. With no frame match, the page's partial (word) match is used as
+  before. When the 2 s run out:
+  `smart-click: frame search stopped after 2s (3 of 7 frames)`; a frame that
+  had not answered by then has not been touched.
+- `smart-fill` and `smart-select` search automatically only frames of the
+  page's own origin, so a typed value never lands in a third-party frame (an
+  ad, chat or payment widget) by accident; reach a cross-origin frame with
+  `>>>` or `--frame`. `smart-click` searches all visible frames.
+- `frame list` without `--frame` prints the same list as before.
+
 ### Debugging
 
 ```bash
@@ -308,7 +378,8 @@ cdpilot storage               # localStorage contents
 cdpilot upload <sel> <file>   # Upload file to input
 cdpilot multi-eval <js>       # Execute JS in all tabs
 cdpilot headless [on|off]     # Toggle headless mode
-cdpilot frame list            # List iframes
+cdpilot frame list            # List iframes (index = --frame <index>)
+cdpilot frame eval --frame <f> <js>  # Run JS inside an iframe (cross-origin too)
 cdpilot dialog auto-accept    # Auto-accept dialogs
 cdpilot permission grant geo  # Grant geolocation
 ```
@@ -883,10 +954,10 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] **Data extraction** (`extract`) — structured DOM data in text, JSON, or list format
 - [x] **Page observation** (`observe`) — list all interactive elements with available actions
 - [x] **Script runner** (`run`) — execute `.cdp` script files with pass/fail reporting
+- [x] **iframe targeting** — `"iframe#card >>> input"` / `--frame` for element commands, same-origin and cross-origin (out-of-process) frames; smart commands search frames automatically
 
 ### Coming Soon
 
-- [ ] **iframe** support — interact with elements inside iframes (Shadow DOM traversal already shipped in smart commands)
 - [ ] **Multi-instance pool** (`CDPILOT_POOL_SIZE`) — N independent browser processes with least-loaded dispatch
 - [ ] **Session recording & replay** — record browser sessions and replay them deterministically
 - [ ] **Stealth mode** *(Pro)* — human-like mouse/typing, anti-fingerprint, CAPTCHA solving
