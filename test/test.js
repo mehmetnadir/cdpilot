@@ -3488,8 +3488,8 @@ test('plugin marketplace: cdpilot MCP server is declared via .mcp.json at the pl
   const mcpConfig = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf8'));
   assert(mcpConfig.mcpServers && mcpConfig.mcpServers.cdpilot, '.mcp.json must declare an mcpServers.cdpilot entry');
   assert.strictEqual(mcpConfig.mcpServers.cdpilot.command, 'npx');
-  assert.deepStrictEqual(mcpConfig.mcpServers.cdpilot.args, ['cdpilot', 'mcp'],
-    'must match the "Claude Code (MCP)" example already in the README');
+  assert.deepStrictEqual(mcpConfig.mcpServers.cdpilot.args, ['-y', 'cdpilot', 'mcp'],
+    'npx -y so a first install never waits on a prompt');
 });
 
 test('plugin marketplace: skill exists and only documents commands the README already has', () => {
