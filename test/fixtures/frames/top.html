@@ -17,7 +17,7 @@
     iframe { width: 520px; height: 420px; border: 6px solid #444; padding: 10px; }
   </style>
 </head>
-<body>
+<body data-log="">
   <h1>Checkout</h1>
   <button id="top-btn" onclick="document.getElementById('top-status').textContent='top clicked'">
     Top button
@@ -28,6 +28,10 @@
   <iframe id="card" name="card-frame" title="Secure card payment"></iframe>
   <script>
     window.FRAME_NAME = 'top';
+    // One entry per click event: counts clicks, and tells real input from el.click().
+    document.getElementById('top-btn').addEventListener('click', function (e) {
+      document.body.dataset.log += 'top-click:' + (e.isTrusted ? 'trusted' : 'script') + ';';
+    });
     var q = new URLSearchParams(location.search);
     document.getElementById('card').src = q.get('child') || 'inner.html';
   </script>

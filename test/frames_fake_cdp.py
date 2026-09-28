@@ -9,8 +9,11 @@ The real cdp_send, WS pool, frame route, rewrite and frame-search code run
 unchanged; only the wire is fake. A smart-* finder is the expression
 "FINDER" (wrapped by _smart_wrap): the fake answers per frame and mode
 (probe / strict / loose) and records an "act" whenever a non-probe finder
-reports found (the real finder clicks or types right there). Prints one JSON object {scenario: result};
-a scenario that raises reports {"error": traceback}.
+reports found (the real finder clicks or types right there). cmd_click's
+own script (the `__cdpilot_waitFor(` one) is answered as one element with a
+box, "#nobox" as one without; the fake counts the script's own el.click()
+calls. Prints one JSON object {scenario: result}; a scenario that raises
+reports {"error": traceback}.
 """
 import asyncio
 import contextlib
@@ -57,6 +60,9 @@ class Browser:
         self.mod, self.top = mod, top
         self.frames, self.ctx, self.sessions = {}, {}, {}
         self.log, self.finder, self.mouse, self.acts = [], [], [], []
+        self.act_real = []        # per act: did the finder get __cdpilotRealClick?
+        self.clicks = []          # cmd_click scripts: el.click() calls the script makes
+        self.leaks = []           # scripts that put a helper on window
         self.attached, self.detached, self.sockets = [], [], []
         self.cancel_on = None
         self.opaque_ids = False   # remote-object ids without "<isolate>.<context>.<n>"
@@ -238,7 +244,12 @@ class Browser:
             ans = self.answer(frame, mode)
             if mode != "probe" and ans.get("found"):
                 self.acts.append([frame.fid, mode])
+                self.act_real.append("__cdpilotRealClick" in expr)
             return value(json.dumps(ans))
+        if expr.startswith("!!document.querySelector("):  # selector ladder, css step
+            return ok({"result": {"type": "boolean", "value": True}})
+        if "__cdpilot_waitFor(" in expr:  # cmd_click / cmd_fill script
+            return value(self.click_script(frame, expr))
         if expr == "HANG":
             return []
         if expr == "NOISY":  # events interleaved before the reply, as a live page sends them
@@ -251,6 +262,25 @@ class Browser:
         if expr.startswith("WHERE:"):
             return value(frame.fid + "|" + expr[len("WHERE:"):])
         return ok({"result": {"type": "undefined"}})
+
+    def click_script(self, frame, expr):
+        """cmd_click's script on one element: centre (40, 50), or no box for #nobox."""
+        if "window.__cdpilot_waitFor" in expr:
+            self.leaks.append(frame.fid)
+        sel = json.loads(re.search(r'__cdpilot_waitFor\(("(?:[^"\\]|\\.)*"), ', expr).group(1))
+        boxless = sel.endswith("#nobox")
+        # The box-less fallback runs only for an element without a box.
+        fallback = re.compile(r"if \(rect\.width < 1 \|\| rect\.height < 1\) \{.*?\n\s*\}", re.S)
+        m = fallback.search(expr)
+        rest = fallback.sub("", expr)
+        n = rest.count("el.click();") + (1 if boxless and m and "el.click();" in m.group(0) else 0)
+        self.clicks.append([frame.fid, n])
+        res = "Clicked: BUTTON " + sel
+        if "JSON.stringify" not in expr:
+            return res
+        if boxless and m:
+            return json.dumps({"res": res, "clicked": True})
+        return json.dumps({"res": res, "cx": 40, "cy": 50})
 
 
 class FakeWS:
@@ -324,6 +354,8 @@ def run(mod, top, body, pool=True):
     mod._WS_POOL.clear()
     mod._WS_LOCKS.clear()
     mod._FRAME_FLAG = None
+    if hasattr(mod, "_FRAME_ISOLATED_NOTED"):
+        mod._FRAME_ISOLATED_NOTED[0] = False  # once per process: a run is a process
     mod._WS_POOL_ENABLED = pool
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -676,19 +708,74 @@ def scenario_frame_list(mod):
 
 
 def scenario_isolated_fallback(mod):
-    """No usable main-world id: an isolated world (same DOM), and frame eval says so."""
+    """No usable main-world id: an isolated world (same DOM), and every command says so."""
     top = Frame("top", children=[Frame("card", elem_id="card", src="http://a.test/inner.html")])
+    seen = []
+    probe = probe_command(mod, seen)
     out = {}
-    for key, args in [("eval", ("eval", "--frame", "#card", "WHERE:z")), ("list", ("list", "--frame", "#card"))]:
-        async def body(b, args=args):
+    for key, steps in [("eval", [(mod.cmd_frame, ("eval", "--frame", "#card", "WHERE:z"))]),
+                       ("list", [(mod.cmd_frame, ("list", "--frame", "#card"))]),
+                       ("click", [(probe, ("#card >>> #btn",))]),
+                       # two frame commands in one process: one note
+                       ("twice", [(probe, ("#card >>> #btn",)), (probe, ("#card >>> #cc",))])]:
+        async def body(b, steps=steps):
             b.opaque_ids = True
-            res = await call(mod.cmd_frame, *args)
+            res = [await call(fn, *args) for fn, args in steps]
             ctxs = [m["params"].get("contextId") for m in b.log
                     if m["method"] == "Runtime.evaluate" and "WHERE:" in m["params"].get("expression", "")]
             return {"res": res, "contexts": ctxs, "isolated": sorted(b.isolated)}
         _, res, stdout, err = run(mod, top, body)
         res.update({"stdout": stdout, "stderr": err})
         out[key] = res
+    return out
+
+
+def scenario_click_input(mod):
+    """cmd_click: one click per command; real mouse input with entropy and in frames."""
+    out = {}
+    # The entropy cases take ~0.5 s each: _humanize_click's pauses are real.
+    for key, target, entropy in [
+        ("page_plain", "#btn", False),
+        ("page_entropy", "#btn", True),
+        ("frame", "#card >>> #btn", False),
+        ("frame_entropy", "#card >>> #nested >>> #btn", True),
+        ("oopif", "#pay >>> #btn", False),
+        ("frame_nobox", "#card >>> #nobox", False),
+    ]:
+        async def body(b, target=target, entropy=entropy):
+            return await call(lambda: mod.cmd_click(target, None, False, entropy))
+        b, res, stdout, err = run(mod, page_tree(), body)
+        # The settle wait before mouse input: [sessionId, contextId] per evaluate.
+        settle = [[m.get("sessionId"), m["params"].get("contextId")] for m in b.log
+                  if m["method"] == "Runtime.evaluate"
+                  and m["params"].get("expression") == mod._TWO_PAGE_FRAMES_JS]
+        out[key] = {"res": res, "stdout": stdout, "stderr": err, "clicks": b.clicks, "leaks": b.leaks,
+                    "settle": settle, "contexts": {f: b.frames[f].ctx for f in ("card", "nested")},
+                    "pressed": [m[1:] for m in b.mouse if m[0] == "mousePressed"],
+                    "released": [m[1:] for m in b.mouse if m[0] == "mouseReleased"]}
+    return out
+
+
+def scenario_smart_real_click(mod):
+    """smart-click: the act inside a frame asks for real mouse input; the page act does not."""
+    out = {}
+    for key, finders in [("smart_frame", {"top": {"strict": {"found": False}, "loose": {"found": False}},
+                                          "card": {"strict": {"found": True, "x": 5, "y": 6}}}),
+                         ("smart_page", {"top": {"strict": {"found": True, "x": 9, "y": 9}}})]:
+        async def body(b):
+            return json.loads(await mod._smart_eval(WS, "FINDER", "smart-click", real_click=True))
+        b, res, _, _ = run(mod, two_level_page(finders), body)
+        out[key] = {"res": res, "acts": b.acts, "act_real": b.act_real}
+
+    async def routed(b):
+        mod._FRAME_FLAG = "#card"
+        try:
+            return await call(mod._frame_aware("text")(
+                lambda t: mod._smart_eval(WS, "FINDER", "smart-click", real_click=True)), "Pay")
+        finally:
+            mod._FRAME_FLAG = None
+    b, res, _, _ = run(mod, two_level_page({"card": {"loose": {"found": True, "x": 5, "y": 6}}}), routed)
+    out["smart_routed"] = {"res": res, "acts": b.acts, "act_real": b.act_real}
     return out
 
 
@@ -728,6 +815,8 @@ SCENARIOS = {
     "text_hops": scenario_text_hops,
     "isolated_fallback": scenario_isolated_fallback,
     "plain_wire": scenario_plain_wire,
+    "click_input": scenario_click_input,
+    "smart_real_click": scenario_smart_real_click,
 }
 
 
