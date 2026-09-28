@@ -4118,6 +4118,21 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       + ' (div#wrap was); used a script click\n');
   });
 
+  test('x bot (fake CDP): _tw_click_sel clicks the box it found (the reply\'s result.value), held', () => {
+    // _tw_click_sel read res[802].value, which is never there: it returned
+    // False and never clicked. It reads result.value now.
+    const r = fake('press_hold');
+    for (const key of ['tw_plain', 'tw_humanized']) {
+      const k = r[`default_${key}`];
+      assert.strictEqual(k.res, true, `${key}: found and clicked`);
+      assert.strictEqual(k.pressed.length, 1, key);
+      assert(Math.abs(k.pressed[0][0] - 25) <= 2 && Math.abs(k.pressed[0][1] - 40) <= 2,
+        `${key}: the centre of {x:10,y:20,w:30,h:40}: ${k.pressed[0]}`);
+      assert.strictEqual(k.press.gaps.length, 1, `${key}: one press and release`);
+    }
+    assert.strictEqual(r.instant_tw_plain.res, true);
+  });
+
   test('press hold (fake CDP): dblclick is two held clicks, clickCount 1 then 2, 60-140 ms apart', () => {
     const r = fake('press_hold');
     for (const key of ['default_dblclick', 'default_dblclick_page']) {

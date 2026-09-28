@@ -334,6 +334,8 @@ class Browser:
                 self.blocker_t.append([pe, time.perf_counter()])
                 return ok({"result": {"type": "boolean", "value": True}})
             return ok({"result": {"type": "boolean", "value": False}})
+        if "getBoundingClientRect();return {x:r.x,y:r.y" in expr:  # the X bot's _tw_click_sel
+            return ok({"result": {"type": "object", "value": {"x": 10, "y": 20, "w": 30, "h": 40}}})
         if "return {x: Math.round(r.left + r.width/2)" in expr:  # _get_element_center
             return value({"x": 40, "y": 50})
         if expr.startswith("!!document.querySelector("):  # selector ladder, css step
@@ -1031,6 +1033,22 @@ def scenario_press_hold(mod):
                         await getattr(mod, fn)(WS, 10, 20)
                     b, _, _, err = run(mod, click_page(), body)
                     out[f"{tag}_{key}"] = {"stderr": err, "press": press_info(b)}
+                # _tw_click_sel itself: finds the box, clicks its centre (humanized or not).
+                for key, humanize in [("tw_plain", "off"), ("tw_humanized", "on")]:
+                    saved = os.environ.get("CDPILOT_TWITTER_HUMANIZE")
+                    os.environ["CDPILOT_TWITTER_HUMANIZE"] = humanize
+
+                    async def body(b):
+                        return await mod._tw_click_sel(WS, "[data-testid=tweetButton]")
+                    try:
+                        b, res, _, err = run(mod, click_page(), body)
+                    finally:
+                        if saved is None:
+                            os.environ.pop("CDPILOT_TWITTER_HUMANIZE", None)
+                        else:
+                            os.environ["CDPILOT_TWITTER_HUMANIZE"] = saved
+                    out[f"{tag}_{key}"] = {"res": res, "stderr": err, "press": press_info(b),
+                                           "pressed": [m[1:] for m in b.mouse if m[0] == "mousePressed"]}
     finally:
         mod.get_visual_config = real_visual
     # The duration draws themselves, and CDPILOT_PRESS_MS parsing.
