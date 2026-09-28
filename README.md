@@ -144,6 +144,8 @@ cdpilot scroll-to <selector>  # Scroll element into view
 cdpilot drag <from> <to>      # Drag and drop
 ```
 
+A real mouse click (inside a frame, or `--entropy=on`) whose target moves or gets covered while the button is held is not clicked again by script: `click` prints `Pressed (released elsewhere, not clicked): …` and ends with **exit 3** (pressed, release missed the target, not clicked; `1` stays "error"). A target the page replaced or navigated away from on mousedown prints `Pressed (the page replaced or left it, not clicked): …` and exits 0. MCP (`browser_click`, `browser_smart_click`) returns `isError: false` with a first line `{"clicked": false, "reason": "moved"|"gone"|"unknown"}`. `batch` and `run` finish every step, then exit 1 if a step failed, else 3 if a click was not clicked, else 0.
+
 ### Element targeting inside iframes
 
 Card forms (Stripe/iyzico-style), embedded login widgets and the reCAPTCHA
@@ -469,6 +471,8 @@ any page script runs. Disabled by default; opt-in.
 At launch, cdpilot also passes `--disable-blink-features=AutomationControlled`,
 which closes the Blink runtime flag that Cloudflare and DataDome probe to detect
 an automated browser.
+
+Real mouse clicks (frames, `--entropy=on`, `click @ref`, `dblclick`, `rightclick`) hold the button 40-120 ms like a person's press; `CDPILOT_PRESS_MS=min-max` changes the range (`0-0` = instant).
 
 #### Three-tier stealth mode
 
