@@ -5,7 +5,14 @@
  * Entry point: detects Python, finds browser, delegates to cdpilot.py
  */
 
-const { execSync, spawn } = require('child_process');
+const { execSync, spawn, spawnSync } = require('child_process');
+
+// Output the launcher prints itself (help, status) must survive process.exit():
+// on macOS a piped stdout is asynchronous, and exiting right after a write
+// longer than the pipe buffer (8 KB) cut --help off mid-text.
+for (const stream of [process.stdout, process.stderr]) {
+  if (stream._handle && typeof stream._handle.setBlocking === 'function') stream._handle.setBlocking(true);
+}
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -253,9 +260,9 @@ function runStatus() {
           console.log(`  Browser: ${info.Browser || 'Unknown'}`);
           console.log(`  Protocol: ${info['Protocol-Version'] || 'Unknown'}`);
           console.log(`  WebSocket: ${info.webSocketDebuggerUrl || 'N/A'}`);
-          const webmcp = webmcpLabel(config.profileDir);
-          console.log(`  ${idleCloseLabel(port)}${webmcp ? '' : '\n'}`);
-          if (webmcp) console.log(`  ${webmcp}\n`);
+          const extra = [webmcpLabel(config.profileDir), botAuthLabel(port)].filter(Boolean);
+          console.log(`  ${idleCloseLabel(port)}${extra.length ? '' : '\n'}`);
+          extra.forEach((l, i) => console.log(`  ${l}${i === extra.length - 1 ? '\n' : ''}`));
         } catch {
           console.log('  ✓ CDP responding but version info unavailable\n');
         }
@@ -324,6 +331,31 @@ function webmcpLabel(profileDir) {
   const m = webmcpMode(profileDir);
   if (!m.on) return null;
   return `WebMCP: on (${m.from}; browsers start with --enable-features=WebMCP)`;
+}
+
+// Web Bot Auth signer line, printed by `status` only when bot-auth is set up
+// (a key in CDPILOT_HOME/bot-auth/, or signer state for this port), so the
+// default output is unchanged. With no signer state file or stale marker in
+// CDPILOT_HOME/bot-auth/signers/ it is "off" without starting Python.
+// Otherwise Python decides (hidden --_bot-auth-label, see
+// _bot_auth_helper_state there): a pid alone proves nothing, the signer is
+// "on" only if that pid's command line is this port's signer and the browser
+// is still the one it attached to; a dead or stale signer also prints the
+// one-line "requests go out unsigned" warning on stderr.
+function botAuthLabel(port) {
+  const home = cdpilotHome();
+  const dir = path.join(home, 'bot-auth', 'signers');
+  const signer = fs.existsSync(path.join(dir, `${port}.json`)) || fs.existsSync(path.join(dir, `${port}.stale`));
+  if (!signer) return fs.existsSync(path.join(home, 'bot-auth', 'config.json')) ? 'bot-auth: off' : null;
+  const python = findPython();
+  if (!python) return 'bot-auth: off';
+  const r = spawnSync(python, [SCRIPT, '--_bot-auth-label'], {
+    encoding: 'utf-8', timeout: 20000,
+    env: { ...process.env, CDP_PORT: String(port), CDPILOT_LOG: '0' },
+  });
+  if (r.stderr) process.stderr.write(r.stderr);
+  const line = (r.stdout || '').trim().split('\n').pop();
+  return /^bot-auth: /.test(line || '') ? line : 'bot-auth: off';
 }
 
 // ── Version ──
@@ -399,12 +431,14 @@ function showHelp() {
 
   SETUP
     setup              Auto-detect browser, create isolated profile
-    launch [--idle-close <min>] [--webmcp|--no-webmcp]
+    launch [--idle-close <min>] [--webmcp|--no-webmcp] [--bot-auth]
                        Start browser with CDP enabled (--idle-close or
                        CDPILOT_IDLE_CLOSE: close it after <min> idle minutes;
                        --webmcp: this project's browsers start with WebMCP on,
-                       saved until --no-webmcp; see WEBMCP below)
-    status             Check browser connection
+                       saved until --no-webmcp; see WEBMCP below; --bot-auth:
+                       sign every request, see WEB BOT AUTH)
+    status             Check browser connection (idle close; WebMCP and the
+                       bot-auth signer when set up)
     stop [--smart]     Stop browser (--smart = close owned tabs, quit if empty)
     close [--force|--keep]  Smart close: close cdpilot's tabs; quit browser only
                        if no user tabs remain (--force quits anyway, --keep never quits)
@@ -496,6 +530,24 @@ function showHelp() {
                        across cdpilot runs to skip Cloudflare walls.
     cookies load <file>
                        Import previously-saved cookies into the current jar.
+
+  WEB BOT AUTH (signed agent — the opposite of stealth; needs: pip install cryptography)
+    bot-auth init --agent-url https://your-domain.com [--force]
+                       Generate an Ed25519 key (0600, never printed) in CDPILOT_HOME/bot-auth/
+    bot-auth directory Print the JWKS to serve at
+                       https://your-domain.com/.well-known/http-message-signatures-directory
+    bot-auth directory --headers [--authority <host>] [--ttl <s>] [--content-digest] [--json]
+                       The same plus the Signature / Signature-Input headers that
+                       response must carry (Cloudflare checks them; one per key)
+    bot-auth format [legacy|dict]
+                       Signature-Agent format. legacy (default): "https://…",
+                       what Cloudflare verifies; dict: sig1="https://…" (draft-05)
+    bot-auth status    Agent URL, keyid, and whether the signer is running
+    launch --bot-auth  Launch with a signer that adds Signature, Signature-Input and
+                       Signature-Agent to EVERY request the browser makes (new tabs,
+                       popups, iframes, workers, page fetches after cdpilot exits).
+                       Or CDPILOT_BOT_AUTH=1. With stealth mode: one warning, stealth
+                       injection skipped. "stop" ends the signer.
 
   RELIABILITY
     browser [name]     Show or set preferred browser (chrome|brave|chromium|edge|vivaldi|auto)
