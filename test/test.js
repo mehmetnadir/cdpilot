@@ -7562,6 +7562,9 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   const os = require('os');
   const { spawnSync, spawn, execFileSync } = require('child_process');
   const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  // HAS_CRYPTO is probed with PYB, so the CLI tests that need cryptography pin
+  // CDPILOT_PYTHON to PYB: bin/cdpilot.js otherwise may pick another interpreter
+  // (python3.13 before python3) that lacks it.
   const HAS_CRYPTO = spawnSync(PYB, ['-c', 'import cryptography.hazmat.primitives.asymmetric.ed25519'],
     { encoding: 'utf-8', timeout: 20000 }).status === 0;
   const HINT = /needs the optional 'cryptography' package[\s\S]*pip install cryptography/;
@@ -7886,7 +7889,7 @@ print("ok")
     test('bot-auth init/directory/status: 0600 key, kid = RFC 7638 of x, key never printed, safe re-init', () => {
       const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-cli-'));
       const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
-        CDP_PORT: '19228', CDPILOT_LOG: '0' };
+        CDP_PORT: '19228', CDPILOT_LOG: '0', CDPILOT_PYTHON: PYB };
       const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf-8', timeout: 30000 });
       for (const bad of ['http://agent.test', 'https://agent.test/bots', 'https://agent.test?a=1', 'agent.test']) {
         const r = c('bot-auth', 'init', '--agent-url', bad);
@@ -8011,7 +8014,7 @@ print("ok")
       'print(json.dumps(got))',
     ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
     const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
-      CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1', CDPILOT_LOG: '0' };
+      CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1', CDPILOT_LOG: '0', CDPILOT_PYTHON: PYB };
     for (const k of ['CDPILOT_TARGET', 'CDPILOT_MODE', 'CDPILOT_BOT_AUTH', 'CDPILOT_TIMEOUT']) delete env[k];
     const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf-8', timeout: 60000, env });
     let r = c('bot-auth', 'init', '--agent-url', 'https://agent.test');
