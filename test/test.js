@@ -5228,6 +5228,390 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   });
 })();
 
+// ── Web Bot Auth (signed agent) ──
+// Signing code, the draft's vectors and the signer helper's CDP loop run in
+// test/bot_auth_fake_cdp.py (the real cdpilot.py, a fake browser socket);
+// the CLI paths run through bin/cdpilot.js; the real browser path is the
+// opt-in e2e test (CDPILOT_E2E=1) with test/fixtures/bot_auth_server.py, an
+// origin that verifies every request it gets. `cryptography` is optional:
+// without it the bot-auth commands must print the install hint and exit 2.
+(function() {
+  const os = require('os');
+  const { spawnSync, spawn, execFileSync } = require('child_process');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const HAS_CRYPTO = spawnSync(PYB, ['-c', 'import cryptography.hazmat.primitives.asymmetric.ed25519'],
+    { encoding: 'utf-8', timeout: 20000 }).status === 0;
+  const HINT = /needs the optional 'cryptography' package[\s\S]*pip install cryptography/;
+
+  test('bot auth signature base generation matches RFC 9421 test vector', () => {
+    const script = `
+import sys
+sys.path.insert(0, "./src")
+from cdpilot import _bot_auth_signature_base
+params_str = '("@authority");created=1735689600;keyid="poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U";alg="ed25519";expires=1735693200;nonce="mYotfW3CUjI68sbGw6oKd7kyXqPjZEtU8xFPGWFrqOAf5qC6MDe3pys3SWWCudB0MvwslHy32WXUpkR7u0lt/w==";tag="web-bot-auth"'
+expected_sig_base = b'"@authority": example.com' + bytes([10]) + b'"@signature-params": ' + params_str.encode()
+sig_base = _bot_auth_signature_base("GET", "example.com", "/path/to/resource", None, params_str)
+if sig_base != expected_sig_base:
+    sys.exit(1)
+print("ok")
+`;
+    const r = spawnSync(PYB, ['-c', script], { encoding: 'utf-8', timeout: 20000,
+      cwd: path.join(__dirname, '..'), env: { ...process.env, CDPILOT_LOG: '0' } });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.strictEqual(r.stdout.trim(), 'ok');
+  });
+
+  let fakeResults = null;
+  function fake(name) {
+    if (!fakeResults) {
+      const env = { ...process.env, CDP_PORT: '19226', CDPILOT_LOG: '0' };
+      for (const k of ['CDPILOT_MODE', 'CDPILOT_BOT_AUTH', 'CDPILOT_TIMEOUT']) delete env[k];
+      const out = execFileSync(PYB, [path.join(__dirname, 'bot_auth_fake_cdp.py'), PY_PATH], {
+        encoding: 'utf-8', timeout: 60000, env,
+      });
+      fakeResults = JSON.parse(out.trim().split('\n').pop());
+    }
+    const r = fakeResults[name];
+    assert(r, `bot-auth scenario ${name} missing`);
+    assert(!r.error, `bot-auth scenario ${name} crashed:\n${r.error}`);
+    return r;
+  }
+  const skipNote = (what) => console.log(`  - skipped: ${what} (cryptography not installed)`);
+
+  test('bot-auth: signature bases of draft-05 A.2 and Cloudflare v2 Ed25519 vectors', () => {
+    const v = fake('vectors');
+    for (const k of ['sig1_base', 'sig2_base', 'draft_a22_base']) assert.strictEqual(v[k], true, k);
+  });
+
+  if (HAS_CRYPTO) {
+    test('bot-auth: Ed25519 vectors reproduce byte for byte (Signature, Signature-Input, Signature-Agent)', () => {
+      const v = fake('vectors');
+      for (const k of ['sig1_headers', 'sig2_headers', 'draft_a21_signature', 'draft_a23_legacy_signature']) {
+        assert.strictEqual(v[k], true, `${k}: ${JSON.stringify(v)}`);
+      }
+    });
+  } else {
+    skipNote('bot-auth vector signatures');
+  }
+
+  test('bot-auth: RFC 7638 JWK thumbprint (RFC 8037 A.3, vector key) and RFC 9421 @authority', () => {
+    const t = fake('thumbprint');
+    assert.strictEqual(t.rfc8037_a3, true, 'RFC 8037 A.3 thumbprint');
+    assert.strictEqual(t.vector_key, true, 'vector key thumbprint');
+    assert.deepStrictEqual(t.authority, ['example.com', 'example.com', 'example.com',
+      '127.0.0.1:8080', 'example.com:8443', '[::1]:9000']);
+  });
+
+  test('bot-auth helper: flat auto-attach; Fetch (Request stage) before the paused target runs', () => {
+    const h = fake('helper');
+    const aa = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true };
+    assert.deepStrictEqual(h.first, ['Target.setAutoAttach', aa, null]);
+    assert.deepStrictEqual(h.ready, [null], 'ready once the browser accepted auto-attach');
+    assert.deepStrictEqual(h.attach, [
+      ['Fetch.enable', 'S1', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] }],
+      ['Target.setAutoAttach', 'S1', aa],
+      ['Runtime.runIfWaitingForDebugger', 'S1', {}],
+    ], 'a page gets Fetch + nested auto-attach, then runs; an "other" target gets nothing');
+  });
+
+  test('bot-auth helper: requestPaused -> continueRequest carries Signature, Signature-Input, Signature-Agent', () => {
+    const h = fake('helper');
+    assert.strictEqual(h.r1_session, 'S1', 'continued on the session that paused it');
+    assert.deepStrictEqual(h.r1_headers, ['Accept', 'X-Keep', 'Signature-Agent', 'Signature-Input', 'Signature'],
+      'page headers kept, a stale signature replaced, the three added');
+    assert.strictEqual(h.r1_values.Signature, 'sig1=:AAAA:');
+  });
+
+  test('bot-auth helper: data:/blob:/chrome-extension: and a signing error continue unsigned; one log line', () => {
+    const h = fake('helper');
+    for (const rid of ['R2', 'R3', 'R4', 'R5']) {
+      assert.deepStrictEqual(h.unsigned[rid] && h.unsigned[rid][1], ['requestId'], `${rid} continued without headers`);
+    }
+    assert.strictEqual(h.unsigned.R5[0], 'S2');
+    assert.deepStrictEqual(h.signed_urls, ['https://example.com/p?q=1', 'https://example.com/boom?token=SECRET123'],
+      'only http(s) reaches the signer');
+    assert.strictEqual(h.logs.length, 1, 'one line per failure');
+    assert(!/SECRET123|boom|token/.test(h.logs[0]), `the log line carries no path or query: ${h.logs[0]}`);
+    assert.strictEqual(h.finished, true, 'the helper returns when the browser socket closes');
+  });
+
+  if (HAS_CRYPTO) {
+    test('bot-auth helper: real signatures verify with the directory key; tampering fails; sign < 1 ms', () => {
+      const r = fake('helper_real_signature');
+      assert.deepStrictEqual(r.verified, [[true, 'sig1'], [true, 'sig1'], [true, 'sig1'], [true, 'sig1']]);
+      assert.strictEqual(r.tampered[0], false, 'another Host must not verify');
+      assert(r.median_ms < 1, `median sign time ${r.median_ms} ms`);
+    });
+  } else {
+    skipNote('bot-auth real-signature helper test');
+  }
+
+  test('bot-auth: navigate sends no stealth script or UA override while the signer runs', () => {
+    const r = fake('navigate_skips_stealth');
+    assert.deepStrictEqual(r.off, { stealth_script: true, ua_override: true, navigated: true },
+      'stealth mode without bot-auth injects as before');
+    assert.deepStrictEqual(r.on, { stealth_script: false, ua_override: false, navigated: true });
+  });
+
+  test('bot-auth: stealth conflict is one warning line; the session log masks signatures', () => {
+    const r = fake('conflict_and_log');
+    assert.deepStrictEqual(r.flag, [true, 1, true], '--stealth with --bot-auth');
+    assert.deepStrictEqual(r.mode, [true, 1, true], 'undetected mode with --bot-auth');
+    assert.deepStrictEqual(r.none, [false, 0, false], 'regular mode: no warning');
+    assert.deepStrictEqual(r.slog, { signature_masked: true, input_masked: true, status_kept: true });
+  });
+
+  test('bot-auth: signer state — status label on/off, a dead pid is off, stop clears it', () => {
+    const r = fake('state');
+    assert.strictEqual(r.off, 'bot-auth: off');
+    assert.strictEqual(r.on, 'bot-auth: on (keyid KID123)');
+    assert.strictEqual(r.active, true);
+    assert.strictEqual(r.dead_pid, 'bot-auth: off');
+    assert.strictEqual(r.state_after_stop, null);
+  });
+
+  // A `cryptography` that fails to import, whatever the interpreter has.
+  function noCryptoEnv(home) {
+    const shim = path.join(home, 'no-crypto');
+    fs.mkdirSync(path.join(shim, 'cryptography'), { recursive: true });
+    fs.writeFileSync(path.join(shim, 'cryptography', '__init__.py'),
+      'raise ImportError("cryptography blocked by the cdpilot test")\n');
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: '19227', CDPILOT_LOG: '0', PYTHONPATH: shim,
+      CHROME_BIN: path.join(home, 'no-such-browser', 'chrome'), CDPILOT_NO_AUTOLAUNCH: '1' };
+    for (const k of ['CDPILOT_MODE', 'CDPILOT_BOT_AUTH', 'CDPILOT_TIMEOUT']) delete env[k];
+    return env;
+  }
+
+  test('bot-auth without cryptography: init/status/directory/launch --bot-auth -> install hint, exit 2', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-nocrypto-'));
+    const env = noCryptoEnv(home);
+    // launch goes straight to Python: the node launcher's first-run preflight
+    // is about the browser and websockets, not this check.
+    for (const args of [['bot-auth', 'init', '--agent-url', 'https://agent.test'], ['bot-auth', 'status'],
+      ['bot-auth', 'directory'], ['launch', '--bot-auth']]) {
+      const r = args[0] === 'launch'
+        ? spawnSync(PYB, [PY_PATH, ...args], { env, encoding: 'utf-8', timeout: 30000 })
+        : spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf-8', timeout: 30000 });
+      assert.strictEqual(r.status, 2, `${args.join(' ')}: exit ${r.status}\n${r.stdout}${r.stderr}`);
+      assert(HINT.test(r.stderr), `${args.join(' ')}: install hint missing:\n${r.stderr}`);
+      assert(!/Launching browser/.test(r.stdout), `${args.join(' ')} must not start a browser`);
+    }
+    assert(!fs.existsSync(path.join(home, 'bot-auth', 'ed25519.key')), 'no key written');
+  });
+
+  test('bot-auth without cryptography: other commands are unaffected', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-nocrypto-'));
+    const env = noCryptoEnv(home);
+    const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf-8', timeout: 30000 });
+    let r = c('version');
+    assert(r.status === 0 && r.stdout.includes(require('../package.json').version), `version: ${r.stdout}${r.stderr}`);
+    r = c('mode');
+    assert(r.status === 0 && /Mode: regular/.test(r.stdout), `mode: ${r.stdout}${r.stderr}`);
+    r = c('bot-auth', '--help');
+    assert(r.status === 0 && /bot-auth <init\|status\|directory>/.test(r.stdout), `bot-auth --help: ${r.stdout}${r.stderr}`);
+    r = c('status');
+    assert(r.status === 0, `status: ${r.stdout}${r.stderr}`);
+    assert(!HINT.test(r.stderr + r.stdout), 'no hint outside bot-auth');
+  });
+
+  if (HAS_CRYPTO) {
+    test('bot-auth init/directory/status: 0600 key, kid = RFC 7638 of x, key never printed, safe re-init', () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-cli-'));
+      const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+        CDP_PORT: '19228', CDPILOT_LOG: '0' };
+      const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf-8', timeout: 30000 });
+      for (const bad of ['http://agent.test', 'https://agent.test/bots', 'https://agent.test?a=1', 'agent.test']) {
+        const r = c('bot-auth', 'init', '--agent-url', bad);
+        assert.strictEqual(r.status, 1, `${bad} must be rejected: ${r.stdout}${r.stderr}`);
+      }
+      const init = c('bot-auth', 'init', '--agent-url', 'https://agent.test/');
+      assert.strictEqual(init.status, 0, init.stderr);
+      const keyFile = path.join(home, 'bot-auth', 'ed25519.key');
+      const pem = fs.readFileSync(keyFile, 'utf-8');
+      if (process.platform !== 'win32') {
+        assert.strictEqual(fs.statSync(keyFile).mode & 0o777, 0o600, 'key file 0600');
+      }
+      const dir = c('bot-auth', 'directory');
+      assert.strictEqual(dir.status, 0, dir.stderr);
+      const jwks = JSON.parse(dir.stdout);
+      assert.strictEqual(jwks.keys.length, 1);
+      const k = jwks.keys[0];
+      assert.deepStrictEqual([k.kty, k.crv, k.use], ['OKP', 'Ed25519', 'sig']);
+      assert(!('d' in k), 'the directory holds no private part');
+      const thumb = require('crypto').createHash('sha256')
+        .update(`{"crv":"Ed25519","kty":"OKP","x":"${k.x}"}`).digest('base64url');
+      assert.strictEqual(k.kid, thumb, 'kid is the RFC 7638 thumbprint');
+      const status = c('bot-auth', 'status');
+      assert(status.stdout.includes(`keyid     : ${thumb}`) && /agent URL : https:\/\/agent\.test$/m.test(status.stdout),
+        status.stdout);
+      assert(/bot-auth: off/.test(status.stdout), 'no signer running');
+      const body = pem.split('\n').filter((l) => l && !l.startsWith('-----')).join('');
+      for (const r of [init, dir, status]) {
+        assert(!/PRIVATE KEY/.test(r.stdout + r.stderr) && !(r.stdout + r.stderr).includes(body.slice(0, 24)),
+          'the private key is never printed');
+      }
+      const again = c('bot-auth', 'init', '--agent-url', 'https://agent.test');
+      assert.strictEqual(again.status, 1, 're-init without --force must refuse');
+      assert.strictEqual(fs.readFileSync(keyFile, 'utf-8'), pem, 'key unchanged');
+      if (process.platform !== 'win32') {
+        fs.chmodSync(keyFile, 0o644);
+        const warn = c('bot-auth', 'status');
+        assert(/private key is 0o644, should be 0600/.test(warn.stderr), `perm warning: ${warn.stderr}`);
+      }
+    });
+  } else {
+    skipNote('bot-auth init/directory/status CLI test');
+  }
+
+  test('bot-auth docs: README section, bin help, __doc__, CHANGELOG [Unreleased]', () => {
+    const root = path.join(__dirname, '..');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    const sec = readme.split(/^### Web Bot Auth \(signed agent\)$/m)[1];
+    assert(sec, 'README needs a "### Web Bot Auth (signed agent)" section');
+    for (const s of ['bot-auth init --agent-url', 'bot-auth directory', 'launch --bot-auth',
+      '/.well-known/http-message-signatures-directory', 'application/http-message-signatures-directory+json',
+      'pip install cryptography', 'stealth', 'Signature-Agent', '"signature-agent";key="sig1"']) {
+      assert(sec.includes(s), `README section must mention ${s}`);
+    }
+    const help = run('--help');
+    assert(help.includes('launch --bot-auth') && help.includes('bot-auth directory'), 'bin help documents bot-auth');
+    assert(PY_CONTENT.slice(0, 3000).includes('launch --bot-auth'), 'python __doc__ documents bot-auth');
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    const secs = changelog.split(/^## \[/m);
+    assert((secs[1] || '').startsWith('Unreleased]') && secs[1].includes('launch --bot-auth'),
+      'CHANGELOG [Unreleased] describes Web Bot Auth');
+  });
+
+  // ── Real browser (CDPILOT_E2E=1): every request the browser makes is signed ──
+  if (process.env.CDPILOT_E2E !== '1') {
+    console.log('  - skipped: bot-auth e2e (set CDPILOT_E2E=1 to run it against a headless browser)');
+    return;
+  }
+  let e2e = null;
+  test('bot-auth e2e: launch --bot-auth starts the signer; status shows bot-auth: on (keyid …)', () => {
+    assert(HAS_CRYPTO, `the bot-auth e2e needs cryptography in ${PYB} (pip install cryptography)`);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-e2e-'));
+    const [cdpPort, port] = JSON.parse(execFileSync(PYB, ['-c', [
+      'import json, socket', 'ss = [socket.socket() for _ in range(2)]',
+      '[s.bind(("127.0.0.1", 0)) for s in ss]',
+      'print(json.dumps([s.getsockname()[1] for s in ss]))', '[s.close() for s in ss]',
+    ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1', CDPILOT_LOG: '0' };
+    for (const k of ['CDPILOT_TARGET', 'CDPILOT_MODE', 'CDPILOT_BOT_AUTH', 'CDPILOT_TIMEOUT']) delete env[k];
+    const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf-8', timeout: 60000, env });
+    let r = c('bot-auth', 'init', '--agent-url', 'https://agent.test');
+    assert.strictEqual(r.status, 0, r.stderr);
+    r = c('bot-auth', 'directory');
+    assert.strictEqual(r.status, 0, r.stderr);
+    const jwksFile = path.join(home, 'jwks.json');
+    fs.writeFileSync(jwksFile, r.stdout);
+    const keyid = JSON.parse(r.stdout).keys[0].kid;
+    const logFile = path.join(home, 'origin.jsonl');
+    const srv = spawn(PYB, [path.join(__dirname, 'fixtures', 'bot_auth_server.py'), '--port', String(port),
+      '--jwks-file', jwksFile, '--log-file', logFile], { stdio: 'ignore' });
+    const stop = () => {
+      c('stop');
+      try { srv.kill(); } catch (err) { /* already gone */ }
+    };
+    try {
+      execFileSync(PYB, ['-c', [
+        'import time, urllib.request',
+        'for _ in range(100):',
+        `    try: urllib.request.urlopen("http://127.0.0.1:${port}/ping", timeout=1); break`,
+        '    except Exception: time.sleep(0.1)',
+      ].join('\n')], { timeout: 20000 });
+      r = c('launch', '--bot-auth');
+      assert(r.status === 0 && /Bot Auth: signing every request as https:\/\/agent\.test/.test(r.stdout),
+        `launch: ${r.status}\n${r.stdout}${r.stderr}`);
+      const state = JSON.parse(fs.readFileSync(path.join(home, 'bot-auth', 'signers', `${cdpPort}.json`), 'utf-8'));
+      assert(state.pid && state.ready, 'signer state names a ready pid');
+      const st = c('status');
+      assert(st.stdout.includes(`bot-auth: on (keyid ${keyid})`), `status: ${st.stdout}`);
+    } catch (err) {
+      stop();
+      throw err;
+    }
+    const readLog = () => fs.readFileSync(logFile, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+      .filter((e) => e.path !== '/ping');
+    e2e = { c, port, keyid, stop, readLog, home, cdpPort };
+  });
+  const need = () => { assert(e2e, 'bot-auth e2e setup failed'); return e2e; };
+  const waitFor = (fn, ms) => {
+    const end = Date.now() + ms;
+    for (;;) {
+      const v = fn();
+      if (v || Date.now() > end) return v;
+      spawnSync(PYB, ['-c', 'import time; time.sleep(0.2)']);
+    }
+  };
+  const signedBy = (e, keyid) => e.verified === true
+    && e.signature_agent === 'sig1="https://agent.test"'
+    && e.signature_input.includes(`keyid="${keyid}"`) && e.signature_input.includes('tag="web-bot-auth"');
+  try {
+    let goDone = 0;
+    test('bot-auth e2e (a): go — the document, a subresource and both redirect hops are signed', () => {
+      const { c, port, keyid, readLog } = need();
+      const r = c('go', `http://127.0.0.1:${port}/start?late=4000&popup=5000&worker=1`);
+      goDone = Date.now() / 1000;
+      assert.strictEqual(r.status, 0, `go: ${r.stdout}${r.stderr}`);
+      const log = waitFor(() => { const l = readLog(); return ['/sub.json', '/after-redirect']
+        .every((p) => l.some((e) => e.path === p)) && l; }, 10000);
+      assert(log, `origin missed /sub.json or /after-redirect: ${JSON.stringify(readLog().map((e) => e.path))}`);
+      for (const p of ['/start?late=4000&popup=5000&worker=1', '/sub.json', '/redirect', '/after-redirect']) {
+        const e = log.find((x) => x.path === p);
+        assert(e && signedBy(e, keyid), `${p}: ${JSON.stringify(e)}`);
+      }
+    });
+    test('bot-auth e2e (b): a fetch() the page makes after the cdpilot command exited is signed', () => {
+      const { keyid, readLog } = need();
+      const log = waitFor(() => { const l = readLog(); return l.some((e) => e.path === '/late?x=1') && l; }, 15000);
+      assert(log, 'origin saw no /late request');
+      const e = log.find((x) => x.path === '/late?x=1');
+      assert(goDone && e.t > goDone, `the late fetch (t=${e.t}) must come after go exited (t=${goDone})`);
+      assert(signedBy(e, keyid), JSON.stringify(e));
+    });
+    test('bot-auth e2e (c): a new tab opened by the page is signed (document and image)', () => {
+      const { keyid, readLog } = need();
+      const log = waitFor(() => { const l = readLog(); return l.some((e) => e.path === '/popup.png') && l; }, 15000);
+      assert(log, 'origin saw no popup requests');
+      for (const p of ['/popup', '/popup.png']) {
+        const e = log.find((x) => x.path === p);
+        assert(e && signedBy(e, keyid), `${p}: ${JSON.stringify(e)}`);
+      }
+    });
+    test('bot-auth e2e (d): a dedicated Worker the page starts is signed (script and its fetch)', () => {
+      const { keyid, readLog } = need();
+      const log = waitFor(() => { const l = readLog(); return l.some((e) => e.path === '/from-worker') && l; }, 10000);
+      assert(log, 'origin saw no request from the worker');
+      for (const p of ['/worker.js', '/from-worker']) {
+        const e = log.find((x) => x.path === p);
+        assert(e && signedBy(e, keyid), `${p}: ${JSON.stringify(e)}`);
+      }
+    });
+    test('bot-auth e2e: every request the origin received verifies with the directory key', () => {
+      const { keyid, readLog } = need();
+      const log = readLog();
+      assert(log.length >= 5, `requests seen: ${log.length}`);
+      const bad = log.filter((e) => !signedBy(e, keyid));
+      assert.deepStrictEqual(bad, [], 'unsigned or unverified requests');
+    });
+    test('bot-auth e2e: stop ends the signer process and status says off', () => {
+      const { c, home, cdpPort } = need();
+      const state = JSON.parse(fs.readFileSync(path.join(home, 'bot-auth', 'signers', `${cdpPort}.json`), 'utf-8'));
+      const r = c('stop');
+      assert.strictEqual(r.status, 0, r.stderr);
+      const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; } };
+      assert(waitFor(() => !alive(state.pid), 5000), `signer pid ${state.pid} still alive after stop`);
+      assert(!fs.existsSync(path.join(home, 'bot-auth', 'signers', `${cdpPort}.json`)), 'signer state cleared');
+      assert(/bot-auth: off/.test(c('bot-auth', 'status').stdout), 'bot-auth status: off');
+    });
+  } finally {
+    if (e2e) e2e.stop();
+  }
+})();
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);

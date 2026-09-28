@@ -243,7 +243,8 @@ function runStatus() {
           console.log(`  Browser: ${info.Browser || 'Unknown'}`);
           console.log(`  Protocol: ${info['Protocol-Version'] || 'Unknown'}`);
           console.log(`  WebSocket: ${info.webSocketDebuggerUrl || 'N/A'}`);
-          console.log(`  ${idleCloseLabel(port)}\n`);
+          console.log(`  ${idleCloseLabel(port)}`);
+          console.log(`  ${botAuthLabel(port)}\n`);
         } catch {
           console.log('  ✓ CDP responding but version info unavailable\n');
         }
@@ -287,6 +288,26 @@ function idleCloseLabel(port) {
     return `idle close in ${Math.ceil(left / 60)}m`;
   } catch {
     return 'idle close off';
+  }
+}
+
+// Web Bot Auth signer, from the file src/cdpilot.py keeps (see
+// _bot_auth_helper_state there): CDPILOT_HOME/bot-auth/signers/<port>.json
+// names the signer pid and the public keyid; "on" only while that pid lives.
+function botAuthLabel(port) {
+  const home = process.env.CDPILOT_HOME || path.join(os.homedir(), '.cdpilot');
+  try {
+    const file = path.join(home, 'bot-auth', 'signers', `${port}.json`);
+    const st = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    if (!st.ready || !st.pid) return 'bot-auth: off';
+    try {
+      process.kill(st.pid, 0); // existence probe; safe on Windows in Node
+    } catch (e) {
+      if (e.code !== 'EPERM') return 'bot-auth: off';
+    }
+    return `bot-auth: on (keyid ${st.keyid || '?'})`;
+  } catch {
+    return 'bot-auth: off';
   }
 }
 
@@ -363,9 +384,10 @@ function showHelp() {
 
   SETUP
     setup              Auto-detect browser, create isolated profile
-    launch [--idle-close <min>]  Start browser with CDP enabled (--idle-close or
-                       CDPILOT_IDLE_CLOSE: close it after <min> idle minutes)
-    status             Check browser connection
+    launch [--idle-close <min>] [--bot-auth]  Start browser with CDP enabled
+                       (--idle-close or CDPILOT_IDLE_CLOSE: close it after <min> idle
+                       minutes; --bot-auth: sign every request, see WEB BOT AUTH)
+    status             Check browser connection (idle close, bot-auth signer)
     stop [--smart]     Stop browser (--smart = close owned tabs, quit if empty)
     close [--force|--keep]  Smart close: close cdpilot's tabs; quit browser only
                        if no user tabs remain (--force quits anyway, --keep never quits)
@@ -458,17 +480,17 @@ function showHelp() {
     cookies load <file>
                        Import previously-saved cookies into the current jar.
 
-  WEB BOT AUTH (verified agent — signs requests with RFC 9421)
-    bot-auth init --agent-url <url>
-                       Generate Ed25519 keypair. Saves to CDPILOT_HOME/bot-auth/.
-                       JWKS directory JSON printed for publishing.
-    bot-auth status    Show key info, keyid, agent-url, enabled state
-    bot-auth directory Print JWKS JSON for /.well-known/http-message-signatures-directory
-    launch --bot-auth  Launch browser with request signing enabled (or CDPILOT_BOT_AUTH=1)
-                       Spawns a detached signer that adds Signature/Signature-Input/
-                       Signature-Agent headers to every Document/XHR/Fetch request.
-                       Contradicts stealth — warns and skips stealth if both are set.
-                       Requires: pip install cryptography
+  WEB BOT AUTH (signed agent — the opposite of stealth; needs: pip install cryptography)
+    bot-auth init --agent-url https://your-domain.com [--force]
+                       Generate an Ed25519 key (0600, never printed) in CDPILOT_HOME/bot-auth/
+    bot-auth directory Print the JWKS to serve at
+                       https://your-domain.com/.well-known/http-message-signatures-directory
+    bot-auth status    Agent URL, keyid, and whether the signer is running
+    launch --bot-auth  Launch with a signer that adds Signature, Signature-Input and
+                       Signature-Agent to EVERY request the browser makes (new tabs,
+                       popups, iframes, workers, page fetches after cdpilot exits).
+                       Or CDPILOT_BOT_AUTH=1. With stealth mode: one warning, stealth
+                       injection skipped. "stop" ends the signer.
 
   RELIABILITY
     browser [name]     Show or set preferred browser (chrome|brave|chromium|edge|vivaldi|auto)
