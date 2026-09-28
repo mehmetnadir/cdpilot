@@ -143,10 +143,21 @@ def answer(msg, path):
         result = {"result": {"type": "string", "value": value} if value is not None
                   else {"type": "undefined"}}
     elif method == "Page.navigate":
+        with LOCK:  # the tab this socket is attached to now shows the new URL
+            for pg in PAGES:
+                if path.endswith("/" + pg["id"]):
+                    pg["url"], pg["title"] = p.get("url", ""), "navigated by cdpilot"
         result = {"frameId": "F1", "loaderId": "L1"}
         events = [{"method": "Page.frameStartedLoading", "params": {"frameId": "F1"}},
                   {"method": "Page.loadEventFired", "params": {"timestamp": 1}},
                   {"method": "Page.frameStoppedLoading", "params": {"frameId": "F1"}}]
+    elif method == "Target.createTarget":
+        with LOCK:
+            SEQ[0] += 1
+            new = {"id": f"PAGE{SEQ[0]}", "type": "page", "url": p.get("url") or "about:blank",
+                   "title": ""}
+            PAGES.append(new)
+        result = {"targetId": new["id"]}
     elif method == "Page.addScriptToEvaluateOnNewDocument":
         result = {"identifier": "1"}
     elif method == "Target.getTargets":
