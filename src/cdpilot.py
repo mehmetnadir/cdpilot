@@ -33,6 +33,7 @@ Environment:
                        a browser cdpilot launched closes itself (auto-launch
                        and MCP: default 15; explicit `launch`: off unless set or
                        `launch --idle-close <min>`; 0 = never)
+  CDPILOT_BROWSER_SEARCH_ROOT  Override DevToolsActivePort search root (tests)
   CDPILOT_LOG=0        Do not write the session log
   CDPILOT_LOG_DAYS     Days of session log to keep (default: 14; 0 = forever)
 """
@@ -149,11 +150,17 @@ def _save_registry(projects):
         raise
 
 
-def _register_project(project_id, port, profile_dir, pid=None):
-    """Register or update a project in the global registry."""
+def _register_project(project_id, port, profile_dir, pid=None,
+                      external=False, browser_name=None):
+    """Register or update a project in the global registry.
+
+    external=True marks a browser that cdpilot connected to but does not own:
+    stop will not kill it, idle-close will not close it, and auto-launch will
+    not replace it with a new browser.
+    """
     registry = _load_registry()
     existing = registry.get(project_id, {})
-    registry[project_id] = {
+    entry = {
         "cwd": os.getcwd(),
         "port": port,
         "profile_dir": profile_dir,
@@ -162,6 +169,11 @@ def _register_project(project_id, port, profile_dir, pid=None):
         "last_used": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "status": "running" if pid else "stopped",
     }
+    if external:
+        entry["external"] = True
+    if browser_name:
+        entry["browser_name"] = browser_name
+    registry[project_id] = entry
     _save_registry(registry)
 
 
@@ -1290,7 +1302,7 @@ AUTOLAUNCH_SKIP_CMDS = frozenset({
     'status', 'health', 'setup', 'help', '--help', '-h', 'version', '--version', '-v',
     'tabs', 'session', 'sessions', 'projects', 'heal',
     'headless', 'proxy', 'browser', 'extensions', 'ext-install', 'ext-remove',
-    'mcp', 'serve', 'log',
+    'mcp', 'serve', 'log', 'connect', 'disconnect',
 })
 # cmd is set by the CLI dispatcher; None (module imported) means never launch.
 _AUTOLAUNCH = {"cmd": None, "attempted": False, "failure": None}
@@ -1314,6 +1326,13 @@ def _autolaunch_if_down():
     _AUTOLAUNCH["attempted"] = True
     if cdp_get("/json/version", no_cache=True):
         return True  # came up meanwhile (e.g. a parallel `cdpilot launch`)
+    # External browser registered but gone: never silently replace it.
+    registry = _load_registry()
+    if registry.get(PROJECT_ID, {}).get("external"):
+        _AUTOLAUNCH["failure"] = (
+            "your connected browser is gone; "
+            "run `cdpilot connect` again or `cdpilot disconnect`")
+        return False
     out, err = io.StringIO(), io.StringIO()
     code = 0
     try:
@@ -1383,7 +1402,7 @@ IDLE_POLL_MAX_S = 30.0
 # `until cdpilot health; do ...` watchdog loop would pin it forever).
 IDLE_PASSIVE_CMDS = frozenset({
     'status', 'health', 'projects', 'version', '--version', '-v',
-    'help', '--help', '-h', 'setup',
+    'help', '--help', '-h', 'setup', 'connect', 'disconnect',
 })
 _IDLE_WARNED = []
 
@@ -9435,6 +9454,18 @@ def cmd_serve(api: bool = False, port: int = 9333):
 def cmd_stop():
     """Stop the browser instance managed by cdpilot (only that one: never the
     user's own Brave/Chrome — see _stop_browser_on_port)."""
+    # External (connect'ed) browser: never kill, just drop the registration.
+    if PROJECT_ID:
+        registry = _load_registry()
+        entry = registry.get(PROJECT_ID, {})
+        if entry.get("external"):
+            browser_name = entry.get("browser_name", "browser")
+            port = entry.get("port", "?")
+            registry.pop(PROJECT_ID, None)
+            _save_registry(registry)
+            print(f"Disconnected from {browser_name} (port {port}); your browser keeps running.")
+            return
+
     if _stop_browser_on_port(CDP_PORT, verbose=True):
         print(f"Browser stopped (port {CDP_PORT}).")
     else:
@@ -9474,10 +9505,11 @@ def cmd_projects():
         if status == "running" and _is_port_free(port):
             status = "stopped"
         icon = "\U0001f7e2" if status == "running" else "\u26ab"
+        ext_tag = " (ext)" if info.get("external") else ""
         marker = " \u2190 current" if pid == current else ""
         if len(cwd) > 45:
             cwd = "..." + cwd[-42:]
-        print(f"  {pid:<26} {port:<7} {icon} {status:<8} {cwd}{marker}")
+        print(f"  {pid:<26} {port:<7} {icon} {status:<8}{ext_tag} {cwd}{marker}")
 
     print(f"\nTotal: {len(registry)} project(s)")
 
@@ -9525,6 +9557,287 @@ def cmd_stop_all():
         print(f"\n{stopped} instance(s) stopped.")
     else:
         print("No active instances.")
+
+
+# ─── Connect to an Existing Browser ───
+# Human-in-the-loop: the user solves a CAPTCHA / login wall in their own
+# browser, then the agent continues in that browser via `connect`.
+
+# DevToolsActivePort default search directories, per browser and platform.
+# The env var CDPILOT_BROWSER_SEARCH_ROOT overrides the platform root (tests).
+_DEVTOOLS_ACTIVE_PORT_DIRS = {
+    "darwin": {
+        "Chrome": "~/Library/Application Support/Google/Chrome",
+        "Chrome Beta": "~/Library/Application Support/Google/Chrome Beta",
+        "Chrome Dev": "~/Library/Application Support/Google/Chrome Dev",
+        "Chrome Canary": "~/Library/Application Support/Google/Chrome Canary",
+        "Brave": "~/Library/Application Support/BraveSoftware/Brave-Browser",
+        "Vivaldi": "~/Library/Application Support/Vivaldi",
+        "Edge": "~/Library/Application Support/Microsoft Edge",
+    },
+    "linux": {
+        "Chrome": "~/.config/google-chrome",
+        "Chrome Beta": "~/.config/google-chrome-beta",
+        "Chrome Dev": "~/.config/google-chrome-unstable",
+        "Chrome Canary": "~/.config/google-chrome-canary",
+        "Brave": "~/.config/BraveSoftware/Brave-Browser",
+        "Vivaldi": "~/.config/vivaldi",
+        "Edge": "~/.config/microsoft-edge",
+    },
+    "win32": {
+        "Chrome": os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "User Data"),
+        "Chrome Beta": os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome Beta", "User Data"),
+        "Chrome Dev": os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome Dev", "User Data"),
+        "Chrome Canary": os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome SxS", "User Data"),
+        "Brave": os.path.join(os.environ.get("LOCALAPPDATA", ""), "BraveSoftware", "Brave-Browser", "User Data"),
+        "Vivaldi": os.path.join(os.environ.get("LOCALAPPDATA", ""), "Vivaldi", "User Data"),
+        "Edge": os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "User Data"),
+    },
+}
+
+
+def _parse_devtools_active_port(content):
+    """Parse a DevToolsActivePort file's content.
+
+    Returns (port: int, ws_path: str) on success, raises ValueError on bad
+    format.  Pure function — no I/O, no side effects.  Format:
+        Line 1: TCP port number (e.g. 51234)
+        Line 2: /devtools/browser/<uuid>
+    """
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise ValueError(f"DevToolsActivePort: need 2 lines, got {len(lines)}")
+    raw_port, ws_path = lines[0], lines[1]
+    try:
+        port = int(raw_port)
+    except ValueError:
+        raise ValueError(f"DevToolsActivePort: bad port {raw_port!r}")
+    if port <= 0 or port > 65535:
+        raise ValueError(f"DevToolsActivePort: port {port} out of range")
+    if not ws_path.startswith("/"):
+        raise ValueError(f"DevToolsActivePort: path must start with '/', got {ws_path!r}")
+    return port, ws_path
+
+
+def _find_devtools_active_port():
+    """Search platform-default browser profile dirs for DevToolsActivePort.
+
+    Returns list of (browser_name, port, ws_url) for each valid file found.
+    Uses CDPILOT_BROWSER_SEARCH_ROOT env to override the search root (tests).
+    """
+    override_root = os.environ.get("CDPILOT_BROWSER_SEARCH_ROOT")
+    if override_root:
+        # Tests: look in all subdirectories of the override root
+        results = []
+        if os.path.isdir(override_root):
+            for name in sorted(os.listdir(override_root)):
+                port_file = os.path.join(override_root, name, "DevToolsActivePort")
+                if os.path.isfile(port_file):
+                    try:
+                        with open(port_file) as f:
+                            port, ws_path = _parse_devtools_active_port(f.read())
+                        results.append((name, port, f"ws://127.0.0.1:{port}{ws_path}"))
+                    except (OSError, ValueError):
+                        pass
+        return results
+
+    plat = sys.platform  # 'darwin', 'linux', 'win32'
+    dirs = _DEVTOOLS_ACTIVE_PORT_DIRS.get(plat, {})
+    results = []
+    for browser_name, profile_dir in dirs.items():
+        expanded = os.path.expanduser(profile_dir)
+        port_file = os.path.join(expanded, "DevToolsActivePort")
+        if os.path.isfile(port_file):
+            try:
+                with open(port_file) as f:
+                    port, ws_path = _parse_devtools_active_port(f.read())
+                results.append((browser_name, port, f"ws://127.0.0.1:{port}{ws_path}"))
+            except (OSError, ValueError):
+                pass
+    return results
+
+
+def _is_external_browser(project_id=None):
+    """True if the current (or given) project's registry entry is external."""
+    pid = project_id or PROJECT_ID
+    registry = _load_registry()
+    return registry.get(pid, {}).get("external", False)
+
+
+def _validate_localhost(addr):
+    """Ensure the address targets 127.0.0.1 or localhost; sys.exit(2) otherwise."""
+    lower = addr.lower()
+    if "://" in lower:
+        # ws://host:port/... or http://host:port/...
+        after_scheme = lower.split("://", 1)[1].split("/", 1)[0]
+        host = after_scheme.split(":")[0]
+    else:
+        host = lower.split(":")[0] if ":" in lower else lower
+    if host not in ("127.0.0.1", "localhost", "[::1]"):
+        print(f"Error: only 127.0.0.1/localhost accepted (got {host!r}).", file=sys.stderr)
+        print("Remote debugging over the network is not supported for security.", file=sys.stderr)
+        sys.exit(2)
+
+
+def _cdp_probe(port):
+    """Probe a CDP port: return /json/version dict or None."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=3) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def _cdp_tab_count(port):
+    """Return the number of page targets on a CDP port, or 0."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=3) as r:
+            targets = json.loads(r.read())
+        return sum(1 for t in targets if t.get("type") == "page")
+    except Exception:
+        return 0
+
+
+def cmd_connect(*args):
+    """Connect to the user's own browser for human-in-the-loop automation.
+
+    Usage:
+        cdpilot connect <port>        Connect via CDP port (127.0.0.1:<port>)
+        cdpilot connect <ws-url>      Connect via WebSocket URL
+        cdpilot connect --auto        Find DevToolsActivePort in profile dirs
+
+    The browser is registered as external: cdpilot will never close it.
+    """
+    global CDP_PORT, CDP_BASE
+
+    mode, target = None, None
+    for a in args:
+        if a == "--auto":
+            mode = "auto"
+        elif a.startswith("ws://") or a.startswith("wss://"):
+            mode, target = "ws", a
+        elif a.isdigit():
+            mode, target = "port", int(a)
+        elif not a.startswith("-"):
+            # Could be host:port
+            mode, target = "addr", a
+
+    if mode is None:
+        print("Usage: cdpilot connect <port> | <ws://url> | --auto", file=sys.stderr)
+        sys.exit(1)
+
+    # ── --auto: scan DevToolsActivePort files ──
+    if mode == "auto":
+        hits = _find_devtools_active_port()
+        if not hits:
+            print("No running browser with remote debugging found.", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Enable remote debugging in your browser:", file=sys.stderr)
+            print("  1. Chrome 144+: open chrome://inspect/#remote-debugging", file=sys.stderr)
+            print("     and toggle on 'Allow remote debugging'.", file=sys.stderr)
+            print("  2. Any Chromium: launch with a separate profile:", file=sys.stderr)
+            print("     chrome --remote-debugging-port=0 --user-data-dir=/tmp/cdpilot-user",
+                  file=sys.stderr)
+            print("  3. Then run: cdpilot connect --auto", file=sys.stderr)
+            sys.exit(1)
+        # Use the first hit
+        browser_name, port, ws_url = hits[0]
+        version_info = _cdp_probe(port)
+        if not version_info:
+            print(f"Found DevToolsActivePort for {browser_name} (port {port}), "
+                  f"but CDP is not responding.", file=sys.stderr)
+            sys.exit(1)
+        _do_connect(port, ws_url, version_info, browser_name)
+        return
+
+    # ── ws:// URL mode ──
+    if mode == "ws":
+        _validate_localhost(target)
+        # Extract port from ws://127.0.0.1:PORT/...
+        try:
+            after_scheme = target.split("://", 1)[1]
+            host_port = after_scheme.split("/", 1)[0]
+            port = int(host_port.split(":")[1])
+        except (IndexError, ValueError):
+            print(f"Error: cannot parse port from {target!r}", file=sys.stderr)
+            sys.exit(1)
+        version_info = _cdp_probe(port)
+        if not version_info:
+            print(f"Error: CDP not responding on port {port}.", file=sys.stderr)
+            sys.exit(1)
+        browser_name = version_info.get("Browser", "Unknown")
+        _do_connect(port, target, version_info, browser_name)
+        return
+
+    # ── port mode ──
+    if mode == "port":
+        port = target
+        _validate_localhost(f"127.0.0.1:{port}")
+        version_info = _cdp_probe(port)
+        if not version_info:
+            print(f"Error: CDP not responding on 127.0.0.1:{port}.", file=sys.stderr)
+            sys.exit(1)
+        ws_url = version_info.get("webSocketDebuggerUrl", f"ws://127.0.0.1:{port}")
+        browser_name = version_info.get("Browser", "Unknown")
+        _do_connect(port, ws_url, version_info, browser_name)
+        return
+
+    # ── addr mode (host:port) ──
+    if mode == "addr":
+        _validate_localhost(target)
+        port_str = target.split(":")[-1] if ":" in target else target
+        try:
+            port = int(port_str)
+        except ValueError:
+            print(f"Error: cannot parse port from {target!r}", file=sys.stderr)
+            sys.exit(1)
+        version_info = _cdp_probe(port)
+        if not version_info:
+            print(f"Error: CDP not responding on {target}.", file=sys.stderr)
+            sys.exit(1)
+        ws_url = version_info.get("webSocketDebuggerUrl", f"ws://127.0.0.1:{port}")
+        browser_name = version_info.get("Browser", "Unknown")
+        _do_connect(port, ws_url, version_info, browser_name)
+
+
+def _do_connect(port, ws_url, version_info, browser_name):
+    """Finalize the connection: register as external, print status."""
+    global CDP_PORT, CDP_BASE
+
+    tab_count = _cdp_tab_count(port)
+
+    # Security warning
+    print("⚠  This browser's cookies and sessions are accessible to cdpilot commands.",
+          file=sys.stderr)
+
+    # Register as external
+    CDP_PORT = port
+    CDP_BASE = f"http://127.0.0.1:{CDP_PORT}"
+    _register_project(PROJECT_ID, port, PROFILE_DIR, pid=None,
+                      external=True, browser_name=browser_name)
+
+    print(f"✓ Connected to {browser_name} on port {port}")
+    print(f"  WebSocket: {ws_url}")
+    print(f"  Tabs: {tab_count}")
+    print(f"  Commands now run in YOUR browser; cdpilot will never close it.")
+
+
+def cmd_disconnect():
+    """Disconnect from an externally connected browser.
+
+    Removes the external registration; the browser keeps running.
+    """
+    registry = _load_registry()
+    entry = registry.get(PROJECT_ID, {})
+    if not entry.get("external"):
+        print("No external browser connected for this project.", file=sys.stderr)
+        sys.exit(1)
+
+    port = entry.get("port", "?")
+    browser_name = entry.get("browser_name", "browser")
+    registry.pop(PROJECT_ID, None)
+    _save_registry(registry)
+    print(f"Disconnected from {browser_name} (port {port}); your browser keeps running.")
 
 
 # ─── New CDP Commands ───
@@ -12962,6 +13275,10 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"tier": {"type": "string", "enum": ["regular", "stealth", "undetected"], "description": "Tier to set. Omit to get the current tier."}}}},
             {"name": "browser_log", "description": "Read this project's cdpilot session log (read-only; reading does not add to it). Every cdpilot command and browser_* tool call is recorded locally: command, redacted arguments, exit code, duration, page URL and title, a short result summary, the error line and the files it wrote (screenshots, PDFs). Values typed into pages, secret-looking arguments and token/key/secret URL parameters are redacted before they are written. Call it when a browser task is finished to report what was done and found: format 'md' returns a Markdown report (pages visited, actions, errors, files produced) ready to paste into an issue or PR, 'table' (default) a compact table, 'json' the raw JSON lines. Covers today unless 'days' is given.",
              "inputSchema": {"type": "object", "properties": {"format": {"type": "string", "enum": ["table", "md", "json"], "description": "Output format (default: table)."}, "days": {"type": "integer", "minimum": 1, "description": "Include the last N days (1 = today, the default)."}}}},
+            {"name": "browser_connect", "description": "Connect to the user's own browser for human-in-the-loop automation. Use when the user needs to solve a CAPTCHA or log in manually, then the agent continues in that browser. Accepts a CDP port number, a ws:// URL, or '--auto' to scan for DevToolsActivePort files. The browser is registered as external: cdpilot will never close it. Only 127.0.0.1/localhost accepted.",
+             "inputSchema": {"type": "object", "properties": {"target": {"type": "string", "description": "CDP port number, ws:// URL, or '--auto' to auto-detect."}}, "required": ["target"]}},
+            {"name": "browser_disconnect", "description": "Disconnect from an externally connected browser. Removes the external registration; the browser keeps running. Use after the human-in-the-loop workflow is complete.",
+             "inputSchema": {"type": "object", "properties": {}}},
         ]
 
     def _handle_request(self, request):
@@ -13041,6 +13358,8 @@ class MCPServer:
             "browser_watch_status": lambda a: ["watch", "status"],
             "browser_mode": lambda a: ["mode"] + ([a["tier"]] if a.get("tier") else []),
             "browser_log": lambda a: ["log"] + ([f"--{a['format']}"] if a.get("format") in ("md", "json") else []) + ([f"--days={a['days']}"] if a.get("days") else []),
+            "browser_connect": lambda a: ["connect", a.get("target", "--auto")],
+            "browser_disconnect": lambda a: ["disconnect"],
         }
         if tool_name not in tool_map:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}}
@@ -15678,6 +15997,8 @@ if __name__ == "__main__":
         'blog': lambda: _dispatch_blog_cmd(args),
         'watch': lambda: _dispatch_watch_cmd(args),
         'log': lambda: cmd_log(*args),
+        'connect': lambda: cmd_connect(*args),
+        'disconnect': cmd_disconnect,
     }
 
     if cmd == "serve":

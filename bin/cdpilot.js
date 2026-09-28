@@ -229,7 +229,23 @@ function runStatus() {
   const config = resolveProjectConfig();
   const port = config.port === '0' ? '9222' : config.port;
   const projLabel = config.projectId ? ` [${config.projectId}]` : '';
-  console.log(`\n  cdpilot status (port ${port})${projLabel}\n`);
+
+  // Check if this project has an external (connect'ed) browser
+  let isExternal = false;
+  let browserName = '';
+  try {
+    const home = process.env.CDPILOT_HOME || path.join(os.homedir(), '.cdpilot');
+    const regFile = path.join(home, 'registry.json');
+    const data = JSON.parse(fs.readFileSync(regFile, 'utf-8'));
+    const entry = (data.projects || {})[config.projectId];
+    if (entry && entry.external) {
+      isExternal = true;
+      browserName = entry.browser_name || '';
+    }
+  } catch {}
+
+  const extLabel = isExternal ? ' (external)' : '';
+  console.log(`\n  cdpilot status (port ${port})${projLabel}${extLabel}\n`);
 
   try {
     const http = require('http');
@@ -240,18 +256,27 @@ function runStatus() {
         try {
           const info = JSON.parse(data);
           console.log(`  ✓ Connected`);
-          console.log(`  Browser: ${info.Browser || 'Unknown'}`);
+          console.log(`  Browser: ${info.Browser || 'Unknown'}${isExternal ? ' (external — your browser)' : ''}`);
           console.log(`  Protocol: ${info['Protocol-Version'] || 'Unknown'}`);
           console.log(`  WebSocket: ${info.webSocketDebuggerUrl || 'N/A'}`);
-          console.log(`  ${idleCloseLabel(port)}\n`);
+          if (isExternal) {
+            console.log(`  cdpilot will never close this browser.\n`);
+          } else {
+            console.log(`  ${idleCloseLabel(port)}\n`);
+          }
         } catch {
           console.log('  ✓ CDP responding but version info unavailable\n');
         }
       });
     });
     req.on('error', () => {
-      console.log('  ❌ No browser connected on this port.');
-      console.log('  Run: cdpilot launch\n');
+      if (isExternal) {
+        console.log(`  ❌ External browser (${browserName || 'unknown'}) is gone.`);
+        console.log('  Run: cdpilot connect again or cdpilot disconnect\n');
+      } else {
+        console.log('  ❌ No browser connected on this port.');
+        console.log('  Run: cdpilot launch\n');
+      }
     });
     req.on('timeout', () => {
       req.destroy();
@@ -367,6 +392,10 @@ function showHelp() {
                        CDPILOT_IDLE_CLOSE: close it after <min> idle minutes)
     status             Check browser connection
     stop [--smart]     Stop browser (--smart = close owned tabs, quit if empty)
+    connect [<port> | <ws-url> | --auto]
+                       Use YOUR browser (human-in-the-loop). --auto scans
+                       DevToolsActivePort (Chrome 144+ chrome://inspect).
+    disconnect         Drop external browser connection (browser keeps running)
     close [--force|--keep]  Smart close: close cdpilot's tabs; quit browser only
                        if no user tabs remain (--force quits anyway, --keep never quits)
 

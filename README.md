@@ -728,6 +728,63 @@ never changes a command's output or exit code, and a failed write costs one
 stderr line. `CDPILOT_LOG=0` turns it off; `CDPILOT_LOG_DAYS` (default 14)
 sets how many days are kept. The MCP server exposes it as `browser_log`.
 
+### Use your own browser (human-in-the-loop)
+
+An agent hits a CAPTCHA or login wall it cannot solve. The human solves it in
+their own browser, then tells the agent to continue in that same browser:
+
+```bash
+# Method 1: Chrome 144+ with in-browser permission
+#   1. Open chrome://inspect/#remote-debugging in Chrome and toggle it on.
+#   2. Chrome may show a permission prompt — accept it.
+cdpilot connect --auto          # finds DevToolsActivePort, connects
+
+# Method 2: Any Chromium with a separate profile
+chrome --remote-debugging-port=0 --user-data-dir=/tmp/my-profile
+cdpilot connect 51234           # use the port Chrome chose (shown in terminal)
+
+# Method 3: WebSocket URL directly
+cdpilot connect ws://127.0.0.1:51234/devtools/browser/abc-123
+```
+
+**Example workflow — CAPTCHA handoff:**
+
+```
+Agent: cdpilot go https://example.com/dashboard
+       → "captcha detected" / login wall
+Agent: "I cannot solve this. Please log in and run: cdpilot connect --auto"
+Human: logs in via their own Chrome, toggles remote debugging on
+Human: cdpilot connect --auto
+       → ✓ Connected to Chrome/131.0.6778.86 on port 51234
+       → Commands now run in YOUR browser; cdpilot will never close it.
+Agent: cdpilot go https://example.com/dashboard   # now past the wall
+Agent: cdpilot shot dashboard.png
+Agent: cdpilot disconnect                          # done, browser stays open
+```
+
+**Safety rules:**
+
+- Only `127.0.0.1`/`localhost` accepted; remote addresses exit with code 2.
+- ⚠ One-line warning on connect: this browser's cookies and sessions are
+  accessible to cdpilot commands.
+- Stealth injections are **not** applied automatically to an external browser
+  (use `--mode stealth` explicitly per command if needed). The user's real
+  browser fingerprint stays untouched.
+- `cdpilot stop` on an external browser **disconnects** (never kills):
+  "disconnected; your browser keeps running."
+- Idle auto-close never closes an external browser.
+- If the external browser is closed by the user, commands fail with a clear
+  error: "your connected browser is gone; run `cdpilot connect` again or
+  `cdpilot disconnect`" — cdpilot never silently launches a new browser.
+
+**Chrome version requirements for `--auto`:**
+
+| Method | Chrome version |
+|--------|---------------|
+| `chrome://inspect/#remote-debugging` | Chrome 144+ |
+| `--remote-debugging-port --user-data-dir=<dir>` | Any Chromium |
+| `--remote-debugging-port` (default profile) | ❌ Ignored since Chrome 136 |
+
 ### Scaling & Workstation Use
 
 ```bash
