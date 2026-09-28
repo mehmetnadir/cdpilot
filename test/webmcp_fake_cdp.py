@@ -38,14 +38,26 @@ class Browser:
         self.node, self.scenario = node, scenario
         self.log, self.calls = [], []
 
+    WORLD = 77  # executionContextId of cdpilot's isolated world
+
     def handle(self, msg):
         method, params = msg["method"], msg.get("params") or {}
+        if method == "Page.getFrameTree":
+            return {"id": msg["id"], "result": {"frameTree": {"frame": {"id": "TOP"}}}}
+        if method == "Page.createIsolatedWorld":
+            ok = params.get("frameId") == "TOP" and self.scenario != "noworld"
+            return {"id": msg["id"], "result": {"executionContextId": self.WORLD} if ok else {}}
         if method != "Runtime.evaluate":
             return {"id": msg["id"], "result": {}}
+        ctx = params.get("contextId")
+        if ctx not in (None, self.WORLD):
+            return {"id": msg["id"], "error": {"code": -32000,
+                                                "message": "Cannot find context with specified id"}}
         run = subprocess.run(
             [self.node, os.path.join(HERE, "webmcp_fake_page.js")],
             input=json.dumps({"expression": params.get("expression", ""),
-                              "scenario": self.scenario}),
+                              "scenario": "spec" if self.scenario == "noworld" else self.scenario,
+                              "world": "isolated" if ctx == self.WORLD else "main"}),
             capture_output=True, text=True, timeout=30)
         page = json.loads(run.stdout or "{}")
         self.calls.append(page.get("calls", []))
@@ -143,6 +155,41 @@ def scenario_call_routing(mod, node):
     res["frame_filter"] = run(mod, node, "spec",
                               lambda: mod.cmd_tools_call("frame_echo", {}, "frame.html"))
     return res
+
+
+def scenario_hostile_page(mod, node):
+    """A page that wrapped getTools/executeTool in its main world."""
+    return {
+        "list": run(mod, node, "patched", lambda: mod.cmd_tools_list(as_json=True)),
+        "call": run(mod, node, "patched",
+                    lambda: mod.cmd_tools_call("add_to_cart", {"sku": "A1", "qty": 2})),
+        "fake": run(mod, node, "patched", lambda: mod.cmd_tools_call("fake_tool", {})),
+    }
+
+
+def scenario_world_fallback(mod, node):
+    """No isolated world, or one without document.modelContext: main world + note."""
+    return {s: {"list": run(mod, node, s, lambda: mod.cmd_tools_list(as_json=True)),
+                "call": run(mod, node, s,
+                            lambda: mod.cmd_tools_call("add_to_cart", {"sku": "A1", "qty": 2}))}
+            for s in ("isoblind", "noworld")}
+
+
+def scenario_two_frames(mod, node):
+    """One tool name in two frames: ambiguous without --frame, --frame picks."""
+    return {
+        "list": run(mod, node, "twoframes", lambda: mod.cmd_tools_list(as_json=True)),
+        "ambiguous": run(mod, node, "twoframes",
+                         lambda: mod.cmd_tools_call("frame_echo", {"text": "x"})),
+        "right": run(mod, node, "twoframes",
+                     lambda: mod.cmd_tools_call("frame_echo", {"text": "x"}, "who=right")),
+        "left": run(mod, node, "twoframes", lambda: mod.cmd_tools_call(
+            "frame_echo", {"text": "x"}, "https://shop.test/frame.html")),
+        "both": run(mod, node, "twoframes",
+                    lambda: mod.cmd_tools_call("frame_echo", {"text": "x"}, "frame.html")),
+        "nomatch": run(mod, node, "twoframes",
+                       lambda: mod.cmd_tools_call("frame_echo", {"text": "x"}, "nowhere")),
+    }
 
 
 def scenario_call_timeout(mod, node):
@@ -273,6 +320,9 @@ SCENARIOS = {
     "list_routing": scenario_list_routing,
     "call_routing": scenario_call_routing,
     "call_timeout": scenario_call_timeout,
+    "hostile_page": scenario_hostile_page,
+    "world_fallback": scenario_world_fallback,
+    "two_frames": scenario_two_frames,
     "call_refusals": scenario_call_refusals,
     "list_diagnosis": scenario_list_diagnosis,
     "validate": scenario_validate,

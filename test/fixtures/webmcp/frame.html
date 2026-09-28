@@ -18,7 +18,7 @@
         },
         execute: async function(input, options) {
           document.getElementById('frame-status').textContent = 'echoed: ' + input.text;
-          return { echo: input.text, from: 'frame' };
+          return { echo: input.text, from: new URLSearchParams(location.search).get('who') || 'frame' };
         }
       });
     }

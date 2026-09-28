@@ -758,7 +758,8 @@ cdpilot launch --no-webmcp     # turn it off again (applies at the next start)
 
 - `launch --webmcp` adds `--enable-features=WebMCP` to the browser's command
   line and saves the mode next to the stealth mode (`webmcp.json` in the
-  project profile); `CDPILOT_WEBMCP=1|0` overrides it. `cdpilot status` shows it.
+  project profile); `CDPILOT_WEBMCP=1|0` overrides it. `cdpilot status` shows a
+  WebMCP line while the mode is on.
   Chrome reads feature flags only at startup: a browser that is already running
   keeps its flags until `cdpilot stop`.
 - `tools list` shows the tools of the page and of its same-origin iframes
@@ -766,7 +767,11 @@ cdpilot launch --no-webmcp     # turn it off again (applies at the next start)
   (`toolautosubmit`), and shows `title` and the `readOnlyHint` /
   `consequentialHint` / `untrustedContentHint` annotations. Nothing is injected
   into the page: the list is the browser's registry at that moment, so it
-  follows reloads and navigations. With no tools it says why (WebMCP not
+  follows reloads and navigations. Both commands run in cdpilot's own isolated
+  world (no `Runtime.enable`), so a page script that wraps `getTools()` /
+  `executeTool()` cannot add tools, change results or see the calls; only if
+  that world cannot see `document.modelContext` does cdpilot use the page's
+  main world, and it says so on stderr. With no tools it says why (WebMCP not
   enabled in the running browser, not a secure context, browser too old,
   document not origin-keyed, or the page registered none) and exits 0.
 - `tools call` checks the arguments against the tool's `inputSchema` first
@@ -775,7 +780,9 @@ cdpilot launch --no-webmcp     # turn it off again (applies at the next start)
   on a mismatch, an unknown tool or a tool error. It passes an `AbortSignal`
   and aborts it when `--timeout` (default 20 s) runs out, then exits 124.
   A form tool without `toolautosubmit` waits for a person to submit the form.
-  `--frame <url-part>` picks a frame when several register the same name.
+  When several frames register the same name, `--frame <url-part>` picks one
+  (an exact frame URL wins); without it the top document's tool is used, and
+  if there is none the call stops and lists the frames.
 - MCP: `browser_site_tools` and `browser_site_tool_call` are listed only while
   the project's WebMCP mode is on (or `CDPILOT_WEBMCP=1` for the server).
 

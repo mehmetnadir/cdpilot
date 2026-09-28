@@ -13249,9 +13249,12 @@ async def cmd_permission(subcmd, perm=None):
 # string of its result; aborting the signal cancels the execution and aborts
 # the signal the tool's execute(input, {signal}) received.
 #
-# cdpilot calls exactly those two methods, with Runtime.evaluate in the page's
-# main world (no contextId, no Runtime.enable, nothing added to the page). It
-# installs no hook and no polyfill: the list is whatever the browser's own
+# cdpilot calls exactly those two methods, with Runtime.evaluate in its own
+# isolated world (Page.createIsolatedWorld; no Runtime.enable, nothing added to
+# the page), where page scripts that wrap the API cannot add tools, replace
+# results or see the calls; only if that world cannot see document.modelContext
+# does it fall back to the main world, with a note. It installs no hook and no
+# polyfill: the list is whatever the browser's own
 # registry holds at that moment, so it follows reloads, navigations and
 # iframes by construction, and the browser applies its own validation of names,
 # duplicates and schemas.
@@ -13413,7 +13416,7 @@ def _webmcp_validate_args(schema, args, where="arguments"):
     return True, None
 
 
-# Evaluated in the page's main world (Runtime.evaluate without contextId).
+# Evaluated in cdpilot's isolated world (see _webmcp_world).
 # Returns plain facts plus getTools() as JSON-safe records; a tool's frame is
 # null for the top document, else its document URL (same-origin frames only
 # are returned by getTools, so the URL is readable).
@@ -13539,12 +13542,40 @@ def _webmcp_diagnose(facts, error=None, mode_on=False, browser=None):
         "`cdpilot launch --webmcp`")
 
 
-async def _webmcp_eval(ws, expression, timeout=15):
-    """Runtime.evaluate in the page's main world; (value, exception text)."""
-    r = await cdp_send(ws, [(1, "Runtime.evaluate", {
-        "expression": expression, "returnByValue": True, "awaitPromise": True,
-    })], timeout=timeout)
-    res = r.get(1) or {}
+WEBMCP_MAIN_WORLD_NOTE = ("cdpilot: document.modelContext is not visible from an isolated "
+                          "world here; using the page's main world, where page scripts can "
+                          "see and change these calls")
+
+
+async def _webmcp_world(ws):
+    """contextId of cdpilot's isolated world in the page's top frame, or None.
+
+    Page.createIsolatedWorld (no Runtime.enable) gives a world with the same
+    DOM and the browser's own document.modelContext, but none of the page's
+    JS: a page that wraps getTools()/executeTool() cannot add fake tools,
+    replace results or watch the calls. The same worldName returns the same
+    world, so asking again for the call step is cheap.
+    """
+    r = await cdp_send(ws, [(1, "Page.getFrameTree", {})])
+    fid = (((r.get(1) or {}).get("frameTree") or {}).get("frame") or {}).get("id")
+    if not fid:
+        return None
+    r = await cdp_send(ws, [(2, "Page.createIsolatedWorld", {
+        "frameId": fid, "worldName": "cdpilot", "grantUniveralAccess": True})])
+    return (r.get(2) or {}).get("executionContextId")
+
+
+async def _webmcp_eval(ws, expression, timeout=15, isolated=True):
+    """Runtime.evaluate in cdpilot's isolated world (isolated=True) or the
+    page's main world; (value, exception text). No world -> error text."""
+    params = {"expression": expression, "returnByValue": True, "awaitPromise": True}
+    if isolated:
+        ctx = await _webmcp_world(ws)
+        if ctx is None:
+            return None, "no isolated world"
+        params["contextId"] = ctx
+    r = await cdp_send(ws, [(3, "Runtime.evaluate", params)], timeout=timeout)
+    res = r.get(3) or {}
     if "exceptionDetails" in res:
         exc = res["exceptionDetails"]
         return None, (exc.get("exception", {}).get("description") or exc.get("text")
@@ -13555,12 +13586,25 @@ async def _webmcp_eval(ws, expression, timeout=15):
 
 
 async def _webmcp_list(ws):
-    """(tools or None, facts, error) from WEBMCP_LIST_JS."""
+    """(tools or None, facts, error, isolated) from WEBMCP_LIST_JS.
+
+    Isolated world first. Only when that world cannot see
+    document.modelContext and the main world can, the main world is used
+    (one stderr note); isolated=False then tells the call step to follow.
+    """
     val, exc = await _webmcp_eval(ws, WEBMCP_LIST_JS)
-    if exc:
-        return None, {}, {"name": "EvaluationError", "message": exc}
-    val = val or {}
-    return val.get("tools"), val.get("facts") or {}, val.get("error")
+    iso = None if exc else (val or {})
+    if iso is not None and (iso.get("facts") or {}).get("api"):
+        return iso.get("tools"), iso.get("facts") or {}, iso.get("error"), True
+    val, exc = await _webmcp_eval(ws, WEBMCP_LIST_JS, isolated=False)
+    main = None if exc else (val or {})
+    if main is not None and (main.get("facts") or {}).get("api"):
+        print(WEBMCP_MAIN_WORLD_NOTE, file=sys.stderr)
+        return main.get("tools"), main.get("facts") or {}, main.get("error"), False
+    got = iso if iso is not None else main
+    if got is None:
+        return None, {}, {"name": "EvaluationError", "message": exc}, True
+    return got.get("tools"), got.get("facts") or {}, got.get("error"), True
 
 
 def _webmcp_browser_name():
@@ -13657,7 +13701,7 @@ async def cmd_tools_list(as_json=False):
     """List the page's WebMCP tools (getTools()); diagnose when there are none."""
     ws, page = get_page_ws()
     _slog_note_page(page)
-    tools, facts, error = await _webmcp_list(ws)
+    tools, facts, error, _ = await _webmcp_list(ws)
     if tools:
         if as_json:
             print(json.dumps({"tools": tools, "url": facts.get("url")}, indent=2,
@@ -13695,24 +13739,26 @@ async def cmd_tools_call(name, call_args, frame=None):
     """Run one WebMCP tool through executeTool() and print its result."""
     ws, page = get_page_ws()
     _slog_note_page(page)
-    tools, facts, error = await _webmcp_list(ws)
+    tools, facts, error, isolated = await _webmcp_list(ws)
     if not tools and (error or not facts.get("api")):
         _, hint = _webmcp_diagnose(facts, error, mode_on=get_webmcp_config(),
                                    browser=_webmcp_browser_name())
         print(f"Error: cannot call '{name}': {hint}", file=sys.stderr)
         sys.exit(1)
     matches = [t for t in (tools or []) if t["name"] == name]
+    doc_url = lambda t: t.get("frame") or facts.get("url") or ""  # noqa: E731
     if frame is not None:
-        matches = [t for t in matches if frame in (t.get("frame") or facts.get("url") or "")]
+        matches = [t for t in matches if frame in doc_url(t)]
+        exact = [t for t in matches if doc_url(t) == frame]
+        if len(matches) > 1:
+            matches = exact[:1] or matches
     elif len(matches) > 1:
-        top = [t for t in matches if t.get("frame") is None]
-        if top:
-            matches = top[:1]
-        else:
-            where = ", ".join(t.get("frame") or "top" for t in matches)
-            print(f"Error: tool '{name}' is registered in several frames ({where}); "
-                  f"pick one with --frame <url-part>", file=sys.stderr)
-            sys.exit(1)
+        matches = [t for t in matches if t.get("frame") is None][:1] or matches
+    if len(matches) > 1:
+        where = ", ".join(doc_url(t) for t in matches)
+        print(f"Error: tool '{name}' is registered in several frames ({where}); "
+              f"pick one with --frame <url-part>", file=sys.stderr)
+        sys.exit(1)
     if not matches:
         known = ", ".join(sorted({t["name"] for t in tools or []})) or "none"
         where = f" in a frame matching '{frame}'" if frame is not None else ""
@@ -13732,7 +13778,7 @@ async def cmd_tools_call(name, call_args, frame=None):
           .replace("__FRAME__", json.dumps(tool.get("frame")))
           .replace("__INPUT__", json.dumps(call_args, ensure_ascii=False))
           .replace("__MS__", str(int(budget * 1000))))
-    val, exc = await _webmcp_eval(ws, js, timeout=budget + 5)
+    val, exc = await _webmcp_eval(ws, js, timeout=budget + 5, isolated=isolated)
     val = val or {}
     status = val.get("status")
     if exc or status is None:
