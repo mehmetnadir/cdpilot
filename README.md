@@ -191,9 +191,11 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
   (`DOM.describeNode` → frame id → the frame's execution context, or
   `Target.attachToTarget` with a flat session for an out-of-process frame),
   never through `contentDocument`, which the browser blocks cross-origin.
-- Real mouse input (`hover`, `dblclick`, `rightclick`, `--entropy=on` clicks)
-  is dispatched at page coordinates: the frame's offset in the page is added
-  automatically, so the browser hit-tests into the right frame.
+- Inside a frame, `click` and `smart-click` are real mouse input
+  (`isTrusted: true`), like `hover`, `dblclick`, `rightclick` and
+  `--entropy=on` clicks; an element with no box falls back to a script click.
+  Mouse input is dispatched at page coordinates: the frame's offset in the
+  page is added automatically, so the browser hit-tests into the right frame.
 - `smart-click` / `smart-fill` / `smart-select` look in the page first and
   compare texts with whitespace collapsed (`&nbsp;` and line breaks count as
   one space). An enabled page element whose text or label contains the whole

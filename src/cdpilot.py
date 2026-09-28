@@ -328,8 +328,11 @@ DEV_EXTENSIONS_FILE = os.path.join(PROFILE_DIR, 'dev-extensions.json')
 
 # ─── Auto-Wait JS Helper ───────────────────────────────────────────────────────
 # Tarayıcıya inject edilir; MutationObserver ile element görünene kadar bekler.
+# A function declaration pasted INSIDE each command's IIFE, so it stays local:
+# nothing is left on `window` for page scripts (anti-bot checks, often in an
+# iframe) to find. It used to be window.__cdpilot_waitFor.
 WAIT_AND_QUERY_JS = """
-window.__cdpilot_waitFor = function(selector, timeout) {
+function __cdpilot_waitFor(selector, timeout) {
   return new Promise(function(resolve) {
     var el = document.querySelector(selector);
     if (el) { resolve(el); return; }
@@ -340,7 +343,7 @@ window.__cdpilot_waitFor = function(selector, timeout) {
     obs.observe(document.documentElement, {childList: true, subtree: true});
     setTimeout(function() { obs.disconnect(); resolve(null); }, timeout || 5000);
   });
-};
+}
 """
 # ─── Stealth & CAPTCHA Detection ──────────────────────────────────────────────
 # Zero-dependency anti-fingerprinting layer. Patches common automation tells
@@ -2298,6 +2301,18 @@ FRAME_AWARE_CMDS = frozenset({
 })
 _FRAME_FLAG = None  # `--frame` value of the current CLI invocation
 _FRAME_CDP_SEQ = [1000000]  # _frame_cdp ids: unique per process, never reused
+# Resolves once the document it runs in has drawn two frames (100 ms cap: a
+# hidden tab draws none); leaves nothing behind. Run in the target frame and
+# in the top page before mouse input into a frame: the browser hit-tests an
+# out-of-process frame from compositor data, which trails both a scroll the
+# command's script just made and a frame that has only just loaded, so input
+# sent at once can miss the frame (measured: 0 of 3 fresh-page clicks into an
+# OOPIF landed without the wait, 24 of 25 with the top-page wait alone).
+_TWO_PAGE_FRAMES_JS = ("new Promise(function (r) { requestAnimationFrame(function () {"
+                       " requestAnimationFrame(r); }); setTimeout(r, 100); })")
+# The isolated-world fallback note: once per process, i.e. once per CLI
+# command (MCP tool calls run the CLI as a subprocess too).
+_FRAME_ISOLATED_NOTED = [False]
 
 
 class _FrameError(Exception):
@@ -2661,6 +2676,10 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     route.labels.append(obj.get("description") or shown)
     route.session_id, route.context_id, route.src = sid, ctx, src
     route.isolated = isolated
+    if isolated and not _FRAME_ISOLATED_NOTED[0]:
+        _FRAME_ISOLATED_NOTED[0] = True
+        print(f"note: frame '{route.labels[-1]}': its page context was not reachable; using an isolated"
+              " world (same DOM, no page JS globals)", file=sys.stderr)
     route.dirty = True
     if r.get(3, {}).get("result", {}).get("value") is True:
         print(f"note: '{hop['value']}' is not an iframe; using the iframe inside it", file=sys.stderr)
@@ -2738,6 +2757,17 @@ async def _frame_route_refresh_offset(route):
     return route.offset
 
 
+async def _frame_route_settle(route):
+    """Before mouse input: the frame, then the top page, draw two frames.
+
+    See _TWO_PAGE_FRAMES_JS for why. Explicit sessions: not rewritten.
+    """
+    settle = dict(route.eval_params(_TWO_PAGE_FRAMES_JS), awaitPromise=True)
+    await _frame_cdp(route, [(1, "Runtime.evaluate", settle, route.session_id)])
+    await _frame_cdp(route, [(1, "Runtime.evaluate", {"expression": _TWO_PAGE_FRAMES_JS,
+                                                      "awaitPromise": True}, None)])
+
+
 async def _frame_route_rewrite(route, commands):
     """Point one cdp_send batch at the route's frame (see the section comment)."""
     out = []
@@ -2755,7 +2785,8 @@ async def _frame_route_rewrite(route, commands):
                 route.dirty = True  # page JS may scroll the frame
             out.append((cmd_id, method, params, route.session_id))
         elif method == "Input.dispatchMouseEvent" and route.chain and "x" in (params or {}):
-            if route.dirty:
+            if route.dirty:  # page JS ran: it may have scrolled the page
+                await _frame_route_settle(route)
                 await _frame_route_refresh_offset(route)
             params = dict(params)
             params["x"] = params["x"] + route.offset[0]
@@ -2857,15 +2888,19 @@ def _smart_found(raw):
 SMART_STRONG_SCORE = 60
 
 
-def _smart_wrap(js, probe=False):
-    """The finder, asked for a real match only; probe=True: find, never act.
+def _smart_wrap(js, probe=False, real_click=False, strict=True):
+    """The finder with its flags; by default asked for a real match only.
 
     Finders read `__cdpilotMinScore` (a weaker best hit is reported, not
-    acted on) and `__cdpilotProbe` (report the hit, do not click/fill).
+    acted on), `__cdpilotProbe` (report the hit, do not click/fill) and
+    `__cdpilotRealClick` (smart-click: return the target's centre instead of
+    calling el.click(); the caller clicks with real mouse input).
     """
-    flags = f"var __cdpilotMinScore = {SMART_STRONG_SCORE};"
+    flags = f"var __cdpilotMinScore = {SMART_STRONG_SCORE};" if strict else ""
     if probe:
         flags += " var __cdpilotProbe = true;"
+    if real_click:
+        flags += " var __cdpilotRealClick = true;"
     return f"(function () {{ {flags} return ({js}); }})()"
 
 
@@ -2874,7 +2909,7 @@ async def _smart_eval_once(ws_url, js):
     return r.get(1, {}).get("result", {}).get("value", "")
 
 
-async def _smart_eval(ws_url, js, label, same_origin_only=False):
+async def _smart_eval(ws_url, js, label, same_origin_only=False, real_click=False):
     """Run a smart-* finder script: page first, then (maybe) its frames.
 
     On the page the finder finds and acts in one script, as before. In order:
@@ -2890,8 +2925,12 @@ async def _smart_eval(ws_url, js, label, same_origin_only=False):
     frames of the page's own origin, so a typed value never lands in a
     third-party frame; `>>>` / `--frame` still reach any frame. Explicit
     targeting skips all of this: the finder runs in that frame only.
+    real_click (smart-click): inside a frame the finder leaves the click to
+    real mouse input (see _smart_wrap); the page path is unchanged.
     """
     if _FRAME_ROUTE.get() is not None:
+        if real_click:
+            return await _smart_eval_once(ws_url, _smart_wrap(js, real_click=True, strict=False))
         return await _smart_eval_once(ws_url, js)
     strict = _smart_wrap(js)
     raw = await _smart_eval_once(ws_url, strict)
@@ -2902,8 +2941,8 @@ async def _smart_eval(ws_url, js, label, same_origin_only=False):
         return raw
     if data.get("disabledReal"):
         return await _smart_eval_once(ws_url, js)
-    hit = await _frame_search(ws_url, _smart_wrap(js, probe=True), strict, label,
-                              same_origin_only=same_origin_only)
+    hit = await _frame_search(ws_url, _smart_wrap(js, probe=True), _smart_wrap(js, real_click=real_click),
+                              label, same_origin_only=same_origin_only)
     if hit is not None:
         return hit
     return await _smart_eval_once(ws_url, js)
@@ -4807,6 +4846,25 @@ async def _humanize_mouse_move(ws_url, x, y):
         await asyncio.sleep(r.uniform(0.008, 0.025))
 
 
+async def _real_click(ws_url, x, y):
+    """One left click as real mouse input: move, press, release (isTrusted).
+
+    Used for clicks inside frames. Under a frame route the rewrite waits for
+    the page to settle (see _frame_route_rewrite); a smart-click frame-search
+    hit has no route any more, so the same wait happens here.
+    """
+    if _FRAME_ROUTE.get() is None:
+        await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": _TWO_PAGE_FRAMES_JS,
+                                                         "awaitPromise": True})])
+    await cdp_send(ws_url, [
+        (1, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}),
+        (2, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y,
+                                         "button": "left", "clickCount": 1}),
+        (3, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y,
+                                         "button": "left", "clickCount": 1}),
+    ])
+
+
 async def _humanize_click(ws_url, x, y):
     """Pre-pause + Bezier move + jitter + mousePressed/Released + post-pause."""
     import random as _r
@@ -5086,9 +5144,15 @@ async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
         _log_heal("click", selector, tried, dur, no_heal)
     safe_sel = json.dumps(res_sel)
     wait_ms = get_auto_wait_ms()
-    js = WAIT_AND_QUERY_JS + f"""
+    # Real mouse input (isTrusted: true) with --entropy=on and inside frames:
+    # the script only locates; the click is Input.dispatchMouseEvent at the
+    # element's centre (the frame route adds the frame's page offset). It used
+    # to call el.click() too, so an entropy click clicked twice. An element
+    # without a box cannot be hit by the mouse: el.click() is the fallback.
+    js = f"""
 (function() {{
-    return window.__cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
+{WAIT_AND_QUERY_JS}
+    return __cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
         if (!el) return 'Timeout waiting for: ' + {safe_sel};
         el.scrollIntoView({{behavior:'instant', block:'center'}});
         if (window.__cdpilot_vfx) {{
@@ -5098,29 +5162,36 @@ async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
             window.__cdpilot_vfx.ripple(cx, cy);
         }}
         var rect = el.getBoundingClientRect();
-        var cx = Math.round(rect.left + rect.width/2), cy = Math.round(rect.top + rect.height/2);
-        el.click();
         var res = 'Clicked: ' + el.tagName + ' ' + (el.textContent || '').substring(0, 60).trim();
         if (el.hasAttribute('data-cdpilot-tmp')) el.removeAttribute('data-cdpilot-tmp');
+        if (rect.width < 1 || rect.height < 1) {{
+            el.click();
+            return JSON.stringify({{res: res, clicked: true}});
+        }}
+        var cx = Math.round(rect.left + rect.width/2), cy = Math.round(rect.top + rect.height/2);
         return JSON.stringify({{res: res, cx: cx, cy: cy}});
     }});
 }})()"""
-    if entropy:
+    if entropy or _FRAME_ROUTE.get() is not None:
         r2 = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})])
         raw = r2.get(1, {}).get("result", {}).get("value", "{}")
         try:
             data = json.loads(raw)
-            cx, cy = data.get("cx", 0), data.get("cy", 0)
             print(data.get("res", "?"))
         except (ValueError, TypeError):
             print(raw)
             return
-        await _humanize_click(ws, cx, cy)
+        if "cx" in data:
+            if entropy:
+                await _humanize_click(ws, data["cx"], data["cy"])
+            else:
+                await _real_click(ws, data["cx"], data["cy"])
     else:
         # Fast path: rewrite JS to return plain string
-        js_fast = WAIT_AND_QUERY_JS + f"""
+        js_fast = f"""
 (function() {{
-    return window.__cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
+{WAIT_AND_QUERY_JS}
+    return __cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
         if (!el) return 'Timeout waiting for: ' + {safe_sel};
         el.scrollIntoView({{behavior:'instant', block:'center'}});
         if (window.__cdpilot_vfx) {{
@@ -5162,9 +5233,10 @@ async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
     wait_ms = get_auto_wait_ms()
     if entropy:
         # Focus element, field-focus pause, then humanize typing
-        js_focus = WAIT_AND_QUERY_JS + f"""
+        js_focus = f"""
 (function() {{
-    return window.__cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
+{WAIT_AND_QUERY_JS}
+    return __cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
         if (!el) return JSON.stringify({{err: 'Timeout waiting for: ' + {safe_sel}}});
         el.scrollIntoView({{behavior:'instant', block:'center'}});
         el.focus();
@@ -5194,9 +5266,10 @@ async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
         await _humanize_type(ws, value)
         print(f"Filled (entropy): {selector} = {value[:50]}")
     else:
-        js = WAIT_AND_QUERY_JS + f"""
+        js = f"""
 (function() {{
-    return window.__cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
+{WAIT_AND_QUERY_JS}
+    return __cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
         if (!el) return 'Timeout waiting for: ' + {safe_sel};
         el.focus();
         if (window.__cdpilot_vfx) {{
@@ -10271,9 +10344,14 @@ async def cmd_smart_click(text):
       if (typeof __cdpilotProbe !== 'undefined' && __cdpilotProbe) return JSON.stringify({{found: true, probe: true, score: best.score}});
       best.el.scrollIntoView({{block: 'center'}});
       var rect = best.el.getBoundingClientRect();
-      best.el.click();
+      // In frames the caller clicks with real mouse input (isTrusted), unless
+      // the element has no box to hit.
+      var realClick = (typeof __cdpilotRealClick !== 'undefined' && __cdpilotRealClick)
+        && rect.width >= 1 && rect.height >= 1;
+      if (!realClick) best.el.click();
       return JSON.stringify({{
         found: true,
+        realClick: realClick,
         tag: best.tag,
         text: best.match,
         score: best.score,
@@ -10285,7 +10363,7 @@ async def cmd_smart_click(text):
       }});
     }})()
     """
-    raw = await _smart_eval(ws_url, js, "smart-click")
+    raw = await _smart_eval(ws_url, js, "smart-click", real_click=True)
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
@@ -10303,6 +10381,8 @@ async def cmd_smart_click(text):
             print(f'No element found matching: "{text}"', file=sys.stderr)
         sys.exit(1)
 
+    if data.get("realClick"):
+        await _real_click(ws_url, data["x"], data["y"])
     await _vfx_ripple(ws_url, data["x"], data["y"])
     # A click can spawn a new tab (target=_blank). Diff the target list and mark
     # any newcomer as cdpilot-owned so `close` will clean it up later.
@@ -12706,9 +12786,6 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
             print("Usage: frame eval [--frame <selector|index|url>] <js>")
             sys.exit(1)
         js_code = " ".join(subcmd_args)
-        if route is not None and route.isolated:
-            print("note: this frame's page context was not reachable; eval runs in an isolated world"
-                  " (same DOM, no page JS globals)", file=sys.stderr)
         res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js_code, "returnByValue": True})])
         val = res.get(1, {})
         if "error" in val or val.get("exceptionDetails"):
