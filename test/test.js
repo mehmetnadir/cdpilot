@@ -8811,7 +8811,66 @@ print("ok")
   }
 })();
 
+
+test('examples: every examples/*/run.sh exists and passes sh -n, and README commands exist in dispatch table', () => {
+  const examplesDir = path.join(__dirname, '..', 'examples');
+  const pyPath = path.join(__dirname, '..', 'src', 'cdpilot.py');
+  const pyCode = fs.readFileSync(pyPath, 'utf-8');
+
+  const dispatchCmds = new Set();
+  const syncMatch = pyCode.match(/sync_cmds\s*=\s*\{([\s\S]*?)\n\s*\}/);
+  if (syncMatch) {
+    for (const m of syncMatch[1].matchAll(/['"]([a-zA-Z0-9_-]+)['"]\s*:/g)) {
+      dispatchCmds.add(m[1]);
+    }
+  }
+  const asyncMatch = pyCode.match(/async_map\s*=\s*\{([\s\S]*?)\n\s*\}/);
+  if (asyncMatch) {
+    for (const m of asyncMatch[1].matchAll(/['"]([a-zA-Z0-9_-]+)['"]\s*:/g)) {
+      dispatchCmds.add(m[1]);
+    }
+  }
+
+  assert(dispatchCmds.size > 0, 'Could not parse dispatch table from src/cdpilot.py');
+
+  const folders = fs.readdirSync(examplesDir).filter((f) => {
+    const full = path.join(examplesDir, f);
+    return fs.statSync(full).isDirectory();
+  });
+
+  assert(folders.length >= 6, `Expected at least 6 example folders, got ${folders.length}`);
+
+  for (const folder of folders) {
+    const folderPath = path.join(examplesDir, folder);
+    const runSh = path.join(folderPath, 'run.sh');
+    assert(fs.existsSync(runSh), `Missing run.sh in examples/${folder}`);
+
+    execSync(`sh -n "${runSh}"`, { stdio: 'pipe' });
+
+    const readme = path.join(folderPath, 'README.md');
+    assert(fs.existsSync(readme), `Missing README.md in examples/${folder}`);
+    const readmeContent = fs.readFileSync(readme, 'utf-8');
+
+    const lines = readmeContent.split('\n');
+    let inCodeBlock = false;
+    for (const line of lines) {
+      if (line.trim().startsWith('```')) {
+        inCodeBlock = !inCodeBlock;
+        continue;
+      }
+      if (inCodeBlock) {
+        const m = line.match(/^\s*(?:\$\s+)?cdpilot\s+([a-zA-Z0-9_-]+)/);
+        if (m) {
+          const cmdName = m[1];
+          assert(dispatchCmds.has(cmdName), `Command '${cmdName}' in examples/${folder}/README.md not in cdpilot dispatch table`);
+        }
+      }
+    }
+  }
+});
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);
+
