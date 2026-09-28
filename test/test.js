@@ -3492,11 +3492,13 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
   }
 
   let fakeResults = null;
+  let fakeTrace = null;  // CDPILOT_CDP_TRACE file of the fake-CDP run
   function fake(name) {
     if (!fakeResults) {
       const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-frames-fake-'));
+      fakeTrace = path.join(home, 'cdp-trace.txt');
       const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
-        CDP_PORT: '19224', CDPILOT_LOG: '0' };
+        CDP_PORT: '19224', CDPILOT_LOG: '0', CDPILOT_CDP_TRACE: fakeTrace };
       for (const k of ['CDPILOT_WS_POOL', 'CDPILOT_TARGET', 'CDPILOT_TIMEOUT']) delete env[k];
       const out = execFileSync(PYB, [path.join(__dirname, 'frames_fake_cdp.py'), PY_PATH], {
         encoding: 'utf-8', timeout: 60000, env,
@@ -3857,6 +3859,53 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
     assert(r.frame.elapsed < 0.39, `frame call: ${r.frame.elapsed}`);
   });
 
+  test('frames (fake CDP): no frame command sends Runtime.enable (main world via DOM.resolveNode)', () => {
+    // Runtime.enable is the best-known CDP detection signal (Turnstile,
+    // DataDome), and Turnstile runs inside an iframe. Every scenario above
+    // (routes, nested and out-of-process frames, smart-* search, frame
+    // list/eval, pool restore) ran against the fake page.
+    fake('routing');
+    const sent = fakeResults._methods;
+    assert(!sent['Runtime.enable'] && !sent['Runtime.disable'], `sent: ${JSON.stringify(sent)}`);
+    assert(sent['DOM.resolveNode'] > 0, 'same-process frames: main world from the frame document');
+    assert.strictEqual(sent['Runtime.releaseObjectGroup'], sent['DOM.resolveNode'],
+      'every resolved frame document is released');
+    assert(sent['Target.attachToTarget'] > 0, 'out-of-process frames: flat session');
+    const r = fake('routing');
+    assert.strictEqual(r.css.context, r.contexts.card, 'the main-world context id');
+    assert.strictEqual(r.nested.context, r.contexts.nested);
+  });
+
+  test('frames (fake CDP): no usable main-world id: isolated world, and frame eval says so', () => {
+    const r = fake('isolated_fallback');
+    assert.deepStrictEqual(r.eval.contexts, r.eval.isolated, 'eval ran in the isolated world');
+    assert.strictEqual(r.eval.stdout, 'Result: card|z\n');
+    assert(/eval runs in an isolated world/.test(r.eval.stderr), r.eval.stderr);
+    assert.strictEqual(r.list.stderr, '', 'only frame eval (page globals) needs the note');
+  });
+
+  test('frames (fake CDP): CDPILOT_CDP_TRACE lists each CDP method sent, names only', () => {
+    fake('routing');
+    const lines = fs.readFileSync(fakeTrace, 'utf8').trim().split(/\r?\n/); // Windows text mode: \r\n
+    assert(lines.length > 100, `${lines.length} lines`);
+    assert(lines.every((l) => /^[A-Z][A-Za-z]*\.[A-Za-z]+$/.test(l)), 'method names only, no params');
+    assert.deepStrictEqual([...new Set(lines)].sort(), Object.keys(fakeResults._methods).sort());
+  });
+
+  test('frames (fake CDP): plain cdp_send sends the same wire messages and skips interleaved events', () => {
+    // Guards removing the frame-only event collection from cdp_send: pooled
+    // and CDPILOT_WS_POOL=0 paths, events arriving before the replies.
+    const r = fake('plain_wire');
+    for (const key of ['pooled', 'unpooled']) {
+      assert.deepStrictEqual(r[key].wire, [
+        { id: 1, method: 'Runtime.evaluate', params: { expression: 'NOISY', returnByValue: true } },
+        { id: 2, method: 'Runtime.evaluate', params: { expression: 'WHERE:x' } },
+      ], key);
+      assert.deepStrictEqual(r[key].result, { 1: { result: { type: 'string', value: 'top|noisy' } },
+        2: { result: { type: 'string', value: 'top|x' } } }, key);
+    }
+  });
+
   test('frames (fake CDP): frame list keeps its old output; --frame lists and evals inside the frame', () => {
     const r = fake('frame_list');
     assert.strictEqual(r.top.stdout, 'iframes (2):\n  [0] src=about:blank name= id=hidden-frame\n'
@@ -3888,7 +3937,9 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
       assert(section.includes(s), `README iframe section must mention ${s}`);
     }
     const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    const unreleased = changelog.split(/^## \[/m)[1] || ''; // newest: [Unreleased] or the release
+    // The newest release, plus the [Unreleased] section above it if there is one.
+    const secs = changelog.split(/^## \[/m);
+    const unreleased = (secs[1] || '').startsWith('Unreleased]') ? secs[1] + (secs[2] || '') : (secs[1] || '');
     for (const s of ['--frame', 'matched no iframe', "page's own origin", 'frame search stopped after 2s',
       'is not an iframe; using the iframe inside it']) {
       assert(unreleased.includes(s), `CHANGELOG [Unreleased] must describe ${s}`);
@@ -3917,8 +3968,9 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
     ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
     const servers = [p1, p2].map((p) => spawn(PYB, ['-m', 'http.server', String(p), '--bind', '127.0.0.1'],
       { cwd: fixtures, stdio: 'ignore' }));
+    const trace = path.join(home, 'cdp-trace.txt');
     const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
-      CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1' };
+      CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1', CDPILOT_CDP_TRACE: trace };
     delete env.CDPILOT_TARGET;
     const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf-8', timeout: 60000, env });
     const stop = () => {
@@ -3940,7 +3992,7 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
       stop();
       throw err;
     }
-    e2e = { c, p1, p2, stop };
+    e2e = { c, p1, p2, stop, trace };
   });
   const ok = (r, re, what) => assert(re.test(r.stdout + r.stderr),
     `${what}: exit ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
@@ -4037,6 +4089,16 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
       const r = c('frame', 'list');
       assert.strictEqual(r.stdout.trimEnd(), ['iframes (2):', '  [0] src=about:blank name= id=hidden-frame',
         `  [1] src=http://localhost:${p2}/widget.html name= id=child`].join('\n'));
+    });
+
+    test('frames e2e: no command above sent Runtime.enable (CDPILOT_CDP_TRACE)', () => {
+      const { trace } = needE2E();
+      const lines = fs.readFileSync(trace, 'utf8').trim().split(/\r?\n/);
+      assert(lines.every((l) => /^[A-Z][A-Za-z]*\.[A-Za-z]+$/.test(l)), 'method names only');
+      const sent = new Set(lines);
+      assert(!sent.has('Runtime.enable'), 'Runtime.enable was sent');
+      assert(sent.has('DOM.resolveNode') && sent.has('Target.attachToTarget'),
+        'same-process and out-of-process frames were both entered');
     });
   } finally {
     if (e2e) e2e.stop();
@@ -4719,7 +4781,9 @@ print("RESULT=" + json.dumps([mod._idle_status(${port}), mod._idle_status(${port
     assert(/\| `CDPILOT_IDLE_CLOSE` \| `15` \|/.test(readme), 'README env table needs CDPILOT_IDLE_CLOSE');
     assert(/Idle auto-close/.test(readme), 'README Reliability section needs the idle auto-close note');
     const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    const unreleased = changelog.split(/^## \[/m)[1] || ''; // newest: [Unreleased] or the release
+    // The newest release, plus the [Unreleased] section above it if there is one.
+    const secs = changelog.split(/^## \[/m);
+    const unreleased = (secs[1] || '').startsWith('Unreleased]') ? secs[1] + (secs[2] || '') : (secs[1] || '');
     assert(unreleased.includes('CDPILOT_IDLE_CLOSE'), 'CHANGELOG [Unreleased] must describe CDPILOT_IDLE_CLOSE');
   });
 
@@ -5154,8 +5218,10 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert(readme.includes(s), `README must mention ${s}`);
     }
     const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    const sections = changelog.split(/^## \[/m).slice(1, 3).join(''); // newest two sections
-    assert(sections && sections.includes('cdpilot log'), 'CHANGELOG newest sections must describe `cdpilot log`');
+    // The newest release, plus the [Unreleased] section above it if there is one.
+    const secs = changelog.split(/^## \[/m);
+    const unreleased = (secs[1] || '').startsWith('Unreleased]') ? secs[1] + (secs[2] || '') : (secs[1] || '');
+    assert(unreleased && unreleased.includes('cdpilot log'), 'CHANGELOG [Unreleased] must describe `cdpilot log`');
     const help = run('--help');
     assert(help.includes('log --md') && help.includes('CDPILOT_LOG'), 'bin help must document log');
     assert(PY_CONTENT.slice(0, 2000).includes('CDPILOT_LOG=0'), 'python __doc__ must document CDPILOT_LOG');
