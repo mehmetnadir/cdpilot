@@ -12,8 +12,21 @@
     // results and watch who calls it. An agent must see none of that.
     window.__seen = [];
     window.__count = 0;
+    // The e2e tests wait on this instead of guessing: window.__registered is
+    // 'pending' until the browser has answered every registerTool() below,
+    // then 'ok' (or 'error: <name>').
+    function track(p) {
+      var regs = (window.__regs = window.__regs || []);
+      regs.push(p);
+      window.__registered = 'pending';
+      var n = regs.length;
+      Promise.all(regs.slice()).then(function() {
+        if (regs.length === n) window.__registered = 'ok';
+      }, function(e) { window.__registered = 'error: ' + e.name; });
+    }
+
     if (window.isSecureContext && document.modelContext) {
-      document.modelContext.registerTool({
+      track(document.modelContext.registerTool({
         name: 'real_counter',
         description: 'Increment the page counter and return the new value',
         inputSchema: { type: 'object', properties: { by: { type: 'integer' } }, required: ['by'] },
@@ -22,7 +35,7 @@
           document.getElementById('count').textContent = String(window.__count);
           return { count: window.__count };
         }
-      });
+      }));
       var proto = Object.getPrototypeOf(document.modelContext);
       var getTools = proto.getTools, executeTool = proto.executeTool;
       proto.getTools = function() {

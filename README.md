@@ -921,7 +921,10 @@ cdpilot launch --no-webmcp     # turn it off again (applies at the next start)
   (`required`, `type` — `true` is not an integer —, `enum`, `const`, nested
   `properties` and `items`; other keywords are left to the page) and exits 1
   on a mismatch, an unknown tool or a tool error. It passes an `AbortSignal`
-  and aborts it when `--timeout` (default 20 s) runs out, then exits 124.
+  and aborts it when `--timeout` (default 20 s) runs out, then exits 124
+  with `timed out after <N>s (--timeout); its execution was aborted`. The
+  signal fires at the `--timeout` deadline; the watchdog waits 3 s more so
+  that report is printed.
   A form tool without `toolautosubmit` waits for a person to submit the form.
   When several frames register the same name, `--frame <url-part>` picks one
   (an exact frame URL wins); without it the top document's tool is used, and
