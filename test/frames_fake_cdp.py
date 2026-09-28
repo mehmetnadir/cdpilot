@@ -50,7 +50,8 @@ class Frame:
         self.covered = ""         # what covers this frame's <iframe> at the click point
         self.target_cover = ""    # what covers the click target inside this frame ("!":
         #                           the target has pointer-events: none)
-        self.cover_after_press = ""  # target_cover once mousePressed was handled (it moved)
+        self.cover_after_press = ""  # target_cover once mousePressed was handled (it moved;
+        #                              "-": removed from the page, "ERR": the page navigated)
         self.settle_hang = False  # the settle wait in this frame never answers
 
 
@@ -77,6 +78,8 @@ class Browser:
         self.settles = []         # settle waits: [frame, context is an isolated world]
         self.blocker = False      # the top page has cdpilot's input blocker
         self.blocker_log = []     # pointer-events values set on it, in order
+        self.blocker_t = []       # the same, as [value, time.perf_counter()]
+        self.mouse_t = []         # mouse events: [type, clickCount, button, time.perf_counter(), timestamp]
         self.blocker_calls = 0    # blocker scripts sent, blocker or not
         self.fail_on = None       # a CDP method whose send raises RuntimeError
         self.arrays = {}          # smart-click real-click results: [JSON, element]
@@ -214,6 +217,8 @@ class Browser:
             return self.call_function(p, ok, err)
         if method == "Input.dispatchMouseEvent":
             self.mouse.append([p.get("type"), p.get("x"), p.get("y")])
+            self.mouse_t.append([p.get("type"), p.get("clickCount"), p.get("button"), time.perf_counter(),
+                                 p.get("timestamp")])
             if p.get("type") == "mousePressed":
                 for f in self.frames.values():
                     if f.cover_after_press:
@@ -247,6 +252,10 @@ class Browser:
             if f is not None:
                 return value(f.covered)
             el = self.element(oid)
+            if el and el[0].target_cover == "ERR":  # the page navigated away: the object is gone
+                return err("Cannot find context with specified id")
+            if el and el[0].target_cover == "HANG":  # no reply (a timeout under load)
+                return []
             return value(el[0].target_cover) if el else err("Could not find object with given id")
         el = self.element(oid)
         if el is not None:
@@ -327,8 +336,11 @@ class Browser:
             pe = json.loads(expr[expr.rindex("(") + 1:-1])
             if frame is self.top and self.blocker:
                 self.blocker_log.append(pe)
+                self.blocker_t.append([pe, time.perf_counter()])
                 return ok({"result": {"type": "boolean", "value": True}})
             return ok({"result": {"type": "boolean", "value": False}})
+        if "getBoundingClientRect();return {x:r.x,y:r.y" in expr:  # the X bot's _tw_click_sel
+            return ok({"result": {"type": "object", "value": {"x": 10, "y": 20, "w": 30, "h": 40}}})
         if "return {x: Math.round(r.left + r.width/2)" in expr:  # _get_element_center
             return value({"x": 40, "y": 50})
         if expr.startswith("!!document.querySelector("):  # selector ladder, css step
@@ -437,6 +449,8 @@ def run(mod, top, body, pool=True):
     mod._WS_POOL.clear()
     mod._WS_LOCKS.clear()
     mod._FRAME_FLAG = None
+    if hasattr(mod, "_CLICK_MISSES"):
+        mod._CLICK_MISSES.clear()  # per command process
     if hasattr(mod, "_FRAME_ISOLATED_NOTED"):
         mod._FRAME_ISOLATED_NOTED[0] = False  # once per process: a run is a process
     mod._WS_POOL_ENABLED = pool
@@ -825,6 +839,34 @@ def click_page(**cfg):
     return top
 
 
+def press_info(b):
+    """Each mousePressed with the next mouseReleased: hold (ms) as it arrived
+    (`gaps`) and between the events' own timestamps (`stamps`), clickCount,
+    button; `between`: ms from a release to the next press; `blocker`: the
+    press/release window lies inside the blocker's pointer-events: none window."""
+    ev = b.mouse_t
+    out, last_release = {"gaps": [], "stamps": [], "counts": [], "buttons": [], "between": []}, None
+    for i, (typ, count, button, t, stamp) in enumerate(ev):
+        if typ != "mousePressed":
+            continue
+        rel = next((e for e in ev[i + 1:] if e[0] == "mouseReleased"), None)
+        if last_release is not None:
+            out["between"].append((t - last_release) * 1000)
+        out["counts"].append(count)
+        out["buttons"].append(button)
+        if rel is not None:
+            out["gaps"].append((rel[3] - t) * 1000)
+            if isinstance(stamp, float) and isinstance(rel[4], float):
+                out["stamps"].append((rel[4] - stamp) * 1000)
+            last_release = rel[3]
+    opened = [t for v, t in b.blocker_t if v == "none"]
+    closed = [t for v, t in b.blocker_t if v == ""]
+    if opened and closed and ev:
+        presses = [e[3] for e in ev if e[0] in ("mousePressed", "mouseReleased")]
+        out["blocker"] = bool(presses) and opened[0] <= min(presses) and max(presses) <= closed[-1]
+    return out
+
+
 def run_click(mod, top, target, entropy=False, blocker=False, fail_on=None):
     async def body(b):
         b.blocker, b.fail_on = blocker, fail_on
@@ -835,7 +877,8 @@ def run_click(mod, top, target, entropy=False, blocker=False, fail_on=None):
     res.update({"stdout": stdout, "stderr": err, "clicks": b.clicks, "leaks": b.leaks, "hits": b.hits,
                 "settles": b.settles, "blocker": b.blocker_log,
                 "pressed": [m[1:] for m in b.mouse if m[0] == "mousePressed"],
-                "released": [m[1:] for m in b.mouse if m[0] == "mouseReleased"]})
+                "released": [m[1:] for m in b.mouse if m[0] == "mouseReleased"],
+                "press": press_info(b), "misses": list(getattr(mod, "_CLICK_MISSES", []))})
     return res
 
 
@@ -945,6 +988,281 @@ def scenario_timeout_restore(mod):
     return res
 
 
+@contextlib.contextmanager
+def press_env(value):
+    """CDPILOT_PRESS_MS set to `value` (None: unset) for the block."""
+    saved = os.environ.get("CDPILOT_PRESS_MS")
+    if value is None:
+        os.environ.pop("CDPILOT_PRESS_MS", None)
+    else:
+        os.environ["CDPILOT_PRESS_MS"] = value
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("CDPILOT_PRESS_MS", None)
+        else:
+            os.environ["CDPILOT_PRESS_MS"] = saved
+
+
+def scenario_press_hold(mod):
+    """Real clicks hold the button (CDPILOT_PRESS_MS, default 40-120 ms); dblclick
+    is two held clicks; the blocker is open around the whole press."""
+    out = {}
+    real_visual = mod.get_visual_config
+    try:
+        for env in [None, "0-0"]:
+            tag = "default" if env is None else "instant"
+            with press_env(env):
+                for key, target, entropy in [("frame", "#card >>> #btn", False),
+                                             ("oopif", "#pay >>> #btn", False),
+                                             ("page_entropy", "#btn", True),
+                                             ("frame_entropy", "#card >>> #nested >>> #btn", True)]:
+                    r = run_click(mod, click_page(), target, entropy, blocker=True)
+                    out[f"{tag}_{key}"] = {k: r[k] for k in ("res", "stderr", "press", "blocker", "clicks")}
+                for key, cover in [("moved", "div#wrap"), ("removed", "-"), ("navigated", "ERR")]:
+                    r = run_click(mod, click_page(**{"card.cover_after_press": cover}), "#card >>> #btn",
+                                  blocker=True)
+                    out[f"{tag}_{key}"] = {k: r[k] for k in ("res", "stderr", "stdout", "press", "blocker",
+                                                             "clicks")}
+                mod.get_visual_config = lambda: True
+                for key, fn, target in [("dblclick", "cmd_dblclick", "#card >>> #btn"),
+                                        ("dblclick_page", "cmd_dblclick", "#btn"),
+                                        ("rightclick", "cmd_rightclick", "#pay >>> #btn")]:
+                    async def body(b, fn=fn, target=target):
+                        b.blocker = True
+                        return await call(lambda: getattr(mod, fn)(target))
+                    b, res, stdout, err = run(mod, click_page(), body)
+                    out[f"{tag}_{key}"] = {"res": res, "stderr": err, "press": press_info(b),
+                                           "blocker": b.blocker_log}
+                mod.get_visual_config = real_visual
+                # The twitter bot's clicks: humanized, and plain (also click @ref's).
+                for key, fn in [("humanize_click", "_humanize_click"), ("click_held", "_mouse_click_held")]:
+                    async def body(b, fn=fn):
+                        await getattr(mod, fn)(WS, 10, 20)
+                    b, _, _, err = run(mod, click_page(), body)
+                    out[f"{tag}_{key}"] = {"stderr": err, "press": press_info(b)}
+                # _tw_click_sel itself: finds the box, clicks its centre (humanized or not).
+                for key, humanize in [("tw_plain", "off"), ("tw_humanized", "on")]:
+                    saved = os.environ.get("CDPILOT_TWITTER_HUMANIZE")
+                    os.environ["CDPILOT_TWITTER_HUMANIZE"] = humanize
+
+                    async def body(b):
+                        return await mod._tw_click_sel(WS, "[data-testid=tweetButton]")
+                    try:
+                        b, res, _, err = run(mod, click_page(), body)
+                    finally:
+                        if saved is None:
+                            os.environ.pop("CDPILOT_TWITTER_HUMANIZE", None)
+                        else:
+                            os.environ["CDPILOT_TWITTER_HUMANIZE"] = saved
+                    out[f"{tag}_{key}"] = {"res": res, "stderr": err, "press": press_info(b),
+                                           "pressed": [m[1:] for m in b.mouse if m[0] == "mousePressed"]}
+    finally:
+        mod.get_visual_config = real_visual
+    # The duration draws themselves, and CDPILOT_PRESS_MS parsing.
+    import random as _r
+    rnd = _r.Random(7)
+    holds = [mod._press_hold_s(rnd) * 1000 for _ in range(2000)]
+    gaps = [mod._dblclick_gap_s(rnd) * 1000 for _ in range(2000)]
+    out["draws"] = {"hold": [min(holds), sorted(holds)[1000], max(holds)],
+                    "gap": [min(gaps), max(gaps)]}
+    parsed = {}
+    for value in [None, "0-0", " 30 - 60 ", "10.5-20", "abc", "50", "120-40", "5-3000", "-5-10", "0-2000"]:
+        with press_env(value):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                first = list(mod._press_ms_range())
+                again = list(mod._press_ms_range())  # warned once per value
+            with press_env(value):
+                zero_gap = mod._dblclick_gap_s()
+        parsed[str(value)] = {"range": first, "again": again, "stderr": err.getvalue(), "zero_gap": zero_gap}
+    out["parse"] = parsed
+    return out
+
+
+def click_exit(mod):
+    """The exit code main() ends with after the command (_click_missed_exit)."""
+    try:
+        mod._click_missed_exit()
+    except SystemExit as e:
+        return e.code
+    return 0
+
+
+def scenario_click_outcome(mod):
+    """A real click whose release misses: exit 3 (moved / no reply), 0 (gone);
+    a target detached before the press: exit 1, nothing clicked; MCP, batch."""
+    out = {}
+    for key, cfg in [("moved", {"card.cover_after_press": "div#wrap"}),
+                     ("gone", {"card.cover_after_press": "-"}),
+                     ("navigated", {"card.cover_after_press": "ERR"}),
+                     ("clicked", {}),
+                     ("detached", {"card.target_cover": "-"})]:
+        r = run_click(mod, click_page(**cfg), "#card >>> #btn", blocker=True)
+        r["exit"] = click_exit(mod)
+        out[key] = {k: r[k] for k in ("res", "stdout", "stderr", "clicks", "pressed", "released", "misses",
+                                      "exit", "blocker")}
+    # The release batch gets no reply (a timeout under load): unknown, not gone.
+    real_cdp = mod._frame_cdp
+
+    async def short(route, commands, timeout=10):
+        return await real_cdp(route, commands, min(timeout, 0.4))
+    mod._frame_cdp = short
+    try:
+        r = run_click(mod, click_page(**{"card.cover_after_press": "HANG"}), "#card >>> #btn", blocker=True)
+    finally:
+        mod._frame_cdp = real_cdp
+    r["exit"] = click_exit(mod)
+    out["no_reply"] = {k: r[k] for k in ("res", "stdout", "stderr", "clicks", "misses", "exit", "blocker")}
+
+    # batch: every step runs and is recorded; then exit 1 if a step failed,
+    # else 3 if one was pressed but not clicked, else 0.
+    real_stdin = sys.stdin
+    miss = {"cmd": "click", "args": ["#card >>> #btn"]}
+    error = {"cmd": "nope", "args": []}
+    fine = {"cmd": "eval", "args": ["1 + 1"]}
+    out["batch"] = {}
+    for key, steps, cover in [("miss", [miss, fine], "div#wrap"), ("mixed", [miss, error, fine], "div#wrap"),
+                              ("errors", [error, fine], ""), ("ok", [miss, fine], "")]:
+        async def batch(b, steps=steps):
+            sys.stdin = io.StringIO(json.dumps(steps))
+            try:
+                return await call(mod.cmd_batch)
+            finally:
+                sys.stdin = real_stdin
+        b, res, stdout, err = run(mod, click_page(**{"card.cover_after_press": cover}), batch)
+        out["batch"][key] = {"res": res, "steps": json.loads(stdout[stdout.index("["):]), "stderr": err}
+
+    # run: each line is its own CLI process (its exit code decides); same rule.
+    real_run = mod.subprocess.run
+    codes = {"click #moved": 3, "click #does-not-exist": 1, "eval 1": 0}
+
+    def fake_line(argv, **kw):
+        line = " ".join(argv[2:])
+        return types.SimpleNamespace(returncode=codes[line], stdout="", stderr="note: x" if codes[line] else "")
+    out["run"] = {}
+    tmp = tempfile.mkdtemp()
+    for key, lines in [("miss", ["click #moved", "eval 1"]), ("mixed", ["click #moved", "click #does-not-exist"]),
+                       ("errors", ["click #does-not-exist", "eval 1"]), ("ok", ["eval 1"])]:
+        path = os.path.join(tmp, key + ".cdp")
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        mod.subprocess.run = fake_line
+        try:
+            _, res, stdout, _ = run(mod, click_page(), lambda b, path=path: call(mod.cmd_run_script, path))
+        finally:
+            mod.subprocess.run = real_run
+        out["run"][key] = {"res": res, "result": stdout.strip().splitlines()[-1]}
+
+    # MCP: the CLI's exit code and stdout, as the server sees them.
+    real_run = mod.subprocess.run
+    server = mod.MCPServer()
+    mcp = {}
+    for key, code, stdout_, stderr_ in [
+            ("moved", 3, "Pressed (released elsewhere, not clicked): BUTTON Menu", "note: #m was no longer ..."),
+            ("gone", 0, "Pressed (the page replaced or left it, not clicked): BUTTON Next", "note: #n was gone ..."),
+            ("unknown", 3, "Pressed (release not confirmed, not clicked): BUTTON Pay", "note: #p could not ..."),
+            ("clicked", 0, "Clicked: BUTTON Pay", ""),
+            ("error", 1, "", "Error: selector '#x' not resolved.")]:
+        cases_tool = "browser_click"
+        mod.subprocess.run = (lambda *a, code=code, o=stdout_, e=stderr_, **k:
+                              types.SimpleNamespace(returncode=code, stdout=o, stderr=e))
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                mcp[key] = server._execute_tool(1, cases_tool, {"selector": "#x"})["result"]
+        finally:
+            mod.subprocess.run = real_run
+    # Other tools print page text: a page saying "Pressed (released elsewhere, ..."
+    # gets no status line, and their exit 3 stays an error.
+    for key, tool, code in [("eval_text", "browser_eval", 0), ("eval_exit3", "browser_eval", 3),
+                            ("smart_click", "browser_smart_click", 3)]:
+        text = "Pressed (released elsewhere, not clicked): BUTTON fake"
+        mod.subprocess.run = (lambda *a, code=code, **k:
+                              types.SimpleNamespace(returncode=code, stdout=text, stderr=""))
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                mcp[key] = server._execute_tool(1, tool, {"expression": "x", "text": "x"})["result"]
+        finally:
+            mod.subprocess.run = real_run
+    out["mcp"] = mcp
+    return out
+
+
+def scenario_timeout_hold(mod):
+    """--timeout fires while a real click holds the button (CDPILOT_PRESS_MS=1000-1000):
+    the watchdog restores the blocker before os._exit (patched to record the exit,
+    with the mouse events and the blocker state at that moment)."""
+    out = {}
+    real_exit, real_popen, real_visual = os._exit, mod.subprocess.Popen, mod.get_visual_config
+    for key, start in [("click", lambda: mod.cmd_click("#card >>> #btn", None, False, False)),
+                       ("dblclick", lambda: mod.cmd_dblclick("#btn"))]:
+        exits = []
+
+        async def body(b, start=start, exits=exits):
+            b.blocker = True
+            task = asyncio.ensure_future(start())
+            mod._arm_timeout_watchdog(0.3, key)
+            for _ in range(150):
+                if exits or task.done():
+                    break
+                await asyncio.sleep(0.02)
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+            return {"exits": exits, "open_after": sorted(mod._BLOCKER_OPEN)}
+
+        def fake_exit(code, exits=exits):
+            b = STATE["browser"]
+            rel = [e[3] for e in b.mouse_t if e[0] == "mouseReleased"]
+            restored = [t for v, t in b.blocker_t if v == ""]
+            exits.append({"code": code, "mouse": [m[0] for m in b.mouse],
+                          "blocker": list(b.blocker_log), "open": sorted(mod._BLOCKER_OPEN),
+                          "presses_open": sorted(mod._PRESS_OPEN),
+                          "released_before_restore": bool(rel and restored and rel[0] < restored[0])})
+        os._exit = fake_exit
+        mod.get_visual_config = lambda: True
+        saved_fd2 = os.dup(2)
+        with tempfile.TemporaryFile() as fd2, press_env("1000-1000"):
+            os.dup2(fd2.fileno(), 2)
+            try:
+                b, res, _, err = run(mod, click_page(), body)
+            finally:
+                os.dup2(saved_fd2, 2)
+                os.close(saved_fd2)
+                os._exit, mod.subprocess.Popen = real_exit, real_popen
+                mod.get_visual_config = real_visual
+            fd2.seek(0)
+            res["fd2"] = fd2.read().decode()
+        res.update({"stderr": err})
+        out[key] = res
+
+    # No watchdog: the command is cancelled (or fails) mid-hold; `finally` releases.
+    for key, start in [("cancel_click", lambda: mod.cmd_click("#card >>> #btn", None, False, False)),
+                       ("cancel_dblclick", lambda: mod.cmd_dblclick("#card >>> #btn"))]:
+        async def body(b, start=start):
+            b.blocker = True
+            task = asyncio.ensure_future(start())
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if any(m[0] == "mousePressed" for m in b.mouse):
+                    break
+            await asyncio.sleep(0.1)
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+            return {"presses_open": sorted(mod._PRESS_OPEN), "open_after": sorted(mod._BLOCKER_OPEN)}
+        mod.get_visual_config = lambda: True
+        try:
+            with press_env("1000-1000"):
+                b, res, _, err = run(mod, click_page(), body)
+        finally:
+            mod.get_visual_config = real_visual
+        res.update({"mouse": b.mouse, "blocker": b.blocker_log, "stderr": err})
+        out[key] = res
+    return out
+
+
 def scenario_smart_real_click(mod):
     """smart-click in a frame: the finder picks, the mouse clicks (hit-tested)."""
     out = {}
@@ -1016,6 +1334,9 @@ SCENARIOS = {
     "smart_real_click": scenario_smart_real_click,
     "mouse_cmds": scenario_mouse_cmds,
     "timeout_restore": scenario_timeout_restore,
+    "press_hold": scenario_press_hold,
+    "timeout_hold": scenario_timeout_hold,
+    "click_outcome": scenario_click_outcome,
 }
 
 

@@ -482,7 +482,8 @@ function showHelp() {
     pdf [file]         Save page as PDF
 
   INTERACTION
-    click <sel>        Click element
+    click <sel>        Click element; exit 3 =
+                       pressed, release missed the target, not clicked
     type <sel> <text>  Type into input
     fill <sel> <val>   Set input value (React-compatible)
     submit <form>      Submit form

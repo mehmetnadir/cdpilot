@@ -1,0 +1,51 @@
+<!doctype html>
+<!--
+  iframe fixture — pages that change under a held mouse press.
+  #menu-btn opens a menu on mousedown (a setTimeout, like a React menu):
+  #menu-item then covers the button, so the release lands on the item and
+  the browser sends the click to their common ancestor, div#wrap.
+  #spa-btn replaces its view on mousedown (a client-side route change):
+  the button is gone by the release.
+  Every event goes into <body data-log>: 'item-up', 'btn-click:trusted|script',
+  'wrap-click:trusted|script', 'spa-down', 'spa-click:trusted|script'.
+  Load it directly or as the child of top.html (?child=pressmenu.html).
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>cdpilot frames: press menu</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 8px; }
+    #wrap { position: relative; width: 300px; height: 100px; background: #eee; }
+    #menu-btn { position: absolute; left: 20px; top: 20px; width: 120px; height: 30px; }
+    #menu-item { position: absolute; left: 10px; top: 10px; width: 200px; height: 60px;
+      background: #fff; border: 1px solid #999; display: none; }
+    #view { margin-top: 16px; }
+  </style>
+</head>
+<body data-log="">
+  <div id="wrap">
+    <button id="menu-btn" type="button">Menu</button>
+    <div id="menu-item" role="menuitem">Delete</div>
+  </div>
+  <div id="view"><button id="spa-btn" type="button">Next page</button></div>
+  <script>
+    function log(s) { document.body.dataset.log += s + ';'; }
+    function how(e) { return e.isTrusted ? 'trusted' : 'script'; }
+    var btn = document.getElementById('menu-btn');
+    var item = document.getElementById('menu-item');
+    btn.addEventListener('mousedown', function () {
+      setTimeout(function () { item.style.display = 'block'; }, 0);
+    });
+    item.addEventListener('mouseup', function () { log('item-up'); });
+    btn.addEventListener('click', function (e) { log('btn-click:' + how(e)); });
+    document.getElementById('wrap').addEventListener('click', function (e) { log('wrap-click:' + how(e)); });
+    var spa = document.getElementById('spa-btn');
+    spa.addEventListener('mousedown', function () {
+      log('spa-down');
+      document.getElementById('view').innerHTML = '<p id="page-two">Page two</p>';
+    });
+    spa.addEventListener('click', function (e) { log('spa-click:' + how(e)); });
+  </script>
+</body>
+</html>
