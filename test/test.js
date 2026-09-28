@@ -4155,6 +4155,32 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.strictEqual(r.covered_frame.hits.length, 2, 'the target frame is checked too, in one batch');
   });
 
+  test('frames (fake CDP): out-of-process frame: no press until a mouse move reached the target', () => {
+    // The browser routes input into an OOPIF by its own copy of the layout,
+    // which can trail a scroll the page just made: the press then lands on
+    // the <iframe> in the top page while every in-page hit-test passes (the
+    // CI "idle" flake). The fake's routing stays stale for N settle waits.
+    const r = fake('mouse_route');
+    const f = r.fresh;
+    assert.strictEqual(f.stdout, 'Clicked: BUTTON #btn\n', f.stderr);
+    assert.deepStrictEqual([f.pressed.length, f.released.length, f.clicks, f.misrouted], [1, 1, [], []]);
+    assert.deepStrictEqual(f.probes, [[0, true]], 'one listener, removed after');
+    assert.deepStrictEqual(f.settles, [['pay', true], ['top', true]], 'no extra wait when the first move lands');
+    const l = r.lagging;  // still stale after the pre-click settle wait
+    assert.deepStrictEqual(l.misrouted, ['mouseMoved'], 'only a probe move went astray, never the press');
+    assert.deepStrictEqual([l.pressed.length, l.released.length, l.clicks, l.stderr], [1, 1, [], '']);
+    assert.deepStrictEqual(l.probes, [[0, true]]);
+    const n = r.never;  // never catches up: no press at all, one script click, a note
+    assert.deepStrictEqual([n.pressed, n.released], [[], []]);
+    assert.deepStrictEqual(n.clicks, [['pay', 'script']]);
+    assert.strictEqual(n.misrouted.length, r.tries, `${r.tries} tries`);
+    assert(n.stderr.includes('note: iframe#pay >>> #btn got no mouse input at the click point'
+      + ' (the browser sent it elsewhere); used a script click'), n.stderr);
+    assert.deepStrictEqual(n.probes, [[0, true]], 'removed after');
+    const s = r.same_process;  // the top page's renderer routes it: no probe, one move
+    assert.deepStrictEqual([s.probes, s.moves.length, s.pressed.length], [[], 1, 1]);
+  });
+
   test('frames (fake CDP): the hit-test is repeated with the release; a target that moved: note, no script click', () => {
     // The target moves once the page handled mousedown: the press is
     // completed (one press, one release) and the mouse click is not claimed.
