@@ -21,8 +21,10 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import re
 import sys
+import tempfile
 import time
 import traceback
 import types
@@ -46,7 +48,9 @@ class Frame:
         self.ctx = None
         self.scale = scale        # the <iframe>'s rendered / layout size
         self.covered = ""         # what covers this frame's <iframe> at the click point
-        self.target_cover = ""    # what covers the click target inside this frame
+        self.target_cover = ""    # what covers the click target inside this frame ("!":
+        #                           the target has pointer-events: none)
+        self.cover_after_press = ""  # target_cover once mousePressed was handled (it moved)
         self.settle_hang = False  # the settle wait in this frame never answers
 
 
@@ -73,6 +77,7 @@ class Browser:
         self.settles = []         # settle waits: [frame, context is an isolated world]
         self.blocker = False      # the top page has cdpilot's input blocker
         self.blocker_log = []     # pointer-events values set on it, in order
+        self.blocker_calls = 0    # blocker scripts sent, blocker or not
         self.fail_on = None       # a CDP method whose send raises RuntimeError
         self.arrays = {}          # smart-click real-click results: [JSON, element]
         self.attached, self.detached, self.sockets = [], [], []
@@ -209,6 +214,10 @@ class Browser:
             return self.call_function(p, ok, err)
         if method == "Input.dispatchMouseEvent":
             self.mouse.append([p.get("type"), p.get("x"), p.get("y")])
+            if p.get("type") == "mousePressed":
+                for f in self.frames.values():
+                    if f.cover_after_press:
+                        f.target_cover = f.cover_after_press
             return ok({})
         if method == "Runtime.evaluate":
             frame = root
@@ -314,11 +323,14 @@ class Browser:
             self.settles.append([frame.fid, params.get("contextId") in self.isolated])
             return [] if frame.settle_hang else ok({"result": {"type": "undefined"}})
         if "cdpilot-input-blocker" in expr:  # _BLOCKER_POINTER_JS
+            self.blocker_calls += 1
             pe = json.loads(expr[expr.rindex("(") + 1:-1])
             if frame is self.top and self.blocker:
                 self.blocker_log.append(pe)
                 return ok({"result": {"type": "boolean", "value": True}})
             return ok({"result": {"type": "boolean", "value": False}})
+        if "return {x: Math.round(r.left + r.width/2)" in expr:  # _get_element_center
+            return value({"x": 40, "y": 50})
         if expr.startswith("!!document.querySelector("):  # selector ladder, css step
             return ok({"result": {"type": "boolean", "value": True}})
         if "__cdpilot_waitFor(" in expr:  # cmd_click / cmd_fill script
@@ -859,7 +871,78 @@ def scenario_click_input(mod):
                                    "#card >>> #btn")
     out["settle_ok"] = run_click(mod, click_page(), "#card >>> #btn")
     out["settle_timeout"] = mod.FRAME_SETTLE_TIMEOUT_S
+    # The target moves away once the page handled mousedown (release misses it).
+    out["moved"] = run_click(mod, click_page(**{"card.cover_after_press": "div#wrap"}), "#card >>> #btn")
+    out["moved_entropy"] = run_click(mod, click_page(**{"top.cover_after_press": "body"}), "#btn", True)
+    # pointer-events: none on the target, and on the <iframe> on the way.
+    out["pe_target"] = run_click(mod, click_page(**{"card.target_cover": "!"}), "#card >>> #btn")
+    out["pe_frame"] = run_click(mod, click_page(**{"card.covered": "!"}), "#card >>> #btn")
     return out
+
+
+def scenario_mouse_cmds(mod):
+    """hover / dblclick / rightclick: through cdpilot's input blocker when visual
+    feedback is on, restored after an error; nothing extra when it is off."""
+    out = {}
+    real_visual = mod.get_visual_config
+    try:
+        for key, visual, fn, target, fail_on in [
+            ("dblclick_page", True, "cmd_dblclick", "#btn", None),
+            ("rightclick_page", True, "cmd_rightclick", "#btn", None),
+            ("hover_page", True, "cmd_hover", "#btn", None),
+            ("dblclick_frame", True, "cmd_dblclick", "#card >>> #btn", None),
+            ("rightclick_oopif", True, "cmd_rightclick", "#pay >>> #btn", None),
+            ("hover_frame", True, "cmd_hover", "#card >>> #nested >>> #btn", None),
+            ("dblclick_error", True, "cmd_dblclick", "#card >>> #btn", "Input.dispatchMouseEvent"),
+            ("dblclick_visual_off", False, "cmd_dblclick", "#card >>> #btn", None),
+            ("hover_visual_off", False, "cmd_hover", "#btn", None),
+        ]:
+            mod.get_visual_config = (lambda v=visual: v)
+            args = (target, None, False, False) if fn == "cmd_hover" else (target,)
+
+            async def body(b, fn=fn, args=args, fail_on=fail_on):
+                b.blocker, b.fail_on = True, fail_on
+                return await call(lambda: getattr(mod, fn)(*args))
+            b, res, stdout, err = run(mod, click_page(), body)
+            out[key] = {"res": res, "stdout": stdout, "stderr": err, "blocker": b.blocker_log,
+                        "blocker_calls": b.blocker_calls, "mouse": b.mouse}
+    finally:
+        mod.get_visual_config = real_visual
+    return out
+
+
+def scenario_timeout_restore(mod):
+    """--timeout fires while a click holds the blocker open: the watchdog restores
+    it before os._exit (patched here to record the exit instead)."""
+    exits, real_exit, real_popen = [], os._exit, mod.subprocess.Popen
+
+    async def body(b):
+        b.blocker = True
+        route = mod._FrameRoute(WS)
+        await mod._blocker_pointer(route, "none")  # the click's press is under way
+        open_before = sorted(mod._BLOCKER_OPEN)
+        mod._arm_timeout_watchdog(0.05, "click")
+        for _ in range(150):  # the command hangs here; the watchdog thread fires
+            if exits:
+                break
+            await asyncio.sleep(0.02)
+        return {"open_before": open_before, "open_after": sorted(mod._BLOCKER_OPEN), "exits": exits}
+    os._exit = exits.append
+    saved_fd2 = os.dup(2)  # the watchdog writes its message straight to fd 2
+    with tempfile.TemporaryFile() as fd2:
+        os.dup2(fd2.fileno(), 2)
+        try:
+            b, res, _, err = run(mod, click_page(), body)
+        finally:
+            os.dup2(saved_fd2, 2)
+            os.close(saved_fd2)
+            os._exit, mod.subprocess.Popen = real_exit, real_popen
+        fd2.seek(0)
+        res["fd2"] = fd2.read().decode()
+    res.update({"blocker": b.blocker_log, "stderr": err})
+    # A stale transparent blocker: the next command's INPUT_BLOCKER_ON resets it.
+    res["blocker_on_js"] = mod.INPUT_BLOCKER_ON
+    return res
 
 
 def scenario_smart_real_click(mod):
@@ -931,6 +1014,8 @@ SCENARIOS = {
     "plain_wire": scenario_plain_wire,
     "click_input": scenario_click_input,
     "smart_real_click": scenario_smart_real_click,
+    "mouse_cmds": scenario_mouse_cmds,
+    "timeout_restore": scenario_timeout_restore,
 }
 
 
