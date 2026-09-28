@@ -343,7 +343,7 @@ function webmcpLabel(profileDir) {
 // is still the one it attached to; a dead or stale signer also prints the
 // one-line "requests go out unsigned" warning on stderr.
 function botAuthLabel(port) {
-  const home = process.env.CDPILOT_HOME || path.join(os.homedir(), '.cdpilot');
+  const home = cdpilotHome();
   const dir = path.join(home, 'bot-auth', 'signers');
   const signer = fs.existsSync(path.join(dir, `${port}.json`)) || fs.existsSync(path.join(dir, `${port}.stale`));
   if (!signer) return fs.existsSync(path.join(home, 'bot-auth', 'config.json')) ? 'bot-auth: off' : null;
