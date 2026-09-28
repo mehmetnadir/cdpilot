@@ -3886,7 +3886,7 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
 
   test('frames (fake CDP): CDPILOT_CDP_TRACE lists each CDP method sent, names only', () => {
     fake('routing');
-    const lines = fs.readFileSync(fakeTrace, 'utf8').trim().split('\n');
+    const lines = fs.readFileSync(fakeTrace, 'utf8').trim().split(/\r?\n/); // Windows text mode: \r\n
     assert(lines.length > 100, `${lines.length} lines`);
     assert(lines.every((l) => /^[A-Z][A-Za-z]*\.[A-Za-z]+$/.test(l)), 'method names only, no params');
     assert.deepStrictEqual([...new Set(lines)].sort(), Object.keys(fakeResults._methods).sort());
@@ -4093,7 +4093,7 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
 
     test('frames e2e: no command above sent Runtime.enable (CDPILOT_CDP_TRACE)', () => {
       const { trace } = needE2E();
-      const lines = fs.readFileSync(trace, 'utf8').trim().split('\n');
+      const lines = fs.readFileSync(trace, 'utf8').trim().split(/\r?\n/);
       assert(lines.every((l) => /^[A-Z][A-Za-z]*\.[A-Za-z]+$/.test(l)), 'method names only');
       const sent = new Set(lines);
       assert(!sent.has('Runtime.enable'), 'Runtime.enable was sent');
