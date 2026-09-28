@@ -14,7 +14,12 @@ const CLI = path.join(__dirname, '..', 'bin', 'cdpilot.js');
 let passed = 0;
 let failed = 0;
 
+// CDPILOT_TEST_ONLY=<text>: run only the tests whose name contains <text>
+// (e.g. "webmcp e2e" to repeat one block while chasing a flake).
+const ONLY = process.env.CDPILOT_TEST_ONLY || '';
+
 function test(name, fn) {
+  if (ONLY && !name.includes(ONLY)) return;
   try {
     fn();
     passed++;
@@ -6154,6 +6159,17 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert(/timed out after 0\.3s; its execution was aborted/.test(r.stderr), r.stderr);
   });
 
+  test('webmcp: with --timeout the tool is aborted at the deadline and the watchdog lets that be reported', () => {
+    const r = fake('call_deadline');
+    assert.strictEqual(r.exit, 124, r.stderr);
+    assert.deepStrictEqual(r.calls[1].map((c) => c.fn), ['getTools', 'executeTool', 'aborted']);
+    assert(/timed out after 1\.5s \(--timeout\); its execution was aborted/.test(r.stderr), r.stderr);
+    // Aborted at the deadline, not before it (the old 0.75 s margin) and not by the watchdog.
+    assert(r.returned_at >= r.seconds - 0.05 && r.returned_at < r.seconds + r.grace, `${r.returned_at}`);
+    assert.deepStrictEqual(r.fired.map(([who]) => who), ['watchdog after grace'], JSON.stringify(r.fired));
+    assert(r.fired[0][1] >= r.seconds + r.grace - 0.05, JSON.stringify(r.fired));
+  });
+
   test('webmcp: a page that wraps getTools/executeTool cannot add tools, change results or see the calls', () => {
     const r = fake('hostile_page');
     for (const key of ['list', 'call', 'fake']) isolatedOnly(r[key], key);
@@ -6380,10 +6396,18 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   let e2e = null;
   test('webmcp e2e: headless browser started with `launch --webmcp` only, fixture server up', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-webmcp-e2e-'));
+    // Two free ports; CDPILOT_E2E_PORTS=<lo>-<hi> keeps them inside a range.
+    const [lo, hi] = (process.env.CDPILOT_E2E_PORTS || '0-0').split('-').map(Number);
     const [cdpPort, httpPort] = JSON.parse(execFileSync(PYB, ['-c', [
-      'import json, socket', 'ss = [socket.socket() for _ in range(2)]',
-      '[s.bind(("127.0.0.1", 0)) for s in ss]',
-      'print(json.dumps([s.getsockname()[1] for s in ss]))', '[s.close() for s in ss]',
+      'import json, random, socket', `lo, hi = ${lo}, ${hi}`, 'got = []',
+      'cands = random.sample(range(lo, hi + 1), hi - lo + 1) if lo else [0, 0]',
+      'for p in cands:',
+      '    s = socket.socket()',
+      '    try: s.bind(("127.0.0.1", p))',
+      '    except OSError: continue',
+      '    got.append(s)',
+      '    if len(got) == 2: break',
+      'print(json.dumps([s.getsockname()[1] for s in got]))', '[s.close() for s in got]',
     ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
     const server = spawn(PYB, ['-m', 'http.server', String(httpPort), '--bind', '127.0.0.1'],
       { cwd: fixtures, stdio: 'ignore' });
@@ -6414,7 +6438,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       stop();
       throw err;
     }
-    e2e = { c, httpPort, stop, trace, skip: null };
+    e2e = { c, cdpPort, httpPort, stop, trace, skip: null };
     // Skip (never fail) only when this browser really has no native WebMCP:
     // started with the flag, on a secure page, and document.modelContext is
     // still missing in the page itself.
@@ -6442,14 +6466,17 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert.strictEqual(r.status, 0, `tools list: ${r.stderr}`);
     return JSON.parse(r.stdout);
   };
-  // Poll `cmd` until pred(result) (a navigation lands between two commands).
-  const until = (fn, pred, what) => {
+  const nap = (ms) => execFileSync(process.execPath, ['-e', `setTimeout(() => {}, ${ms})`]);
+  // Poll fn() until pred(result), up to a time budget (not a count: under
+  // load every cdpilot process is slower).
+  const until = (fn, pred, what, budgetMs = 30000) => {
+    const deadline = Date.now() + budgetMs;
     let last;
-    for (let i = 0; i < 25; i++) {
+    do {
       last = fn();
       if (pred(last)) return last;
-      execFileSync(process.execPath, ['-e', 'setTimeout(() => {}, 200)']);
-    }
+      nap(200);
+    } while (Date.now() < deadline);
     assert.fail(`${what}: ${JSON.stringify(last)}`);
   };
   const evalJson = (c, js) => {
@@ -6457,12 +6484,60 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert.strictEqual(r.status, 0, r.stderr);
     return JSON.parse(r.stdout.trim());
   };
+  // The page and its iframes: document identity (timeOrigin), load state and
+  // the fixtures' window.__registered ('pending' until the browser answered
+  // every registerTool(), then 'ok'; 'none' on a page without tools).
+  const DOCS_JS = '(() => { const wins = [window, ...Array.from(document.querySelectorAll("iframe"), '
+    + '(f) => f.contentWindow)]; return { t0: performance.timeOrigin, url: location.href, '
+    + 'docs: wins.map((w, i) => { try { return { i, url: w.location.href, t0: w.performance.timeOrigin, '
+    + 'state: w.document.readyState, reg: w.__registered || "none" }; } '
+    + 'catch (e) { return { i, state: "unreadable" }; } }) }; })()';
+  const docs = (c) => {
+    try { return evalJson(c, DOCS_JS); } catch (err) { return null; }  // mid-navigation
+  };
+  // Wait until the page is a new document (timeOrigin != `after`, when given),
+  // loaded, and every registerTool() in it and in its iframes was answered.
+  // A "go" or a reload returning is not that: tools are registered by page
+  // scripts, and the browser answers each registration asynchronously.
+  // Chromium sometimes never answers an iframe's registerTool() (seen on
+  // 153: the promise stays pending and the tool never reaches getTools(),
+  // whoever asks). That is a browser bug, not cdpilot's: such a frame is
+  // reloaded (at most 3 times, with a note in the output) and waited on again.
+  // A stuck top-level registration is not worked around: it fails the test.
+  const settle = (c, what, after) => {
+    const deadline = Date.now() + 45000;
+    const pendingSince = new Map();
+    let last = null;
+    let reloads = 0;
+    while (Date.now() < deadline) {
+      last = docs(c);
+      const fresh = last && (after === undefined || last.t0 !== after);
+      if (fresh && last.docs.every((d) => d.state === 'complete' && (d.reg === 'ok' || d.reg === 'none'))) {
+        return last;
+      }
+      for (const d of fresh ? last.docs : []) {
+        if (d.i === 0 || d.state !== 'complete' || d.reg !== 'pending') continue;
+        const key = `${d.url} ${d.t0}`;
+        if (!pendingSince.has(key)) {
+          pendingSince.set(key, Date.now());
+        } else if (Date.now() - pendingSince.get(key) > 5000 && reloads < 3) {
+          reloads++;
+          console.log(`    note: ${what}: the browser never answered registerTool() in ${d.url}; `
+            + 'reloading that frame (Chromium bug)');
+          c('eval', `document.querySelectorAll("iframe")[${d.i - 1}].contentWindow.location.reload()`);
+        }
+      }
+      nap(200);
+    }
+    assert.fail(`${what}: page not settled: ${JSON.stringify(last)}`);
+  };
 
   try {
     test('webmcp e2e: go + tools list shows imperative, declarative and iframe tools with title/annotations', () => {
       const { c, httpPort, trace } = needE2E();
       ok(c('status'), /WebMCP: on/, 'status');
       ok(c('go', `http://127.0.0.1:${httpPort}/shop.html`), /WebMCP fixture shop/, 'go');
+      settle(c, 'shop');
       fs.writeFileSync(trace, '');
       const out = until(() => listJson(c), (o) => o.tools.length === 4, 'four tools');
       const byName = Object.fromEntries(out.tools.map((t) => [t.name, t]));
@@ -6525,6 +6600,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     test('webmcp e2e: a page that wraps getTools/executeTool gets no fake tool, no hijacked result, no view of the calls', () => {
       const { c, httpPort } = needE2E();
       ok(c('go', `http://127.0.0.1:${httpPort}/patched.html`), /Patched API/, 'go');
+      settle(c, 'patched page');
       const out = until(() => listJson(c), (o) => o.tools.length > 0, 'patched page tools');
       assert.deepStrictEqual(out.tools.map((t) => t.name), ['real_counter'], 'only the real tool');
       const r = c('tools', 'call', 'real_counter', '{"by":3}');
@@ -6546,6 +6622,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     test('webmcp e2e: one tool name in two same-origin frames: --frame picks which one runs', () => {
       const { c, httpPort } = needE2E();
       c('go', `http://127.0.0.1:${httpPort}/twoframes.html`);
+      settle(c, 'two frames');
       const out = until(() => listJson(c), (o) => o.tools.length === 2, 'two frame tools');
       assert.deepStrictEqual(out.tools.map((t) => t.name), ['frame_echo', 'frame_echo']);
       assert.deepStrictEqual(out.tools.map((t) => t.frame.replace(/^.*\//, '')).sort(),
@@ -6566,20 +6643,27 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     test('webmcp e2e: a --timeout aborts the running tool through its signal (exit 124)', () => {
       const { c, httpPort } = needE2E();
       c('go', `http://127.0.0.1:${httpPort}/shop.html`);
+      settle(c, 'shop');
       until(() => listJson(c), (o) => o.tools.length === 4, 'shop tools');
-      const r = c('--timeout', '4', 'tools', 'call', 'wait_for_abort');
+      // 10 s: connecting and listing (slow on a loaded CI runner) come out of the
+      // same budget, and the tool must have started before its signal aborts.
+      const r = c('--timeout', '10', 'tools', 'call', 'wait_for_abort');
       assert.strictEqual(r.status, 124, `${r.stdout}${r.stderr}`);
-      ok(r, /its execution was aborted/, 'timeout message');
+      ok(r, /timed out after 10s \(--timeout\); its execution was aborted/, 'timeout message');
       assert.strictEqual(evalJson(c, 'window.__slowAborted'), true, "the tool's signal was aborted");
     });
 
     test('webmcp e2e: the list follows a reload and a link navigation to another page', () => {
       const { c } = needE2E();
+      const shop = settle(c, 'shop');
       c('eval', 'location.reload()');
-      until(() => evalJson(c, 'window.__cart ? window.__cart.length : -1'), (n) => n === 0, 'reloaded');
+      const reloaded = settle(c, 'reload', shop.t0);  // a new document, not the old one
+      assert(/shop\.html$/.test(reloaded.url), reloaded.url);
       const again = until(() => listJson(c), (o) => o.tools.length === 4, 'tools after reload');
       assert(again.tools.some((t) => t.name === 'add_to_cart'));
       ok(c('click', '#next'), /Clicked/, 'click link');
+      const two = settle(c, 'page two', reloaded.t0);
+      assert(/page2\.html$/.test(two.url), two.url);
       const p2 = until(() => listJson(c), (o) => o.tools.length === 1, 'page two tools');
       assert.strictEqual(p2.tools[0].name, 'lookup_order');
       assert.strictEqual(p2.tools[0].annotations.readOnlyHint, true);
@@ -6595,6 +6679,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     test('webmcp e2e: bad arguments exit 1 before the tool runs', () => {
       const { c, httpPort } = needE2E();
       c('go', `http://127.0.0.1:${httpPort}/shop.html`);
+      settle(c, 'shop again');
       until(() => listJson(c), (o) => o.tools.length === 4, 'shop again');
       for (const [args, re] of [[['{"sku":"B1"}'], /missing required argument: qty/],
         [['{"sku":"B1","qty":true}'], /qty: expected integer, got boolean/],
@@ -6616,6 +6701,21 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert(!/WebMCP/.test(l.stdout), l.stdout);
       assert(!/WebMCP/.test(c('status').stdout), 'status: no WebMCP line while the mode is off');
       c('go', `http://127.0.0.1:${httpPort}/shop.html`);
+      settle(c, 'shop without the flag');
+      if (evalJson(c, 'typeof document.modelContext') === 'object') {
+        // Some builds turn WebMCP on without the flag (Chrome for Testing 153 does,
+        // through its field-trial config). Then there is nothing to diagnose; only
+        // make sure cdpilot did not pass the flag itself.
+        // chrome://version shows this browser's own command line.
+        const v = c('go', 'chrome://version');
+        assert.strictEqual(v.status, 0, v.stdout + v.stderr);
+        const cmdline = evalJson(c, 'document.getElementById("command_line").textContent');
+        assert(cmdline.includes(`--remote-debugging-port=${e2e.cdpPort}`), cmdline);
+        assert(!/--enable-features=\S*WebMCP/.test(cmdline), cmdline);
+        console.log('    note: this browser enables WebMCP without --enable-features=WebMCP; '
+          + 'the no-WebMCP diagnosis was not exercised');
+        return;
+      }
       const out = listJson(c);
       assert.deepStrictEqual(out.tools, []);
       assert.strictEqual(out.reason, 'flag-off');
