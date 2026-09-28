@@ -582,7 +582,13 @@ function showHelp() {
                        injection skipped. "stop" ends the signer.
 
   RELIABILITY
-    browser [name]     Show or set preferred browser (chrome|brave|chromium|edge|vivaldi|auto)
+    browser [name]     Show or set preferred browser
+                       (chrome|brave|chromium|edge|vivaldi|chrome-for-testing|auto)
+    browser install chrome-for-testing [--channel stable|beta|dev|canary] [--version X]
+                       Download Chrome for Testing (~150-190 MB, only on this
+                       command) for extension development: Chrome 137+ ignores
+                       --load-extension, CfT does not. Used instead of Chrome
+                       while dev extensions are registered. Not for stealth.
     health             JSON status: alive, port, tabs, browser, today's crashes
 
   PROJECTS
@@ -849,6 +855,10 @@ if (cmd === 'status') {
 
   if (browser && !process.env.CHROME_BIN) {
     env.CHROME_BIN = browser;
+    // Tells src/cdpilot.py this CHROME_BIN is our guess, not the user's: it
+    // still applies `cdpilot browser <name>` and the dev-extension rule
+    // (Chrome -> Chrome for Testing) on top of it.
+    env.CDPILOT_CHROME_BIN_AUTO = '1';
   }
 
   const child = spawn(python, [SCRIPT, ...args], {
