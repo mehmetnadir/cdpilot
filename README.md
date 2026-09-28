@@ -788,14 +788,21 @@ and exits with code 2 and the start command above instead of half-working.
 
 **What cdpilot does with a connected browser:**
 
-- Page commands (`go`, `click`, `fill`, `shot`, …) run in it. `go` may reuse the
-  tab that is already open.
+- Page commands (`go`, `click`, `fill`, `shot`, …) run in a tab cdpilot opens
+  for itself (`Target.createTarget`) on the first page command, and keep using
+  that tab. Your own tabs are never navigated or typed into; only a command that
+  names a tab touches it (`switch-tab`, `close-tab <index|id>`, `CDPILOT_TARGET`,
+  and `multi-eval`, which runs its script in every open tab).
 - It never closes or kills it. `close`, `close --force`, `stop`,
   `stop --smart [--force]`, `project-stop`, `stop-all`, `session-close` and MCP
   `browser_close` only print "connected browser left running; run
   `cdpilot disconnect` to forget it". The idle auto-close never touches it,
-  `tabs --reap` closes nothing, `close-tab` never closes the last tab, `wipe`
-  is refused, and `launch` / MCP `browser_launch` start nothing.
+  `tabs --reap` closes nothing, `wipe` and `permission` are refused,
+  `context close` only destroys a context `context create` made, and `launch` /
+  MCP `browser_launch` start nothing.
+- `close-tab` is an explicit command and **can close your tabs**: the active
+  (cdpilot) tab with no argument, or any tab you name by index or id. It never
+  closes the last tab, which would quit the browser on Windows and Linux.
 - It injects nothing into it: no stealth patch or user-agent override (whatever
   `cdpilot mode` / `stealth` says), no glow, no input blocker, no dev-extension
   scripts, no auto-cookie restore.
@@ -816,8 +823,9 @@ and exits with code 2 and the start command above instead of half-working.
   runs, not just to cdpilot. Close the browser when you are done.
 - Sites can tell automation more easily: cdpilot applies no stealth to a
   connected browser.
-- Commands act in the tab you may be looking at; an agent's `go` replaces the
-  page you have open there.
+- cdpilot's tab opens in the foreground of your browser window, and an agent
+  may still act in one of your tabs when it names it (`switch-tab`,
+  `close-tab <n>`, `multi-eval`).
 
 ### WebMCP tools (opt-in)
 

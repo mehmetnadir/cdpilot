@@ -195,12 +195,12 @@ EXTERNAL_GONE = ("your connected browser is gone; "
                  "run `cdpilot connect` again or `cdpilot disconnect`")
 
 
-def _refuse_external(action):
-    """On a connected (external) browser, exit 1: `action` would clear or close
-    things in the user's own browser (cookies, storage, tabs)."""
+def _refuse_external(action, what="clears its cookies, storage or tabs"):
+    """On a connected (external) browser, exit 1: `action` would clear, close
+    or change something in the user's own browser."""
     if _is_external():
-        print(f"{action} refused: this is your connected browser; cdpilot never clears "
-              "its cookies, storage or tabs", file=sys.stderr)
+        print(f"{action} refused: this is your connected browser; cdpilot never {what}",
+              file=sys.stderr)
         sys.exit(1)
 
 
@@ -1914,6 +1914,22 @@ def _create_session_window():
     """
     sid = _get_session_id()
 
+    # A connected (external) browser's open tabs are the user's own: never
+    # adopt one (a `go` would navigate it away, unsaved form and all). The
+    # session gets a tab of its own, opened with Target.createTarget.
+    if _is_external():
+        target_id = _external_create_tab()
+        if target_id:
+            sessions = _load_sessions()
+            sessions[sid] = {
+                "target_id": target_id,
+                "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "last_used": time.time(),
+            }
+            _save_sessions(sessions)
+            _mark_owned_tab(target_id)
+        return target_id
+
     # Check existing tabs — reuse if already open
     tabs = cdp_get("/json")
     if tabs:
@@ -1958,10 +1974,44 @@ def _create_session_window():
 
     return target_id
 
+def _external_create_tab(url="about:blank"):
+    """Open a new tab in the connected (external) browser: Target.createTarget
+    on the browser socket. Returns its target id, or None.
+
+    Runs on a worker thread with its own loop, like _cdp_browser_close, so a
+    caller inside a running loop (an async command's get_page_ws) works too.
+    """
+    ver = cdp_get("/json/version", no_cache=True) or {}
+    browser_ws = ver.get("webSocketDebuggerUrl")
+    if not browser_ws:
+        return None
+    out = []
+
+    def _send():
+        try:
+            r = asyncio.run(cdp_send(browser_ws, [(1, "Target.createTarget", {"url": url})],
+                                     timeout=10))
+            out.append((r.get(1) or {}).get("targetId"))
+        except BaseException:  # cdp_send exits when it cannot connect at all
+            pass
+
+    worker = threading.Thread(target=_send, daemon=True)
+    worker.start()
+    worker.join(15)
+    cdp_cache_invalidate()
+    return out[0] if out else None
+
+
+def _session_target_usable(target_id):
+    """On a connected (external) browser only a tab cdpilot opened itself may
+    serve as the session tab; anywhere else any recorded target does."""
+    return bool(target_id) and (not _is_external() or target_id in _load_owned_tabs())
+
+
 def _ensure_session_window():
     """Create a session window if none exists, or validate the existing one."""
     target_id = _get_session_window_target_id()
-    if target_id:
+    if target_id and _session_target_usable(target_id):
         # Verify target still exists
         tabs = cdp_get("/json") or []
         if any(t.get("id") == target_id for t in tabs):
@@ -2007,6 +2057,9 @@ def get_page_ws(prefer_url=None):
 
     # Get target ID for the current session window
     session_target_id = _get_session_window_target_id()
+    external = _is_external()
+    if external and not _session_target_usable(session_target_id):
+        session_target_id = None  # never a user tab of a connected browser
 
     if session_target_id and pages:
         session_page = None
@@ -2035,6 +2088,12 @@ def get_page_ws(prefer_url=None):
                 for t in tabs:
                     if t.get("id") == new_target_id:
                         return t["webSocketDebuggerUrl"], t
+
+    if external:
+        # Never fall back to one of the user's own tabs.
+        print("Could not open a tab of cdpilot's own in the connected browser; "
+              "your tabs were left untouched.", file=sys.stderr)
+        sys.exit(1)
 
     # Fallback: use any available page
     if pages:
@@ -3312,9 +3371,10 @@ async def _blocker_passthrough(ws_url):
 
     Only with visual feedback on (`show on`, CDPILOT_SHOW=1, MCP sessions):
     without it there is no blocker and nothing extra is sent. The blocker is
-    restored in `finally`.
+    restored in `finally`. Never on a connected (external) browser: cdpilot
+    puts no blocker there (see _control_start).
     """
-    if not get_visual_config():
+    if not get_visual_config() or _is_external():
         yield
         return
     route = _FRAME_ROUTE.get() or _FrameRoute(ws_url)
@@ -7227,6 +7287,7 @@ async def cmd_context_create(url='about:blank'):
         print(f'createTarget failed: {r2.get(2)}', file=sys.stderr)
         sys.exit(1)
     cdp_cache_invalidate()
+    _mark_owned_context(ctx_id)
     print(json.dumps({
         "context_id": ctx_id,
         "target_id": tgt_id,
@@ -7272,13 +7333,41 @@ async def cmd_context_list():
     }, indent=2))
 
 
+OWNED_CONTEXTS_FILE = os.path.join(PROFILE_DIR, 'owned-contexts.json')
+
+
+def _load_owned_contexts():
+    try:
+        with open(OWNED_CONTEXTS_FILE) as f:
+            return set(json.load(f).get("owned", []))
+    except (OSError, ValueError, AttributeError):
+        return set()
+
+
+def _mark_owned_context(ctx_id):
+    """Record a browser context `context create` made (see cmd_context_close)."""
+    owned = _load_owned_contexts() | {ctx_id}
+    try:
+        os.makedirs(os.path.dirname(OWNED_CONTEXTS_FILE), exist_ok=True)
+        with open(OWNED_CONTEXTS_FILE, "w") as f:
+            json.dump({"owned": sorted(owned)}, f)
+    except OSError:
+        pass
+
+
 async def cmd_context_close(context_id):
     """Destroy a browser context. All tabs inside it close automatically.
 
     Refuses to destroy the default context (which has no context_id anyway).
+    On a connected (external) browser only a context `context create` made is
+    destroyed: any other one holds the user's own tabs.
     """
     if not context_id or context_id == 'default':
         print('Cannot destroy the default context.', file=sys.stderr)
+        sys.exit(1)
+    if _is_external() and context_id not in _load_owned_contexts():
+        print(f"context close refused: {context_id} was not created by cdpilot and this is "
+              f"your connected browser; {EXTERNAL_LEFT_RUNNING}", file=sys.stderr)
         sys.exit(1)
     ver = cdp_get('/json/version')
     browser_ws = ver.get('webSocketDebuggerUrl') if ver else None
@@ -13873,7 +13962,9 @@ async def cmd_geo(lat_or_preset, lng=None, accuracy=None):
 
 
 async def cmd_permission(subcmd, perm=None):
-    """Manage browser permissions."""
+    """Manage browser permissions. Refused on a connected (external) browser:
+    grant/deny/reset would change the user's own browser for every origin."""
+    _refuse_external("permission", "changes its permissions")
     browser_ws = await _get_browser_ws()
     ws_url, page_info = get_page_ws()
 

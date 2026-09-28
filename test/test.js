@@ -6100,6 +6100,53 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     } finally { fake.stop(); }
   });
 
+  test('external guard: page commands open a tab of their own, never touch the user\'s tab', () => {
+    const run = (external) => {
+      const fake = startFake();
+      try {
+        const home = mkHome();
+        const entry = external ? externalEntry(fake.port)
+          : { ...externalEntry(fake.port), external: undefined, status: 'running' };
+        writeRegistry(home, { proj: entry });
+        // A session record naming the user's tab (what the old reuse wrote):
+        // on a connected browser it must not be trusted.
+        fs.mkdirSync(path.join(home, 'profile'), { recursive: true });
+        if (external) {
+          fs.writeFileSync(path.join(home, 'profile', 'sessions.json'), JSON.stringify({
+            'cdpilot-default': { target_id: 'PAGE1', created: 'x', last_used: Date.now() / 1000 } }));
+        }
+        const env = isoEnv(home, fake.port, 'proj');
+        const outs = [['go', 'https://example.com/'], ['content'], ['eval', 'document.title'],
+          ['html']].map((a) => {
+          const r = cli(a, env);
+          assert.strictEqual(r.status, 0, `${a.join(' ')} exit ${r.status}: ${r.stdout}${r.stderr}`);
+          return r;
+        });
+        const listed = JSON.parse(spawnSync(PY_BIN, ['-c',
+          `import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:${fake.port}/json").read().decode())`],
+          { encoding: 'utf-8', timeout: 10000 }).stdout);
+        return { fake, outs, entries: fake.entries(), listed };
+      } finally { fake.stop(); }
+    };
+    const ext = run(true);
+    const creates = ext.entries.filter((e) => e.method === 'Target.createTarget');
+    assert.strictEqual(creates.length, 1, `one tab of its own for all four commands: ${JSON.stringify(creates)}`);
+    const onUser = ext.entries.filter((e) => (e.ws || e.ws_open || '').endsWith('/PAGE1'));
+    assert.deepStrictEqual(onUser, [], 'no socket may touch the user\'s tab');
+    const pageMethods = ext.entries.filter((e) => e.method && (e.ws || '').includes('/devtools/page/'));
+    assert(pageMethods.length > 0 && pageMethods.every((e) => e.ws === '/devtools/page/PAGE2'),
+      `every page command must run in cdpilot's own tab: ${JSON.stringify(pageMethods)}`);
+    const user = ext.listed.find((t) => t.id === 'PAGE1');
+    assert.strictEqual(user.url, 'https://user.example/inbox', 'the user tab keeps its URL');
+    assert.strictEqual(user.title, "The user's own tab", 'the user tab keeps its title');
+    assert(ext.listed.some((t) => t.id === 'PAGE2' && t.url === 'https://example.com/'),
+      `go navigated cdpilot's tab: ${JSON.stringify(ext.listed)}`);
+    // Control: a cdpilot browser reuses its open tab, so the fake would show it.
+    const own = run(false);
+    assert(own.entries.some((e) => e.method === 'Page.navigate' && e.ws === '/devtools/page/PAGE1'),
+      'control: without the external rule the open tab is reused');
+  });
+
   // ── connect --auto ──
 
   test('connect: --auto finds DevToolsActivePort via CDPILOT_BROWSER_SEARCH_ROOT', () => {
@@ -6184,7 +6231,16 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       '_idle_watcher_step', '_cleanup_idle_sessions', 'cmd_wipe', '_close_target', '_reap_tabs',
       '_browser_close_graceful', 'cmd_close', 'cmd_session_close', 'cmd_close_tab',
       '_cdp_browser_close', '_stop_browser_on_port', 'cmd_stop', 'cmd_project_stop', 'cmd_stop_all',
+      // Network.deleteCookies + Storage.clearDataForOrigin: cmd_wipe (above).
+      'cmd_context_close',  // disposeBrowserContext: only contexts `context create` made
+      'cmd_permission',     // Browser.resetPermissions (+ grant/deny): refused
     ];
+    // Target.disposeBrowserContext that cannot reach a user context: each one
+    // disposes a context the same function created a moment earlier (a
+    // rollback after createTarget failed), or the per-`go` isolated context
+    // cmd_go made through _new_isolated_context. A user's context id never
+    // reaches them.
+    const OWN_CONTEXT_ONLY = ['cmd_context_create', '_new_isolated_context', '_dispose_context'];
     const VIA_GUARDED_HELPER = {  // reach a browser only through a guarded helper
       _api_create_session: /_stop_browser_on_port\(/, _api_release_session: /_stop_browser_on_port\(|Browser\.close/,
     };
@@ -6192,7 +6248,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       '_pid_alive', '_watch_pid_alive', '_watch_daemon_run', 'cmd_watch_start', 'cmd_watch_stop',
       '_arm_timeout_watchdog',
     ];
-    const PAT = /Browser\.close|os\.kill\(|taskkill|Target\.closeTarget|\/json\/close|Page\.close|_stop_browser_on_port\(|_cdp_browser_close\(|_browser_close_graceful\(|_close_target\(|\.kill\(\)|\.terminate\(\)|SIGKILL|SIGTERM/;
+    const PAT = /Browser\.close|os\.kill\(|taskkill|Target\.closeTarget|\/json\/close|Page\.close|_stop_browser_on_port\(|_cdp_browser_close\(|_browser_close_graceful\(|_close_target\(|\.kill\(\)|\.terminate\(\)|SIGKILL|SIGTERM|Target\.disposeBrowserContext|Storage\.clearDataForOrigin|Network\.deleteCookies|Network\.clearBrowserCookies|Storage\.clearCookies|Browser\.resetPermissions/;
     const lines = PY_CONTENT.split('\n');
     const bodies = {};
     const hits = {};
@@ -6205,7 +6261,21 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       if (/^\s*#/.test(line)) continue;
       if (PAT.test(line)) (hits[cur] = hits[cur] || []).push(line.trim());
     }
-    const known = new Set([...GUARDED, ...Object.keys(VIA_GUARDED_HELPER), ...NOT_A_BROWSER]);
+    const known = new Set([...GUARDED, ...Object.keys(VIA_GUARDED_HELPER), ...NOT_A_BROWSER,
+      ...OWN_CONTEXT_ONLY]);
+    for (const f of OWN_CONTEXT_ONLY) {
+      for (const h of hits[f] || []) {
+        assert(/Target\.disposeBrowserContext/.test(h), `${f} may only dispose its own context: ${h}`);
+      }
+      if (f !== '_dispose_context') {
+        assert(/Target\.createBrowserContext/.test(bodies[f]), `${f} must create the context it disposes`);
+      }
+    }
+    const disposeCallers = Object.keys(bodies).filter((f) => f !== '_dispose_context'
+      && /_dispose_context\(/.test(bodies[f]));
+    assert.deepStrictEqual(disposeCallers, ['cmd_go'], `_dispose_context callers: ${disposeCallers}`);
+    assert(/ctx_id_to_dispose = ctx_id/.test(bodies.cmd_go) && /_new_isolated_context\(/.test(bodies.cmd_go),
+      'cmd_go may only dispose the context _new_isolated_context made');
     const unknown = Object.keys(hits).filter((f) => !known.has(f));
     assert.deepStrictEqual(unknown, [],
       `new destructive call site(s) outside the guarded helpers: ${unknown.map((f) => `${f}: ${hits[f][0]}`).join(' | ')}`);
@@ -6289,11 +6359,42 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     return candidates.find((c) => fs.existsSync(c)) || null;
   }
 
-  function startHeadless(browserBin, cdpPort, userDataDir) {
+  // The first page target titled USER-MAIL (or the first page), read straight
+  // over CDP (not through cdpilot); `expr` is evaluated in it.
+  function userTab(cdpPort, expr) {
+    const r = spawnSync(PY_BIN, ['-c', [
+      'import asyncio, json, sys, urllib.request, websockets',
+      `pages = [t for t in json.loads(urllib.request.urlopen("http://127.0.0.1:${cdpPort}/json").read()) if t.get("type") == "page"]`,
+      'tab = next((t for t in pages if t.get("title") == "USER-MAIL"), pages[0] if pages else None)',
+      'async def ev():',
+      '    async with websockets.connect(tab["webSocketDebuggerUrl"], max_size=2**24) as ws:',
+      `        await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": ${JSON.stringify(expr)}, "returnByValue": True}}))`,
+      '        while True:',
+      '            m = json.loads(await ws.recv())',
+      '            if m.get("id") == 1:',
+      '                return m["result"]["result"].get("value")',
+      // A headless background tab sometimes leaves one evaluate unanswered for
+      // seconds (measured: 3 of 17 probes, each fine on the next try): retry.
+      'value, err = None, None',
+      'for _ in range(6):',
+      '    try:',
+      '        value = asyncio.run(asyncio.wait_for(ev(), 5)) if tab else None',
+      '        err = None',
+      '        break',
+      '    except Exception as e:',
+      '        err = repr(e)',
+      'if err:',
+      '    sys.exit("probe failed: " + err)',
+      'print(json.dumps({"id": tab and tab["id"], "title": tab and tab["title"], "url": tab and tab["url"], "value": value, "pages": len(pages)}))',
+    ].join('\n')], { encoding: 'utf-8', timeout: 20000 });
+    try { return JSON.parse(r.stdout.trim()); } catch { return { error: `${r.status} ${r.stdout} ${r.stderr}`.slice(-600) }; }
+  }
+
+  function startHeadless(browserBin, cdpPort, userDataDir, startUrl = 'about:blank') {
     const chrome = spawn(browserBin, [
       `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${userDataDir}`,
       '--headless=new', '--no-first-run', '--no-default-browser-check',
-      '--disable-background-networking', '--remote-allow-origins=*', 'about:blank',
+      '--disable-background-networking', '--remote-allow-origins=*', startUrl,
     ], { stdio: 'ignore', detached: true });
     chrome.unref();
     let wsPath = '';
@@ -6329,13 +6430,18 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       const browserBin = findBrowserBin();
       assert(browserBin, 'No browser found for e2e connect test');
 
-      // Start the browser ourselves (NOT via cdpilot) with --user-data-dir and --remote-debugging-port
-      const browser = startHeadless(browserBin, cdpPort, userDataDir);
+      // Start the browser ourselves (NOT via cdpilot) with --user-data-dir and
+      // --remote-debugging-port. Its one tab is "the user's": a known title and
+      // a form with text typed but never saved.
+      const userUrl = 'data:text/html,<title>USER-MAIL</title><textarea id="draft"></textarea>';
+      const browser = startHeadless(browserBin, cdpPort, userDataDir, userUrl);
+      const user = userTab(cdpPort, 'document.getElementById("draft").value = "unsaved draft 42"; document.title');
+      assert(user && user.title === 'USER-MAIL', `user tab not ready: ${JSON.stringify(user)}`);
       const env = isoEnv(home, cdpPort, 'connect-e2e', { CDPILOT_PROFILE: path.join(home, 'cdpilot-profile') });
       const c = (...cArgs) => spawnSync(process.execPath, [CLI, ...cArgs], {
         encoding: 'utf-8', timeout: 60000, env,
       });
-      e2eConnect = { c, browser, cdpPort, home, env, pid: browser.pid };
+      e2eConnect = { c, browser, cdpPort, home, env, pid: browser.pid, user };
     });
 
     const needConnect = () => { assert(e2eConnect, 'connect e2e setup failed'); return e2eConnect; };
@@ -6352,6 +6458,22 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
         assert(/Connected to/.test(r.stdout), `should say Connected: ${r.stdout}`);
         assert(/will never close/.test(r.stdout), `should say never close: ${r.stdout}`);
         assert(/cookies and sessions/.test(r.stderr), `should warn about cookies: ${r.stderr}`);
+      });
+
+      test('connect e2e: the user tab survives connect + go + content unchanged (title, URL, unsaved text)', () => {
+        const { c, cdpPort, user } = needConnect();
+        const g = c('go', 'data:text/html,<title>AGENT</title><p>agent page</p>');
+        assert.strictEqual(g.status, 0, `go: ${g.stdout}${g.stderr}`);
+        const t = c('content');
+        assert.strictEqual(t.status, 0, `content: ${t.stdout}${t.stderr}`);
+        assert(/agent page/.test(t.stdout), `content reads cdpilot's own tab: ${t.stdout}`);
+        const after = userTab(cdpPort, 'document.getElementById("draft").value');
+        assert(after, 'user tab must still exist');
+        assert.strictEqual(after.id, user.id, 'same user tab (not closed and reopened)');
+        assert.strictEqual(after.title, 'USER-MAIL', `user tab title changed: ${JSON.stringify(after)}`);
+        assert.strictEqual(after.url, user.url, 'user tab URL changed');
+        assert.strictEqual(after.value, 'unsaved draft 42', 'unsaved text in the user tab was lost');
+        assert.strictEqual(after.pages, user.pages + 1, 'cdpilot opened exactly one tab of its own');
       });
 
       test('connect e2e: go, content, smart-click work on the connected browser', () => {
@@ -6389,6 +6511,10 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
         assert(/keeps running/.test(r.stdout + r.stderr), `should say keeps running: ${r.stdout}`);
         assert(!readRegistry(home)['connect-e2e'], 'entry must be gone after disconnect');
         assert(browserAlive(), 'browser process should still be alive after disconnect');
+        const { cdpPort, user } = needConnect();
+        const after = userTab(cdpPort, 'document.getElementById("draft").value');
+        assert(after && after.id === user.id && after.title === 'USER-MAIL'
+          && after.value === 'unsaved draft 42', `user tab after the whole run: ${JSON.stringify(after)}`);
       });
     } finally {
       if (e2eConnect) e2eConnect.browser.stop();
