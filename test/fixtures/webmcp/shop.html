@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>WebMCP Test Fixture — Shop</title>
+</head>
+<body>
+  <h1>WebMCP Test Shop</h1>
+  <p id="status">Cart: 0 items</p>
+
+  <!-- Declarative form tool -->
+  <form toolname="subscribe_newsletter" tooldescription="Subscribe to store newsletter">
+    <label>Email: <input type="email" name="email" required
+           toolparameterdescription="Customer email address"></label>
+    <button type="submit">Subscribe</button>
+  </form>
+  <p id="sub-status">Not subscribed</p>
+
+  <script>
+    // ── Page state ──
+    window.__cart = [];
+    window.__subscribed = null;
+
+    // Handle newsletter form
+    document.querySelector('form[toolname]').addEventListener('submit', function(e) {
+      e.preventDefault();
+      var email = new FormData(this).get('email');
+      window.__subscribed = email;
+      document.getElementById('sub-status').textContent = 'Subscribed: ' + email;
+    });
+
+    // ── Imperative tool registration ──
+    function registerTools() {
+      if (typeof document.modelContext === 'undefined') return;
+
+      var ac = new AbortController();
+      window.__toolAbort = ac;
+
+      document.modelContext.registerTool({
+        name: 'add_to_cart',
+        description: 'Add a product to the shopping cart',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sku:  { type: 'string',  description: 'Product SKU identifier' },
+            qty:  { type: 'integer', description: 'Quantity to add', default: 1 }
+          },
+          required: ['sku', 'qty']
+        },
+        execute: async function(input) {
+          window.__cart.push({ sku: input.sku, qty: input.qty });
+          document.getElementById('status').textContent =
+            'Cart: ' + window.__cart.length + ' items';
+          return { ok: true, sku: input.sku, qty: input.qty,
+                   cart_size: window.__cart.length };
+        }
+      }, { signal: ac.signal });
+    }
+
+    // Run after DOM ready (and after any polyfill that may create the API)
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', registerTools);
+    } else {
+      registerTools();
+    }
+  </script>
+</body>
+</html>

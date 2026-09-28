@@ -363,8 +363,10 @@ function showHelp() {
 
   SETUP
     setup              Auto-detect browser, create isolated profile
-    launch [--idle-close <min>]  Start browser with CDP enabled (--idle-close or
-                       CDPILOT_IDLE_CLOSE: close it after <min> idle minutes)
+    launch [--idle-close <min>] [--webmcp]
+                       Start browser with CDP enabled (--idle-close or
+                       CDPILOT_IDLE_CLOSE: close it after <min> idle minutes;
+                       --webmcp: enable WebMCP bridge, see WEBMCP below)
     status             Check browser connection
     stop [--smart]     Stop browser (--smart = close owned tabs, quit if empty)
     close [--force|--keep]  Smart close: close cdpilot's tabs; quit browser only
@@ -479,6 +481,16 @@ function showHelp() {
                        Typed values, secret-looking args and token/key/secret URL
                        params are redacted. CDPILOT_LOG=0 turns it off;
                        CDPILOT_LOG_DAYS (default 14) sets how many days are kept.
+
+  WEBMCP (opt-in: launch --webmcp or CDPILOT_WEBMCP=1)
+    tools list [--json] List WebMCP tools registered on the current page:
+                        name, description, inputSchema, source (imperative
+                        JS or declarative HTML form). If no tools found,
+                        shows a diagnostic hint.
+    tools call <name> [json-args | --arg k=v ...]
+                        Invoke a WebMCP tool, print JSON result. Arguments
+                        validated against inputSchema. Tool errors → exit 1.
+                        SECURITY: runs the page's own JS — treat as untrusted.
 
   WATCH (continuous screencast for AI video understanding)
     watch start <url>  Begin JPEG screencast at N fps to a disk ring buffer
@@ -715,6 +727,11 @@ if (cmd === 'status') {
 
   if (browser && !process.env.CHROME_BIN) {
     env.CHROME_BIN = browser;
+  }
+
+  // --webmcp flag: enable WebMCP bridge (tools list / tools call)
+  if (argv.includes('--webmcp')) {
+    env.CDPILOT_WEBMCP = '1';
   }
 
   const child = spawn(python, [SCRIPT, ...args], {

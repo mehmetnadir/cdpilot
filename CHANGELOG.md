@@ -2,6 +2,17 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **WebMCP bridge** (`tools list`, `tools call`). WebMCP is a web standard where pages register JavaScript functions and HTML forms as structured "tools" that AI agents can discover and invoke. cdpilot now exposes a bridge to this protocol via two new CLI commands and two new MCP tools.
+  - **`tools list [--json]`** — List all WebMCP tools registered on the current page: name, description, JSON Schema (`inputSchema`), source (`imperative` for JS-registered, `declarative` for HTML `<form toolname>` elements). When no tools are found, the output includes a diagnostic hint (API not available, flag disabled, not a secure context, page hasn't registered tools).
+  - **`tools call <name> [json-args | --arg k=v ...]`** — Invoke a tool by name with arguments. Arguments are validated against the tool's `inputSchema` (required fields, type checking) before invocation; validation errors print a clear message and exit 1. Tool handler errors also exit 1 with the JS error.
+  - **MCP tools**: `browser_site_tools` (list) and `browser_site_tool_call` (name + arguments) follow the existing `browser_*` tool pattern in the MCP server.
+  - **`launch --webmcp`** flag (also `CDPILOT_WEBMCP=1` env var) enables the bridge: Chrome is launched with `--enable-features=WebMCP,WebMCPTesting` and a polyfill/hook is injected via `Page.addScriptToEvaluateOnNewDocument` before page scripts. The hook wraps `document.modelContext.registerTool` (if the browser has native WebMCP) or provides a minimal polyfill, mirroring all registrations to `window.__cdpilot_webmcp_tools` for external listing/invocation. Declarative `<form toolname>` elements are scanned after DOM ready.
+  - **Security**: tool invocation runs the page's own JavaScript — documented in README and `--help`. `tools call` argument values whose JSON keys contain `password`, `token`, `secret`, or `key` are redacted in the session log (`«redacted:N chars»`).
+  - **Test fixture**: `test/fixtures/webmcp/shop.html` — a self-contained page with an imperative tool (`add_to_cart`) and a declarative form tool (`subscribe_newsletter`). Browserless tests validate the hook/polyfill logic and argument validation; e2e tests launch a headless browser, serve the fixture on localhost, and exercise `tools list` + `tools call` + error paths.
+
 ## [0.9.3] - 2026-09-28
 
 ### Added
