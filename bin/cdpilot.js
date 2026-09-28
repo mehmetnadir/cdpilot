@@ -243,7 +243,9 @@ function runStatus() {
           console.log(`  Browser: ${info.Browser || 'Unknown'}`);
           console.log(`  Protocol: ${info['Protocol-Version'] || 'Unknown'}`);
           console.log(`  WebSocket: ${info.webSocketDebuggerUrl || 'N/A'}`);
-          console.log(`  ${idleCloseLabel(port)}\n`);
+          const webmcp = webmcpLabel(config.profileDir);
+          console.log(`  ${idleCloseLabel(port)}${webmcp ? '' : '\n'}`);
+          if (webmcp) console.log(`  ${webmcp}\n`);
         } catch {
           console.log('  ✓ CDP responding but version info unavailable\n');
         }
@@ -251,6 +253,8 @@ function runStatus() {
     });
     req.on('error', () => {
       console.log('  ❌ No browser connected on this port.');
+      const webmcp = webmcpLabel(config.profileDir);
+      if (webmcp) console.log(`  ${webmcp}`);
       console.log('  Run: cdpilot launch\n');
     });
     req.on('timeout', () => {
@@ -288,6 +292,28 @@ function idleCloseLabel(port) {
   } catch {
     return 'idle close off';
   }
+}
+
+// This project's WebMCP mode, as src/cdpilot.py reads it (get_webmcp_config):
+// CDPILOT_WEBMCP=1|0 wins, else <profile>/webmcp.json written by
+// `launch --webmcp` / `launch --no-webmcp`.
+function webmcpMode(profileDir) {
+  const raw = (process.env.CDPILOT_WEBMCP || '').trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return { on: true, from: 'CDPILOT_WEBMCP' };
+  if (['0', 'false', 'no', 'off'].includes(raw)) return { on: false, from: 'CDPILOT_WEBMCP' };
+  try {
+    const st = JSON.parse(fs.readFileSync(path.join(profileDir, 'webmcp.json'), 'utf-8'));
+    return { on: st.webmcp === true, from: 'launch --webmcp' };
+  } catch {
+    return { on: false, from: null };
+  }
+}
+
+// Printed by `status` only while the mode is on (the default output is unchanged).
+function webmcpLabel(profileDir) {
+  const m = webmcpMode(profileDir);
+  if (!m.on) return null;
+  return `WebMCP: on (${m.from}; browsers start with --enable-features=WebMCP)`;
 }
 
 // ── Version ──
@@ -363,8 +389,11 @@ function showHelp() {
 
   SETUP
     setup              Auto-detect browser, create isolated profile
-    launch [--idle-close <min>]  Start browser with CDP enabled (--idle-close or
-                       CDPILOT_IDLE_CLOSE: close it after <min> idle minutes)
+    launch [--idle-close <min>] [--webmcp|--no-webmcp]
+                       Start browser with CDP enabled (--idle-close or
+                       CDPILOT_IDLE_CLOSE: close it after <min> idle minutes;
+                       --webmcp: this project's browsers start with WebMCP on,
+                       saved until --no-webmcp; see WEBMCP below)
     status             Check browser connection
     stop [--smart]     Stop browser (--smart = close owned tabs, quit if empty)
     close [--force|--keep]  Smart close: close cdpilot's tabs; quit browser only
@@ -479,6 +508,17 @@ function showHelp() {
                        Typed values, secret-looking args and token/key/secret URL
                        params are redacted. CDPILOT_LOG=0 turns it off;
                        CDPILOT_LOG_DAYS (default 14) sets how many days are kept.
+
+  WEBMCP (tools a page registers on document.modelContext; needs launch --webmcp)
+    tools list [--json] The page's tools from getTools(): imperative, <form
+                        toolname> and same-origin iframe tools, with title,
+                        annotations, inputSchema. None: says why (WebMCP off,
+                        insecure page, old browser, none registered); exit 0.
+    tools call <name> [json-args | --arg k=v ...] [--frame <url-part>]
+                        Check args against inputSchema, run executeTool() with
+                        an abort signal (--timeout, default 20s), print the
+                        result. Bad args / tool error: exit 1; timeout: 124.
+                        Runs the page's own code: its result is untrusted.
 
   WATCH (continuous screencast for AI video understanding)
     watch start <url>  Begin JPEG screencast at N fps to a disk ring buffer
