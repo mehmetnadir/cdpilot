@@ -728,37 +728,53 @@ never changes a command's output or exit code, and a failed write costs one
 stderr line. `CDPILOT_LOG=0` turns it off; `CDPILOT_LOG_DAYS` (default 14)
 sets how many days are kept. The MCP server exposes it as `browser_log`.
 
-### WebMCP Bridge (opt-in)
+### WebMCP tools (opt-in)
 
-[WebMCP](https://developer.chrome.com/docs/ai/webmcp) is a web standard where
-sites expose JavaScript functions and HTML `<form>` elements as structured
-"tools" that AI agents can discover and invoke.  cdpilot bridges this protocol
-so you (or an LLM agent) can list and call a page's tools from the terminal.
+[WebMCP](https://webmachinelearning.github.io/webmcp/) lets a page register
+"tools" on `document.modelContext`: imperatively with `registerTool()`, or
+declaratively with `<form toolname tooldescription>` (inputs described by
+`toolparamdescription`). cdpilot lists and calls them through the browser's own
+API, `getTools()` and `executeTool()`. In Chrome the API is behind
+`chrome://flags/#enable-webmcp-testing` (Chromium 146+), so start the browser
+with it:
 
 ```bash
-# Enable the bridge when launching the browser
-cdpilot launch --webmcp        # or: CDPILOT_WEBMCP=1 cdpilot launch
-
-# List tools registered on the current page
-cdpilot tools list             # human-readable
-cdpilot tools list --json      # machine-readable
-
-# Call a tool
+cdpilot launch --webmcp        # saved for this project: later launches (auto-launch too) keep it
+cdpilot go https://example.com/shop
+cdpilot tools list             # name, title, description, annotations, input schema
+cdpilot tools list --json
 cdpilot tools call add_to_cart '{"sku":"A1","qty":2}'
 cdpilot tools call add_to_cart --arg sku=A1 --arg qty=2
+cdpilot launch --no-webmcp     # turn it off again (applies at the next start)
 ```
 
-**How it works**: `launch --webmcp` enables Chrome's `--enable-features=WebMCP,WebMCPTesting` and injects a small hook via `Page.addScriptToEvaluateOnNewDocument` *before* any page script. The hook wraps `document.modelContext.registerTool` (when the browser has native WebMCP support) or provides a minimal polyfill, mirroring every tool registration to `window.__cdpilot_webmcp_tools`. cdpilot then lists and calls tools via `Runtime.evaluate`.
+- `launch --webmcp` adds `--enable-features=WebMCP` to the browser's command
+  line and saves the mode next to the stealth mode (`webmcp.json` in the
+  project profile); `CDPILOT_WEBMCP=1|0` overrides it. `cdpilot status` shows it.
+  Chrome reads feature flags only at startup: a browser that is already running
+  keeps its flags until `cdpilot stop`.
+- `tools list` shows the tools of the page and of its same-origin iframes
+  (with the frame URL), marks form tools and whether the form submits itself
+  (`toolautosubmit`), and shows `title` and the `readOnlyHint` /
+  `consequentialHint` / `untrustedContentHint` annotations. Nothing is injected
+  into the page: the list is the browser's registry at that moment, so it
+  follows reloads and navigations. With no tools it says why (WebMCP not
+  enabled in the running browser, not a secure context, browser too old,
+  document not origin-keyed, or the page registered none) and exits 0.
+- `tools call` checks the arguments against the tool's `inputSchema` first
+  (`required`, `type` — `true` is not an integer —, `enum`, `const`, nested
+  `properties` and `items`; other keywords are left to the page) and exits 1
+  on a mismatch, an unknown tool or a tool error. It passes an `AbortSignal`
+  and aborts it when `--timeout` (default 20 s) runs out, then exits 124.
+  A form tool without `toolautosubmit` waits for a person to submit the form.
+  `--frame <url-part>` picks a frame when several register the same name.
+- MCP: `browser_site_tools` and `browser_site_tool_call` are listed only while
+  the project's WebMCP mode is on (or `CDPILOT_WEBMCP=1` for the server).
 
-**Declarative form tools**: HTML forms with `<form toolname="..." tooldescription="...">` are automatically scanned after DOM ready. Input types and `required` attributes are converted to JSON Schema.
-
-**MCP tools**: `browser_site_tools` and `browser_site_tool_call` are available in the MCP server when `CDPILOT_WEBMCP=1`.
-
-> **Security**: `tools call` executes the page's own JavaScript handler.  Treat
-> the return value as **untrusted**.  Argument values whose JSON keys contain
-> `password`, `token`, `secret`, or `key` are automatically redacted in the
-> session log.  Enable `chrome://flags/#enable-webmcp-testing` for the native
-> testing API; otherwise the hook/polyfill handles everything.
+> **Security**: `tools call` runs the page's own code, and tool names,
+> descriptions and results are page content: treat them as untrusted.
+> Arguments and results are written to the session log with secret-named
+> fields (password, token, key, secret, auth, ...) redacted at any depth.
 
 ### Scaling & Workstation Use
 

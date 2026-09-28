@@ -243,7 +243,8 @@ function runStatus() {
           console.log(`  Browser: ${info.Browser || 'Unknown'}`);
           console.log(`  Protocol: ${info['Protocol-Version'] || 'Unknown'}`);
           console.log(`  WebSocket: ${info.webSocketDebuggerUrl || 'N/A'}`);
-          console.log(`  ${idleCloseLabel(port)}\n`);
+          console.log(`  ${idleCloseLabel(port)}`);
+          console.log(`  ${webmcpLabel(config.profileDir)}\n`);
         } catch {
           console.log('  ✓ CDP responding but version info unavailable\n');
         }
@@ -251,6 +252,7 @@ function runStatus() {
     });
     req.on('error', () => {
       console.log('  ❌ No browser connected on this port.');
+      console.log(`  ${webmcpLabel(config.profileDir)}`);
       console.log('  Run: cdpilot launch\n');
     });
     req.on('timeout', () => {
@@ -288,6 +290,27 @@ function idleCloseLabel(port) {
   } catch {
     return 'idle close off';
   }
+}
+
+// This project's WebMCP mode, as src/cdpilot.py reads it (get_webmcp_config):
+// CDPILOT_WEBMCP=1|0 wins, else <profile>/webmcp.json written by
+// `launch --webmcp` / `launch --no-webmcp`.
+function webmcpMode(profileDir) {
+  const raw = (process.env.CDPILOT_WEBMCP || '').trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return { on: true, from: 'CDPILOT_WEBMCP' };
+  if (['0', 'false', 'no', 'off'].includes(raw)) return { on: false, from: 'CDPILOT_WEBMCP' };
+  try {
+    const st = JSON.parse(fs.readFileSync(path.join(profileDir, 'webmcp.json'), 'utf-8'));
+    return { on: st.webmcp === true, from: 'launch --webmcp' };
+  } catch {
+    return { on: false, from: null };
+  }
+}
+
+function webmcpLabel(profileDir) {
+  const m = webmcpMode(profileDir);
+  if (!m.on) return 'WebMCP: off (launch --webmcp turns it on)';
+  return `WebMCP: on (${m.from}; browsers start with --enable-features=WebMCP)`;
 }
 
 // ── Version ──
@@ -363,10 +386,11 @@ function showHelp() {
 
   SETUP
     setup              Auto-detect browser, create isolated profile
-    launch [--idle-close <min>] [--webmcp]
+    launch [--idle-close <min>] [--webmcp|--no-webmcp]
                        Start browser with CDP enabled (--idle-close or
                        CDPILOT_IDLE_CLOSE: close it after <min> idle minutes;
-                       --webmcp: enable WebMCP bridge, see WEBMCP below)
+                       --webmcp: this project's browsers start with WebMCP on,
+                       saved until --no-webmcp; see WEBMCP below)
     status             Check browser connection
     stop [--smart]     Stop browser (--smart = close owned tabs, quit if empty)
     close [--force|--keep]  Smart close: close cdpilot's tabs; quit browser only
@@ -482,15 +506,16 @@ function showHelp() {
                        params are redacted. CDPILOT_LOG=0 turns it off;
                        CDPILOT_LOG_DAYS (default 14) sets how many days are kept.
 
-  WEBMCP (opt-in: launch --webmcp or CDPILOT_WEBMCP=1)
-    tools list [--json] List WebMCP tools registered on the current page:
-                        name, description, inputSchema, source (imperative
-                        JS or declarative HTML form). If no tools found,
-                        shows a diagnostic hint.
-    tools call <name> [json-args | --arg k=v ...]
-                        Invoke a WebMCP tool, print JSON result. Arguments
-                        validated against inputSchema. Tool errors → exit 1.
-                        SECURITY: runs the page's own JS — treat as untrusted.
+  WEBMCP (tools a page registers on document.modelContext; needs launch --webmcp)
+    tools list [--json] The page's tools from getTools(): imperative, <form
+                        toolname> and same-origin iframe tools, with title,
+                        annotations, inputSchema. None: says why (WebMCP off,
+                        insecure page, old browser, none registered); exit 0.
+    tools call <name> [json-args | --arg k=v ...] [--frame <url-part>]
+                        Check args against inputSchema, run executeTool() with
+                        an abort signal (--timeout, default 20s), print the
+                        result. Bad args / tool error: exit 1; timeout: 124.
+                        Runs the page's own code: its result is untrusted.
 
   WATCH (continuous screencast for AI video understanding)
     watch start <url>  Begin JPEG screencast at N fps to a disk ring buffer
@@ -727,11 +752,6 @@ if (cmd === 'status') {
 
   if (browser && !process.env.CHROME_BIN) {
     env.CHROME_BIN = browser;
-  }
-
-  // --webmcp flag: enable WebMCP bridge (tools list / tools call)
-  if (args.includes('--webmcp')) {
-    env.CDPILOT_WEBMCP = '1';
   }
 
   const child = spawn(python, [SCRIPT, ...args], {

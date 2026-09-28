@@ -2,66 +2,81 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>WebMCP Test Fixture — Shop</title>
+  <title>WebMCP fixture: shop</title>
 </head>
 <body>
-  <h1>WebMCP Test Shop</h1>
+  <h1>WebMCP fixture shop</h1>
   <p id="status">Cart: 0 items</p>
 
-  <!-- Declarative form tool -->
-  <form toolname="subscribe_newsletter" tooldescription="Subscribe to store newsletter">
-    <label>Email: <input type="email" name="email" required
-           toolparameterdescription="Customer email address"></label>
+  <!-- Declarative tool: attribute names as in the WebMCP declarative explainer
+       (toolname, tooltitle, tooldescription, toolautosubmit on the form;
+       toolparamdescription on its controls). -->
+  <form id="newsletter" toolname="subscribe_newsletter" tooltitle="Subscribe"
+        tooldescription="Subscribe an email address to the store newsletter" toolautosubmit>
+    <label>Email <input type="email" name="email" required
+           toolparamdescription="Customer email address"></label>
     <button type="submit">Subscribe</button>
   </form>
   <p id="sub-status">Not subscribed</p>
 
+  <a id="next" href="page2.html">Page two</a>
+  <iframe id="widget" src="frame.html" title="widget"></iframe>
+
   <script>
-    // ── Page state ──
     window.__cart = [];
     window.__subscribed = null;
+    window.__agentInvoked = null;
+    window.__slowAborted = false;
 
-    // Handle newsletter form
-    document.querySelector('form[toolname]').addEventListener('submit', function(e) {
+    // An agent-invoked submission answers through SubmitEvent#respondWith().
+    document.getElementById('newsletter').addEventListener('submit', function(e) {
       e.preventDefault();
-      var email = new FormData(this).get('email');
+      var email = new FormData(e.target).get('email');
       window.__subscribed = email;
+      window.__agentInvoked = !!e.agentInvoked;
       document.getElementById('sub-status').textContent = 'Subscribed: ' + email;
+      if (e.agentInvoked) e.respondWith(Promise.resolve({ subscribed: email }));
     });
 
-    // ── Imperative tool registration ──
-    function registerTools() {
-      if (typeof document.modelContext === 'undefined') return;
-
-      var ac = new AbortController();
-      window.__toolAbort = ac;
-
+    if (window.isSecureContext && document.modelContext) {
+      // Imperative tool, spec-shaped: execute(inputObject, {signal}).
       document.modelContext.registerTool({
         name: 'add_to_cart',
+        title: 'Add to cart',
         description: 'Add a product to the shopping cart',
         inputSchema: {
           type: 'object',
           properties: {
-            sku:  { type: 'string',  description: 'Product SKU identifier' },
-            qty:  { type: 'integer', description: 'Quantity to add', default: 1 }
+            sku: { type: 'string', description: 'Product SKU identifier' },
+            qty: { type: 'integer', description: 'Quantity to add' }
           },
           required: ['sku', 'qty']
         },
-        execute: async function(input) {
+        annotations: { consequentialHint: true },
+        execute: async function(input, options) {
+          if (!options || !(options.signal instanceof AbortSignal)) {
+            throw new TypeError('execute() was called without options.signal');
+          }
           window.__cart.push({ sku: input.sku, qty: input.qty });
           document.getElementById('status').textContent =
             'Cart: ' + window.__cart.length + ' items';
-          return { ok: true, sku: input.sku, qty: input.qty,
-                   cart_size: window.__cart.length };
+          return { ok: true, sku: input.sku, qty: input.qty, cart_size: window.__cart.length };
         }
-      }, { signal: ac.signal });
-    }
+      });
 
-    // Run after DOM ready (and after any polyfill that may create the API)
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', registerTools);
-    } else {
-      registerTools();
+      // Settles only when the caller aborts the execution (timeout test).
+      document.modelContext.registerTool({
+        name: 'wait_for_abort',
+        description: 'Never finishes on its own; rejects when the execution is aborted',
+        execute: function(input, options) {
+          return new Promise(function(resolve, reject) {
+            options.signal.addEventListener('abort', function() {
+              window.__slowAborted = true;
+              reject(options.signal.reason);
+            });
+          });
+        }
+      });
     }
   </script>
 </body>

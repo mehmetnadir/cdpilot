@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>WebMCP fixture: page two</title>
+</head>
+<body>
+  <h1>Page two</h1>
+  <a id="back" href="shop.html">Back to the shop</a>
+  <script>
+    if (window.isSecureContext && document.modelContext) {
+      document.modelContext.registerTool({
+        name: 'lookup_order',
+        description: 'Look up an order by its id',
+        inputSchema: {
+          type: 'object',
+          properties: { id: { type: 'string', description: 'Order id' } },
+          required: ['id']
+        },
+        annotations: { readOnlyHint: true },
+        execute: async function(input, options) {
+          return { id: input.id, state: 'shipped' };
+        }
+      });
+    }
+  </script>
+</body>
+</html>
