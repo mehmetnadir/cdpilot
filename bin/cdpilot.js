@@ -246,7 +246,23 @@ function runStatus() {
   const config = resolveProjectConfig();
   const port = config.port === '0' ? '9222' : config.port;
   const projLabel = config.projectId ? ` [${config.projectId}]` : '';
-  console.log(`\n  cdpilot status (port ${port})${projLabel}\n`);
+
+  // Check if this project has an external (connect'ed) browser
+  let isExternal = false;
+  let browserName = '';
+  try {
+    const home = cdpilotHome();
+    const regFile = path.join(home, 'registry.json');
+    const data = JSON.parse(fs.readFileSync(regFile, 'utf-8'));
+    const entry = (data.projects || {})[config.projectId];
+    if (entry && entry.external) {
+      isExternal = true;
+      browserName = entry.browser_name || '';
+    }
+  } catch {}
+
+  const extLabel = isExternal ? ' (external)' : '';
+  console.log(`\n  cdpilot status (port ${port})${projLabel}${extLabel}\n`);
 
   try {
     const http = require('http');
@@ -257,22 +273,31 @@ function runStatus() {
         try {
           const info = JSON.parse(data);
           console.log(`  ✓ Connected`);
-          console.log(`  Browser: ${info.Browser || 'Unknown'}`);
+          console.log(`  Browser: ${info.Browser || 'Unknown'}${isExternal ? ' (external — your browser)' : ''}`);
           console.log(`  Protocol: ${info['Protocol-Version'] || 'Unknown'}`);
           console.log(`  WebSocket: ${info.webSocketDebuggerUrl || 'N/A'}`);
-          const extra = [webmcpLabel(config.profileDir), botAuthLabel(port)].filter(Boolean);
-          console.log(`  ${idleCloseLabel(port)}${extra.length ? '' : '\n'}`);
-          extra.forEach((l, i) => console.log(`  ${l}${i === extra.length - 1 ? '\n' : ''}`));
+          if (isExternal) {
+            console.log(`  cdpilot will never close this browser.\n`);
+          } else {
+            const extra = [webmcpLabel(config.profileDir), botAuthLabel(port)].filter(Boolean);
+            console.log(`  ${idleCloseLabel(port)}${extra.length ? '' : '\n'}`);
+            extra.forEach((l, i) => console.log(`  ${l}${i === extra.length - 1 ? '\n' : ''}`));
+          }
         } catch {
           console.log('  ✓ CDP responding but version info unavailable\n');
         }
       });
     });
     req.on('error', () => {
-      console.log('  ❌ No browser connected on this port.');
-      const webmcp = webmcpLabel(config.profileDir);
-      if (webmcp) console.log(`  ${webmcp}`);
-      console.log('  Run: cdpilot launch\n');
+      if (isExternal) {
+        console.log(`  ❌ External browser (${browserName || 'unknown'}) is gone.`);
+        console.log('  Run: cdpilot connect again or cdpilot disconnect\n');
+      } else {
+        console.log('  ❌ No browser connected on this port.');
+        const webmcp = webmcpLabel(config.profileDir);
+        if (webmcp) console.log(`  ${webmcp}`);
+        console.log('  Run: cdpilot launch\n');
+      }
     });
     req.on('timeout', () => {
       req.destroy();
@@ -440,6 +465,12 @@ function showHelp() {
     status             Check browser connection (idle close; WebMCP and the
                        bot-auth signer when set up)
     stop [--smart]     Stop browser (--smart = close owned tabs, quit if empty)
+    connect [<port> | <ws-url> | --auto]
+                       Use a browser you started with --remote-debugging-port
+                       and --user-data-dir; cdpilot never closes or injects
+                       into it. --auto reads DevToolsActivePort files.
+                       (chrome://inspect remote-debugging mode: not supported yet)
+    disconnect         Forget the connected browser (it keeps running)
     close [--force|--keep]  Smart close: close cdpilot's tabs; quit browser only
                        if no user tabs remain (--force quits anyway, --keep never quits)
 

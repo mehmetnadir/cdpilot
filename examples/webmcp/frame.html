@@ -7,9 +7,6 @@
 <body>
   <p id="frame-status">frame ready</p>
   <script>
-    // The e2e tests wait on this instead of guessing: window.__registered is
-    // 'pending' until the browser has answered every registerTool() below,
-    // then 'ok' (or 'error: <name>').
     function track(p) {
       var regs = (window.__regs = window.__regs || []);
       regs.push(p);
