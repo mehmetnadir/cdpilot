@@ -6410,6 +6410,8 @@ print("ok")
     assert.strictEqual(r.on, 'bot-auth: on (keyid KID123)', 'command line --_bot-auth-signer <port> <token> + same browser');
     assert.strictEqual(r.active, true);
     assert.strictEqual(r.kept_while_on, true);
+    assert.deepStrictEqual(r.unreachable, [true, 'bot-auth: on (keyid KID123)', false, '', true, false],
+      '/json/version timing out: still active (no stealth/escalation), no warning, state kept');
     for (const k of ['other_token', 'browser_restarted', 'reused_pid']) {
       assert.deepStrictEqual(r[k], ['bot-auth: off', null, true], `${k}: off, state file dropped, stale marker left`);
     }
@@ -6425,6 +6427,31 @@ print("ok")
     assert.strictEqual(r.marker_after_stop, false, 'stop clears the stale marker');
     assert.strictEqual(r.real_signer_stopped, true);
     assert.strictEqual(r.state_after_stop, null);
+  });
+
+  test('bot-auth: spawn lock — holder SIGKILLed, three concurrent launches -> exactly one signer', () => {
+    const r = fake('lock');
+    assert.strictEqual(r.held, 'held');
+    assert.strictEqual(r.lock_left, true, 'the dead holder left its lock file behind');
+    assert.deepStrictEqual(r.errors, []);
+    assert.strictEqual(r.spawned, 1, `signers spawned: ${r.spawned}`);
+    assert.strictEqual(r.all_same, true, 'all three launches report the one signer');
+  });
+
+  test('bot-auth: health has no bot_auth key while bot-auth is unused (same keys as before), one once set up', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-health-'));
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: '19229', CDPILOT_LOG: '0', CDPILOT_NO_AUTOLAUNCH: '1' };
+    for (const k of ['CDPILOT_WEBMCP', 'CDPILOT_BOT_AUTH', 'CDPILOT_TIMEOUT']) delete env[k];
+    const health = () => {
+      const r = spawnSync(PYB, [PY_PATH, 'health'], { encoding: 'utf-8', timeout: 30000, env });
+      return JSON.parse(r.stdout.trim().split('\n').pop());
+    };
+    assert.deepStrictEqual(Object.keys(health()), ['alive', 'port', 'project_id', 'tabs', 'browser',
+      'crashes_today', 'stealth', 'uptime_warning', 'idle_close', 'idle_close_in_s'], 'health keys unchanged');
+    fs.mkdirSync(path.join(home, 'bot-auth'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'bot-auth', 'config.json'), '{"agent_url": "https://agent.test"}');
+    assert.strictEqual(health().bot_auth, 'bot-auth: off', 'configured: bot_auth key present');
   });
 
   test('bot-auth: idle close counts CDP clients other than the signer (socket owners per OS)', () => {
