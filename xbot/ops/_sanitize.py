@@ -91,7 +91,7 @@ def wrap_external(clean: str) -> str:
 
 
 def render_flags(flags: list[str]) -> str:
-    """Human-readable flag summary for Telegram."""
+    """Human-readable flag summary for a phone push."""
     if not flags:
         return "✅ temiz"
     return " · ".join(f"⚠️ {f}" for f in flags)

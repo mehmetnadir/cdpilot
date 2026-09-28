@@ -11,7 +11,10 @@ okur ve srv21 Claude CLI ile bugünün CONCRETE önerisini üretir:
 
 Çıktı:
   ~/cdpilot-twitter-data/state/strategy/YYYY-MM-DD.json (strategy artifact)
-  Telegram'a karar kartı (✅ Onayla / 💬 Revize / ⏭ Geç)
+  CDPILOT_AUTO_POST on (canlı ayar): taslak doğrudan kuyruğa girer, poster
+  atınca ntfy'ye linkli bildirim düşer.
+  AUTO_POST off: artifact "awaiting_decision" kalır, ntfy'ye "Onay bekliyor"
+  bildirimi gider (dokununca X'in yazma ekranı taslakla açılır).
 
 DOCTRINE.md §3 Faz A item 1.
 """
@@ -29,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import bot_home  # noqa: E402
+import _notify  # noqa: E402
 
 DATA = bot_home()
 XBOT = Path(__file__).resolve().parent.parent
@@ -347,7 +351,7 @@ def _ask_claude(context: dict, timeout: int = 180) -> dict:
 
 
 def _render_card_text(rec: dict, context: dict) -> str:
-    """Plain-text strategy card for Telegram."""
+    """Plain-text strategy card (ntfy notice body)."""
     pb = context.get("pillar_balance_7d", {})
     worst_pillar = min(pb.items(), key=lambda kv: kv[1]["delta"])[0] if pb else "?"
     kpi = context.get("kpi_last_3d", {})
@@ -386,53 +390,26 @@ def _render_card_text(rec: dict, context: dict) -> str:
     if context.get("active_experiments", {}).get("url_in_reply"):
         exp = context["active_experiments"]["url_in_reply"]
         lines.append(f"URL-reply deneyi: {exp.get('days_left')} gün kaldı")
-    lines += [
-        "",
-        "👇 Karar ver:",
-        "✅ Onayla → görsel üretilir + taslak kuyruğa girer",
-        "💬 Revize → bu mesaja reply'la not yaz",
-        "⏭ Geç → bugün strateji atlanır",
-    ]
     return "\n".join(lines)
 
 
-def _send_to_telegram(card_text: str, strategy_id: str) -> dict:
-    """Send the strategy card with approve/revise/skip inline buttons."""
-    sys.path.insert(0, str(Path(__file__).parent))
-    import telegram_bridge as tb  # type: ignore
+def _send_waiting_notice(card_text: str, strategy_id: str,
+                         artifact: dict | None = None) -> dict:
+    """AUTO_POST off: the strategy waits for Nadir — nothing is queued.
 
-    env = tb._load_env()
-    if not env.get("TELEGRAM_CHAT_ID"):
-        _log("TELEGRAM_CHAT_ID missing, skipping send")
-        return {"_error": "no_chat_id"}
-
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "✅ Bugün bunu yap", "callback_data": f"stratgo:{strategy_id}"},
-            {"text": "💬 Revize", "callback_data": f"stratrev:{strategy_id}"},
-            {"text": "⏭ Geç", "callback_data": f"stratskip:{strategy_id}"},
-        ]]
-    }
-
-    # Telegram message limit is 4096; trim if needed.
-    if len(card_text) > 3800:
-        card_text = card_text[:3800] + "\n…(kısaltıldı)"
-
-    result = tb._api(env, "sendMessage", {
-        "chat_id": int(env["TELEGRAM_CHAT_ID"]),
-        "text": card_text,
-        "disable_web_page_preview": True,
-        "reply_markup": keyboard,
-    })
-    # Register the strategy under message_id so the daemon can route the callback.
-    msg_id = result.get("message_id")
-    if msg_id:
-        tb._register_pending(msg_id, {
-            "id": f"strategy-{strategy_id}",
-            "kind": "strategy",
-            "strategy_id": strategy_id,
-        })
-    return result
+    ntfy "Onay bekliyor" notice with the card as body; tapping opens X's
+    composer prefilled with the compiled tweet, so approving = posting it
+    himself. No Telegram, no endpoint.
+    """
+    draft_text = ""
+    if artifact:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import telegram_bridge as tb  # type: ignore  # pure helper, no network
+        draft = tb._strategy_to_draft(strategy_id, artifact)
+        draft_text = (draft or {}).get("text", "")
+    ok = _notify.notify_waiting(f"günün tweet'i ({strategy_id})", draft_text,
+                                reason=card_text[:1500], compose=bool(draft_text))
+    return {"notified": ok}
 
 
 def _auto_queue(strategy_id: str, artifact: dict) -> dict:
@@ -479,14 +456,13 @@ def run(send: bool = True) -> dict:
                 card = _render_card_text(rec, ctx)
                 # Mark as approved-from-weekly to indicate origin in card
                 card = "📆 Haftalık plandan türetildi.\n\n" + card
-                tg_result = _send_to_telegram(card, today_str)
-                existing["telegram_message_id"] = tg_result.get("message_id")
-                existing["approval_status"] = "awaiting_telegram"
+                _send_waiting_notice(card, today_str, existing)
+                existing["approval_status"] = "awaiting_decision"
                 out_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2))
-                _log(f"sent weekly-derived strategy card for {today_str}")
+                _log(f"weekly-derived strategy for {today_str} waits for Nadir")
                 return {"status": "weekly_card_sent", "path": str(out_path)}
             except Exception as e:
-                _log(f"weekly card send failed: {e}")
+                _log(f"weekly notice send failed: {e}")
                 return {"status": "weekly_card_fail", "path": str(out_path), "error": str(e)}
         _log(f"strategy already exists for {today_str}: {out_path} (set CDPILOT_STRATEGIST_FORCE=1 to overwrite)")
         return {"status": "exists", "strategy": existing, "path": str(out_path)}
@@ -521,13 +497,11 @@ def run(send: bool = True) -> dict:
         _log(f"recommendation error: {rec['_error']}")
         if send:
             try:
-                _send_to_telegram(
-                    f"⚠️ Daily Strategist hatası: {rec.get('_error')}\n"
-                    f"Artifact: {out_path}",
-                    today_str,
-                )
-            except Exception as e:
-                _log(f"telegram error notification failed: {e}")
+                _notify.notify("Strateji hatası",
+                               f"Daily strategist: {rec.get('_error')}\nArtifact: {out_path}",
+                               priority="yuksek", tags=["warning"])
+            except Exception as e:  # noqa: BLE001
+                _log(f"ntfy error notification failed: {e!r}")
         return {"status": "error", "path": str(out_path), "error": rec["_error"]}
 
     if send:
@@ -547,20 +521,19 @@ def run(send: bool = True) -> dict:
                     "recommendation": rec, **aq}
         try:
             card = _render_card_text(rec, context)
-            tg_result = _send_to_telegram(card, today_str)
-            artifact["telegram_message_id"] = tg_result.get("message_id")
-            artifact["approval_status"] = "awaiting_telegram"
+            _send_waiting_notice(card, today_str, artifact)
+            artifact["approval_status"] = "awaiting_decision"
             out_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2))
         except Exception as e:
-            _log(f"telegram send failed: {e}")
-            return {"status": "telegram_fail", "path": str(out_path), "error": str(e)}
+            _log(f"waiting notice failed: {e}")
+            return {"status": "notify_fail", "path": str(out_path), "error": str(e)}
 
     return {"status": "ok", "path": str(out_path), "recommendation": rec}
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--no-send", action="store_true", help="don't send Telegram card, only write artifact")
+    p.add_argument("--no-send", action="store_true", help="don't queue or notify, only write artifact")
     p.add_argument("--force", action="store_true", help="overwrite existing strategy for today")
     p.add_argument("--print-context", action="store_true", help="dump context blob and exit (no claude call)")
     args = p.parse_args()

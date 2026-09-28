@@ -2,8 +2,11 @@
 """follow_manager.py — curated follow queue with Faz 0 rate limit.
 
 Reads tier1.json, proposes up to 2 follows per day from `follow_priority=high`
-candidates we are not yet following. Each proposal sent to Telegram for
-approval, then queued in ~/cdpilot-twitter-data/queue/ as kind=follow.
+candidates we are not yet following. With CDPILOT_AUTO_POST on (the live
+setting) each pick is queued in queue/ as kind=follow and the poster executes
+it — no approval round-trip; the poster pushes "Takip edildi" to ntfy with the
+profile link. With AUTO_POST off the pick is only suggested via ntfy (tap =
+their profile, follow by hand).
 
 Strategy:
   Faz 0 (week 1-2): max 2 follows/day, only follow_priority=high
@@ -36,6 +39,7 @@ from twikit import Client  # type: ignore
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import bot_home  # noqa: E402
+import _notify  # noqa: E402
 
 DATA = bot_home()
 TIER_FILE = ROOT / "tier1.json"
@@ -83,27 +87,12 @@ def _save_state(s: dict) -> None:
     STATE_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=2))
 
 
-def _telegram_draft(handle: str, topic: str) -> None:
-    """Send draft proposal to Telegram via bridge."""
-    try:
-        import subprocess
-        bridge = Path(__file__).parent / "telegram_bridge.py"
-        text_tr = f"@{handle} hesabını takip edelim mi?\nKonu: {topic}"
-        text_en = f"follow @{handle}"
-        result = subprocess.run(
-            [sys.executable, str(bridge), "draft",
-             "--kind", "follow",
-             "--to", handle,
-             "--text-tr", text_tr,
-             "--text-en", text_en],
-            timeout=20, check=False, capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            _log(f"telegram draft failed for @{handle}: {result.stderr[:200]}")
-        else:
-            _log(f"telegram draft sent for @{handle}")
-    except Exception as e:
-        _log(f"telegram draft exception @{handle}: {e}")
+def _suggest_follow(handle: str, topic: str) -> None:
+    """AUTO_POST off: suggest via ntfy — tapping opens the profile."""
+    ok = _notify.notify(f"Takip önerisi: @{handle}", f"Konu: {topic}",
+                        url=_notify.profile_url(handle), priority="dusuk",
+                        tags=["bust_in_silhouette"])
+    _log(f"follow suggestion @{handle} {'pushed' if ok else 'NOT delivered'}")
 
 
 def _queue_follow(handle: str, topic: str) -> None:
@@ -154,6 +143,10 @@ async def _follow_back(client: Client, state: dict, blocklist: set) -> int:
             _log(f"follow-back fail @{u.screen_name}: {e!r}")
     if n:
         fb_days[today] = done_today + n
+        back = state["followed_back"][-n:]
+        _notify.notify(f"Geri takip: {n} hesap", " ".join(f"@{h}" for h in back),
+                       url=_notify.profile_url(back[0]), priority="dusuk",
+                       tags=["handshake"])
     return n
 
 
@@ -207,7 +200,7 @@ async def main_async() -> None:
             _queue_follow(entry["handle"], entry.get("topic", "—"))
             _log(f"auto-queued follow @{entry['handle']}")
         else:
-            _telegram_draft(entry["handle"], entry.get("topic", "—"))
+            _suggest_follow(entry["handle"], entry.get("topic", "—"))
         proposed_today.append(entry["handle"])
 
     state.setdefault("proposed", {})[today] = proposed_today

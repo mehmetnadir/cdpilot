@@ -3,7 +3,8 @@
 
 Scans ~/cdpilot-twitter-data/queue/ for items where scheduled_time <= now,
 posts via twikit (phin fork) with cookies-only auth — no browser, no CDP.
-Notifies Telegram on success/failure.
+Notifies Nadir's phone via ntfy (ops/_notify.py) on success/failure: every
+push carries the tweet link as its Click, so tapping it opens the post.
 
 Designed for launchd (Mac) or systemd (srv21). Same JSON queue schema as the
 old CDP-based poster.py. Idempotent: only picks items with status=="pending".
@@ -33,6 +34,7 @@ from twikit import Client  # type: ignore
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import bot_home  # noqa: E402
+import _notify  # noqa: E402
 
 DATA = bot_home()
 QUEUE_DIR = DATA / "queue"
@@ -56,7 +58,6 @@ COOKIES_PATH = Path(os.environ.get(
     str(DATA / "cookies" / "cdpilot_dev.json"),
 ))
 LANG = os.environ.get("CDPILOT_TWIKIT_LANG", "en-US")
-TELEGRAM_BRIDGE = Path(__file__).parent / "telegram_bridge.py"
 
 
 def _log(msg: str) -> None:
@@ -67,15 +68,59 @@ def _log(msg: str) -> None:
     sys.stderr.write(line)
 
 
-def _telegram_notify(text: str) -> None:
+def _phone_notify(title: str, text: str = "", url: str | None = None, *,
+                  priority: str = "normal", tags: list[str] | None = None,
+                  alarm: bool = False, actions: list[dict] | None = None) -> None:
+    """ntfy push (routine channel unless `alarm`). Never raises."""
     try:
-        import subprocess
-        subprocess.run(
-            [sys.executable, str(TELEGRAM_BRIDGE), "send", text],
-            timeout=15, check=False,
-        )
-    except Exception as e:
-        _log(f"telegram notify failed: {e}")
+        if not _notify.notify(title, text, url=url, priority=priority, tags=tags,
+                              alarm=alarm, actions=actions):
+            _log(f"ntfy push not delivered: {title}")
+    except Exception as e:  # noqa: BLE001
+        _log(f"ntfy push failed: {e!r}")
+
+
+_DONE_LABEL = {
+    "tweet": "Tweet atıldı",
+    "reply": "Cevap atıldı",
+    "quote": "Alıntı atıldı",
+    "thread": "Thread atıldı",
+    "like": "Beğenildi",
+    "retweet": "Repost edildi",
+    "rt": "Repost edildi",
+    "bookmark": "Yer imi",
+    "follow": "Takip edildi",
+}
+_DONE_TAG = {"tweet": "bird", "reply": "speech_balloon", "quote": "repeat",
+             "thread": "thread", "like": "yellow_heart", "retweet": "repeat",
+             "rt": "repeat", "bookmark": "bookmark", "follow": "handshake"}
+
+
+def _target_url(item: dict) -> str | None:
+    return _notify.x_url(item.get("to_url") or item.get("to") or item.get("quote_url"))
+
+
+def _notify_done(item: dict, kind: str, result: dict, summary: str = "") -> None:
+    """Post-action push: our tweet link as Click; target as a second button."""
+    label = _DONE_LABEL.get(kind, "Tweet atıldı")
+    if kind == "thread":
+        label += f" ({result.get('thread_count')} tweet)"
+    target = _target_url(item)
+    own = item.get("tweet_url")
+    if kind in ("tweet", "reply", "quote", "thread"):
+        url = own or target
+        actions = [{"label": "Hedef tweet", "url": target}] if target and target != url else []
+        if item.get("followup_tweet_url"):
+            actions.append({"label": "Link yanıtı", "url": item["followup_tweet_url"]})
+        user = target.split("/status/")[0].rsplit("/", 1)[-1] \
+            if target and "/status/" in target else ""
+        who = f" → @{user}" if kind == "reply" and user and user != "i" else ""
+        body = (summary or (item.get("text") or "")[:200]).strip()
+        _phone_notify(f"{label}{who}", body, url, tags=[_DONE_TAG.get(kind, "bird")],
+                      actions=actions)
+    else:  # like / retweet / bookmark / follow — the target is the link
+        _phone_notify(label, (item.get("context") or "")[:160], target,
+                      priority="dusuk", tags=[_DONE_TAG.get(kind, "white_check_mark")])
 
 
 def _tr_summary(text: str) -> str:
@@ -459,6 +504,13 @@ async def main_async() -> None:
     POSTED_DIR.mkdir(parents=True, exist_ok=True)
     FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Held routine pushes (burst limiter) go out as one digest once there is
+    # room — the poster is the 5-minute heartbeat that guarantees that.
+    try:
+        _notify.flush_digest()
+    except Exception as e:  # noqa: BLE001
+        _log(f"ntfy digest flush failed: {e!r}")
+
     # Crisis freeze short-circuits posting
     if FREEZE_FLAG.exists():
         _log("🔴 CRISIS FREEZE active — skipping posting cycle")
@@ -501,8 +553,10 @@ async def main_async() -> None:
         due.append((p, item))
 
     if stale_archived:
-        _telegram_notify(
-            f"🗄 {stale_archived} bayat reply arşivlendi (> {REPLY_MAX_AGE_H}h) — atılmadı."
+        _phone_notify(
+            "Bayat yanıt arşivlendi",
+            f"{stale_archived} yanıt {REPLY_MAX_AGE_H} saatten eski — atılmadı.",
+            priority="dusuk", tags=["file_cabinet"],
         )
 
     if not due:
@@ -510,7 +564,9 @@ async def main_async() -> None:
 
     if not COOKIES_PATH.exists():
         _log(f"cookies file missing: {COOKIES_PATH}")
-        _telegram_notify(f"⚠️ Poster: cookies bulunamadı ({COOKIES_PATH.name}). Refresh gerekli.")
+        _phone_notify("Poster: cookie yok",
+                      f"{COOKIES_PATH.name} bulunamadı — hiçbir şey atılamıyor. Refresh gerekli.",
+                      priority="yuksek", tags=["warning"], alarm=True)
         return
 
     _log(f"due items: {len(due)}")
@@ -536,9 +592,12 @@ async def main_async() -> None:
                         json.dumps(item, ensure_ascii=False, indent=2))
                     p.unlink()
                     _log(f"⛔ duplicate {item['id']} — same text as {dup}, not posting")
-                    _telegram_notify(
-                        f"⛔ `{item['id']}` atılmadı: metin `{dup}` ile birebir aynı. "
-                        "Taslak üreteci bozuk olabilir."
+                    _phone_notify(
+                        "Tekrar metin engellendi",
+                        f"{item['id']} atılmadı: metin {dup} ile birebir aynı. "
+                        "Taslak üreteci bozuk olabilir.",
+                        _target_url(item), priority="yuksek", tags=["no_entry"],
+                        alarm=True,
                     )
                     continue
             _log(f"posting {item['id']} ({kind}): {preview}...")
@@ -578,42 +637,34 @@ async def main_async() -> None:
                     except Exception as fe:
                         item["followup_error"] = str(fe)
                         _log(f"  ↳ followup FAILED: {fe}")
-                        _telegram_notify(
-                            f"⚠️ `{item['id']}` followup atılamadı: {str(fe)[:200]}"
+                        _phone_notify(
+                            "Link yanıtı atılamadı",
+                            f"{item['id']}: {str(fe)[:200]}",
+                            item.get("tweet_url"), tags=["warning"], alarm=True,
                         )
 
                 (POSTED_DIR / p.name).write_text(json.dumps(item, ensure_ascii=False, indent=2))
                 p.unlink()
-                _log(f"✅ posted {item['id']} → {item['tweet_url']}")
-                fu_suffix = (
-                    f"\n  ↳ followup: {item.get('followup_tweet_url')}"
-                    if item.get("followup_tweet_url") else ""
-                )
-                # Post-notify: link + Turkish summary (claude CLI, fallback raw)
-                kind_label = {
-                    "tweet": "Tweet atıldı",
-                    "reply": "Cevap atıldı",
-                    "quote": "Alıntı atıldı",
-                    "thread": "Thread atıldı",
-                }.get(kind, "Tweet atıldı")
-                if kind == "thread":
-                    kind_label += f" ({result.get('thread_count')} tweet)"
-                summary = _tr_summary(
-                    item.get("text") or (item.get("texts") or [""])[0]
-                )
-                summary_line = f"\n\n📝 TR özet: {summary}" if summary else ""
-                _telegram_notify(
-                    f"✅ {kind_label}\n{item['tweet_url']}{summary_line}{fu_suffix}"
-                )
+                _log(f"✅ posted {item['id']} → {item.get('tweet_url')}")
+                # Post-notify: link as Click + Turkish summary (claude CLI, fallback raw)
+                summary = ""
+                if kind in ("tweet", "reply", "quote", "thread"):
+                    summary = _tr_summary(
+                        item.get("text") or (item.get("texts") or [""])[0]
+                    )
+                _notify_done(item, kind, result, summary)
             elif result.get("partial"):
                 # Mid-chain thread failure: progress already persisted to the
                 # queue file (status=partial) — next poster run resumes there.
                 _log(f"🧵 partial {item['id']}: {result.get('posted')}/"
                      f"{result.get('total')} — will resume next run")
-                _telegram_notify(
-                    f"⚠️ Thread `{item['id']}` kısmi: {result.get('posted')}/"
-                    f"{result.get('total')} atıldı — sonraki cycle kaldığı yerden "
-                    f"devam edecek. ({str(result.get('err'))[:150]})"
+                root = (item.get("posted_ids") or [None])[0]
+                _phone_notify(
+                    "Thread yarım kaldı",
+                    f"{item['id']}: {result.get('posted')}/{result.get('total')} atıldı — "
+                    f"sonraki koşu kaldığı yerden sürer. ({str(result.get('err'))[:150]})",
+                    _notify.status_url(root, _notify.HANDLE) if root else None,
+                    priority="yuksek", tags=["warning"], alarm=True,
                 )
             else:
                 err = result.get("err", "unknown")
@@ -623,7 +674,9 @@ async def main_async() -> None:
                 (FAILED_DIR / p.name).write_text(json.dumps(item, ensure_ascii=False, indent=2))
                 p.unlink()
                 _log(f"❌ failed {item['id']}: {err}")
-                _telegram_notify(f"🔴 `{item['id']}` ATIM HATASI: {err}")
+                _phone_notify("Atım hatası", f"{item['id']} ({kind}): {str(err)[:200]}",
+                              _target_url(item), priority="yuksek", tags=["x"],
+                              alarm=True)
         except Exception as e:
             tb = traceback.format_exc()
             _log(f"exception on {item['id']}: {tb}")
@@ -633,9 +686,11 @@ async def main_async() -> None:
                 item["status"] = "partial"
                 item["error"] = _err_str(e)
                 p.write_text(json.dumps(item, ensure_ascii=False, indent=2))
-                _telegram_notify(
-                    f"⚠️ Thread `{item['id']}` exception — kısmi ilerleme korundu, "
-                    f"devam edilecek: {str(e)[:200]}"
+                _phone_notify(
+                    "Thread hatası (ilerleme korundu)",
+                    f"{item['id']}: {_err_str(e)[:200]}",
+                    _notify.status_url(item["posted_ids"][0], _notify.HANDLE),
+                    priority="yuksek", tags=["warning"], alarm=True,
                 )
                 continue
             item["status"] = "failed"
@@ -643,7 +698,8 @@ async def main_async() -> None:
             item["traceback"] = tb
             (FAILED_DIR / p.name).write_text(json.dumps(item, ensure_ascii=False, indent=2))
             p.unlink()
-            _telegram_notify(f"🔴 `{item['id']}` EXCEPTION: {_err_str(e)[:200]}")
+            _phone_notify("Atım hatası", f"{item['id']} ({kind}): {_err_str(e)[:200]}",
+                          _target_url(item), priority="yuksek", tags=["x"], alarm=True)
 
 
 def main() -> None:
