@@ -1,6 +1,6 @@
 {
   "name": "cdpilot",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "mcpName": "io.github.mehmetnadir/cdpilot",
   "description": "Zero-dependency browser automation CLI. Raw CDP, 70+ commands, friction ladder, 3-tier stealth, CAPTCHA + press-and-hold solvers, proxy pools, MCP server. No Puppeteer/Playwright/Selenium.",
   "bin": {

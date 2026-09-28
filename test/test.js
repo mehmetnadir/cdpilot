@@ -3888,7 +3888,7 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
       assert(section.includes(s), `README iframe section must mention ${s}`);
     }
     const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    const unreleased = (changelog.match(/## \[Unreleased\]([\s\S]*?)\n## \[/) || [])[1] || '';
+    const unreleased = changelog.split(/^## \[/m)[1] || ''; // newest: [Unreleased] or the release
     for (const s of ['--frame', 'matched no iframe', "page's own origin", 'frame search stopped after 2s',
       'is not an iframe; using the iframe inside it']) {
       assert(unreleased.includes(s), `CHANGELOG [Unreleased] must describe ${s}`);
@@ -4719,7 +4719,7 @@ print("RESULT=" + json.dumps([mod._idle_status(${port}), mod._idle_status(${port
     assert(/\| `CDPILOT_IDLE_CLOSE` \| `15` \|/.test(readme), 'README env table needs CDPILOT_IDLE_CLOSE');
     assert(/Idle auto-close/.test(readme), 'README Reliability section needs the idle auto-close note');
     const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    const unreleased = (changelog.match(/## \[Unreleased\]([\s\S]*?)\n## \[/) || [])[1] || '';
+    const unreleased = changelog.split(/^## \[/m)[1] || ''; // newest: [Unreleased] or the release
     assert(unreleased.includes('CDPILOT_IDLE_CLOSE'), 'CHANGELOG [Unreleased] must describe CDPILOT_IDLE_CLOSE');
   });
 
@@ -5154,7 +5154,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert(readme.includes(s), `README must mention ${s}`);
     }
     const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    const unreleased = changelog.split(/^## \[/m).find((s) => s.startsWith('Unreleased]'));
+    const unreleased = changelog.split(/^## \[/m)[1] || ''; // newest: [Unreleased] or the release
     assert(unreleased && unreleased.includes('cdpilot log'), 'CHANGELOG [Unreleased] must describe `cdpilot log`');
     const help = run('--help');
     assert(help.includes('log --md') && help.includes('CDPILOT_LOG'), 'bin help must document log');
