@@ -38,9 +38,22 @@
       if (e.agentInvoked) e.respondWith(Promise.resolve({ subscribed: email }));
     });
 
+    // The e2e tests wait on this instead of guessing: window.__registered is
+    // 'pending' until the browser has answered every registerTool() below,
+    // then 'ok' (or 'error: <name>').
+    function track(p) {
+      var regs = (window.__regs = window.__regs || []);
+      regs.push(p);
+      window.__registered = 'pending';
+      var n = regs.length;
+      Promise.all(regs.slice()).then(function() {
+        if (regs.length === n) window.__registered = 'ok';
+      }, function(e) { window.__registered = 'error: ' + e.name; });
+    }
+
     if (window.isSecureContext && document.modelContext) {
       // Imperative tool, spec-shaped: execute(inputObject, {signal}).
-      document.modelContext.registerTool({
+      track(document.modelContext.registerTool({
         name: 'add_to_cart',
         title: 'Add to cart',
         description: 'Add a product to the shopping cart',
@@ -62,10 +75,10 @@
             'Cart: ' + window.__cart.length + ' items';
           return { ok: true, sku: input.sku, qty: input.qty, cart_size: window.__cart.length };
         }
-      });
+      }));
 
       // Settles only when the caller aborts the execution (timeout test).
-      document.modelContext.registerTool({
+      track(document.modelContext.registerTool({
         name: 'wait_for_abort',
         description: 'Never finishes on its own; rejects when the execution is aborted',
         execute: function(input, options) {
@@ -76,7 +89,7 @@
             });
           });
         }
-      });
+      }));
     }
   </script>
 </body>
