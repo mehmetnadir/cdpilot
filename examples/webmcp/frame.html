@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>WebMCP fixture: same-origin frame</title>
+</head>
+<body>
+  <p id="frame-status">frame ready</p>
+  <script>
+    function track(p) {
+      var regs = (window.__regs = window.__regs || []);
+      regs.push(p);
+      window.__registered = 'pending';
+      var n = regs.length;
+      Promise.all(regs.slice()).then(function() {
+        if (regs.length === n) window.__registered = 'ok';
+      }, function(e) { window.__registered = 'error: ' + e.name; });
+    }
+
+    if (window.isSecureContext && document.modelContext) {
+      track(document.modelContext.registerTool({
+        name: 'frame_echo',
+        description: 'Echo a text back from the same-origin iframe',
+        inputSchema: {
+          type: 'object',
+          properties: { text: { type: 'string', description: 'Text to echo' } },
+          required: ['text']
+        },
+        execute: async function(input, options) {
+          document.getElementById('frame-status').textContent = 'echoed: ' + input.text;
+          return { echo: input.text, from: new URLSearchParams(location.search).get('who') || 'frame' };
+        }
+      }));
+    }
+  </script>
+</body>
+</html>

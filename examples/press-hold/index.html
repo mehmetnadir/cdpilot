@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Press Hold Demo</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    #target { padding: 12px 24px; font-size: 16px; cursor: pointer; }
+    #log { margin-top: 20px; font-size: 18px; font-weight: bold; color: #333; }
+  </style>
+</head>
+<body>
+  <h1>Press Hold Gap Measurement</h1>
+  <button id="target">Click Me</button>
+  <div id="log">Waiting for click...</div>
+
+  <script>
+    let t0 = 0;
+    const target = document.getElementById('target');
+    const log = document.getElementById('log');
+
+    target.addEventListener('mousedown', () => {
+      t0 = performance.now();
+    });
+
+    target.addEventListener('mouseup', () => {
+      if (t0 > 0) {
+        const gap = Math.round(performance.now() - t0);
+        log.textContent = 'Mousedown -> Mouseup Gap: ' + gap + ' ms';
+      }
+    });
+  </script>
+</body>
+</html>

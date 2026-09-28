@@ -910,6 +910,110 @@ never changes a command's output or exit code, and a failed write costs one
 stderr line. `CDPILOT_LOG=0` turns it off; `CDPILOT_LOG_DAYS` (default 14)
 sets how many days are kept. The MCP server exposes it as `browser_log`.
 
+### Use your own browser (human-in-the-loop)
+
+An agent hits a CAPTCHA or a login wall it cannot get past. A person solves it,
+and the agent carries on in the same browser.
+
+**The simplest way needs no `connect`.** cdpilot's own browser is a normal,
+visible window unless you launch it headless (`cdpilot headless on` /
+`CHROME_HEADLESS=1`). The person solves the CAPTCHA or logs in right there, and
+the agent continues:
+
+```bash
+cdpilot go https://example.com/dashboard   # agent: "captcha detected" / login wall
+cdpilot captcha-wait 300                   # agent waits while the person solves it
+cdpilot go https://example.com/dashboard   # agent continues in the same window
+```
+
+That window uses cdpilot's own profile, so the login stays for later runs.
+
+**`connect` is for a browser you start yourself**, with a debugging port and
+your own profile directory (log into it once; it keeps its cookies):
+
+```bash
+# macOS
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9450 --user-data-dir="$HOME/cdpilot-chrome"
+# Linux
+google-chrome --remote-debugging-port=9450 --user-data-dir="$HOME/cdpilot-chrome"
+# Windows
+"%ProgramFiles%\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9450 --user-data-dir="%USERPROFILE%\cdpilot-chrome"
+
+cdpilot connect 9450          # or: cdpilot connect ws://127.0.0.1:9450/devtools/browser/<id>
+cdpilot connect --auto        # or: find it via a DevToolsActivePort file
+cdpilot go https://example.com/dashboard
+cdpilot disconnect            # forget it; the browser keeps running
+```
+
+Since Chrome 136, `--remote-debugging-port` is ignored on the default profile,
+so the separate `--user-data-dir` is required. `connect --auto` reads the
+DevToolsActivePort file of each known profile directory (`~/cdpilot-chrome`
+from the command above, Chrome stable/beta/dev/canary, Chromium, Brave,
+Vivaldi, Edge), skips files left over from a browser that is gone or was
+replaced on that port (the browser id in the file must match), and connects to
+the first live one. It asks over HTTP only; a WebSocket probe (which Chrome's
+chrome://inspect mode may answer with a permission prompt) is sent only when no
+live browser was found.
+
+**Not supported yet: Chrome's `chrome://inspect/#remote-debugging` toggle**
+(Chrome 144+, your everyday logged-in profile). In that mode Chrome answers
+only on its WebSocket (`/json/version` and `/json` return 404) and may ask you
+to allow every new debugging connection, while cdpilot lists tabs over `/json`
+and opens a new connection per command. `connect --auto` recognises the mode
+and exits with code 2 and the start command above instead of half-working.
+
+**What cdpilot does with a connected browser:**
+
+- Page commands (`go`, `click`, `fill`, `shot`, …) run in a tab cdpilot opens
+  for itself in a new window that does not take the focus
+  (`Target.createTarget` with `newWindow` + `background`, so your window and
+  tab keep it) on the first page command, and keep using that tab. `close`,
+  `session-close` and the idle session cleanup close only such tabs, the ones
+  cdpilot opened in this browser run, never the last one. Your own tabs are
+  never navigated or typed into; only a command that names a tab touches it
+  (`switch-tab`, `close-tab <index|id>`, `CDPILOT_TARGET`, and `multi-eval`,
+  which runs its script in every open tab).
+- It never closes or kills the browser. `close`, `close --force`, `stop`,
+  `stop --smart [--force]`, `project-stop`, `stop-all`, `session-close` and MCP
+  `browser_close` close at most cdpilot's own tabs (above) and print
+  "connected browser left running; run `cdpilot disconnect` to forget it".
+  The idle auto-close never touches it,
+  `tabs --reap` closes nothing, `wipe`, `permission`, `cookies load` and `cf-replay` are refused (add `--allow-external` to load/replay cookies anyway),
+  `context close` only destroys a context `context create` made, and `launch` /
+  MCP `browser_launch` start nothing.
+- `close-tab` is an explicit command and **can close your tabs**: the active
+  (cdpilot) tab with no argument, or any tab you name by index or id. It never
+  closes the last tab, which would quit the browser on Windows and Linux.
+- It injects nothing into it: no stealth patch or user-agent override (whatever
+  `cdpilot mode` / `stealth` says), no glow, no input blocker, no dev-extension
+  scripts, no auto-cookie restore.
+- The registration stays until you run `cdpilot disconnect`. If the browser is
+  closed, page commands exit 1 with "your connected browser is gone; run
+  `cdpilot connect` again or `cdpilot disconnect`", and cdpilot never launches a
+  browser in its place.
+- `connect` refuses when this project already has a browser cdpilot launched
+  ("stop it first (`cdpilot stop`) or use another project"), and only
+  `127.0.0.1` / `localhost` is accepted (anything else exits 2). `disconnect`
+  also stops this project's `watch` daemon.
+- cdpilot treats a browser as its own only with proof: the browser id it
+  recorded at `launch` (or, for older entries, a live recorded pid that holds
+  the debug port). A busy port is not proof, so a leftover registry entry never
+  makes `stop` / `close` touch your own Chrome on port 9222.
+
+**Risks:**
+
+- Every cdpilot command, and any agent that can run cdpilot, can read and act
+  with the cookies and sessions of that profile (mail, banking, admin panels).
+  Use a profile that is logged into only what the task needs.
+- The debugging port is open to every local program for as long as that browser
+  runs, not just to cdpilot. Close the browser when you are done.
+- Sites can tell automation more easily: cdpilot applies no stealth to a
+  connected browser.
+- cdpilot's tab sits next to yours in the same window, and an agent may
+  still act in one of your tabs when it names it (`switch-tab`,
+  `close-tab <n>`, `multi-eval`).
+
 ### WebMCP tools (opt-in)
 
 [WebMCP](https://webmachinelearning.github.io/webmcp/) lets a page register
