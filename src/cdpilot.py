@@ -4122,8 +4122,20 @@ async def _mouse_reaches(route, target_oid, x, y):
     sid = route.session_id
     if sid is None:
         return True
+    # The listener goes in cdpilot's isolated world: a page that wraps
+    # addEventListener or composedPath in its own world never sees the probe.
+    # Resolving there fails (old browser, fake CDP): the target's own world.
+    probe_oid = target_oid
+    ctx = await _frame_world(route, sid, route.frame_id)
+    if ctx is not None:
+        r = await _frame_cdp(route, [(43, "DOM.describeNode", {"objectId": target_oid}, sid)])
+        backend = r.get(43, {}).get("node", {}).get("backendNodeId")
+        if backend:
+            r = await _frame_cdp(route, [(44, "DOM.resolveNode", {
+                "backendNodeId": backend, "executionContextId": ctx}, sid)])
+            probe_oid = r.get(44, {}).get("object", {}).get("objectId") or target_oid
     r = await _frame_cdp(route, [(40, "Runtime.callFunctionOn", {
-        "objectId": target_oid, "functionDeclaration": _MOUSE_PROBE_FN}, sid)])
+        "objectId": probe_oid, "functionDeclaration": _MOUSE_PROBE_FN}, sid)])
     probe = r.get(40, {}).get("result", {}).get("objectId")
     if not probe:  # no listener: click as before
         return True
