@@ -50,7 +50,8 @@ class Frame:
         self.covered = ""         # what covers this frame's <iframe> at the click point
         self.target_cover = ""    # what covers the click target inside this frame ("!":
         #                           the target has pointer-events: none)
-        self.cover_after_press = ""  # target_cover once mousePressed was handled (it moved)
+        self.cover_after_press = ""  # target_cover once mousePressed was handled (it moved;
+        #                              "-": removed from the page, "ERR": the page navigated)
         self.settle_hang = False  # the settle wait in this frame never answers
 
 
@@ -251,6 +252,8 @@ class Browser:
             if f is not None:
                 return value(f.covered)
             el = self.element(oid)
+            if el and el[0].target_cover == "ERR":  # the page navigated away: the object is gone
+                return err("Cannot find context with specified id")
             return value(el[0].target_cover) if el else err("Could not find object with given id")
         el = self.element(oid)
         if el is not None:
@@ -1013,9 +1016,11 @@ def scenario_press_hold(mod):
                                              ("frame_entropy", "#card >>> #nested >>> #btn", True)]:
                     r = run_click(mod, click_page(), target, entropy, blocker=True)
                     out[f"{tag}_{key}"] = {k: r[k] for k in ("res", "stderr", "press", "blocker", "clicks")}
-                r = run_click(mod, click_page(**{"card.cover_after_press": "div#wrap"}), "#card >>> #btn",
-                              blocker=True)
-                out[f"{tag}_moved"] = {k: r[k] for k in ("res", "stderr", "press", "blocker", "clicks")}
+                for key, cover in [("moved", "div#wrap"), ("removed", "-"), ("navigated", "ERR")]:
+                    r = run_click(mod, click_page(**{"card.cover_after_press": cover}), "#card >>> #btn",
+                                  blocker=True)
+                    out[f"{tag}_{key}"] = {k: r[k] for k in ("res", "stderr", "stdout", "press", "blocker",
+                                                             "clicks")}
                 mod.get_visual_config = lambda: True
                 for key, fn, target in [("dblclick", "cmd_dblclick", "#card >>> #btn"),
                                         ("dblclick_page", "cmd_dblclick", "#btn"),
@@ -1097,8 +1102,12 @@ def scenario_timeout_hold(mod):
 
         def fake_exit(code, exits=exits):
             b = STATE["browser"]
+            rel = [e[3] for e in b.mouse_t if e[0] == "mouseReleased"]
+            restored = [t for v, t in b.blocker_t if v == ""]
             exits.append({"code": code, "mouse": [m[0] for m in b.mouse],
-                          "blocker": list(b.blocker_log), "open": sorted(mod._BLOCKER_OPEN)})
+                          "blocker": list(b.blocker_log), "open": sorted(mod._BLOCKER_OPEN),
+                          "presses_open": sorted(mod._PRESS_OPEN),
+                          "released_before_restore": bool(rel and restored and rel[0] < restored[0])})
         os._exit = fake_exit
         mod.get_visual_config = lambda: True
         saved_fd2 = os.dup(2)
@@ -1114,6 +1123,30 @@ def scenario_timeout_hold(mod):
             fd2.seek(0)
             res["fd2"] = fd2.read().decode()
         res.update({"stderr": err})
+        out[key] = res
+
+    # No watchdog: the command is cancelled (or fails) mid-hold; `finally` releases.
+    for key, start in [("cancel_click", lambda: mod.cmd_click("#card >>> #btn", None, False, False)),
+                       ("cancel_dblclick", lambda: mod.cmd_dblclick("#card >>> #btn"))]:
+        async def body(b, start=start):
+            b.blocker = True
+            task = asyncio.ensure_future(start())
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if any(m[0] == "mousePressed" for m in b.mouse):
+                    break
+            await asyncio.sleep(0.1)
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+            return {"presses_open": sorted(mod._PRESS_OPEN), "open_after": sorted(mod._BLOCKER_OPEN)}
+        mod.get_visual_config = lambda: True
+        try:
+            with press_env("1000-1000"):
+                b, res, _, err = run(mod, click_page(), body)
+        finally:
+            mod.get_visual_config = real_visual
+        res.update({"mouse": b.mouse, "blocker": b.blocker_log, "stderr": err})
         out[key] = res
     return out
 
