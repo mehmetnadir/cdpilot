@@ -393,9 +393,11 @@ function showHelp() {
     status             Check browser connection
     stop [--smart]     Stop browser (--smart = close owned tabs, quit if empty)
     connect [<port> | <ws-url> | --auto]
-                       Use YOUR browser (human-in-the-loop). --auto scans
-                       DevToolsActivePort (Chrome 144+ chrome://inspect).
-    disconnect         Drop external browser connection (browser keeps running)
+                       Use a browser you started with --remote-debugging-port
+                       and --user-data-dir; cdpilot never closes or injects
+                       into it. --auto reads DevToolsActivePort files.
+                       (chrome://inspect remote-debugging mode: not supported yet)
+    disconnect         Forget the connected browser (it keeps running)
     close [--force|--keep]  Smart close: close cdpilot's tabs; quit browser only
                        if no user tabs remain (--force quits anyway, --keep never quits)
 
