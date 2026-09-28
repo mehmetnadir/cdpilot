@@ -18,6 +18,7 @@ Global options:
   --timeout <seconds>  Abort the command after <seconds> (exit 124). Accepted
                        before or after the command name; 0 disables.
 
+
 Session log:
   cdpilot log          Today's commands for this project (time, exit, command,
                        url, result). --md: Markdown report (pages visited,
@@ -38,6 +39,8 @@ Environment:
                        `launch --idle-close <min>`; 0 = never)
   CDPILOT_BROWSER_SEARCH_ROOT  Override DevToolsActivePort search root (tests)
   CDPILOT_LOG=0        Do not write the session log
+  CDPILOT_PRESS_MS     How long real mouse clicks hold the button: min-max in
+                       ms (default: 40-120; 0-0 = instant)
   CDPILOT_LOG_DAYS     Days of session log to keep (default: 14; 0 = forever)
   CDPILOT_BOT_AUTH=1   Same as `launch --bot-auth` (Web Bot Auth, below)
   CDPILOT_WEBMCP=1|0   Overrides this project's WebMCP mode (set by
@@ -56,6 +59,13 @@ pip install cryptography):
                        and Signature-Agent to every request the browser makes
                        (tabs, popups, iframes, workers), until `stop`
   cdpilot bot-auth status      Agent URL, keyid, signer on/off
+
+Exit codes: 0 ok, 1 error (batch / run: a step failed), 124 --timeout;
+  exit 3 from click / smart-click (batch / run: one, and no failed step):
+  pressed, release missed the target, not clicked (a real mouse click whose
+  target moved or got covered under the press; see the stderr note). A target
+  the page replaced or navigated away from on mousedown prints
+  "Pressed (the page replaced or left it ...)" and exits 0.
 """
 
 __version__ = "0.9.3"
@@ -4686,11 +4696,13 @@ _BLOCKER_POINTER_JS = """(function (pe) {
 })(%s)"""
 
 # On an element: is it what the mouse hits at (x, y) of its own document?
-# '' if so (the target counts when one of its descendants is hit); '!' if the
+# '' if so (the target counts when one of its descendants is hit); '-' if it
+# is no longer in its document (the page replaced it); '!' if the
 # element itself takes no mouse input (pointer-events: none, own or
 # inherited), so the mouse falls through to whatever is below; else what is
 # on top, as tag#id.class.
 _HIT_TEST_FN = """function (x, y) {
+  if (!this.isConnected) return '-';
   var root = this.getRootNode ? this.getRootNode() : null;
   if (!root || !root.elementFromPoint) root = this.ownerDocument;
   var e = root.elementFromPoint(x, y);
@@ -4712,11 +4724,22 @@ _CLICK_GROUP = "cdpilot-click"
 # (page WebSocket URLs). --timeout ends the process with os._exit, which skips
 # `finally`; its watchdog restores these first (_blocker_restore_on_exit).
 _BLOCKER_OPEN = set()
+# Presses cdpilot sent and has not released yet: page WebSocket URL ->
+# mouseReleased params (page coordinates). A release that never comes leaves
+# the page with the button down (drag widgets stick); `finally` sends it, and
+# the --timeout watchdog sends it for these first.
+_PRESS_OPEN = {}
 BLOCKER_EXIT_RESTORE_S = 0.5  # the watchdog's budget for that restore
 
 
 async def _blocker_pointer(route, value):
-    """Set pointer-events on cdpilot's input blocker (top page); True if there is one."""
+    """Set pointer-events on cdpilot's input blocker (top page); True if there is one.
+
+    Never on a connected (external) browser: cdpilot puts no blocker there
+    (see _control_start), so a click or press there sends nothing but the
+    click itself."""
+    if _is_external():
+        return False
     params = {"expression": _BLOCKER_POINTER_JS % json.dumps(value), "returnByValue": True}
     ctx = await _frame_world(route, None, None)
     if ctx is not None:
@@ -4752,25 +4775,35 @@ async def _blocker_passthrough(ws_url):
 
 
 def _blocker_restore_on_exit(budget_s=BLOCKER_EXIT_RESTORE_S):
-    """Make blockers in _BLOCKER_OPEN opaque again, from the --timeout watchdog.
+    """From the --timeout watchdog: release the presses in _PRESS_OPEN, then
+    make the blockers in _BLOCKER_OPEN opaque again.
 
     Best effort within `budget_s`: its own event loop in a helper thread and a
     fresh WebSocket per page (the main thread's socket may be the one that
     hung). The page's main world is enough for a style reset.
     """
-    pages = list(_BLOCKER_OPEN)
+    presses = dict(_PRESS_OPEN)
+    pages = list(dict.fromkeys(list(presses) + list(_BLOCKER_OPEN)))
     if not pages:
         return
+
+    async def send(ws, msg):
+        await ws.send(json.dumps(msg))
+        while json.loads(await ws.recv()).get("id") != msg["id"]:
+            pass
 
     async def restore():
         import websockets
         for ws_url in pages:
             async with websockets.connect(ws_url, max_size=16 * 1024 * 1024) as ws:
-                await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
-                    "expression": _BLOCKER_POINTER_JS % json.dumps(""), "returnByValue": True}}))
-                while json.loads(await ws.recv()).get("id") != 1:
-                    pass
-            _BLOCKER_OPEN.discard(ws_url)
+                if ws_url in presses:  # before the blocker is opaque again
+                    await send(ws, {"id": 2, "method": "Input.dispatchMouseEvent",
+                                    "params": presses[ws_url]})
+                    _PRESS_OPEN.pop(ws_url, None)
+                if ws_url in _BLOCKER_OPEN:
+                    await send(ws, {"id": 1, "method": "Runtime.evaluate", "params": {
+                        "expression": _BLOCKER_POINTER_JS % json.dumps(""), "returnByValue": True}})
+                    _BLOCKER_OPEN.discard(ws_url)
 
     def run():
         try:
@@ -4783,37 +4816,213 @@ def _blocker_restore_on_exit(budget_s=BLOCKER_EXIT_RESTORE_S):
 
 
 def _hit_failure(route, results, base, n, released=False):
-    """Why the hit-test in `results` (ids base..base+n-1) failed, as note text, or None.
+    """Why the hit-test in `results` (ids base..base+n-1) failed: (note text,
+    kind), or None.
 
     Checks are ordered like route.chain, then the target. released: the
-    repeat of the check sent with mouseReleased.
+    repeat of the check sent with mouseReleased. kind: "moved" (something
+    else is on top: covered, or it moved away), "gone" (removed from its
+    document; with the release also a failed call: its page navigated away),
+    "unknown" (with the release: no reply in time, so nothing is known).
     """
     for i in range(n):
-        v = results.get(base + i, {}).get("result", {}).get("value")
+        reply = results.get(base + i)
+        v = reply.get("result", {}).get("value") if isinstance(reply, dict) else None
         if v == "":
             continue
+        if released and reply is None:  # a missing reply is not a navigation
+            return ("could not be checked when the mouse button was released (no reply from"
+                    " the page in time)", "unknown")
+        if v == "-" or (v is None and released):  # removed, or its page navigated away
+            return ("was gone by the time the mouse button was released (the page replaced"
+                    " or left it)" if released else "is no longer in the page", "gone")
         if v == "!":
             what = (f"is inside {route.labels[i]}, which has pointer-events: none"
                     if i < len(route.chain) else "has pointer-events: none")
-            return what + (" by the time the mouse button was released" if released else "")
+            return what + (" by the time the mouse button was released" if released else ""), "moved"
         v = v if isinstance(v, str) and v else "(unknown)"
         if released:
-            return f"was no longer under the mouse when the button was released ({v} was)"
-        return f"is covered by {v} at the click point"
+            return f"was no longer under the mouse when the button was released ({v} was)", "moved"
+        return f"is covered by {v} at the click point", "moved"
     return None
+
+
+# A real click whose release did not land on the target is not clicked again
+# by script (it could click twice); the command says so instead of
+# "Clicked". "moved" and "unknown" end the command with exit code 3
+# ("pressed, the release missed the target, not clicked"; 1 stays "error"),
+# "gone" (the page replaced the target or navigated on mousedown, which is
+# usually what the click was for) with 0. MCP maps both to isError: false
+# plus a first line {"clicked": false, "reason": ...}; batch and run record
+# the step and end with 3.
+CLICK_MISSED_EXIT_CODE = 3
+PRESSED_PREFIX = {
+    "moved": "Pressed (released elsewhere, not clicked): ",
+    "unknown": "Pressed (release not confirmed, not clicked): ",
+    "gone": "Pressed (the page replaced or left it, not clicked): ",
+}
+_CLICK_MISSES = []  # reasons of this process's real clicks that were not clicked
+MCP_CLICK_TOOLS = ("browser_click", "browser_smart_click")  # the MCP tools that report it
+
+
+def _click_missed_exit():
+    """Exit 3 when a click of this command was pressed but not clicked
+    ("moved" / "unknown"); a "gone" one exits 0."""
+    if any(r != "gone" for r in _CLICK_MISSES):
+        sys.exit(CLICK_MISSED_EXIT_CODE)
+
+
+def _pressed_status(stdout):
+    """{"clicked": false, "reason": ...} when `stdout` reports a press that
+    was not clicked, else None (for MCP callers)."""
+    for line in (stdout or "").splitlines():
+        for reason, prefix in PRESSED_PREFIX.items():
+            if line.startswith(prefix):
+                return {"clicked": False, "reason": reason}
+    return None
+
+
+# ─── Press duration of real mouse clicks ───
+# A person holds a mouse button down for roughly 50-150 ms; cdpilot's real
+# clicks sent mousePressed and mouseReleased 0.1-6 ms apart, a plain bot
+# signal. Every real click now holds the button PRESS_MS_DEFAULT ms (a
+# log-normal draw kept inside the range), from the press's reply (mousedown
+# handled) to sending the release; the events' own timestamps are exactly
+# the draw apart (the press is stamped after the reply to the last mouse
+# event, so it never precedes it). dblclick waits DBLCLICK_GAP_MS between
+# its two clicks. CDPILOT_PRESS_MS=min-max overrides the range (ms, 0 <= min <= max
+# <= PRESS_MS_MAX); `0-0` is the old instant click (dblclick gap included).
+# The el.click() paths (plain page click, script-click fallbacks) press
+# nothing and are unchanged.
+PRESS_MS_ENV = "CDPILOT_PRESS_MS"
+PRESS_MS_DEFAULT = (40.0, 120.0)
+PRESS_MS_MAX = 2000.0
+DBLCLICK_GAP_MS = (60.0, 140.0)
+_PRESS_MS_WARNED = set()  # bad CDPILOT_PRESS_MS values already warned about
+
+
+def _press_ms_range(env=None):
+    """The (min, max) press duration in ms: CDPILOT_PRESS_MS or the default.
+
+    A bad value (not `min-max`, negative, min > max, max over PRESS_MS_MAX)
+    gets one stderr warning per process and the default.
+    """
+    env = os.environ if env is None else env
+    raw = (env.get(PRESS_MS_ENV) or "").strip()
+    if not raw:
+        return PRESS_MS_DEFAULT
+    m = _re.fullmatch(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)", raw)
+    if m:
+        lo, hi = float(m.group(1)), float(m.group(2))
+        if lo <= hi <= PRESS_MS_MAX:
+            return lo, hi
+    if raw not in _PRESS_MS_WARNED:
+        _PRESS_MS_WARNED.add(raw)
+        print(f"cdpilot: warning: ignoring {PRESS_MS_ENV}={raw!r} (min-max in ms,"
+              f" 0 <= min <= max <= {PRESS_MS_MAX:g}); using"
+              f" {PRESS_MS_DEFAULT[0]:g}-{PRESS_MS_DEFAULT[1]:g}", file=sys.stderr)
+    return PRESS_MS_DEFAULT
+
+
+def _human_ms(lo, hi, rnd):
+    """A duration in [lo, hi] ms: log-normal around the geometric mean, with
+    [lo, hi] at two standard deviations; draws outside are drawn again."""
+    import math
+    if hi <= 0:
+        return 0.0
+    if lo <= 0 or lo == hi:
+        return rnd.uniform(lo, hi)
+    mu, sigma = math.log(lo * hi) / 2, math.log(hi / lo) / 4
+    for _ in range(20):
+        v = rnd.lognormvariate(mu, sigma)
+        if lo <= v <= hi:
+            return v
+    return rnd.uniform(lo, hi)
+
+
+def _press_hold_s(rnd=None):
+    """How long the next real click holds the button, in seconds."""
+    import random as _r
+    lo, hi = _press_ms_range()
+    return _human_ms(lo, hi, rnd or _r.Random()) / 1000.0
+
+
+def _dblclick_gap_s(rnd=None):
+    """Seconds between a double click's release and its second press (0 when
+    CDPILOT_PRESS_MS asks for instant clicks)."""
+    import random as _r
+    if _press_ms_range()[1] <= 0:
+        return 0.0
+    return _human_ms(*DBLCLICK_GAP_MS, rnd or _r.Random()) / 1000.0
+
+
+async def _release_open_press(send, ws_url, params):
+    """`finally` of a held press that did not get its release: send it (best
+    effort, the original error goes on)."""
+    if _PRESS_OPEN.pop(ws_url, None) is None:
+        return  # the --timeout watchdog released it already
+    try:
+        await asyncio.wait_for(send([(99, "Input.dispatchMouseEvent", params)]), 3)
+    except (Exception, asyncio.CancelledError):
+        pass
+
+
+async def _mouse_click_held(ws_url, x, y, button="left", click_count=1, rnd=None, cid=1):
+    """One real click at (x, y): mousePressed, hold (_press_hold_s), mouseReleased.
+
+    The hold starts at the press's reply (the page has handled mousedown), so
+    the button is never down for less than the drawn time; the events carry
+    their own timestamps (press when it is sent, which is after the reply to
+    every earlier mouse event; release `hold` later), so the page's
+    mousedown/mouseup timeStamps are the drawn hold even when a busy machine
+    wakes the release late. The release is sent in `finally` too (and by the
+    --timeout watchdog): the page is never left with the button down. Sent
+    with cdp_send, so an active frame route moves the point into its frame.
+    """
+    ev = {"x": x, "y": y, "button": button, "clickCount": click_count}
+    hold, down_at = _press_hold_s(rnd), time.time()
+    _PRESS_OPEN[ws_url] = dict(ev, type="mouseReleased")  # before the send: it may be cut off
+    released = False
+    try:
+        await cdp_send(ws_url, [(cid, "Input.dispatchMouseEvent",
+                                 dict(ev, type="mousePressed", timestamp=down_at))])
+        route = _FRAME_ROUTE.get()
+        if route is not None and route.chain and ws_url == route.root_ws and ws_url in _PRESS_OPEN:
+            sx, sy, tx, ty = route.xform  # the rewrite just used it: page coordinates
+            _PRESS_OPEN[ws_url].update(x=tx + sx * x, y=ty + sy * y)
+        await asyncio.sleep(hold)
+        await cdp_send(ws_url, [(cid + 1, "Input.dispatchMouseEvent",
+                                 dict(ev, type="mouseReleased", timestamp=down_at + hold))])
+        released = True
+    finally:
+        if released:
+            _PRESS_OPEN.pop(ws_url, None)
+        else:
+            params = _PRESS_OPEN.get(ws_url)
+            token = _FRAME_ROUTE.set(None)  # the params are page coordinates
+            try:
+                await _release_open_press(lambda c: cdp_send(ws_url, c, timeout=2), ws_url, params)
+            finally:
+                _FRAME_ROUTE.reset(token)
 
 
 async def _pointer_click(route, target_oid, label, humanize=False):
     """Click the element `target_oid` (an object in the route's frame, or in
     the page for a route without hops) with real mouse input, if it is hit.
 
-    Returns (how, x, y): how is "mouse", or "script" when the hit-test failed
-    and el.click() clicked it (one stderr note says why); x, y is the click
+    Returns (how, x, y): how is "mouse"; "script" when the hit-test before
+    the press failed and el.click() clicked it; "moved", "gone" or
+    "unknown" (see _hit_failure) when the press and release were sent but
+    the release did not land on the target (no script click then: the page
+    already got a trusted mousedown/mouseup, and on a menu that opens on
+    mousedown a native click on a common ancestor, so el.click() would
+    click twice). A stderr note says why. A target no longer in the page
+    before the press raises _FrameError (nothing is clicked). x, y is the click
     point in page coordinates. humanize: --entropy=on's approach, jitter and
-    pauses. The hit-test runs before the press and again, in one batch with
-    the release, after the page has handled the press: a target that moved
-    or got covered meanwhile did not get the click, so after completing the
-    release el.click() clicks it.
+    pauses. The button is held like a person's press (_press_hold_s). The
+    hit-test runs before the press and again, in one batch with the
+    release, after the page has handled the press: a target that moved,
+    got covered or was replaced meanwhile did not get the click ("missed").
     """
     import random as _r
     rnd = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
@@ -4831,7 +5040,7 @@ async def _pointer_click(route, target_oid, label, humanize=False):
         ly += rnd.uniform(-1, 1) * min(2, max(0, c[3] / 2 - 1))
     pts = _frame_points(boxes, lx, ly)
     px, py = round(pts[0][0]), round(pts[0][1])
-    why = None
+    why = missed = None
     token = _FRAME_ROUTE.set(None)  # page coordinates from here: no rewriting
     try:
         if humanize:
@@ -4846,24 +5055,52 @@ async def _pointer_click(route, target_oid, label, humanize=False):
                     for i, ((s, oid), (x, y)) in enumerate(zip(route.chain + [(sid, target_oid)], pts))]
             n = len(pts)
             why = _hit_failure(route, await _frame_cdp(route, checks(10)), 10, n)
+            if why is not None and why[1] == "gone":  # a detached node: el.click() does nothing
+                raise _FrameError(f"{label}: the target is no longer in the page")
             if why is None:
                 press = {"x": px, "y": py, "button": "left", "clickCount": 1}
-                # The press alone: its reply comes once the page handled mousedown.
+                # The last move on its own: Chrome stamps it on arrival, so the
+                # press, stamped after its reply, never comes before it.
                 await _frame_cdp(route, [
-                    (20, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": px, "y": py}, None),
-                    (21, "Input.dispatchMouseEvent", dict(press, type="mousePressed"), None)])
-                # Same check again, then the release in the same batch (the
-                # button is down: it is released whatever the check says).
-                r = await _frame_cdp(route, checks(30) + [
-                    (29, "Input.dispatchMouseEvent", dict(press, type="mouseReleased"), None)])
-                why = _hit_failure(route, r, 30, n, released=True)
+                    (20, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": px, "y": py}, None)])
+                hold, down_at = _press_hold_s(rnd), time.time()
+                root = route.root_ws
+                _PRESS_OPEN[root] = dict(press, type="mouseReleased")
+                released = False
+                try:
+                    # The press alone: its reply comes once the page handled mousedown.
+                    await _frame_cdp(route, [(21, "Input.dispatchMouseEvent", dict(
+                        press, type="mousePressed", timestamp=down_at), None)])
+                    # Held like a person's press; the blocker stays open meanwhile
+                    # (in _BLOCKER_OPEN, so --timeout restores it mid-hold too).
+                    await asyncio.sleep(hold)
+                    # Same check again, then the release in the same batch (the
+                    # button is down: it is released whatever the check says).
+                    r = await _frame_cdp(route, checks(30) + [
+                        (29, "Input.dispatchMouseEvent", dict(press, type="mouseReleased",
+                                                              timestamp=down_at + hold), None)])
+                    released = True
+                finally:
+                    if released:
+                        _PRESS_OPEN.pop(root, None)
+                    else:
+                        await _release_open_press(lambda c: _frame_cdp(route, [
+                            (i, m, prm, None) for i, m, prm in c], timeout=2),
+                            root, _PRESS_OPEN.get(root))
+                missed = _hit_failure(route, r, 30, n, released=True)
         finally:
             if opened:
                 await _blocker_pointer(route, "")
     finally:
         _FRAME_ROUTE.reset(token)
+    if missed is not None:  # the trusted press and release were sent
+        text, kind = missed
+        sent = "were sent" if kind == "unknown" else "reached the page"
+        print(f"note: {label} {text}; the press and release {sent}, so no script click"
+              " (it could click twice)", file=sys.stderr)
+        return kind, px, py
     if why is not None:
-        print(f"note: {label} {why}; used a script click", file=sys.stderr)
+        print(f"note: {label} {why[0]}; used a script click", file=sys.stderr)
         await _frame_cdp(route, [(1, "Runtime.callFunctionOn", {
             "objectId": target_oid, "functionDeclaration": _SCRIPT_CLICK_FN}, sid)])
         return "script", px, py
@@ -6787,20 +7024,14 @@ _CLICK_LABEL_FN = """function () {
 
 
 async def _humanize_click(ws_url, x, y):
-    """Pre-pause + Bezier move + jitter + mousePressed/Released + post-pause."""
+    """Pre-pause + Bezier move + jitter + held mousePressed/Released + post-pause."""
     import random as _r
     r = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
     await asyncio.sleep(r.uniform(0.05, 0.15))
     jx = x + r.randint(-2, 2)
     jy = y + r.randint(-2, 2)
     await _humanize_mouse_move(ws_url, jx, jy)
-    cmds = [
-        (991, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": jx, "y": jy,
-            "button": "left", "clickCount": 1}),
-        (992, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": jx, "y": jy,
-            "button": "left", "clickCount": 1}),
-    ]
-    await cdp_send(ws_url, cmds)
+    await _mouse_click_held(ws_url, jx, jy, rnd=r, cid=991)
     await asyncio.sleep(r.uniform(0.08, 0.20))
 
 
@@ -7099,13 +7330,22 @@ async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
             r3 = await _frame_cdp(route, [(2, "Runtime.callFunctionOn", {
                 "objectId": oid, "functionDeclaration": _CLICK_LABEL_FN, "returnByValue": True}, sid)])
             info = _smart_data(r3.get(2, {}).get("result", {}).get("value"))
+            res = info.get("res", "?")
             if info.get("box"):
                 where = f"{route.describe()} {FRAME_SEP} {selector}" if route.chain else selector
-                await _pointer_click(route, oid, where, humanize=bool(entropy))
+                try:
+                    how, _, _ = await _pointer_click(route, oid, where, humanize=bool(entropy))
+                except _FrameError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    sys.exit(1)
+                if how in PRESSED_PREFIX:
+                    _CLICK_MISSES.append(how)
+                    if res.startswith("Clicked: "):
+                        res = PRESSED_PREFIX[how] + res[len("Clicked: "):]
             else:
                 await _frame_cdp(route, [(3, "Runtime.callFunctionOn", {
                     "objectId": oid, "functionDeclaration": _SCRIPT_CLICK_FN}, sid)])
-            print(info.get("res", "?"))
+            print(res)
         finally:
             await _frame_cdp(route, [(9, "Runtime.releaseObjectGroup", {"objectGroup": g}, sid)])
     else:
@@ -7282,6 +7522,7 @@ async def cmd_batch():
     for item in data:
         cmd_name = item.get("cmd", "")
         cmd_args = item.get("args", [])
+        misses = len(_CLICK_MISSES)
         try:
             if cmd_name == "go":
                 await cmd_go(cmd_args[0] if cmd_args else "")
@@ -7302,13 +7543,24 @@ async def cmd_batch():
             else:
                 results.append({"cmd": cmd_name, "status": "error", "error": f"Unsupported command: {cmd_name}"})
                 continue
-            results.append({"cmd": cmd_name, "status": "ok"})
+            if len(_CLICK_MISSES) > misses:  # pressed, not clicked: the batch goes on
+                reason = _CLICK_MISSES[-1]
+                results.append({"cmd": cmd_name, "status": "ok" if reason == "gone" else "not_clicked",
+                                "clicked": False, "reason": reason})
+            else:
+                results.append({"cmd": cmd_name, "status": "ok"})
         except SystemExit:
             results.append({"cmd": cmd_name, "status": "error", "error": "Command exited with error"})
         except Exception as exc:
             results.append({"cmd": cmd_name, "status": "error", "error": str(exc)})
 
     print(json.dumps(results, indent=2, ensure_ascii=False))
+    # After every step ran: a failed step ends the batch with exit 1 (it used
+    # to exit 0), else a step pressed but not clicked with exit 3.
+    if any(r["status"] == "error" for r in results):
+        sys.exit(1)
+    if any(r["status"] == "not_clicked" for r in results):
+        sys.exit(CLICK_MISSED_EXIT_CODE)
 
 
 async def cmd_network(url=None):
@@ -12977,7 +13229,11 @@ async def cmd_smart_click(text):
                 _mark_owned_tab(t.get("id"))
     except Exception:
         pass
-    print(f'Clicked: {data["tag"].upper()} "{data["text"]}" (score:{data["score"]})')
+    verb = "Clicked: "
+    if data.get("via") in PRESSED_PREFIX:
+        _CLICK_MISSES.append(data["via"])
+        verb = PRESSED_PREFIX[data["via"]]
+    print(f'{verb}{data["tag"].upper()} "{data["text"]}" (score:{data["score"]})')
     if data.get("alternatives"):
         print(f'  Also found: {", ".join(data["alternatives"])}')
 
@@ -13484,6 +13740,7 @@ async def cmd_run_script(script_path):
     import shlex
     passed = 0
     failed = 0
+    not_clicked = 0
     for line_num, line in enumerate(lines, 1):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -13506,7 +13763,12 @@ async def cmd_run_script(script_path):
             if output:
                 for out_line in output.split("\n"):
                     print(f"     {out_line}")
-            if result.returncode != 0:
+            if result.returncode == CLICK_MISSED_EXIT_CODE:
+                # Pressed, the release missed the target: not an error, not a click.
+                err = result.stderr.strip()
+                print(f"     NOT CLICKED (exit {CLICK_MISSED_EXIT_CODE})" + (f": {err}" if err else ""))
+                not_clicked += 1
+            elif result.returncode != 0:
                 err = result.stderr.strip()
                 if err:
                     print(f"     ERROR: {err}")
@@ -13519,7 +13781,12 @@ async def cmd_run_script(script_path):
 
     print(f"\n{'─' * 40}")
     print(f"Script: {script_path}")
-    print(f"Result: {passed} passed, {failed} failed, {passed + failed} total")
+    extra = f", {not_clicked} not clicked" if not_clicked else ""
+    print(f"Result: {passed} passed, {failed} failed{extra}, {passed + failed + not_clicked} total")
+    if failed:  # a failed step is an error (it used to exit 0)
+        sys.exit(1)
+    if not_clicked:
+        sys.exit(CLICK_MISSED_EXIT_CODE)
 
 
 # ─── Testing Commands ───
@@ -13987,14 +14254,8 @@ async def cmd_click_ref(ref_str):
 
     x, y = val["x"], val["y"]
     await _vfx_ripple(ws_url, x, y)
-    await cdp_send(ws_url, [
-        (3, "Input.dispatchMouseEvent", {
-            "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1
-        }),
-        (4, "Input.dispatchMouseEvent", {
-            "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1
-        }),
-    ])
+    async with _blocker_passthrough(ws_url):
+        await _mouse_click_held(ws_url, x, y, cid=3)
     print(f"Clicked @{ref_num} (backendNodeId={backend_node_id}): ({x}, {y})")
 
 
@@ -14413,7 +14674,7 @@ async def _tw_click_sel(ws, selector):
         'expression': f'(function(){{var e=document.querySelector({json.dumps(selector)});if(!e)return null;var r=e.getBoundingClientRect();return {{x:r.x,y:r.y,w:r.width,h:r.height}};}})();',
         'returnByValue': True,
     })])
-    box = res.get(802, {}).get('value')
+    box = res.get(802, {}).get('result', {}).get('value')
     if not box:
         return False
     x = box['x'] + box['w'] / 2
@@ -14421,10 +14682,7 @@ async def _tw_click_sel(ws, selector):
     if _TW_HUMANIZE():
         await _humanize_click(ws, int(x), int(y))
     else:
-        await cdp_send(ws, [
-            (803, 'Input.dispatchMouseEvent', {'type': 'mousePressed', 'x': int(x), 'y': int(y), 'button': 'left', 'clickCount': 1}),
-            (804, 'Input.dispatchMouseEvent', {'type': 'mouseReleased', 'x': int(x), 'y': int(y), 'button': 'left', 'clickCount': 1}),
-        ])
+        await _mouse_click_held(ws, int(x), int(y), cid=803)
     return True
 
 
@@ -15155,14 +15413,11 @@ async def cmd_dblclick(selector):
     ws_url, _ = get_page_ws()
     x, y = await _get_element_center(ws_url, selector)
     await _vfx_ripple(ws_url, x, y)
-    cmds = [
-        (1, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1}),
-        (2, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1}),
-        (3, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2}),
-        (4, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2}),
-    ]
+    # Two held clicks (clickCount 1, then 2) with a person's pause between.
     async with _blocker_passthrough(ws_url):
-        await cdp_send(ws_url, cmds)
+        await _mouse_click_held(ws_url, x, y, click_count=1, cid=1)
+        await asyncio.sleep(_dblclick_gap_s())
+        await _mouse_click_held(ws_url, x, y, click_count=2, cid=3)
     print(f"Double-clicked: {selector}")
 
 
@@ -15172,12 +15427,8 @@ async def cmd_rightclick(selector):
     ws_url, _ = get_page_ws()
     x, y = await _get_element_center(ws_url, selector)
     await _vfx_ripple(ws_url, x, y)
-    cmds = [
-        (1, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "right", "clickCount": 1}),
-        (2, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "right", "clickCount": 1}),
-    ]
     async with _blocker_passthrough(ws_url):
-        await cdp_send(ws_url, cmds)
+        await _mouse_click_held(ws_url, x, y, button="right", cid=1)
     print(f"Right-clicked: {selector}")
 
 
@@ -16181,7 +16432,7 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"url": {"type": "string", "description": "Full URL to navigate to (must include https://)"}}, "required": ["url"]}},
             {"name": "browser_screenshot", "description": "Capture a screenshot of the current browser viewport. Supports element-level cropping to save tokens (capture only a specific element instead of full page). Use JPEG format with quality parameter for smaller files (~5x smaller than PNG). Prefer element cropping + JPEG for token-efficient AI workflows.",
              "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Output file path (e.g. /tmp/screenshot.png). Extension determines format: .png, .jpg, .webp", "default": "screenshot.png"}, "element": {"type": "string", "description": "CSS selector to capture only that element (crops to bounding box). Saves ~3-7x tokens vs full page."}, "quality": {"type": "number", "description": "JPEG quality 1-100 (only for .jpg files). Lower = smaller file = fewer tokens. Default: 80"}}}},
-            {"name": "browser_click", "description": "Click an element on the page identified by CSS selector. Auto-waits up to 5 seconds for the element to appear (MutationObserver). Scrolls the element into view before clicking. Returns the tag name and text of the clicked element.",
+            {"name": "browser_click", "description": "Click an element on the page identified by CSS selector. Auto-waits up to 5 seconds for the element to appear (MutationObserver). Scrolls the element into view before clicking. Returns the tag name and text of the clicked element. When a real mouse click (inside a frame, or with entropy) was pressed but the page changed under the press so the release missed the target, nothing is clicked again by script and the first line is JSON {\"clicked\": false, \"reason\": \"moved\"|\"gone\"|\"unknown\"} (isError stays false): the page may already have reacted to the press, so check it before retrying.",
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element to click (e.g. '#submit-btn', '.nav a', 'button[type=submit]'). Inside an iframe (cross-origin too): 'iframe#card >>> button#pay'"}}, "required": ["selector"]}},
             {"name": "browser_type", "description": "Type text into an input or textarea element. Uses React-compatible value setting (native setter + input/change events). Auto-waits up to 5 seconds for the element. Use browser_fill as an alias.",
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the input element. Inside an iframe (cross-origin too): 'iframe#card >>> input[name=cardnumber]'"}, "text": {"type": "string", "description": "Text value to type into the element"}}, "required": ["selector", "text"]}},
@@ -16393,13 +16644,25 @@ class MCPServer:
             output = result.stdout.strip()
             errors = result.stderr.strip()
             content = []
+            # A click pressed but not clicked is no error (a retry could
+            # click twice): a machine-readable first line tells the agent.
+            # Only the click tools: other tools print page text, which could
+            # start with the same words, and exit 3 means other things there.
+            click_tool = tool_name in MCP_CLICK_TOOLS
+            status = _pressed_status(output) if click_tool else None
+            if click_tool and result.returncode == CLICK_MISSED_EXIT_CODE and status is None:
+                status = {"clicked": False, "reason": "moved"}
+            if status is not None:
+                content.append({"type": "text", "text": json.dumps(status)})
             if output:
                 content.append({"type": "text", "text": output})
             if errors:
                 content.append({"type": "text", "text": f"stderr: {errors}"})
             if not content:
                 content.append({"type": "text", "text": "Command executed successfully"})
-            return {"jsonrpc": "2.0", "id": req_id, "result": {"content": content, "isError": result.returncode != 0}}
+            ok_codes = (0, CLICK_MISSED_EXIT_CODE) if click_tool else (0,)
+            return {"jsonrpc": "2.0", "id": req_id, "result": {
+                "content": content, "isError": result.returncode not in ok_codes}}
         except subprocess.TimeoutExpired:
             _slog_record_external(cli_args, TIMEOUT_EXIT_CODE, started, int((time.monotonic() - t0) * 1000),
                                   "MCP tool call timed out (30s); the command was killed", via)
@@ -19339,6 +19602,7 @@ if __name__ == "__main__":
             print(f"Did you mean: {matches[0]}?", file=sys.stderr)
         print(f"\nAvailable commands: {', '.join(all_cmds)}", file=sys.stderr)
         sys.exit(1)
+    _click_missed_exit()  # pressed, not clicked: exit 3 (after the command's cleanup)
     # Reached only when no SystemExit or exception ended the command (see
     # _slog_exit_code): the session log then records exit 0.
     _SLOG["main_done"] = True
