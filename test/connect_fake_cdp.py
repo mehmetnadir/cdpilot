@@ -161,7 +161,8 @@ def answer(msg, path):
         with LOCK:
             SEQ[0] += 1
             new = {"id": f"PAGE{SEQ[0]}", "type": "page", "url": p.get("url") or "about:blank",
-                   "title": "", "background": bool(p.get("background"))}
+                   "title": "", "background": bool(p.get("background")),
+                   "newWindow": bool(p.get("newWindow"))}
             PAGES.append(new)
         result = {"targetId": new["id"]}
     elif method == "Target.closeTarget":

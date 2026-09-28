@@ -3322,10 +3322,16 @@ def _browser_ws_call(method, params, timeout=10):
 
 def _external_create_tab(url="about:blank"):
     """Open a tab of cdpilot's own in the connected (external) browser:
-    Target.createTarget in the background (the user's tab keeps the focus),
-    recorded in the GUID-bound set. Returns its target id, or None."""
+    Target.createTarget in a new window shown inactive (newWindow +
+    background: the user's window and tab keep the focus), recorded in the
+    GUID-bound set. Returns its target id, or None.
+
+    Not a background tab in the user's window: that page is hidden, and a
+    Runtime.evaluate right after a navigation there went unanswered for the
+    full 15 s timeout (measured, headless Chrome: 3 of 12 `go` + `eval`
+    pairs; 0 of 16 in an inactive window, 0 of 12 in a foreground tab)."""
     guid = _browser_guid(cdp_get("/json/version", no_cache=True))
-    r = _browser_ws_call("Target.createTarget", {"url": url, "background": True})
+    r = _browser_ws_call("Target.createTarget", {"url": url, "newWindow": True, "background": True})
     target_id = (r or {}).get("targetId")
     if target_id and guid:
         old_guid, tabs = _external_tabs_load()
