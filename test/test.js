@@ -5601,6 +5601,595 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   });
 })();
 
+// ── WebMCP tests ──
+// Browserless: test/webmcp_fake_cdp.py runs the real `tools list/call` code
+// over a fake CDP wire; each Runtime.evaluate it sends is executed by
+// test/webmcp_fake_page.js against a recording document.modelContext, so
+// these tests check what the evaluated code did (getTools, executeTool and
+// its options), not its source. Opt-in e2e (CDPILOT_E2E=1): a real headless
+// browser started with `launch --webmcp` only, fixtures in test/fixtures/webmcp.
+(function() {
+  const { execFileSync, spawn, spawnSync } = require('child_process');
+  const os = require('os');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const PY_PATH = path.join(__dirname, '..', 'src', 'cdpilot.py');
+
+  let fakeResults = null;
+  function fake(name) {
+    if (!fakeResults) {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-webmcp-fake-'));
+      const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+        CDP_PORT: '19225', CDPILOT_LOG: '0' };
+      delete env.CDPILOT_WEBMCP;
+      delete env.CDPILOT_TIMEOUT;
+      const out = execFileSync(PYB, [path.join(__dirname, 'webmcp_fake_cdp.py'), PY_PATH,
+        process.execPath], { encoding: 'utf-8', timeout: 120000, env });
+      fakeResults = JSON.parse(out.trim().split('\n').pop());
+    }
+    const r = fakeResults[name];
+    assert(r, `fake-CDP scenario ${name} missing`);
+    assert(!r.error, `fake-CDP scenario ${name} failed:\n${r.error}`);
+    return r;
+  }
+  // A tools command only asks for cdpilot's isolated world in the top frame and
+  // evaluates there (contextId 77 in the fake): no Runtime.enable, nothing
+  // injected, no main-world evaluate.
+  const isolatedOnly = (run, what) => {
+    assert(run.wire.length > 0, `${what}: sent nothing`);
+    for (const m of run.wire) {
+      if (m.method === 'Page.getFrameTree') continue;
+      if (m.method === 'Page.createIsolatedWorld') {
+        assert.strictEqual(m.params.frameId, 'TOP', what);
+        assert.strictEqual(m.params.worldName, 'cdpilot', what);
+        continue;
+      }
+      assert.strictEqual(m.method, 'Runtime.evaluate', `${what}: sent ${m.method}`);
+      assert.deepStrictEqual(m.params, { returnByValue: true, awaitPromise: true, contextId: 77 },
+        `${what}: evaluate params ${JSON.stringify(m.params)}`);
+    }
+    for (const c of [].concat(...run.calls)) assert.strictEqual(c.world, 'isolated', `${what}: ${c.fn} ran in ${c.world}`);
+  };
+
+  test('webmcp: tools list calls getTools() in an isolated world and reports title/annotations/frame/form', () => {
+    const r = fake('list_routing');
+    for (const shape of ['spec', 'legacy']) {
+      const run = r[shape];
+      isolatedOnly(run, shape);
+      assert.strictEqual(run.exit, 0, run.stderr);
+      assert.strictEqual(run.stderr, '', 'no main-world note');
+      assert.deepStrictEqual(run.calls, [[{ fn: 'getTools', world: 'isolated', argc: 0 }]], shape);
+      const tools = JSON.parse(run.stdout).tools;
+      assert.deepStrictEqual(tools.map((t) => t.name), ['add_to_cart', 'frame_echo', 'subscribe_newsletter']);
+      const [cart, frame, form] = tools;
+      // Chrome 154 returns inputSchema as a JSON string; the spec as an object.
+      assert.deepStrictEqual(cart.inputSchema.required, ['sku', 'qty'], `${shape}: schema is an object`);
+      assert.strictEqual(cart.title, 'Add to cart');
+      assert.strictEqual(cart.annotations.consequentialHint, true);
+      assert.strictEqual(cart.frame, null);
+      assert.strictEqual(frame.frame, 'https://shop.test/frame.html');
+      assert.strictEqual(form.declarative, true);
+      assert.strictEqual(form.autosubmit, true);
+      assert.strictEqual(cart.declarative, false);
+    }
+  });
+
+  test('webmcp: tools call runs executeTool(tool, input, {signal}) in an isolated world', () => {
+    const r = fake('call_routing');
+    for (const key of ['spec', 'legacy', 'frame', 'frame_filter']) {
+      isolatedOnly(r[key], key);
+      assert.strictEqual(r[key].exit, 0, `${key}: ${r[key].stderr}`);
+    }
+    const exec = (run) => run.calls[1].filter((c) => c.fn === 'executeTool');
+    // Spec shape: the input object itself, and options carrying an AbortSignal.
+    const [spec] = exec(r.spec);
+    assert.strictEqual(exec(r.spec).length, 1);
+    assert.strictEqual(spec.name, 'add_to_cart');
+    assert.deepStrictEqual(spec.input, { sku: 'A1', qty: 2 });
+    assert.strictEqual(spec.inputType, 'object');
+    assert.strictEqual(spec.argc, 3);
+    assert.strictEqual(spec.signal, true, 'options.signal must be an AbortSignal');
+    // Chrome 154 shape (executeTool.length 2): the JSON string, same options.
+    const [legacy] = exec(r.legacy);
+    assert.strictEqual(exec(r.legacy).length, 1, 'no failed first attempt');
+    assert.strictEqual(legacy.inputType, 'string');
+    assert.deepStrictEqual(JSON.parse(legacy.input), { sku: 'A1', qty: 2 });
+    assert.strictEqual(legacy.signal, true);
+    // The tool's JSON result string is printed as JSON.
+    assert.deepStrictEqual(JSON.parse(r.spec.stdout), { ok: true, tool: 'add_to_cart', got: { sku: 'A1', qty: 2 } });
+    // A same-origin iframe's tool runs on that frame's tool object.
+    assert.strictEqual(exec(r.frame)[0].frame, 'frame');
+    assert.strictEqual(exec(r.frame_filter)[0].name, 'frame_echo');
+  });
+
+  test('webmcp: tools call aborts the execution signal when its time budget ends (exit 124)', () => {
+    const r = fake('call_timeout');
+    isolatedOnly(r, 'timeout');
+    assert.strictEqual(r.exit, 124, r.stderr);
+    assert.deepStrictEqual(r.calls[1].map((c) => c.fn), ['getTools', 'executeTool', 'aborted']);
+    assert.strictEqual(r.calls[1][2].reason, 'TimeoutError');
+    assert(/timed out after 0\.3s; its execution was aborted/.test(r.stderr), r.stderr);
+  });
+
+  test('webmcp: a page that wraps getTools/executeTool cannot add tools, change results or see the calls', () => {
+    const r = fake('hostile_page');
+    for (const key of ['list', 'call', 'fake']) isolatedOnly(r[key], key);
+    const seen = (run) => [].concat(...run.calls).map((c) => c.fn);
+    for (const key of ['list', 'call', 'fake']) {
+      assert(!seen(r[key]).some((f) => f.startsWith('patched:')), `${key}: the page's wrappers ran`);
+    }
+    assert.deepStrictEqual(JSON.parse(r.list.stdout).tools.map((t) => t.name),
+      ['add_to_cart', 'frame_echo', 'subscribe_newsletter'], 'only the real tools');
+    assert.strictEqual(r.call.exit, 0, r.call.stderr);
+    assert.deepStrictEqual(JSON.parse(r.call.stdout), { ok: true, tool: 'add_to_cart', got: { sku: 'A1', qty: 2 } },
+      'the real result, not the hijacked one');
+    assert.strictEqual(r.fake.exit, 1);
+    assert(/tool 'fake_tool' not found/.test(r.fake.stderr), r.fake.stderr);
+  });
+
+  test('webmcp: without a usable isolated world it falls back to the main world with one note', () => {
+    const r = fake('world_fallback');
+    for (const s of ['isoblind', 'noworld']) {
+      const { list, call } = r[s];
+      assert.strictEqual(list.exit, 0, list.stderr);
+      assert.strictEqual(JSON.parse(list.stdout).tools.length, 3, s);
+      assert.strictEqual(call.exit, 0, call.stderr);
+      assert.deepStrictEqual(JSON.parse(call.stdout).got, { sku: 'A1', qty: 2 });
+      for (const run of [list, call]) {
+        assert.strictEqual(run.stderr.trim().split('\n').length, 1, `${s}: one note: ${run.stderr}`);
+        assert(/not visible from an isolated world.*main world/.test(run.stderr), run.stderr);
+      }
+      const exec = [].concat(...call.calls).filter((c) => c.fn === 'executeTool');
+      assert.deepStrictEqual(exec.map((c) => c.world), ['main'], `${s}: the call follows the list's world`);
+      assert(!call.wire.some((m) => m.method === 'Runtime.enable'));
+    }
+  });
+
+  test('webmcp: one tool name in two frames: ambiguous without --frame, --frame picks one', () => {
+    const r = fake('two_frames');
+    const frames = JSON.parse(r.list.stdout).tools.filter((t) => t.name === 'frame_echo').map((t) => t.frame);
+    assert.deepStrictEqual(frames, ['https://shop.test/frame.html', 'https://shop.test/frame.html?who=right']);
+    const exec = (run) => [].concat(...run.calls).filter((c) => c.fn === 'executeTool');
+    for (const key of ['ambiguous', 'both']) {
+      assert.strictEqual(r[key].exit, 1, key);
+      assert(/registered in several frames .*pick one with --frame/.test(r[key].stderr), r[key].stderr);
+      assert.strictEqual(exec(r[key]).length, 0, `${key} must not execute`);
+    }
+    assert.strictEqual(r.right.exit, 0, r.right.stderr);
+    assert.deepStrictEqual(exec(r.right).map((c) => c.frame), ['frame2']);
+    assert.strictEqual(r.left.exit, 0, r.left.stderr);
+    assert.deepStrictEqual(exec(r.left).map((c) => c.frame), ['frame'], 'an exact frame URL wins');
+    assert.strictEqual(r.nomatch.exit, 1);
+    assert(/not found in a frame matching 'nowhere'/.test(r.nomatch.stderr), r.nomatch.stderr);
+  });
+
+  test('webmcp: bad args and unknown tools never reach executeTool (exit 1)', () => {
+    const r = fake('call_refusals');
+    for (const [key, re] of [['missing', /missing required argument: qty/],
+      ['bool_int', /qty: expected integer, got boolean/], ['unknown', /tool 'nope' not found/],
+      ['noapi', /cannot call 'add_to_cart': document\.modelContext is missing/]]) {
+      assert.strictEqual(r[key].exit, 1, key);
+      assert(re.test(r[key].stderr), `${key}: ${r[key].stderr}`);
+      const executed = [].concat(...r[key].calls).filter((c) => c.fn === 'executeTool');
+      assert.strictEqual(executed.length, 0, `${key} must not execute`);
+    }
+  });
+
+  test('webmcp: tools list with no usable tools exits 0 and says why', () => {
+    const r = fake('list_diagnosis');
+    for (const [key, reason] of [['noapi', 'flag-off'], ['insecure', 'insecure-context'],
+      ['refused', 'not-origin-keyed']]) {
+      assert.strictEqual(r[key].exit, 0, key);
+      const out = JSON.parse(r[key].stdout);
+      assert.deepStrictEqual(out.tools, []);
+      assert.strictEqual(out.reason, reason, key);
+      assert.strictEqual(out.available, false);
+    }
+    assert(/launch --webmcp/.test(JSON.parse(r.noapi.stdout).hint));
+  });
+
+  test('webmcp: argument validator (required, type with bool != integer, enum, const, unions, nested)', () => {
+    const v = fake('validate');
+    const pass = ['ok', 'int_is_number', 'float_integral_is_integer', 'enum_ok', 'enum_1_ok',
+      'const_ok', 'union_null_ok', 'unsupported_keywords_deferred', 'no_schema', 'empty_schema'];
+    for (const k of pass) assert.deepStrictEqual(v[k], [true, null], k);
+    const fail = {
+      missing_required: 'missing required argument: n',
+      bool_not_integer: 'n: expected integer, got boolean',
+      bool_not_number: 'x: expected number, got boolean',
+      float_not_integer: 'n: expected integer, got number',
+      string_not_integer: 'n: expected integer, got string',
+      enum_bad: 's: must be one of ["a", "b"]',
+      enum_true_is_not_1: 'one: must be one of [1, "1"]',
+      const_bad: 'c: must be true',
+      union_bad: 'u: expected string or null, got integer',
+      items_bad: 'arr[1]: expected integer, got string',
+      nested_required: 'o: missing required argument: k',
+      nested_type: 'o.k: expected string, got integer',
+      not_object: 'arguments must be a JSON object',
+    };
+    for (const [k, msg] of Object.entries(fail)) assert.deepStrictEqual(v[k], [false, msg], k);
+  });
+
+  test('webmcp: diagnosis names the cause (flag off, insecure, old browser, legacy API, policy)', () => {
+    const d = fake('diagnose');
+    assert.strictEqual(d.no_tools[0], 'no-tools');
+    assert.strictEqual(d.insecure[0], 'insecure-context');
+    assert.strictEqual(d.old[0], 'old-browser');
+    assert(/Chromium 146/.test(d.old[1]), d.old[1]);
+    assert.strictEqual(d.legacy[0], 'legacy-api');
+    assert.strictEqual(d.flag_off_mode_off[0], 'flag-off');
+    assert(/launch --webmcp/.test(d.flag_off_mode_off[1]), d.flag_off_mode_off[1]);
+    assert(/mode is on/.test(d.flag_off_mode_on[1]) && !/--webmcp`/.test(d.flag_off_mode_on[1]),
+      d.flag_off_mode_on[1]);
+    assert.strictEqual(d.not_origin_keyed[0], 'not-origin-keyed');
+    assert.strictEqual(d.policy[0], 'policy');
+  });
+
+  test('webmcp: mode persists in webmcp.json, CDPILOT_WEBMCP overrides, launch merges --enable-features', () => {
+    const m = fake('mode_and_flags');
+    assert.strictEqual(m.absent, false);
+    assert.strictEqual(m.saved_on, true);
+    assert.strictEqual(m.env_off_wins, false);
+    assert.strictEqual(m.saved_off, false);
+    assert.strictEqual(m.env_on_wins, true);
+    assert.strictEqual(m.corrupt, false);
+    assert.deepStrictEqual(m.flag, [true, false, null, null]);
+    assert.deepStrictEqual(m.args_plain, ['chrome', '--disable-features=Translate', '--enable-features=WebMCP']);
+    assert.deepStrictEqual(m.args_merge, ['chrome', '--enable-features=Foo,WebMCP']);
+    assert.deepStrictEqual(m.args_dedup, ['chrome', '--enable-features=WebMCP']);
+  });
+
+  test('webmcp: session log redacts secret-named fields in tools call args and in results', () => {
+    const r = fake('redaction');
+    const json = JSON.parse(r.args[2]);
+    assert.strictEqual(json.user, 'ann');
+    assert.strictEqual(json.password, '«redacted:7 chars»');
+    assert.strictEqual(json.nested.api_key, '«redacted:6 chars»');
+    assert.strictEqual(r.args[4], 'token=«redacted:9 chars»');
+    assert.strictEqual(r.args[5], '--arg=qty=2');
+    assert.strictEqual(r.args[7], 'frame.html');
+    for (const s of ['hunter2', 'sk-abc', 't0ps3cret']) assert(r.secrets.includes(s), s);
+    const sum = JSON.parse(r.summary);
+    assert.strictEqual(sum.user, 'ann');
+    assert.strictEqual(sum.session_token, '«redacted:10 chars»');
+    assert.strictEqual(sum.profile.secret, '«redacted:12 chars»');
+    assert.strictEqual(sum.profile.name, 'Ann');
+    assert.strictEqual(sum.items[0].auth, '«redacted:7 chars»');
+    for (const s of ['zz-9876543', 's3cr3t-value', 'abc-123']) assert(!r.summary.includes(s), s);
+    assert.deepStrictEqual(JSON.parse(r.plain), { ok: true, qty: 2 });
+  });
+
+  // One MCP server per mode: tools/list, and a browser_site_tools call.
+  function mcpTools(extraEnv, modeFile) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-webmcp-mcp-'));
+    const profile = path.join(home, 'profile');
+    if (modeFile !== undefined) {
+      fs.mkdirSync(profile, { recursive: true });
+      fs.writeFileSync(path.join(profile, 'webmcp.json'), JSON.stringify({ webmcp: modeFile }));
+    }
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: profile, CDP_PORT: '19226',
+      CDPILOT_LOG: '0', CDPILOT_NO_AUTOLAUNCH: '1', ...extraEnv };
+    if (!('CDPILOT_WEBMCP' in extraEnv)) delete env.CDPILOT_WEBMCP;
+    const reqs = [{ jsonrpc: '2.0', id: 1, method: 'tools/list' },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'browser_site_tools', arguments: {} } }];
+    const r = spawnSync(PYB, [PY_PATH, 'mcp'], { input: reqs.map((x) => JSON.stringify(x)).join('\n') + '\n',
+      encoding: 'utf-8', timeout: 60000, env });
+    const res = r.stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    return { names: res.find((x) => x.id === 1).result.tools.map((t) => t.name), call: res.find((x) => x.id === 2) };
+  }
+
+  test('webmcp: MCP tools/list is 43 tools with WebMCP off, 45 with it on', () => {
+    const off = mcpTools({});
+    assert.strictEqual(off.names.length, 43, `off: ${off.names.length}`);
+    assert(!off.names.some((n) => n.startsWith('browser_site_')), 'off: no browser_site_* tools');
+    assert(/Unknown tool: browser_site_tools/.test(JSON.stringify(off.call)), 'off: not callable');
+    const offByFile = mcpTools({}, false);
+    assert.strictEqual(offByFile.names.length, 43);
+    for (const on of [mcpTools({ CDPILOT_WEBMCP: '1' }), mcpTools({}, true)]) {
+      assert.strictEqual(on.names.length, 45, `on: ${on.names.length}`);
+      assert.deepStrictEqual(on.names.slice(0, 43), off.names, 'the 43 base tools are unchanged');
+      assert.deepStrictEqual(on.names.slice(43), ['browser_site_tools', 'browser_site_tool_call']);
+      assert(!/Unknown tool/.test(JSON.stringify(on.call)), 'on: browser_site_tools routes to the CLI');
+    }
+  });
+
+  test('webmcp: launch --webmcp saves the mode for later processes; status shows it only while on', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-webmcp-mode-'));
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: '19227', CDPILOT_LOG: '0', CHROME_BIN: path.join(home, 'no-such-browser') };
+    delete env.CDPILOT_WEBMCP;
+    const status = () => spawnSync(process.execPath, [CLI, 'status'], { encoding: 'utf-8', timeout: 20000, env }).stdout;
+    // Mode off: the output is exactly what it was before WebMCP existed.
+    const plain = '\n  cdpilot status (port 19227)\n\n  ❌ No browser connected on this port.\n  Run: cdpilot launch\n\n';
+    assert.strictEqual(status(), plain, 'default status unchanged');
+    // No browser here: launch fails to start one, the mode is saved first.
+    spawnSync(PYB, [PY_PATH, 'launch', '--webmcp'], { encoding: 'utf-8', timeout: 30000, env });
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(home, 'profile', 'webmcp.json'), 'utf8')), { webmcp: true });
+    const on = status();
+    assert(/\n  ❌ No browser connected on this port\.\n  WebMCP: on \(launch --webmcp; browsers start with --enable-features=WebMCP\)\n  Run: cdpilot launch\n/.test(on), on);
+    spawnSync(PYB, [PY_PATH, 'launch', '--no-webmcp'], { encoding: 'utf-8', timeout: 30000, env });
+    assert.strictEqual(status(), plain, 'status after launch --no-webmcp');
+    assert(/WebMCP: on \(CDPILOT_WEBMCP;/.test(spawnSync(process.execPath, [CLI, 'status'],
+      { encoding: 'utf-8', timeout: 20000, env: { ...env, CDPILOT_WEBMCP: '1' } }).stdout), 'env override');
+  });
+
+  test('webmcp: `tools` is in Available commands; help documents tools list/call and --webmcp', () => {
+    const r = spawnSync(process.execPath, [CLI, 'no-such-command-xyz'], { encoding: 'utf-8', timeout: 20000,
+      env: { ...process.env, CDP_PORT: '19222', CDPILOT_LOG: '0' } });
+    const m = /Available commands: (.*)/.exec(r.stderr);
+    assert(m, r.stderr);
+    assert(m[1].split(', ').includes('tools'), m[1]);
+    const help = run('--help');
+    assert(/tools list/.test(help) && /tools call/.test(help) && /--webmcp/.test(help), 'help');
+    const usage = spawnSync(PYB, [PY_PATH, 'tools'], { encoding: 'utf-8', timeout: 20000,
+      env: { ...process.env, CDP_PORT: '19222', CDPILOT_LOG: '0' } });
+    assert.strictEqual(usage.status, 1);
+    assert(/Usage: tools list/.test(usage.stderr), usage.stderr);
+  });
+
+  if (process.env.CDPILOT_E2E !== '1') {
+    console.log('  - skipped: webmcp e2e (set CDPILOT_E2E=1 to run it against a headless browser)');
+    return;
+  }
+
+  const fixtures = path.join(__dirname, 'fixtures', 'webmcp');
+  let e2e = null;
+  test('webmcp e2e: headless browser started with `launch --webmcp` only, fixture server up', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-webmcp-e2e-'));
+    const [cdpPort, httpPort] = JSON.parse(execFileSync(PYB, ['-c', [
+      'import json, socket', 'ss = [socket.socket() for _ in range(2)]',
+      '[s.bind(("127.0.0.1", 0)) for s in ss]',
+      'print(json.dumps([s.getsockname()[1] for s in ss]))', '[s.close() for s in ss]',
+    ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
+    const server = spawn(PYB, ['-m', 'http.server', String(httpPort), '--bind', '127.0.0.1'],
+      { cwd: fixtures, stdio: 'ignore' });
+    const trace = path.join(home, 'cdp-trace.txt');
+    // No CDPILOT_WEBMCP anywhere: the mode must come from `launch --webmcp`.
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1', CDPILOT_LOG: '0', CDPILOT_CDP_TRACE: trace };
+    delete env.CDPILOT_TARGET;
+    delete env.CDPILOT_WEBMCP;
+    delete env.CDPILOT_TIMEOUT;
+    const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf-8', timeout: 60000, env });
+    const stop = () => {
+      c('stop');
+      try { server.kill(); } catch (err) { /* already gone */ }
+    };
+    try {
+      execFileSync(PYB, ['-c', [
+        'import time, urllib.request',
+        `url = "http://127.0.0.1:${httpPort}/shop.html"`,
+        'for _ in range(50):',
+        '    try: urllib.request.urlopen(url, timeout=1); break',
+        '    except Exception: time.sleep(0.1)',
+      ].join('\n')], { timeout: 20000 });
+      const r = c('launch', '--webmcp');
+      assert(/CDP ready/.test(r.stdout + r.stderr), `launch: ${r.stdout}${r.stderr}`);
+      assert(/WebMCP: on \(--enable-features=WebMCP\)/.test(r.stdout), r.stdout);
+    } catch (err) {
+      stop();
+      throw err;
+    }
+    e2e = { c, httpPort, stop, trace, skip: null };
+    // Skip (never fail) only when this browser really has no native WebMCP:
+    // started with the flag, on a secure page, and document.modelContext is
+    // still missing in the page itself.
+    c('go', `http://127.0.0.1:${httpPort}/shop.html`);
+    const probe = c('eval', 'JSON.stringify([isSecureContext, typeof document.modelContext])');
+    const [secure, api] = JSON.parse(probe.stdout.trim());
+    if (secure === true && api === 'undefined') {
+      const browser = (/Browser: (.*)/.exec(c('status').stdout) || [])[1] || 'this browser';
+      e2e.skip = `${browser} has no native document.modelContext even with --enable-features=WebMCP`;
+    } else {
+      assert.deepStrictEqual([secure, api], [true, 'object'], probe.stdout + probe.stderr);
+    }
+  });
+  if (e2e && e2e.skip) {
+    console.log(`  - skipped: webmcp e2e (${e2e.skip})`);
+    e2e.stop();
+    return;
+  }
+
+  const ok = (r, re, what) => assert(re.test(r.stdout + r.stderr),
+    `${what}: exit ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+  const needE2E = () => { assert(e2e, 'browser setup failed'); return e2e; };
+  const listJson = (c) => {
+    const r = c('tools', 'list', '--json');
+    assert.strictEqual(r.status, 0, `tools list: ${r.stderr}`);
+    return JSON.parse(r.stdout);
+  };
+  // Poll `cmd` until pred(result) (a navigation lands between two commands).
+  const until = (fn, pred, what) => {
+    let last;
+    for (let i = 0; i < 25; i++) {
+      last = fn();
+      if (pred(last)) return last;
+      execFileSync(process.execPath, ['-e', 'setTimeout(() => {}, 200)']);
+    }
+    assert.fail(`${what}: ${JSON.stringify(last)}`);
+  };
+  const evalJson = (c, js) => {
+    const r = c('eval', `(async () => JSON.stringify(await (${js})))()`);
+    assert.strictEqual(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout.trim());
+  };
+
+  try {
+    test('webmcp e2e: go + tools list shows imperative, declarative and iframe tools with title/annotations', () => {
+      const { c, httpPort, trace } = needE2E();
+      ok(c('status'), /WebMCP: on/, 'status');
+      ok(c('go', `http://127.0.0.1:${httpPort}/shop.html`), /WebMCP fixture shop/, 'go');
+      fs.writeFileSync(trace, '');
+      const out = until(() => listJson(c), (o) => o.tools.length === 4, 'four tools');
+      const byName = Object.fromEntries(out.tools.map((t) => [t.name, t]));
+      assert.deepStrictEqual(Object.keys(byName).sort(),
+        ['add_to_cart', 'frame_echo', 'subscribe_newsletter', 'wait_for_abort']);
+      assert.strictEqual(byName.add_to_cart.title, 'Add to cart');
+      // Titles and annotations are passed through as the browser reports them;
+      // which hints exist depends on the Chrome version (153 has no
+      // consequentialHint), so compare with the page's own getTools().
+      const native = evalJson(c, 'document.modelContext.getTools().then((ts) => Object.fromEntries('
+        + 'ts.map((t) => [t.name, { title: t.title, annotations: t.annotations || null }])))');
+      for (const t of out.tools) {
+        assert.strictEqual(t.title, native[t.name].title || '', `${t.name} title`);
+        assert.deepStrictEqual(t.annotations || null, native[t.name].annotations, `${t.name} annotations`);
+      }
+      const hasConsequential = 'consequentialHint' in (native.add_to_cart.annotations || {});
+      if (hasConsequential) assert.strictEqual(byName.add_to_cart.annotations.consequentialHint, true);
+      assert.deepStrictEqual(byName.add_to_cart.inputSchema.required, ['sku', 'qty']);
+      const form = byName.subscribe_newsletter;
+      assert.strictEqual(form.title, 'Subscribe', 'tooltitle');
+      assert.strictEqual(form.declarative, true);
+      assert.strictEqual(form.autosubmit, true, 'toolautosubmit');
+      assert.strictEqual(form.inputSchema.properties.email.description, 'Customer email address',
+        'toolparamdescription');
+      assert.deepStrictEqual(form.inputSchema.required, ['email']);
+      assert(/\/frame\.html$/.test(byName.frame_echo.frame), `frame: ${byName.frame_echo.frame}`);
+      ok(c('tools', 'list'), hasConsequential
+        ? /4 WebMCP tools on .*\n\s+add_to_cart\s+"Add to cart"\s+\[consequential\]/
+        : /4 WebMCP tools on .*\n\s+add_to_cart\s+"Add to cart"/, 'human list');
+      const sent = fs.readFileSync(trace, 'utf8').split('\n').filter(Boolean);
+      assert(sent.includes('Runtime.evaluate') && sent.includes('Page.createIsolatedWorld'), sent.join(','));
+      for (const bad of ['Runtime.enable', 'Page.addScriptToEvaluateOnNewDocument']) {
+        assert(!sent.includes(bad), `tools list sent ${bad}`);
+      }
+      // Nothing of cdpilot's is left on the page (Chrome's own interfaces such as
+      // WebMCPEvent are native functions); the API is the browser's own.
+      assert.deepStrictEqual(evalJson(c, 'Object.getOwnPropertyNames(window).filter((k) => '
+        + '/cdpilot|webmcp|modelcontext/i.test(k) && !/\\[native code\\]/.test(String(window[k])))'), []);
+      assert.strictEqual(evalJson(c, 'String(document.modelContext.getTools).includes("[native code]")'), true);
+    });
+
+    test('webmcp e2e: tools call returns the real result and changes the page (imperative, form, iframe)', () => {
+      const { c } = needE2E();
+      const r = c('tools', 'call', 'add_to_cart', '{"sku":"A1","qty":2}');
+      assert.strictEqual(r.status, 0, r.stderr);
+      assert.deepStrictEqual(JSON.parse(r.stdout), { ok: true, sku: 'A1', qty: 2, cart_size: 1 });
+      assert.deepStrictEqual(evalJson(c, 'window.__cart'), [{ sku: 'A1', qty: 2 }]);
+      assert.strictEqual(evalJson(c, 'document.getElementById("status").textContent'), 'Cart: 1 items');
+      const f = c('tools', 'call', 'subscribe_newsletter', '--arg', 'email=ann@example.com');
+      assert.strictEqual(f.status, 0, f.stderr);
+      assert.deepStrictEqual(JSON.parse(f.stdout), { subscribed: 'ann@example.com' }, 'respondWith() result');
+      assert.deepStrictEqual(evalJson(c, '[window.__subscribed, window.__agentInvoked]'), ['ann@example.com', true]);
+      const e = c('tools', 'call', 'frame_echo', '{"text":"hi"}');
+      assert.strictEqual(e.status, 0, e.stderr);
+      assert.deepStrictEqual(JSON.parse(e.stdout), { echo: 'hi', from: 'frame' });
+      assert.strictEqual(evalJson(c,
+        'document.getElementById("widget").contentDocument.getElementById("frame-status").textContent'), 'echoed: hi');
+    });
+
+    test('webmcp e2e: a page that wraps getTools/executeTool gets no fake tool, no hijacked result, no view of the calls', () => {
+      const { c, httpPort } = needE2E();
+      ok(c('go', `http://127.0.0.1:${httpPort}/patched.html`), /Patched API/, 'go');
+      const out = until(() => listJson(c), (o) => o.tools.length > 0, 'patched page tools');
+      assert.deepStrictEqual(out.tools.map((t) => t.name), ['real_counter'], 'only the real tool');
+      const r = c('tools', 'call', 'real_counter', '{"by":3}');
+      assert.strictEqual(r.status, 0, r.stderr);
+      assert.deepStrictEqual(JSON.parse(r.stdout), { count: 3 }, 'the real result');
+      const human = c('tools', 'list');
+      assert(!/main world/.test(r.stderr + human.stderr), 'no main-world fallback');
+      ok(human, /1 WebMCP tool on .*patched\.html/, 'human list');
+      assert.strictEqual(evalJson(c, 'window.__count'), 3, 'the real tool ran');
+      const fakeCall = c('tools', 'call', 'fake_tool', '{}');
+      assert.strictEqual(fakeCall.status, 1);
+      ok(fakeCall, /tool 'fake_tool' not found/, 'fake tool');
+      assert.deepStrictEqual(evalJson(c, 'window.__seen'), [], "the page's wrappers never ran");
+      // Sanity: in the page's own world the wrappers are live.
+      assert.deepStrictEqual(evalJson(c, 'document.modelContext.getTools().then((t) => t.map((x) => x.name))'),
+        ['real_counter', 'fake_tool']);
+    });
+
+    test('webmcp e2e: one tool name in two same-origin frames: --frame picks which one runs', () => {
+      const { c, httpPort } = needE2E();
+      c('go', `http://127.0.0.1:${httpPort}/twoframes.html`);
+      const out = until(() => listJson(c), (o) => o.tools.length === 2, 'two frame tools');
+      assert.deepStrictEqual(out.tools.map((t) => t.name), ['frame_echo', 'frame_echo']);
+      assert.deepStrictEqual(out.tools.map((t) => t.frame.replace(/^.*\//, '')).sort(),
+        ['frame.html?who=left', 'frame.html?who=right']);
+      const amb = c('tools', 'call', 'frame_echo', '{"text":"x"}');
+      assert.strictEqual(amb.status, 1);
+      ok(amb, /registered in several frames .*--frame/, 'ambiguous');
+      for (const who of ['left', 'right']) {
+        const r = c('tools', 'call', 'frame_echo', '{"text":"x"}', '--frame', `who=${who}`);
+        assert.strictEqual(r.status, 0, r.stderr);
+        assert.deepStrictEqual(JSON.parse(r.stdout), { echo: 'x', from: who });
+      }
+      assert.deepStrictEqual(evalJson(c, '["a", "b"].map((id) => '
+        + 'document.getElementById(id).contentDocument.getElementById("frame-status").textContent)'),
+      ['echoed: x', 'echoed: x']);
+    });
+
+    test('webmcp e2e: a --timeout aborts the running tool through its signal (exit 124)', () => {
+      const { c, httpPort } = needE2E();
+      c('go', `http://127.0.0.1:${httpPort}/shop.html`);
+      until(() => listJson(c), (o) => o.tools.length === 4, 'shop tools');
+      const r = c('--timeout', '4', 'tools', 'call', 'wait_for_abort');
+      assert.strictEqual(r.status, 124, `${r.stdout}${r.stderr}`);
+      ok(r, /its execution was aborted/, 'timeout message');
+      assert.strictEqual(evalJson(c, 'window.__slowAborted'), true, "the tool's signal was aborted");
+    });
+
+    test('webmcp e2e: the list follows a reload and a link navigation to another page', () => {
+      const { c } = needE2E();
+      c('eval', 'location.reload()');
+      until(() => evalJson(c, 'window.__cart ? window.__cart.length : -1'), (n) => n === 0, 'reloaded');
+      const again = until(() => listJson(c), (o) => o.tools.length === 4, 'tools after reload');
+      assert(again.tools.some((t) => t.name === 'add_to_cart'));
+      ok(c('click', '#next'), /Clicked/, 'click link');
+      const p2 = until(() => listJson(c), (o) => o.tools.length === 1, 'page two tools');
+      assert.strictEqual(p2.tools[0].name, 'lookup_order');
+      assert.strictEqual(p2.tools[0].annotations.readOnlyHint, true);
+      assert(/page2\.html$/.test(p2.url), p2.url);
+      const r = c('tools', 'call', 'lookup_order', '{"id":"42"}');
+      assert.strictEqual(r.status, 0, r.stderr);
+      assert.deepStrictEqual(JSON.parse(r.stdout), { id: '42', state: 'shipped' });
+      const gone = c('tools', 'call', 'add_to_cart', '{"sku":"A","qty":1}');
+      assert.strictEqual(gone.status, 1);
+      ok(gone, /tool 'add_to_cart' not found/, 'old page tool gone');
+    });
+
+    test('webmcp e2e: bad arguments exit 1 before the tool runs', () => {
+      const { c, httpPort } = needE2E();
+      c('go', `http://127.0.0.1:${httpPort}/shop.html`);
+      until(() => listJson(c), (o) => o.tools.length === 4, 'shop again');
+      for (const [args, re] of [[['{"sku":"B1"}'], /missing required argument: qty/],
+        [['{"sku":"B1","qty":true}'], /qty: expected integer, got boolean/],
+        [['{"sku":"B1","qty":"2"}'], /qty: expected integer, got string/],
+        [['[1,2]'], /arguments must be a JSON object/],
+        [['not json'], /invalid JSON arguments/]]) {
+        const r = c('tools', 'call', 'add_to_cart', ...args);
+        assert.strictEqual(r.status, 1, `${args}: ${r.stdout}${r.stderr}`);
+        ok(r, re, String(args));
+      }
+      assert.deepStrictEqual(evalJson(c, 'window.__cart'), [], 'nothing was added');
+    });
+
+    test('webmcp e2e: a browser without WebMCP gets the diagnosis (exit 0)', () => {
+      const { c, httpPort } = needE2E();
+      ok(c('stop'), /stopped/i, 'stop');
+      const l = c('launch', '--no-webmcp');
+      assert(/CDP ready/.test(l.stdout), l.stdout + l.stderr);
+      assert(!/WebMCP/.test(l.stdout), l.stdout);
+      assert(!/WebMCP/.test(c('status').stdout), 'status: no WebMCP line while the mode is off');
+      c('go', `http://127.0.0.1:${httpPort}/shop.html`);
+      const out = listJson(c);
+      assert.deepStrictEqual(out.tools, []);
+      assert.strictEqual(out.reason, 'flag-off');
+      assert(/launch --webmcp/.test(out.hint), out.hint);
+      const human = c('tools', 'list');
+      assert.strictEqual(human.status, 0);
+      ok(human, /No WebMCP tools on .*shop\.html\.\n\s+document\.modelContext is missing/, 'human diagnosis');
+      const call = c('tools', 'call', 'add_to_cart', '{"sku":"A","qty":1}');
+      assert.strictEqual(call.status, 1);
+      ok(call, /cannot call 'add_to_cart'/, 'call diagnosis');
+    });
+  } finally {
+    if (e2e) {
+      try { e2e.stop(); } catch (err) { /* best effort */ }
+    }
+  }
+})();
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
