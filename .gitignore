@@ -3,6 +3,9 @@ dist/
 *.log
 .DS_Store
 demo/out/
+# Built MCP Bundle output (scripts/build-mcpb.sh) — built by CI/release, not committed
+*.mcpb
+.mcpb-cache/
 __pycache__/
 *.pyc
 .env
