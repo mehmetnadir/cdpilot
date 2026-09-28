@@ -9,8 +9,12 @@ The real cdp_send, WS pool, frame route, rewrite and frame-search code run
 unchanged; only the wire is fake. A smart-* finder is the expression
 "FINDER" (wrapped by _smart_wrap): the fake answers per frame and mode
 (probe / strict / loose) and records an "act" whenever a non-probe finder
-reports found (the real finder clicks or types right there). Prints one JSON object {scenario: result};
-a scenario that raises reports {"error": traceback}.
+reports found (the real finder clicks or types right there). cmd_click's
+own script (the `__cdpilot_waitFor(` one) finds one element "el:<frame>:<sel>"
+with its centre at (40, 50) of its frame ("#nobox": no box); the real-click
+helpers (_CENTER_FN, _HIT_TEST_FN, _SCRIPT_CLICK_FN, cdpilot's input blocker,
+the settle wait) are answered from per-frame settings. Prints one JSON object
+{scenario: result}; a scenario that raises reports {"error": traceback}.
 """
 import asyncio
 import contextlib
@@ -24,7 +28,8 @@ import traceback
 import types
 
 WS = "ws://fake/devtools/page/1"
-STATE = {"browser": None, "methods": {}}  # methods: every CDP method sent, all scenarios
+STATE = {"browser": None, "methods": {}, "released": {}}  # every CDP method sent / object
+# group released, over all scenarios
 
 
 class Frame:
@@ -32,13 +37,17 @@ class Frame:
 
     def __init__(self, fid, origin="http://a.test", oop=False, elem_id="", name="",
                  src="", visible=True, box=(0, 0), finder=None, slow=False, children=(),
-                 wrappers=()):
+                 wrappers=(), scale=1.0):
         self.fid, self.origin, self.oop = fid, origin, oop
         self.wrappers = list(wrappers)  # selectors of elements around the <iframe>
         self.elem_id, self.name, self.src, self.visible = elem_id, name, src, visible
         self.box, self.finder, self.slow = box, finder or {}, slow
         self.children = list(children)
         self.ctx = None
+        self.scale = scale        # the <iframe>'s rendered / layout size
+        self.covered = ""         # what covers this frame's <iframe> at the click point
+        self.target_cover = ""    # what covers the click target inside this frame
+        self.settle_hang = False  # the settle wait in this frame never answers
 
 
 class Transport:
@@ -57,6 +66,15 @@ class Browser:
         self.mod, self.top = mod, top
         self.frames, self.ctx, self.sessions = {}, {}, {}
         self.log, self.finder, self.mouse, self.acts = [], [], [], []
+        self.act_real = []        # per act: did the finder get __cdpilotRealClick?
+        self.clicks = []          # [frame, "script"]: an el.click() cdpilot caused
+        self.leaks = []           # scripts that put a helper on window
+        self.hits = []            # hit-tests: [objectId, x, y]
+        self.settles = []         # settle waits: [frame, context is an isolated world]
+        self.blocker = False      # the top page has cdpilot's input blocker
+        self.blocker_log = []     # pointer-events values set on it, in order
+        self.fail_on = None       # a CDP method whose send raises RuntimeError
+        self.arrays = {}          # smart-click real-click results: [JSON, element]
         self.attached, self.detached, self.sockets = [], [], []
         self.cancel_on = None
         self.opaque_ids = False   # remote-object ids without "<isolate>.<context>.<n>"
@@ -143,7 +161,11 @@ class Browser:
             self.ctx[self.next_ctx[0]], self.isolated = f, self.isolated | {self.next_ctx[0]}
             return ok({"executionContextId": self.next_ctx[0]})
         if method == "Runtime.releaseObjectGroup":
+            g = p.get("objectGroup")
+            STATE["released"][g] = STATE["released"].get(g, 0) + 1
             return ok({})
+        if method == "Page.getFrameTree":
+            return ok({"frameTree": {"frame": {"id": root.fid}}})
         if method == "Runtime.evaluate" and p.get("expression") == "document":
             ctx = p.get("contextId", root.ctx)
             f = self.ctx.get(ctx)
@@ -184,10 +206,7 @@ class Browser:
                 node["contentDocument"] = {"nodeName": "#document", "backendNodeId": 5000 + f.ctx}
             return ok({"node": node})
         if method == "Runtime.callFunctionOn":
-            f = self.owner(p.get("objectId"))
-            if f is None:
-                return err("Could not find object with given id")
-            return ok({"result": {"type": "object", "value": list(f.box)}})
+            return self.call_function(p, ok, err)
         if method == "Input.dispatchMouseEvent":
             self.mouse.append([p.get("type"), p.get("x"), p.get("y")])
             return ok({})
@@ -197,10 +216,54 @@ class Browser:
                 frame = self.ctx.get(p["contextId"])
                 if frame is None or frame not in self.process(root):
                     return err("Cannot find context with specified id")
-            return self.evaluate(frame, p.get("expression", ""), ok)
+            return self.evaluate(frame, p.get("expression", ""), ok, p)
         return ok({})
 
-    def evaluate(self, frame, expr, ok):
+    def element(self, oid):
+        """(frame, selector) of an "el:<frame>:<selector>" object id, else None."""
+        parts = str(oid).split(":", 2)
+        if len(parts) == 3 and parts[0] == "el" and parts[1] in self.frames:
+            return self.frames[parts[1]], parts[2]
+        return None
+
+    def call_function(self, p, ok, err):
+        fd, oid, mod = p.get("functionDeclaration", ""), p.get("objectId"), self.mod
+        args = [a.get("value") for a in p.get("arguments") or []]
+
+        def value(v):
+            return ok({"result": {"type": "object" if isinstance(v, list) else "string", "value": v}})
+        if fd == mod._HIT_TEST_FN:
+            self.hits.append([oid] + args)
+            f = self.owner(oid)
+            if f is not None:
+                return value(f.covered)
+            el = self.element(oid)
+            return value(el[0].target_cover) if el else err("Could not find object with given id")
+        el = self.element(oid)
+        if el is not None:
+            f, sel = el
+            if fd == mod._CENTER_FN:
+                return value([40, 50, 20, 10])
+            if fd == mod._CLICK_LABEL_FN:
+                return value(json.dumps({"res": "Clicked: BUTTON " + sel, "box": not sel.endswith("#nobox")}))
+            if fd == mod._SCRIPT_CLICK_FN:
+                self.clicks.append([f.fid, "script"])
+                return ok({"result": {"type": "undefined"}})
+            return err("unexpected function on an element")
+        if oid in self.arrays:
+            raw, hit = self.arrays[oid]
+            if "this[0]" in fd:
+                return value(raw)
+            if hit is None:
+                return ok({"result": {"type": "object", "subtype": "null", "value": None}})
+            return ok({"result": {"type": "object", "subtype": "node", "objectId": hit}})
+        f = self.owner(oid)
+        if f is None:
+            return err("Could not find object with given id")
+        return ok({"result": {"type": "object", "value": [f.box[0], f.box[1], 0, 0, f.scale, f.scale]}})
+
+    def evaluate(self, frame, expr, ok, params=None):
+        params = params or {}
         def value(v):
             return ok({"result": {"type": "object" if isinstance(v, list) else "string", "value": v}})
 
@@ -238,7 +301,28 @@ class Browser:
             ans = self.answer(frame, mode)
             if mode != "probe" and ans.get("found"):
                 self.acts.append([frame.fid, mode])
+                self.act_real.append("__cdpilotRealClick" in expr)
+            if "__cdpilotHit" in expr:  # _smart_wrap(real_click=True): [JSON, element]
+                hit = None
+                if ans.get("found") and mode != "probe":
+                    ans, hit = dict(ans, realClick=True), "el:%s:finder" % frame.fid
+                oid = "arr:%d" % len(self.arrays)
+                self.arrays[oid] = (json.dumps(ans), hit)
+                return ok({"result": {"type": "object", "subtype": "array", "objectId": oid}})
             return value(json.dumps(ans))
+        if expr == self.mod._TWO_PAGE_FRAMES_JS:  # the settle wait before mouse input
+            self.settles.append([frame.fid, params.get("contextId") in self.isolated])
+            return [] if frame.settle_hang else ok({"result": {"type": "undefined"}})
+        if "cdpilot-input-blocker" in expr:  # _BLOCKER_POINTER_JS
+            pe = json.loads(expr[expr.rindex("(") + 1:-1])
+            if frame is self.top and self.blocker:
+                self.blocker_log.append(pe)
+                return ok({"result": {"type": "boolean", "value": True}})
+            return ok({"result": {"type": "boolean", "value": False}})
+        if expr.startswith("!!document.querySelector("):  # selector ladder, css step
+            return ok({"result": {"type": "boolean", "value": True}})
+        if "__cdpilot_waitFor(" in expr:  # cmd_click / cmd_fill script
+            return self.click_script(frame, expr, params, ok)
         if expr == "HANG":
             return []
         if expr == "NOISY":  # events interleaved before the reply, as a live page sends them
@@ -251,6 +335,21 @@ class Browser:
         if expr.startswith("WHERE:"):
             return value(frame.fid + "|" + expr[len("WHERE:"):])
         return ok({"result": {"type": "undefined"}})
+
+    def click_script(self, frame, expr, params, ok):
+        """cmd_click's script: the element "el:<frame>:<sel>", or (plain page
+        path, returnByValue) its "Clicked:" line after the script's el.click()."""
+        if "window.__cdpilot_waitFor" in expr:
+            self.leaks.append(frame.fid)
+        sel = json.loads(re.search(r'__cdpilot_waitFor\(("(?:[^"\\]|\\.)*"), ', expr).group(1))
+        if params.get("returnByValue") is False:
+            if "el.click()" in expr:
+                self.clicks.append([frame.fid, "script"])
+            return ok({"result": {"type": "object", "subtype": "node",
+                                  "objectId": "el:%s:%s" % (frame.fid, sel)}})
+        for _ in range(expr.count("el.click();")):
+            self.clicks.append([frame.fid, "script"])
+        return ok({"result": {"type": "string", "value": "Clicked: BUTTON " + sel}})
 
 
 class FakeWS:
@@ -270,6 +369,8 @@ class FakeWS:
         self.b.log.append(msg)
         if self.b.cancel_on == msg.get("method"):
             raise asyncio.CancelledError()
+        if self.b.fail_on == msg.get("method"):
+            raise RuntimeError("boom")
         for payload in self.b.handle(msg):
             delay = payload.pop("_delay", 0)
             if delay:
@@ -324,6 +425,8 @@ def run(mod, top, body, pool=True):
     mod._WS_POOL.clear()
     mod._WS_LOCKS.clear()
     mod._FRAME_FLAG = None
+    if hasattr(mod, "_FRAME_ISOLATED_NOTED"):
+        mod._FRAME_ISOLATED_NOTED[0] = False  # once per process: a run is a process
     mod._WS_POOL_ENABLED = pool
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -676,19 +779,117 @@ def scenario_frame_list(mod):
 
 
 def scenario_isolated_fallback(mod):
-    """No usable main-world id: an isolated world (same DOM), and frame eval says so."""
+    """No usable main-world id: an isolated world (same DOM), and every command says so."""
     top = Frame("top", children=[Frame("card", elem_id="card", src="http://a.test/inner.html")])
+    seen = []
+    probe = probe_command(mod, seen)
     out = {}
-    for key, args in [("eval", ("eval", "--frame", "#card", "WHERE:z")), ("list", ("list", "--frame", "#card"))]:
-        async def body(b, args=args):
+    for key, steps in [("eval", [(mod.cmd_frame, ("eval", "--frame", "#card", "WHERE:z"))]),
+                       ("list", [(mod.cmd_frame, ("list", "--frame", "#card"))]),
+                       ("click", [(probe, ("#card >>> #btn",))]),
+                       # two frame commands in one process: one note
+                       ("twice", [(probe, ("#card >>> #btn",)), (probe, ("#card >>> #cc",))])]:
+        async def body(b, steps=steps):
             b.opaque_ids = True
-            res = await call(mod.cmd_frame, *args)
+            res = [await call(fn, *args) for fn, args in steps]
             ctxs = [m["params"].get("contextId") for m in b.log
                     if m["method"] == "Runtime.evaluate" and "WHERE:" in m["params"].get("expression", "")]
             return {"res": res, "contexts": ctxs, "isolated": sorted(b.isolated)}
         _, res, stdout, err = run(mod, top, body)
         res.update({"stdout": stdout, "stderr": err})
         out[key] = res
+    return out
+
+
+def click_page(**cfg):
+    """page_tree() with the real-click settings `cfg` applied:
+    "<frame>.<attr>": value (frame "top", "card", "nested", "pay")."""
+    top = page_tree()
+    frames = {"top": top, "card": top.children[0], "nested": top.children[0].children[0],
+              "pay": top.children[1]}
+    for key, v in cfg.items():
+        fid, attr = key.split(".")
+        setattr(frames[fid], attr, v)
+    return top
+
+
+def run_click(mod, top, target, entropy=False, blocker=False, fail_on=None):
+    async def body(b):
+        b.blocker, b.fail_on = blocker, fail_on
+        t0 = time.monotonic()
+        res = await call(lambda: mod.cmd_click(target, None, False, entropy))
+        return {"res": res, "elapsed": time.monotonic() - t0}
+    b, res, stdout, err = run(mod, top, body)
+    res.update({"stdout": stdout, "stderr": err, "clicks": b.clicks, "leaks": b.leaks, "hits": b.hits,
+                "settles": b.settles, "blocker": b.blocker_log,
+                "pressed": [m[1:] for m in b.mouse if m[0] == "mousePressed"],
+                "released": [m[1:] for m in b.mouse if m[0] == "mouseReleased"]})
+    return res
+
+
+def scenario_click_input(mod):
+    """cmd_click: one click per command; real mouse input with entropy and in frames,
+    only where the hit-test passes; cdpilot's input blocker opened and restored."""
+    out = {}
+    # The entropy cases take ~0.5 s each: the humanized pauses are real.
+    for key, target, entropy in [
+        ("page_plain", "#btn", False),
+        ("page_entropy", "#btn", True),
+        ("frame", "#card >>> #btn", False),
+        ("frame_entropy", "#card >>> #nested >>> #btn", True),
+        ("oopif", "#pay >>> #btn", False),
+        ("frame_nobox", "#card >>> #nobox", False),
+    ]:
+        out[key] = run_click(mod, click_page(), target, entropy)
+    # A cookie banner over the <iframe>, and one over the target inside the frame.
+    out["covered_frame"] = run_click(mod, click_page(**{"card.covered": "div#cookie.banner"}), "#card >>> #btn")
+    out["covered_target"] = run_click(mod, click_page(**{"nested.target_cover": "div.overlay"}),
+                                      "#card >>> #nested >>> #btn")
+    out["covered_page"] = run_click(mod, click_page(**{"top.target_cover": "div#cookie"}), "#btn", True)
+    # transform: scale(.5) on #card, zoom: 2 on #nested inside it.
+    out["scaled"] = run_click(mod, click_page(**{"card.scale": 0.5, "nested.scale": 2.0}),
+                              "#card >>> #nested >>> #btn")
+    # cdpilot's input blocker on the top page (visual feedback on).
+    out["blocker"] = run_click(mod, click_page(), "#card >>> #btn", blocker=True)
+    out["blocker_entropy"] = run_click(mod, click_page(), "#btn", True, blocker=True)
+    out["blocker_error"] = run_click(mod, click_page(), "#card >>> #btn", blocker=True,
+                                     fail_on="Input.dispatchMouseEvent")
+    # The settle wait never answers, in the frame and in the top page.
+    out["settle_hang"] = run_click(mod, click_page(**{"card.settle_hang": True, "top.settle_hang": True}),
+                                   "#card >>> #btn")
+    out["settle_ok"] = run_click(mod, click_page(), "#card >>> #btn")
+    out["settle_timeout"] = mod.FRAME_SETTLE_TIMEOUT_S
+    return out
+
+
+def scenario_smart_real_click(mod):
+    """smart-click in a frame: the finder picks, the mouse clicks (hit-tested)."""
+    out = {}
+    for key, finders, cover in [
+        ("smart_frame", {"top": {"strict": {"found": False}, "loose": {"found": False}},
+                         "card": {"strict": {"found": True, "x": 5, "y": 6}}}, ""),
+        ("smart_covered", {"top": {"strict": {"found": False}, "loose": {"found": False}},
+                           "card": {"strict": {"found": True, "x": 5, "y": 6}}}, "div#cookie"),
+        ("smart_page", {"top": {"strict": {"found": True, "x": 9, "y": 9}}}, ""),
+    ]:
+        async def body(b):
+            return json.loads(await mod._smart_eval(WS, "FINDER", "smart-click", real_click='"Pay"'))
+        page = two_level_page(finders)
+        page.children[0].covered = cover
+        b, res, _, err = run(mod, page, body)
+        out[key] = {"res": res, "acts": b.acts, "act_real": b.act_real, "clicks": b.clicks, "stderr": err,
+                    "pressed": [m[1:] for m in b.mouse if m[0] == "mousePressed"]}
+
+    async def routed(b):
+        mod._FRAME_FLAG = "#card"
+        try:
+            return await call(mod._frame_aware("text")(
+                lambda t: mod._smart_eval(WS, "FINDER", "smart-click", real_click='"Pay"')), "Pay")
+        finally:
+            mod._FRAME_FLAG = None
+    b, res, _, _ = run(mod, two_level_page({"card": {"loose": {"found": True, "x": 5, "y": 6}}}), routed)
+    out["smart_routed"] = {"res": res, "acts": b.acts, "act_real": b.act_real,
+                           "pressed": [m[1:] for m in b.mouse if m[0] == "mousePressed"]}
     return out
 
 
@@ -728,6 +929,8 @@ SCENARIOS = {
     "text_hops": scenario_text_hops,
     "isolated_fallback": scenario_isolated_fallback,
     "plain_wire": scenario_plain_wire,
+    "click_input": scenario_click_input,
+    "smart_real_click": scenario_smart_real_click,
 }
 
 
@@ -741,6 +944,7 @@ def main():
         except BaseException:  # noqa: BLE001 - report, keep going
             results[name] = {"error": traceback.format_exc()}
     results["_methods"] = STATE["methods"]  # CDP methods sent, summed over all scenarios run
+    results["_released"] = STATE["released"]  # Runtime.releaseObjectGroup per group
     sys.stdout.write(json.dumps(results) + "\n")
 
 
