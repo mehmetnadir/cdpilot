@@ -20,6 +20,16 @@ const os = require('os');
 const SCRIPT = path.join(__dirname, '..', 'src', 'cdpilot.py');
 const VERSION = require('../package.json').version;
 
+// CDPILOT_HOME resolution — must match src/cdpilot.py exactly:
+//   CDPILOT_HOME = os.environ.get("CDPILOT_HOME") or os.path.expanduser("~/.cdpilot")
+// A set-but-empty CDPILOT_HOME falls back to the default (empty string is
+// falsy in both Python's `or` and JS's `||`). A non-empty CDPILOT_HOME is
+// used verbatim — no `~` expansion — same as Python's os.environ.get() here
+// (expanduser is only applied to the hardcoded "~/.cdpilot" fallback).
+function cdpilotHome() {
+  return process.env.CDPILOT_HOME || path.join(os.homedir(), '.cdpilot');
+}
+
 // ── Browser Detection ──
 
 function findBrowser() {
@@ -168,7 +178,7 @@ function checkWebsockets(python) {
 }
 
 function preflight() {
-  const markerFile = path.join(os.homedir(), '.cdpilot', '.preflight-done');
+  const markerFile = path.join(cdpilotHome(), '.preflight-done');
 
   // Skip if already passed (not first run) and all deps present
   const python = findPython();
@@ -278,7 +288,7 @@ function runStatus() {
 // _idle_status there): CDPILOT_HOME/idle/<port>.json names the watcher and its
 // minutes, CDPILOT_HOME/projects/<id>/last-activity the last command.
 function idleCloseLabel(port) {
-  const home = process.env.CDPILOT_HOME || path.join(os.homedir(), '.cdpilot');
+  const home = cdpilotHome();
   try {
     const st = JSON.parse(fs.readFileSync(path.join(home, 'idle', `${port}.json`), 'utf-8'));
     const minutes = Number(st.minutes) || 0;
@@ -374,8 +384,8 @@ function resolveProjectConfig() {
   }
 
   const projectId = getProjectId();
-  const registryFile = path.join(os.homedir(), '.cdpilot', 'registry.json');
-  const defaultProfile = path.join(os.homedir(), '.cdpilot', 'projects', projectId, 'profile');
+  const registryFile = path.join(cdpilotHome(), 'registry.json');
+  const defaultProfile = path.join(cdpilotHome(), 'projects', projectId, 'profile');
 
   let registry = {};
   try {
