@@ -2,7 +2,7 @@
 """poster.py — Local Mac queue worker.
 
 Scans ~/cdpilot-twitter-data/queue/ for items where scheduled_time <= now,
-posts via Vivaldi CDP (port 9227, @cdpilot_dev session), notifies Telegram,
+posts via Vivaldi CDP (port 9227, @cdpilot_dev session), pushes to ntfy,
 moves the item to posted/ or failed/.
 
 Designed to be invoked by launchd every 5 minutes. Idempotent: only picks
@@ -23,13 +23,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from _phase0_lib import open_tab, page_eval, _http  # type: ignore
 from _paths import bot_home  # type: ignore
+import _notify  # type: ignore
 
 DATA = bot_home()
 QUEUE_DIR = DATA / "queue"
 POSTED_DIR = DATA / "posted"
 FAILED_DIR = DATA / "failed"
 LOG_FILE = DATA / "logs" / "poster.log"
-TELEGRAM_BRIDGE = Path(__file__).parent / "telegram_bridge.py"
 
 
 def _log(msg: str) -> None:
@@ -40,16 +40,13 @@ def _log(msg: str) -> None:
     sys.stderr.write(line)
 
 
-def _telegram_notify(text: str) -> None:
-    """Send a plain status message to Telegram via the bridge."""
+def _phone_notify(title: str, text: str = "", url: str | None = None,
+                  priority: str = "normal", alarm: bool = False) -> None:
+    """ntfy push (routine channel; `alarm` → bekci, never digested). Never raises."""
     try:
-        import subprocess
-        subprocess.run(
-            ["/opt/homebrew/bin/python3.13", str(TELEGRAM_BRIDGE), "send", text],
-            timeout=15, check=False,
-        )
-    except Exception as e:
-        _log(f"telegram notify failed: {e}")
+        _notify.notify(title, text, url=url, priority=priority, alarm=alarm)
+    except Exception as e:  # noqa: BLE001
+        _log(f"ntfy notify failed: {e!r}")
 
 
 def _check_browser_alive() -> bool:
@@ -179,7 +176,8 @@ def main() -> None:
 
     if not _check_browser_alive():
         _log("CDP not reachable on port 9227 — Vivaldi closed or not logged in")
-        _telegram_notify("⚠️ Poster: Vivaldi CDP (9227) ulaşılmıyor. Atılamadı.")
+        _phone_notify("Poster (Mac): tarayıcı yok", "Vivaldi CDP (9227) ulaşılmıyor. Atılamadı.",
+                      priority="yuksek", alarm=True)
         return
 
     _log(f"due items: {len(due)}")
@@ -195,9 +193,7 @@ def main() -> None:
                 dest.write_text(json.dumps(item, ensure_ascii=False, indent=2))
                 p.unlink()
                 _log(f"✅ posted {item['id']} → {item.get('tweet_url')}")
-                _telegram_notify(
-                    f"🟢 `{item['id']}` atıldı\n{item.get('tweet_url') or '(URL alınamadı)'}"
-                )
+                _phone_notify("Atıldı", f"{item['id']}", item.get("tweet_url"))
             else:
                 err = result.get("err", "unknown")
                 item["status"] = "failed"
@@ -207,7 +203,8 @@ def main() -> None:
                 dest.write_text(json.dumps(item, ensure_ascii=False, indent=2))
                 p.unlink()
                 _log(f"❌ failed {item['id']}: {err}")
-                _telegram_notify(f"🔴 `{item['id']}` ATIM HATASI: {err}")
+                _phone_notify("Atım hatası", f"{item['id']}: {err}", priority="yuksek",
+                              alarm=True)
         except Exception as e:
             tb = traceback.format_exc()
             _log(f"exception on {item['id']}: {tb}")
@@ -217,7 +214,8 @@ def main() -> None:
             dest = FAILED_DIR / p.name
             dest.write_text(json.dumps(item, ensure_ascii=False, indent=2))
             p.unlink()
-            _telegram_notify(f"🔴 `{item['id']}` ATIM EXCEPTION: {str(e)[:200]}")
+            _phone_notify("Atım hatası", f"{item['id']}: {str(e)[:200]}", priority="yuksek",
+                          alarm=True)
 
 
 if __name__ == "__main__":

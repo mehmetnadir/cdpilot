@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import bot_home  # noqa: E402
 from _relevance import off_limits  # noqa: E402
+import _notify  # noqa: E402
 
 DATA = bot_home()
 INBOX_DIR = DATA / "inbox"
@@ -195,6 +196,17 @@ def main() -> None:
                         "text": res["draft"]})
         queued += 1
         room -= 1
+
+    deferred = [r for r in results if r["action"] == "defer"
+                and str(r.get("why", "")).startswith("daily cap")]
+    if args.apply and deferred:
+        # Cap reached → no action, one info push (the mention push already
+        # carried each tweet's link).
+        _notify.notify(f"Sohbet: {len(deferred)} yanıt ertelendi",
+                       f"Günlük sınır {DAILY_CAP} doldu: "
+                       + ", ".join(str(r.get("author")) for r in deferred[:8]),
+                       url=f"https://x.com/{_notify.HANDLE}/with_replies",
+                       priority="dusuk", tags=["pause_button"])
 
     print(json.dumps({"queued": queued, "results": results},
                      ensure_ascii=False, indent=2))

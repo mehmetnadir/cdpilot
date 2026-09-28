@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""dm_handler.py — poll DM inbox, sanitize, draft reply via Telegram.
+"""dm_handler.py — poll DM inbox, sanitize, tell Nadir via ntfy.
 
 twikit doesn't expose inbox listing publicly, so we hit
 i/api/1.1/dm/inbox_initial_state.json directly via twikit's authenticated
 session (cookies + ct0 + transaction id are all already configured).
 
 Behavior (Faz 0 strict):
-  - Read-only: NEVER auto-replies. Always pushes to Telegram for manual draft.
+  - Read-only: NEVER auto-replies (a DM to a stranger is not routine
+    engagement). Pushes to ntfy; tapping opens the DM conversation on X.
   - Spam pattern filter: silently ignored, logged to audit
   - Crisis topic filter: pushed with red flag
   - Rate cap: max 5 new DM drafts per slot
@@ -44,6 +45,7 @@ from _sanitize import sanitize, render_flags  # type: ignore
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import bot_home  # noqa: E402
+import _notify  # noqa: E402
 
 DATA = bot_home()
 STATE_FILE = DATA / "state" / "dm-seen.json"
@@ -93,16 +95,23 @@ def _save_state(s: dict) -> None:
     STATE_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=2))
 
 
-def _telegram_send(text: str) -> None:
-    try:
-        import subprocess
-        bridge = Path(__file__).parent / "telegram_bridge.py"
-        subprocess.run(
-            [sys.executable, str(bridge), "send", text],
-            timeout=15, check=False,
-        )
-    except Exception as e:
-        _log(f"telegram send failed: {e}")
+def dm_url(conversation_id: str | None) -> str:
+    return f"https://x.com/messages/{conversation_id}" if conversation_id \
+        else "https://x.com/messages"
+
+
+def notify_dm(sender_handle: str, sender_name: str, clean_text: str,
+              flags: list[str], conversation_id: str | None) -> bool:
+    flag_str = render_flags(flags)
+    body = (f"{sender_name}\n{flag_str}\n\n{clean_text[:600]}\n\n"
+            "Bot DM'e cevap yazmaz — cevap senden.")
+    crisis = "crisis_topic" in (flags or [])
+    return _notify.notify(
+        f"Yeni DM: @{sender_handle}", body, url=dm_url(conversation_id),
+        priority="yuksek" if crisis else "normal", alarm=crisis,
+        tags=["envelope"], open_label="DM'i aç",
+        actions=[{"label": "Profil", "url": _notify.profile_url(sender_handle)}],
+    )
 
 
 def _today() -> str:
@@ -218,15 +227,9 @@ async def main_async() -> None:
             _log(f"DM cap reached, {new_count - drafted} deferred")
             break
 
-        # Telegram draft (taslak modu — manual cevap)
-        flag_str = render_flags(san["flags"])
-        msg_text = (
-            f"📩 Yeni DM @{sender_handle} ({sender_name})\n"
-            f"{flag_str}\n\n"
-            f"📥 İçerik (sanitized):\n{san['clean'][:800]}\n\n"
-            f"⚠️ Faz 0: Bot otomatik cevap yazmaz. Manuel cevap için X'i aç."
-        )
-        _telegram_send(msg_text)
+        # ntfy INFO (manual reply — the bot never answers DMs)
+        notify_dm(sender_handle, sender_name, san["clean"], san["flags"],
+                  msg.get("conversation_id"))
         drafted += 1
 
     state["last_poll"] = int(time.time())

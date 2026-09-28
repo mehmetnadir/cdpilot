@@ -12,7 +12,10 @@ Behavior:
   - Runs weekly (Tuesday 11:00 TR by default — flexible)
   - Picks a topic from rotation (browser/stealth/CDP/agent/security)
   - Generates a draft with @grok mention + question
-  - Saves to drafts/, sends as Telegram approval card
+  - Saves to drafts/ and pushes an ntfy "Onay bekliyor" notice. NOT posted
+    unattended (an original provocation tweet is not routine engagement):
+    tapping the push opens X's composer prefilled with the draft — Nadir
+    posts it himself or ignores it.
 
 Rotation (8 topics, ~2 month cycle):
   1. Playwright vs raw CDP fingerprint diff
@@ -41,6 +44,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import bot_home  # noqa: E402
+import _notify  # noqa: E402
 
 DATA = bot_home()
 DRAFTS = DATA / "drafts"
@@ -226,14 +230,14 @@ def cmd_propose(topic_id: int | None) -> None:
     state["last_topic"] = topic["tag"]
     _save_state(state)
     _log(f"proposed grok draft {draft_id} (topic {topic['id']}: {topic['tag']})")
-    # Push to Telegram bridge
+    # Waits for Nadir: ntfy notice, tap = X composer prefilled with the draft
     try:
-        import subprocess
-        bridge = Path(__file__).parent / "telegram_bridge.py"
-        subprocess.run([sys.executable, str(bridge), "draft", str(out)],
-                       check=False, timeout=30)
-    except Exception as e:
-        _log(f"telegram push failed: {e}")
+        _notify.notify_waiting(
+            "@grok sorusu", draft["text"],
+            reason=f"Haftalık @grok sorusu ({topic['tag']}). TR: {topic['text_tr'][:200]}",
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"ntfy push failed: {e!r}")
     print(json.dumps({"draft_id": draft_id, "topic": topic["tag"], "path": str(out)}))
 
 

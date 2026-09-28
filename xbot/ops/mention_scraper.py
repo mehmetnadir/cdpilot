@@ -26,6 +26,7 @@ from twikit import Client  # type: ignore
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import bot_home  # noqa: E402
+import _notify  # noqa: E402
 
 DATA = bot_home()
 INBOX_DIR = DATA / "inbox"
@@ -45,6 +46,25 @@ def _log(msg: str) -> None:
     with open(LOG_FILE, "a") as f:
         f.write(line)
     sys.stderr.write(line)
+
+
+def notify_mention(item: dict) -> bool:
+    """ntfy INFO for a new mention; tapping it opens their tweet.
+
+    Answering is conversation_keeper's job — it runs right after this in the
+    same cycle with the bounded rails (freshness, depth, daily cap, off-limits,
+    Nadir-only threads). The old path spawned `telegram_bridge incoming-reply`
+    here, which queued a SECOND reply to the same tweet (aireply-to-<id> next
+    to conv-<id>) without those rails, and was usually killed by the 15 s
+    subprocess timeout before its draft finished anyway.
+    """
+    reply = bool(item.get("is_reply_to_us"))
+    title = f"{'Yanıt' if reply else 'Bahsetme'}: {item.get('author', '@?')}"
+    return _notify.notify(
+        title, (item.get("text") or "")[:240], url=item.get("tweet_url"),
+        priority="normal" if reply else "dusuk",
+        tags=["speech_balloon" if reply else "mega"],
+    )
 
 
 def _load_seen() -> set:
@@ -116,17 +136,10 @@ async def _scrape(since_hours: int) -> int:
         seen.add(tid)
         new_count += 1
         _log(f"new mention {tid} from @{author}: {text[:80]}")
-        # Push to Telegram as decision card (only for actual replies to us, not random mentions)
-        if item["is_reply_to_us"]:
-            try:
-                import subprocess
-                bridge = Path(__file__).parent / "telegram_bridge.py"
-                subprocess.run(
-                    [sys.executable, str(bridge), "incoming-reply", str(inbox_file)],
-                    timeout=15, check=False,
-                )
-            except Exception as e:
-                _log(f"telegram notify failed for {tid}: {e}")
+        try:
+            notify_mention(item)
+        except Exception as e:  # noqa: BLE001
+            _log(f"ntfy notify failed for {tid}: {e!r}")
 
     _save_seen(seen)
     _log(f"scan complete — {new_count} new mentions")
