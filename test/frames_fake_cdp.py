@@ -24,7 +24,7 @@ import traceback
 import types
 
 WS = "ws://fake/devtools/page/1"
-STATE = {"browser": None}
+STATE = {"browser": None, "methods": {}}  # methods: every CDP method sent, all scenarios
 
 
 class Frame:
@@ -59,6 +59,9 @@ class Browser:
         self.log, self.finder, self.mouse, self.acts = [], [], [], []
         self.attached, self.detached, self.sockets = [], [], []
         self.cancel_on = None
+        self.opaque_ids = False   # remote-object ids without "<isolate>.<context>.<n>"
+        self.isolated = set()     # context ids made by Page.createIsolatedWorld
+        self.next_ctx = [900]
         seq = [100]
 
         def walk(f):
@@ -121,9 +124,40 @@ class Browser:
         def err(text):
             return [dict({"id": mid, "error": {"code": -32000, "message": text}}, **tag)]
 
+        STATE["methods"][method] = STATE["methods"].get(method, 0) + 1
         if sid and sid not in self.sessions:
             return err("Session with given id not found.")
         root = self.sessions[sid] if sid else self.top
+        if method == "DOM.resolveNode":  # the frame document, in its main world
+            f = self.ctx.get(p.get("backendNodeId", 0) - 5000)
+            if f is None or f not in self.process(root):
+                return err("No node with given id found")
+            oid = ("opaque-" + f.fid) if self.opaque_ids else "-77.%d.1" % f.ctx
+            return ok({"object": {"type": "object", "subtype": "node", "className": "HTMLDocument",
+                                  "description": "#document", "objectId": oid}})
+        if method == "Page.createIsolatedWorld":
+            f = self.frames.get(p.get("frameId"))
+            if f is None or f not in self.process(root):
+                return err("No frame for given id found")
+            self.next_ctx[0] += 1
+            self.ctx[self.next_ctx[0]], self.isolated = f, self.isolated | {self.next_ctx[0]}
+            return ok({"executionContextId": self.next_ctx[0]})
+        if method == "Runtime.releaseObjectGroup":
+            return ok({})
+        if method == "Runtime.evaluate" and p.get("expression") == "document":
+            ctx = p.get("contextId", root.ctx)
+            f = self.ctx.get(ctx)
+            if f is None or f not in self.process(root):
+                return err("Cannot find context with specified id")
+            return ok({"result": {"type": "object", "subtype": "node", "objectId": "doc.%d" % ctx}})
+        if method == "Runtime.callFunctionOn" and "this === d" in p.get("functionDeclaration", ""):
+            main = str(p.get("objectId", "")).split(".")
+            arg = str(((p.get("arguments") or [{}])[0]).get("objectId", "")).split(".")
+            if len(main) != 3 or len(arg) != 2:
+                return err("Could not find object with given id")
+            if main[1] != arg[1]:  # another context: another world or frame
+                return err("Argument should belong to the same JavaScript world as target object")
+            return ok({"result": {"type": "boolean", "value": True}})
         if method == "Runtime.enable":
             events = [dict({"method": "Runtime.executionContextCreated", "params": {"context": {
                 "id": f.ctx, "origin": f.origin, "auxData": {"frameId": f.fid, "isDefault": True}}}}, **tag)
@@ -145,8 +179,10 @@ class Browser:
             f = self.owner(p.get("objectId"))
             if f is None:
                 return err("Could not find node with given id")
-            return ok({"node": {"nodeName": "IFRAME", "frameId": f.fid,
-                                "attributes": ["id", f.elem_id, "src", f.src]}})
+            node = {"nodeName": "IFRAME", "frameId": f.fid, "attributes": ["id", f.elem_id, "src", f.src]}
+            if not f.oop:  # a local frame's document is part of the node
+                node["contentDocument"] = {"nodeName": "#document", "backendNodeId": 5000 + f.ctx}
+            return ok({"node": node})
         if method == "Runtime.callFunctionOn":
             f = self.owner(p.get("objectId"))
             if f is None:
@@ -205,6 +241,9 @@ class Browser:
             return value(json.dumps(ans))
         if expr == "HANG":
             return []
+        if expr == "NOISY":  # events interleaved before the reply, as a live page sends them
+            ev = {"method": "Page.frameNavigated", "params": {"frame": {"id": frame.fid}}}
+            return [dict(ev), dict(ev, method="Network.requestWillBeSent")] + value(frame.fid + "|noisy")
         if expr.startswith("LATE:"):  # answers after LATE:<seconds>
             out = value(frame.fid + "|late")
             out[0]["_delay"] = float(expr[len("LATE:"):])
@@ -636,6 +675,36 @@ def scenario_frame_list(mod):
     return out
 
 
+def scenario_isolated_fallback(mod):
+    """No usable main-world id: an isolated world (same DOM), and frame eval says so."""
+    top = Frame("top", children=[Frame("card", elem_id="card", src="http://a.test/inner.html")])
+    out = {}
+    for key, args in [("eval", ("eval", "--frame", "#card", "WHERE:z")), ("list", ("list", "--frame", "#card"))]:
+        async def body(b, args=args):
+            b.opaque_ids = True
+            res = await call(mod.cmd_frame, *args)
+            ctxs = [m["params"].get("contextId") for m in b.log
+                    if m["method"] == "Runtime.evaluate" and "WHERE:" in m["params"].get("expression", "")]
+            return {"res": res, "contexts": ctxs, "isolated": sorted(b.isolated)}
+        _, res, stdout, err = run(mod, top, body)
+        res.update({"stdout": stdout, "stderr": err})
+        out[key] = res
+    return out
+
+
+def scenario_plain_wire(mod):
+    """Plain (unrouted) cdp_send: exact wire messages, events ignored, same result."""
+    out = {}
+    for key, pool in [("pooled", True), ("unpooled", False)]:
+        async def body(b):
+            r = await mod.cdp_send(WS, [(1, "Runtime.evaluate", {"expression": "NOISY", "returnByValue": True}),
+                                        (2, "Runtime.evaluate", {"expression": "WHERE:x"})])
+            return {"result": r, "wire": list(b.log)}
+        _, res, _, _ = run(mod, Frame("top"), body, pool=pool)
+        out[key] = res
+    return out
+
+
 def scenario_commands(mod):
     """Which loaded commands resolve `>>>` / `--frame`, and how."""
     names = ["cmd_click", "cmd_fill", "cmd_submit", "cmd_hover", "cmd_dblclick", "cmd_rightclick",
@@ -657,6 +726,8 @@ SCENARIOS = {
     "probe_timeout": scenario_probe_timeout,
     "late_reply": scenario_late_reply,
     "text_hops": scenario_text_hops,
+    "isolated_fallback": scenario_isolated_fallback,
+    "plain_wire": scenario_plain_wire,
 }
 
 
@@ -669,6 +740,7 @@ def main():
             results[name] = SCENARIOS[name](mod)
         except BaseException:  # noqa: BLE001 - report, keep going
             results[name] = {"error": traceback.format_exc()}
+    results["_methods"] = STATE["methods"]  # CDP methods sent, summed over all scenarios run
     sys.stdout.write(json.dumps(results) + "\n")
 
 
