@@ -8837,6 +8837,287 @@ print("ok")
   }
 })();
 
+// ── Chrome for Testing (extension development) ──
+// Chrome 137+ ignores --load-extension; Chrome for Testing does not.
+// test/cft_fake.py runs a fake of the CfT JSON endpoints + download bucket
+// (127.0.0.1:59570-59599) and drives the real install command, the
+// integrity checks and the browser choice. Opt-in e2e (CDPILOT_E2E=1):
+// a real CfT download into a scratch CDPILOT_HOME, loading
+// test/fixtures/extension/unpacked, whose content script must mark a page.
+(function() {
+  const os = require('os');
+  const { spawn, spawnSync } = require('child_process');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const HARNESS = path.join(__dirname, 'cft_fake.py');
+  const cache = {};
+  const fake = (scenario) => {
+    if (!cache[scenario]) {
+      const r = spawnSync(PYB, [HARNESS, PY_PATH, scenario], { encoding: 'utf-8', timeout: 300000 });
+      const line = (r.stdout || '').trim().split('\n').pop() || '';
+      let parsed;
+      try { parsed = JSON.parse(line); } catch (err) {
+        parsed = { error: `exit ${r.status}: ${r.stdout}\n${r.stderr}` };
+      }
+      cache[scenario] = parsed;
+    }
+    assert(!cache[scenario].error, cache[scenario].error);
+    return cache[scenario];
+  };
+
+  test('cft: install downloads the platform zip, verifies size + md5, extracts, records (mac/linux/win)', () => {
+    const r = fake('install');
+    const rels = {
+      'mac-arm64': 'browsers/chrome-for-testing/150.0.7000.1/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+      linux64: 'browsers/chrome-for-testing/150.0.7000.1/chrome-linux64/chrome',
+      win64: 'browsers/chrome-for-testing/150.0.7000.1/chrome-win64/chrome.exe',
+    };
+    for (const [plat, rel] of Object.entries(rels)) {
+      const p = r.platforms[plat];
+      assert.strictEqual(p.rc, 0, `${plat}: ${p.out}\n${p.err}`);
+      assert.strictEqual(p.binary_rel, rel, plat);
+      assert(p.binary_exists, `${plat}: binary missing`);
+      assert.strictEqual(p.current, '150.0.7000.1');
+      assert.strictEqual(p.platform, plat);
+      assert.strictEqual(p.channel, 'stable');
+      assert(p.bytes_ok, `${plat}: recorded byte count`);
+      for (const k of ['bytes', 'md5', 'path', 'sha256', 'url', 'version']) assert(p.rec_keys.includes(k), `${plat}: ${k}`);
+      assert(/size verified; md5 verified; sha256 [0-9a-f]{64}/.test(p.out), p.out);
+      assert.deepStrictEqual(p.leftovers, [], `${plat}: no .download/.staging left`);
+      assert.deepStrictEqual(p.requests, ['/last-known-good-versions-with-downloads.json',
+        `/dl/150.0.7000.1/${plat}/chrome-${plat}.zip`], plat);
+      assert(/Not a stealth browser/.test(p.out), 'install says it is not for stealth');
+    }
+    if (process.platform !== 'win32') {
+      assert(r.platforms.linux64.exec, 'linux binary keeps its exec bit');
+      assert.deepStrictEqual(r.platforms['mac-arm64'].symlinks, [true, 'Versions/Current/Fake', true],
+        'the .app bundle keeps its framework symlinks');
+    }
+  });
+
+  test('cft: a second install of the same version downloads nothing', () => {
+    const r = fake('install');
+    assert.strictEqual(r.again.rc, 0, r.again.out);
+    assert(/already installed/.test(r.again.out), r.again.out);
+    assert.deepStrictEqual(r.again.requests, ['/last-known-good-versions-with-downloads.json']);
+  });
+
+  test('cft: browser status shows it; `browser chrome-for-testing` selects it', () => {
+    const r = fake('install');
+    assert.strictEqual(r.status.rc, 0, r.status.err);
+    assert(/Installed: .*chrome-for-testing/.test(r.status.out), r.status.out);
+    assert(/Chrome for Testing: 150\.0\.7000\.1 \(linux64\)/.test(r.status.out), r.status.out);
+    assert(/not stealth/.test(r.status.out), r.status.out);
+    assert.strictEqual(r.select.rc, 0, r.select.err);
+    assert.deepStrictEqual(r.pref, { browser: 'chrome-for-testing' });
+    assert(/Preference: +chrome-for-testing\n +resolved: .*chrome-linux64[\\/]chrome\n/.test(r.status_after.out),
+      r.status_after.out);
+  });
+
+  test('cft: --channel beta, --version <full>, --version <milestone> resolve from the right endpoint', () => {
+    const r = fake('install');
+    assert.deepStrictEqual([r.beta.rc, r.beta.current, r.beta.channel], [0, '151.0.7100.2', 'beta'], r.beta.err);
+    assert.deepStrictEqual([r.beta_eq.rc, r.beta_eq.current], [0, '151.0.7100.2'], r.beta_eq.err);
+    assert.deepStrictEqual([r.version.rc, r.version.current, r.version.channel], [0, '149.0.6900.5', null], r.version.err);
+    assert.deepStrictEqual([r.milestone.rc, r.milestone.current], [0, '148.0.6800.3'], r.milestone.err);
+  });
+
+  test('cft: bad arguments and unknown versions fail cleanly, install nothing', () => {
+    const b = fake('install').bad;
+    assert.strictEqual(b.unknown_version.rc, 1);
+    assert(/has no version 147\.0\.1\.1/.test(b.unknown_version.err), b.unknown_version.err);
+    for (const k of ['bad_version', 'bad_channel', 'both', 'other_browser']) assert.strictEqual(b[k].rc, 2, `${k}: ${b[k].err}`);
+    assert(/can install one browser: chrome-for-testing/.test(b.other_browser.err), b.other_browser.err);
+    assert.strictEqual(b.no_platform_build.rc, 1);
+    assert(/no linux-arm64 download/.test(b.no_platform_build.err), b.no_platform_build.err);
+    for (const [k, v] of Object.entries(b)) {
+      assert.strictEqual(v.installed, false, `${k}: nothing recorded`);
+      assert.deepStrictEqual(v.leftovers, [], k);
+    }
+  });
+
+  test('cft: refuses md5 mismatch, truncated body, no Content-Length, non-zip, zip-slip and escaping symlinks', () => {
+    const r = fake('integrity');
+    const want = { bad_md5: /md5 mismatch/, truncated: /size mismatch|interrupted/, no_length: /no Content-Length/,
+      not_zip: /not a valid zip/, zip_slip: /unsafe path in zip/,
+      symlink_escape: process.platform === 'win32' ? /./ : /unsafe symlink in zip/ };
+    for (const [k, re] of Object.entries(want)) {
+      const v = r[k];
+      if (k === 'symlink_escape' && process.platform === 'win32') {
+        // No symlinks on Windows: the link is a plain file inside the target.
+        assert.strictEqual(v.escaped, false, k);
+        continue;
+      }
+      assert.strictEqual(v.rc, 1, `${k}: ${v.err}`);
+      assert(re.test(v.err), `${k}: ${v.err}`);
+      assert.deepStrictEqual([v.installed, v.version_dir, v.escaped], [false, false, false], k);
+      assert.deepStrictEqual(v.leftovers, [], `${k}: temp files cleaned`);
+    }
+  });
+
+  test('cft: dev extensions + branded Chrome + CfT installed -> CfT, one stderr line; otherwise unchanged', () => {
+    const r = fake('select');
+    const line = /^cdpilot: dev extensions registered and Chrome ignores --load-extension — using Chrome for Testing 150\.0\.7000\.1 instead\n$/;
+    assert.deepStrictEqual([r.ext_pref_chrome.pick, r.ext_pref_chrome.info_lines], ['cft', 1]);
+    assert(line.test(r.ext_pref_chrome.err), r.ext_pref_chrome.err);
+    assert.deepStrictEqual([r.ext_auto_only_chrome.pick, r.ext_auto_only_chrome.info_lines], ['cft', 1]);
+    assert.deepStrictEqual([r.no_ext_pref_chrome.pick, r.no_ext_pref_chrome.info_lines], ['chrome', 0], 'no extensions: Chrome stays');
+    assert.deepStrictEqual([r.no_ext_auto.pick, r.no_ext_auto.info_lines], ['chrome', 0]);
+    assert.deepStrictEqual([r.ext_auto_vivaldi.pick, r.ext_auto_vivaldi.info_lines], ['vivaldi', 0], 'Vivaldi loads extensions: kept');
+    assert.deepStrictEqual([r.ext_pref_chrome_no_cft.pick, r.ext_pref_chrome_no_cft.info_lines], ['chrome', 0]);
+    assert.strictEqual(r.pref_cft_no_ext.pick, 'cft', '`browser chrome-for-testing` wins without extensions too');
+    assert.strictEqual(r.pref_cft_missing.pick, 'chrome');
+    assert(/Install it: cdpilot browser install chrome-for-testing/.test(r.pref_cft_missing.err), r.pref_cft_missing.err);
+    for (const k of Object.keys(r).filter((x) => r[x] && r[x].pick)) assert(r[k].same_twice, k);
+  });
+
+  test("cft: bin/cdpilot.js's CHROME_BIN guess is re-resolved; a user's CHROME_BIN is not", () => {
+    const f = fake('select').refine;
+    assert.deepStrictEqual(f, { guess_ext: 'cft', user_ext: 'chrome', guess_no_ext: 'chrome',
+      guess_pref_vivaldi: 'vivaldi', guess_ext_no_cft: 'chrome' });
+    const bin = fs.readFileSync(CLI, 'utf8');
+    assert(/env\.CHROME_BIN = browser;[\s\S]{0,300}env\.CDPILOT_CHROME_BIN_AUTO = '1'/.test(bin),
+      'bin/cdpilot.js flags its own CHROME_BIN guess');
+  });
+
+  test('cft: ext-install suggests the install (Vivaldi/Brave as fallback) and never downloads by itself', () => {
+    const r = fake('select');
+    const hint = r.ext_install_no_cft.err;
+    assert(/Chrome 137\+ silently ignores --load-extension/.test(hint), hint);
+    assert(/cdpilot browser install chrome-for-testing/.test(hint), hint);
+    assert(/cdpilot browser vivaldi \(or brave\)/.test(hint), hint);
+    assert(r.ext_install_no_cft.registered);
+    assert(/using Chrome for Testing 150\.0\.7000\.1 instead/.test(r.ext_install_cft.err), r.ext_install_cft.err);
+    assert(!/⚠️/.test(r.ext_install_cft.err), 'no warning once CfT is used');
+    assert.strictEqual(r.ext_install_vivaldi.err, '', 'no hint for a browser that loads extensions');
+    assert.deepStrictEqual([r.select_missing.code, r.select_missing.pref], [1, 'auto']);
+    assert(/cdpilot browser install chrome-for-testing/.test(r.select_missing.err), r.select_missing.err);
+    assert.strictEqual(r.alias_pref, 'chrome-for-testing', '`browser cft` alias');
+    assert.deepStrictEqual(r.requests, [], 'choosing a browser made HTTP requests (auto-download?)');
+  });
+
+  test('cft: path classification (ours, .app, Puppeteer layout, branded Chrome, Chromium)', () => {
+    const p = fake('select').paths;
+    assert.deepStrictEqual([p.ours, p.mac_app, p.puppeteer, p.chrome_is_cft], [true, true, true, false]);
+    assert.deepStrictEqual([p.branded_chrome, p.branded_cft], [true, false]);
+    if (process.platform !== 'win32') {
+      assert.deepStrictEqual([p.branded_linux, p.branded_chromium], [true, false]);
+    }
+  });
+
+  test('cft: help, README and CHANGELOG describe it (extension development, not stealth)', () => {
+    const root = path.join(__dirname, '..');
+    const help = run('help');
+    assert(/browser install chrome-for-testing/.test(help), 'bin help');
+    const doc = (PY_CONTENT.match(/^"""([\s\S]*?)"""/m) || [])[1] || '';
+    assert(/browser install chrome-for-testing/.test(doc) && /CDPILOT_CFT_BASE_URL/.test(doc), 'python docstring');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    for (const s of ['cdpilot browser install chrome-for-testing', 'Chrome 137', 'not a stealth browser',
+      'cdpilot browser chrome-for-testing']) {
+      assert(readme.includes(s), `README must mention ${s}`);
+    }
+    const secs = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8').split(/^## \[/m);
+    const unreleased = (secs[1] || '').startsWith('Unreleased]') ? secs[1] : '';
+    assert(/Chrome for Testing/.test(unreleased) && unreleased.includes('browser install chrome-for-testing'),
+      'CHANGELOG [Unreleased] describes Chrome for Testing');
+  });
+
+  // ── Real download + real extension (CDPILOT_E2E=1) ──
+  if (process.env.CDPILOT_E2E !== '1') {
+    console.log('  - skipped: chrome-for-testing e2e (set CDPILOT_E2E=1 to download CfT and load a real extension)');
+    return;
+  }
+  const online = spawnSync(PYB, ['-c', [
+    'import sys, urllib.request',
+    'try:',
+    '    urllib.request.urlopen("https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json", timeout=15).read()',
+    'except Exception as e:',
+    '    print(e); sys.exit(1)',
+  ].join('\n')], { encoding: 'utf-8', timeout: 30000 });
+  if (online.status !== 0) {
+    console.log(`  - skipped: chrome-for-testing e2e (offline: ${(online.stdout || online.stderr || 'no answer').trim()})`);
+    return;
+  }
+
+  const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  const freePorts = (n) => JSON.parse(spawnSync(PYB, ['-c', [
+    'import json, socket', 'out = []',
+    'for p in range(59500, 59600):',
+    '    s = socket.socket()',
+    '    try: s.bind(("127.0.0.1", p)); out.append(p)',
+    '    except OSError: pass',
+    '    finally: s.close()',
+    `    if len(out) == ${n}: break`,
+    'print(json.dumps(out))',
+  ].join('\n')], { encoding: 'utf-8', timeout: 15000 }).stdout.trim());
+  const getJson = (port, p) => {
+    const r = spawnSync(PYB, ['-c', `import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:${port}${p}", timeout=5).read().decode())`],
+      { encoding: 'utf-8', timeout: 20000 });
+    return r.status === 0 ? JSON.parse(r.stdout) : null;
+  };
+  const brandedChrome = {
+    darwin: ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'],
+    linux: ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable'],
+    win32: [path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe')],
+  }[process.platform] || [];
+  const hasChrome = brandedChrome.some((p) => fs.existsSync(p));
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-cft-e2e-'));
+  const [cdpPort, httpPort] = freePorts(2);
+  const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+    CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1', CDPILOT_LOG: '0', CDPILOT_PYTHON: PYB };
+  for (const k of ['CHROME_BIN', 'CDPILOT_CHROME_BIN_AUTO', 'CDPILOT_TIMEOUT', 'CDPILOT_TARGET',
+    'CDPILOT_WEBMCP', 'CDPILOT_BOT_AUTH', 'CDPILOT_CFT_BASE_URL', 'CDPILOT_CFT_PLATFORM']) delete env[k];
+  const c = (...args) => spawnSync(process.execPath, [CLI, ...args],
+    { encoding: 'utf-8', timeout: args[0] === 'browser' && args[1] === 'install' ? 900000 : 90000, env });
+  const server = spawn(PYB, ['-m', 'http.server', String(httpPort), '--bind', '127.0.0.1'],
+    { cwd: path.join(__dirname, 'fixtures', 'extension'), stdio: 'ignore' });
+  let installed = null;
+  try {
+    test('cft e2e: `browser install chrome-for-testing` downloads and records the real build', () => {
+      const r = c('browser', 'install', 'chrome-for-testing');
+      assert.strictEqual(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      const m = /Downloaded (\d+) bytes \(size verified; md5 (verified|not published); sha256 ([0-9a-f]{64})\)/.exec(r.stdout);
+      assert(m, r.stdout);
+      const st = JSON.parse(fs.readFileSync(path.join(home, 'browsers', 'chrome-for-testing', 'installed.json'), 'utf8'));
+      installed = st.installs[st.current];
+      assert(fs.existsSync(installed.path), installed.path);
+      assert.strictEqual(installed.bytes, Number(m[1]));
+      console.log(`    CfT ${installed.version} ${installed.platform}: ${m[1]} bytes, md5 ${m[2]}, sha256 ${m[3].slice(0, 16)}…`);
+    });
+    test(`cft e2e: ${hasChrome ? '`browser chrome` + dev extension -> CfT used automatically' : '`browser chrome-for-testing` + dev extension'}: the content script runs`, () => {
+      assert(installed, 'install failed');
+      const sel = c('browser', hasChrome ? 'chrome' : 'chrome-for-testing');
+      assert.strictEqual(sel.status, 0, sel.stderr);
+      const ext = path.join(__dirname, 'fixtures', 'extension', 'unpacked');
+      const r = c('ext-install', ext);
+      assert.strictEqual(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert(/Dev extension registered: cdpilot e2e fixture/.test(r.stdout), r.stdout);
+      assert(/CDP ready/.test(r.stdout), `launch: ${r.stdout}\n${r.stderr}`);
+      if (hasChrome) {
+        assert(/using Chrome for Testing .* instead/.test(r.stderr), `no info line: ${r.stderr}`);
+      }
+      assert(!/⚠️/.test(r.stderr), r.stderr);
+      const ver = getJson(cdpPort, '/json/version');
+      assert(ver && ver.Browser.endsWith('/' + installed.version), `running browser: ${JSON.stringify(ver)}`);
+      const go = c('go', `http://127.0.0.1:${httpPort}/page.html`);
+      assert.strictEqual(go.status, 0, go.stderr);
+      let mark = '';
+      for (let i = 0; i < 20 && !mark.startsWith('loaded:'); i++) {
+        mark = c('eval', 'document.documentElement.dataset.cdpilotExt || ""').stdout.trim();
+        if (!mark.startsWith('loaded:')) sleep(500);
+      }
+      assert(/^loaded:[a-p]{32}$/.test(mark), `content script did not run: ${JSON.stringify(mark)}`);
+      const id = mark.slice('loaded:'.length);
+      const targets = getJson(cdpPort, '/json/list') || [];
+      const sw = targets.find((t) => t.url === `chrome-extension://${id}/background.js`);
+      assert(sw, `no extension service worker target: ${JSON.stringify(targets.map((t) => [t.type, t.url]))}`);
+      console.log(`    ${ver.Browser}: content script mark ${mark}; service worker ${sw.type} ${sw.url}`);
+    });
+  } finally {
+    c('stop');
+    try { server.kill(); } catch (err) { /* already gone */ }
+  }
+})();
 
 test('examples: every examples/*/run.sh exists and passes sh -n, and README commands exist in dispatch table', () => {
   const examplesDir = path.join(__dirname, '..', 'examples');
