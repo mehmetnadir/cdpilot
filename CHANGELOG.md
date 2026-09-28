@@ -11,6 +11,10 @@ All notable changes to cdpilot will be documented in this file.
 - **MCP tools `browser_connect` / `browser_disconnect`** for agent-driven human-in-the-loop workflows (CAPTCHA handoff, login walls).
 - **Security warning** on connect: "This browser's cookies and sessions are accessible to cdpilot commands."
 
+### Fixed
+- **Frame commands no longer send `Runtime.enable`.** To find an iframe's execution context, 0.9.3 briefly enabled the Runtime domain (enable + disable) and read the replayed `executionContextCreated` events. `Runtime.enable` is the best-known CDP automation signal (Cloudflare Turnstile and DataDome watch its side effects), and Turnstile itself runs in an iframe, so the trace landed exactly where detection runs. cdpilot now never sends it: a same-process frame's main world comes from `DOM.resolveNode` on the frame's document (`DOM.describeNode` → `contentDocument`; no `DOM.enable`), with the context id checked by an identity test; an out-of-process frame is used through its flat session's default context, which is its main world. `frame eval --frame` still sees the frame's page globals. If neither path works, cdpilot falls back to an isolated world (same DOM, no page JS globals) and `frame eval` says so on stderr.
+- **`CDPILOT_CDP_TRACE=<file>`** (debug aid) appends the name of every CDP method cdpilot sends through its CDP client, one per line; params are never written.
+
 ## [0.9.3] - 2026-09-28
 
 ### Added
