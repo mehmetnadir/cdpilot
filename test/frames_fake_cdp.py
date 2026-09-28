@@ -88,6 +88,14 @@ class Browser:
         self.opaque_ids = False   # remote-object ids without "<isolate>.<context>.<n>"
         self.isolated = set()     # context ids made by Page.createIsolatedWorld
         self.next_ctx = [900]
+        # The browser routes mouse input into out-of-process frames by its own
+        # copy of the layout: while route_stale > 0 every mouse event goes
+        # elsewhere (into `misrouted`, never reaching a frame); each answered
+        # settle wait takes one off (a frame was drawn).
+        self.route_stale = 0
+        self.misrouted = []
+        self.moves_in = 0         # mouse moves that reached the page
+        self.probes = {}          # _MOUSE_PROBE_FN listeners: id -> [moves_in when added, removed]
         seq = [100]
 
         def walk(f):
@@ -219,6 +227,11 @@ class Browser:
             self.mouse.append([p.get("type"), p.get("x"), p.get("y")])
             self.mouse_t.append([p.get("type"), p.get("clickCount"), p.get("button"), time.perf_counter(),
                                  p.get("timestamp")])
+            if self.route_stale:
+                self.misrouted.append(p.get("type"))
+                return ok({})
+            if p.get("type") == "mouseMoved":
+                self.moves_in += 1
             if p.get("type") == "mousePressed":
                 for f in self.frames.values():
                     if f.cover_after_press:
@@ -257,9 +270,17 @@ class Browser:
             if el and el[0].target_cover == "HANG":  # no reply (a timeout under load)
                 return []
             return value(el[0].target_cover) if el else err("Could not find object with given id")
+        if oid in self.probes and fd == getattr(mod, "_MOUSE_PROBE_READ_FN", None):
+            probe = self.probes[oid]
+            probe[1] = probe[1] or bool(args and args[0])
+            return ok({"result": {"type": "boolean", "value": self.moves_in > probe[0]}})
         el = self.element(oid)
         if el is not None:
             f, sel = el
+            if fd == getattr(mod, "_MOUSE_PROBE_FN", None):
+                pid = "mprobe:%d" % len(self.probes)
+                self.probes[pid] = [self.moves_in, False]
+                return ok({"result": {"type": "function", "objectId": pid}})
             if fd == mod._CENTER_FN:
                 return value([40, 50, 20, 10])
             if fd == mod._CLICK_LABEL_FN:
@@ -330,7 +351,10 @@ class Browser:
             return value(json.dumps(ans))
         if expr == self.mod._TWO_PAGE_FRAMES_JS:  # the settle wait before mouse input
             self.settles.append([frame.fid, params.get("contextId") in self.isolated])
-            return [] if frame.settle_hang else ok({"result": {"type": "undefined"}})
+            if frame.settle_hang:
+                return []
+            self.route_stale = max(0, self.route_stale - 1)
+            return ok({"result": {"type": "undefined"}})
         if "cdpilot-input-blocker" in expr:  # _BLOCKER_POINTER_JS
             self.blocker_calls += 1
             pe = json.loads(expr[expr.rindex("(") + 1:-1])
@@ -923,6 +947,29 @@ def scenario_click_input(mod):
     return out
 
 
+def scenario_mouse_route(mod):
+    """A target in an out-of-process frame: the press is sent only once a mouse
+    move reached the target (the browser's routing lags the page's layout)."""
+    out = {}
+    for key, target, stale in [
+        ("fresh", "#pay >>> #btn", 0),      # routed right at once
+        ("lagging", "#pay >>> #btn", 3),    # still stale after the pre-click settle wait
+        ("never", "#pay >>> #btn", 100),    # never catches up within the tries
+        ("same_process", "#card >>> #btn", 0),  # the top page's renderer: no probe
+    ]:
+        async def body(b, target=target, stale=stale):
+            b.route_stale = stale
+            return await call(lambda: mod.cmd_click(target, None, False, False))
+        b, res, stdout, err = run(mod, click_page(), body)
+        out[key] = {"res": res, "stdout": stdout, "stderr": err, "clicks": b.clicks,
+                    "misrouted": b.misrouted, "probes": list(b.probes.values()), "settles": b.settles,
+                    "moves": [m[1:] for m in b.mouse if m[0] == "mouseMoved"],
+                    "pressed": [m[1:] for m in b.mouse if m[0] == "mousePressed"],
+                    "released": [m[1:] for m in b.mouse if m[0] == "mouseReleased"]}
+    out["tries"] = getattr(mod, "MOUSE_PROBE_TRIES", None)
+    return out
+
+
 def scenario_mouse_cmds(mod):
     """hover / dblclick / rightclick: through cdpilot's input blocker when visual
     feedback is on, restored after an error; nothing extra when it is off."""
@@ -1331,6 +1378,7 @@ SCENARIOS = {
     "isolated_fallback": scenario_isolated_fallback,
     "plain_wire": scenario_plain_wire,
     "click_input": scenario_click_input,
+    "mouse_route": scenario_mouse_route,
     "smart_real_click": scenario_smart_real_click,
     "mouse_cmds": scenario_mouse_cmds,
     "timeout_restore": scenario_timeout_restore,
