@@ -548,19 +548,29 @@ when the file is readable by others. The agent URL must be an `https://` origin 
 second `init` refuses to replace the key unless you pass `--force`, because the new key would no
 longer match the directory you published.
 
-**2. Host the directory on your own domain.** `cdpilot bot-auth directory` prints the public key
-as a JWKS, where `kid` is the key's RFC 7638 JWK thumbprint:
+**2. Host the directory on your own domain, signed.** `cdpilot bot-auth directory` prints the
+public key as a JWKS, where `kid` is the key's RFC 7638 JWK thumbprint. Cloudflare also requires
+the directory *response* to be signed, so `--headers` prints the headers to serve with it:
 
 ```bash
-cdpilot bot-auth directory > http-message-signatures-directory
-# serve it at   https://your-domain.com/.well-known/http-message-signatures-directory
-# with          Content-Type: application/http-message-signatures-directory+json
+cdpilot bot-auth directory --headers        # headers, a blank line, then the JSON body
+cdpilot bot-auth directory --headers --json # the same as {"authority", "headers", "body"}
 ```
 
-The directory draft also recommends signing the directory response itself (tag
-`http-message-signatures-directory`). cdpilot doesn't produce that response signature;
-Cloudflare's [Workers example](https://github.com/cloudflare/web-bot-auth/tree/main/examples)
-shows how to serve a signed directory.
+```
+Content-Type: application/http-message-signatures-directory+json
+Signature-Input: sig1=("@authority";req);created=…;keyid="<thumbprint>";alg="ed25519";expires=…;nonce="…";tag="http-message-signatures-directory"
+Signature: sig1=:<base64 Ed25519 signature>:
+
+{ "keys": [ … ] }
+```
+
+Serve that body at `https://your-domain.com/.well-known/http-message-signatures-directory` with
+those three headers. The signature covers `("@authority";req)`, the host the directory is fetched
+from: by default the agent URL's host, or `--authority <host>`. There is one signature per key in
+the directory. It is valid for 24 hours (`--ttl <seconds>`), so re-run the command (by hand or
+from cron) to refresh it. `--content-digest` also covers the body (`Content-Digest`, RFC 9530), as
+in Cloudflare's reference vector; then the body must be served byte for byte as printed.
 
 **3. Launch a signing browser:**
 
@@ -585,12 +595,37 @@ Each request gets three headers:
 
 | Header | Value |
 |--------|-------|
-| `Signature-Agent` | `sig1="https://your-domain.com"` |
-| `Signature-Input` | `sig1=("@authority" "signature-agent";key="sig1");created=…;keyid="<thumbprint>";alg="ed25519";expires=…;nonce="…";tag="web-bot-auth"` |
+| `Signature-Agent` | `"https://your-domain.com"` |
+| `Signature-Input` | `sig1=("@authority" "signature-agent");created=…;keyid="<thumbprint>";alg="ed25519";expires=…;nonce="…";tag="web-bot-auth"` |
 | `Signature` | `sig1=:<base64 Ed25519 signature>:` |
 
 `expires` is `created` + 5 minutes. The `nonce` is 64 random bytes, base64-encoded, and new for
 every request.
+
+This is the **legacy** `Signature-Agent` form (draft-05 A.2.3), and it is the default because it
+is the form Cloudflare's verifier accepts: Cloudflare rejects the dictionary form of later drafts.
+To send the dictionary form instead (`Signature-Agent: sig1="https://your-domain.com"`, covered as
+`"signature-agent";key="sig1"`), run `cdpilot bot-auth format dict` (`bot-auth format legacy`
+switches back, `bot-auth format` shows it, `bot-auth init --agent-format dict` sets it at
+creation). It applies from the next `launch --bot-auth`.
+
+**What is not signed.** WebSocket handshakes are not signed: the browser does not pass them
+through CDP's `Fetch` domain, so a `wss://` connection the page opens goes out without the
+headers. Service-worker-internal cache hits and `data:`/`blob:` URLs never reach a server.
+
+**If the signer dies or hangs.** While it runs, the signer holds every request of the browser at
+the Fetch stage until it has added the headers. If it is killed, requests go out unsigned; `cdpilot
+status` and `cdpilot go` then print one stderr line (signer not running, requests go out unsigned,
+run `cdpilot launch --bot-auth` again) until you do, or `stop`. If it is frozen (a
+stopped process, a debugger), requests hang: `cdpilot stop` and `launch --bot-auth` again.
+cdpilot trusts its signer state only for the process whose command line is that port's signer and
+only for the browser it attached to, so a stale state file whose pid was reused by another program
+is dropped, never signalled.
+
+**Idle close** still works while the signer runs: the signer is attached to every page, so instead
+of "a page is attached" cdpilot counts the CDP clients other than the signer (by socket owner:
+`netstat` on macOS and Windows, `ss` on Linux), and a `watch` daemon or a Playwright session keeps
+the browser open.
 
 **Stealth conflict.** Signing says "I am an agent", and stealth says "I am not". If you pass
 `--bot-auth` together with `--stealth`/`--undetected`, or while `cdpilot mode` is `stealth` or

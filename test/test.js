@@ -5527,9 +5527,10 @@ print("ok")
   }
   const skipNote = (what) => console.log(`  - skipped: ${what} (cryptography not installed)`);
 
-  test('bot-auth: signature bases of draft-05 A.2 and Cloudflare v2 Ed25519 vectors', () => {
+  test('bot-auth: signature bases of draft-05 A.2 (legacy A.2.3 too), Cloudflare v2 and directory vectors', () => {
     const v = fake('vectors');
-    for (const k of ['sig1_base', 'sig2_base', 'draft_a22_base']) assert.strictEqual(v[k], true, k);
+    for (const k of ['sig1_base', 'sig2_base', 'draft_a22_base', 'draft_a23_legacy_base', 'directory_base',
+      'directory_content_digest']) assert.strictEqual(v[k], true, k);
   });
 
   if (HAS_CRYPTO) {
@@ -5538,6 +5539,14 @@ print("ok")
       for (const k of ['sig1_headers', 'sig2_headers', 'draft_a21_signature', 'draft_a23_legacy_signature']) {
         assert.strictEqual(v[k], true, `${k}: ${JSON.stringify(v)}`);
       }
+    });
+    test('bot-auth: the DEFAULT wire format is legacy — draft-05 A.2.3 headers byte for byte', () => {
+      // Signature-Agent: "https://…" covered as bare "signature-agent": the form
+      // Cloudflare's verifier accepts (it rejects the dictionary form).
+      assert.strictEqual(fake('vectors').draft_a23_legacy_headers, true);
+    });
+    test('bot-auth: signed directory response reproduces the reference vector (directory_response_v1)', () => {
+      assert.strictEqual(fake('vectors').directory_vector, true);
     });
   } else {
     skipNote('bot-auth vector signatures');
@@ -5588,8 +5597,22 @@ print("ok")
     test('bot-auth helper: real signatures verify with the directory key; tampering fails; sign < 1 ms', () => {
       const r = fake('helper_real_signature');
       assert.deepStrictEqual(r.verified, [[true, 'sig1'], [true, 'sig1'], [true, 'sig1'], [true, 'sig1']]);
+      assert.deepStrictEqual(r.agents, Array(4).fill('"https://agent.example"'), 'legacy Signature-Agent');
+      assert.deepStrictEqual(r.dict, Array(4).fill([true, false]),
+        'dict format verifies with a dict verifier, and the legacy verifier rejects it');
       assert.strictEqual(r.tampered[0], false, 'another Host must not verify');
       assert(r.median_ms < 1, `median sign time ${r.median_ms} ms`);
+    });
+    test('bot-auth directory --headers: ("@authority";req), tag, one signature per key; verifies independently', () => {
+      const d = fake('directory');
+      assert(/^sig1=\("@authority";req\);created=\d+;keyid="[\w-]{43}";alg="ed25519";expires=\d+;nonce="[^"]{88}";tag="http-message-signatures-directory"$/
+        .test(d.input), d.input);
+      assert.deepStrictEqual(d.ok, [true, '1 key(s)']);
+      assert.deepStrictEqual(d.ok_digest, [true, '1 key(s)']);
+      assert.deepStrictEqual(d.two_keys, [true, '2 key(s)']);
+      for (const k of ['other_host', 'expired', 'edited_body', 'two_keys_one_signed']) {
+        assert.strictEqual(d[k], false, `${k} must not verify`);
+      }
     });
   } else {
     skipNote('bot-auth real-signature helper test');
@@ -5607,16 +5630,45 @@ print("ok")
     assert.deepStrictEqual(r.flag, [true, 1, true], '--stealth with --bot-auth');
     assert.deepStrictEqual(r.mode, [true, 1, true], 'undetected mode with --bot-auth');
     assert.deepStrictEqual(r.none, [false, 0, false], 'regular mode: no warning');
-    assert.deepStrictEqual(r.slog, { signature_masked: true, input_masked: true, status_kept: true });
+    assert.deepStrictEqual(r.slog, { signature_masked: true, input_masked: true, status_kept: true,
+      prose_kept: true, dump_masked: true }, 'only real header lines / header dumps are masked');
   });
 
-  test('bot-auth: signer state — status label on/off, a dead pid is off, stop clears it', () => {
+  test('bot-auth: signer state is trusted only for this port\'s signer and browser; stale = dropped + warning', () => {
     const r = fake('state');
     assert.strictEqual(r.off, 'bot-auth: off');
-    assert.strictEqual(r.on, 'bot-auth: on (keyid KID123)');
+    assert.strictEqual(r.on, 'bot-auth: on (keyid KID123)', 'command line --_bot-auth-signer <port> <token> + same browser');
     assert.strictEqual(r.active, true);
+    assert.strictEqual(r.kept_while_on, true);
+    for (const k of ['other_token', 'browser_restarted', 'reused_pid']) {
+      assert.deepStrictEqual(r[k], ['bot-auth: off', null, true], `${k}: off, state file dropped, stale marker left`);
+    }
+    const w = 'bot-auth: signer not running, requests go out unsigned — run `cdpilot launch --bot-auth` again\n';
+    assert.deepStrictEqual(r.warning, [true, true, w + w], 'one line per command, until launch or stop');
     assert.strictEqual(r.dead_pid, 'bot-auth: off');
+  });
+
+  test('bot-auth: stop never signals a reused pid (live sleep survives), ends a real signer, clears state', () => {
+    const r = fake('state');
+    assert.strictEqual(r.stop_reused, true);
+    assert.strictEqual(r.sleeper_alive_after_stop, true, 'stop killed an unrelated process');
+    assert.strictEqual(r.marker_after_stop, false, 'stop clears the stale marker');
+    assert.strictEqual(r.real_signer_stopped, true);
     assert.strictEqual(r.state_after_stop, null);
+  });
+
+  test('bot-auth: idle close counts CDP clients other than the signer (socket owners per OS)', () => {
+    const r = fake('clients');
+    for (const k of ['lsof', 'netstat', 'bsd_netstat', 'ss']) assert.deepStrictEqual(r[k], [101, 303], k);
+    assert.strictEqual(typeof r.live, 'object', `live check: ${JSON.stringify(r.live)}`);
+    if (r.live.tool) {
+      assert.strictEqual(r.live.child_seen, true, 'a connected client is seen');
+      assert.strictEqual(r.live.server_side_not_counted, true);
+      assert.strictEqual(r.live.other_than_child, false, 'the signer alone is not a client');
+      assert.strictEqual(r.live.other_than_signer, true, 'another client keeps the browser open');
+    } else {
+      console.log('  - note: no socket-owner tool on this machine; idle close ignores clients while signing');
+    }
   });
 
   // A `cryptography` that fails to import, whatever the interpreter has.
@@ -5658,7 +5710,7 @@ print("ok")
     r = c('mode');
     assert(r.status === 0 && /Mode: regular/.test(r.stdout), `mode: ${r.stdout}${r.stderr}`);
     r = c('bot-auth', '--help');
-    assert(r.status === 0 && /bot-auth <init\|status\|directory>/.test(r.stdout), `bot-auth --help: ${r.stdout}${r.stderr}`);
+    assert(r.status === 0 && /bot-auth <init\|status\|directory\|format>/.test(r.stdout), `bot-auth --help: ${r.stdout}${r.stderr}`);
     r = c('status');
     assert(r.status === 0, `status: ${r.stdout}${r.stderr}`);
     assert(!HINT.test(r.stderr + r.stdout), 'no hint outside bot-auth');
@@ -5695,8 +5747,42 @@ print("ok")
       assert(status.stdout.includes(`keyid     : ${thumb}`) && /agent URL : https:\/\/agent\.test$/m.test(status.stdout),
         status.stdout);
       assert(/bot-auth: off/.test(status.stdout), 'no signer running');
+      assert(/format    : Signature-Agent legacy$/m.test(status.stdout), `legacy is the default: ${status.stdout}`);
+      // The signed directory response: headers + the exact body, verified by the fixture.
+      const dh = c('bot-auth', 'directory', '--headers', '--json');
+      assert.strictEqual(dh.status, 0, dh.stderr);
+      const signed = JSON.parse(dh.stdout);
+      assert.strictEqual(signed.authority, 'agent.test', 'authority defaults to the agent URL host');
+      assert.strictEqual(signed.headers['Content-Type'], 'application/http-message-signatures-directory+json');
+      assert.deepStrictEqual(JSON.parse(signed.body), jwks, 'same JWKS as `bot-auth directory`');
+      const verifyDir = (headers, host, body) => JSON.parse(execFileSync(PYB, ['-c', [
+        'import json, sys', `sys.path.insert(0, ${JSON.stringify(path.join(__dirname, 'fixtures'))})`,
+        'import bot_auth_server as s', 'a = json.loads(sys.stdin.read())',
+        'print(json.dumps(s.verify_directory(a[0], a[1], a[2])))'].join('\n')],
+      { input: JSON.stringify([headers, host, body]), encoding: 'utf-8', timeout: 20000 }));
+      assert.deepStrictEqual(verifyDir(signed.headers, 'agent.test', signed.body), [true, '1 key(s)']);
+      assert.strictEqual(verifyDir(signed.headers, 'other.test', signed.body)[0], false);
+      const plain = c('bot-auth', 'directory', '--headers', '--authority', 'bots.agent.test', '--ttl', '60');
+      assert.strictEqual(plain.status, 0, plain.stderr);
+      const [head, ...rest] = plain.stdout.split('\n\n');
+      assert(/^Content-Type: application\/http-message-signatures-directory\+json$/m.test(head), head);
+      assert(/^Signature-Input: sig1=\("@authority";req\);created=(\d+);.*expires=(\d+);.*tag="http-message-signatures-directory"$/m
+        .test(head), head);
+      assert(/^Signature: sig1=:[A-Za-z0-9+/]{86}==:$/m.test(head), head);
+      const hdrs = Object.fromEntries(head.split('\n').map((l) => [l.slice(0, l.indexOf(':')), l.slice(l.indexOf(':') + 2)]));
+      assert.deepStrictEqual(verifyDir(hdrs, 'bots.agent.test', rest.join('\n\n')), [true, '1 key(s)']);
+      const [, created, expires] = head.match(/created=(\d+);.*expires=(\d+)/);
+      assert.strictEqual(Number(expires) - Number(created), 60, '--ttl');
+      // Opt-in dictionary format, and back.
+      let f = c('bot-auth', 'format', 'dict');
+      assert(f.status === 0 && /format: dict/.test(f.stdout), f.stdout + f.stderr);
+      assert(/format    : Signature-Agent dict$/m.test(c('bot-auth', 'status').stdout), 'format dict persisted');
+      f = c('bot-auth', 'format', 'bogus');
+      assert.strictEqual(f.status, 2, 'unknown format rejected');
+      f = c('bot-auth', 'format', 'legacy');
+      assert(f.status === 0 && /Signature-Agent format: legacy/.test(c('bot-auth', 'format').stdout));
       const body = pem.split('\n').filter((l) => l && !l.startsWith('-----')).join('');
-      for (const r of [init, dir, status]) {
+      for (const r of [init, dir, status, dh, plain]) {
         assert(!/PRIVATE KEY/.test(r.stdout + r.stderr) && !(r.stdout + r.stderr).includes(body.slice(0, 24)),
           'the private key is never printed');
       }
@@ -5720,16 +5806,22 @@ print("ok")
     assert(sec, 'README needs a "### Web Bot Auth (signed agent)" section');
     for (const s of ['bot-auth init --agent-url', 'bot-auth directory', 'launch --bot-auth',
       '/.well-known/http-message-signatures-directory', 'application/http-message-signatures-directory+json',
-      'pip install cryptography', 'stealth', 'Signature-Agent', '"signature-agent";key="sig1"']) {
+      'pip install cryptography', 'stealth', 'Signature-Agent', '"signature-agent";key="sig1"',
+      'bot-auth directory --headers', '("@authority" "signature-agent")', 'bot-auth format dict',
+      'WebSocket', 'requests go out unsigned']) {
       assert(sec.includes(s), `README section must mention ${s}`);
     }
     const help = run('--help');
-    assert(help.includes('launch --bot-auth') && help.includes('bot-auth directory'), 'bin help documents bot-auth');
+    assert(help.includes('launch --bot-auth') && help.includes('bot-auth directory --headers')
+      && help.includes('bot-auth format'), 'bin help documents bot-auth');
     assert(PY_CONTENT.slice(0, 3000).includes('launch --bot-auth'), 'python __doc__ documents bot-auth');
     const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
     const secs = changelog.split(/^## \[/m);
     assert((secs[1] || '').startsWith('Unreleased]') && secs[1].includes('launch --bot-auth'),
       'CHANGELOG [Unreleased] describes Web Bot Auth');
+    for (const s of ['`bot-auth:` line', '`bot_auth` key', 'directory --headers', 'legacy']) {
+      assert(secs[1].includes(s), `CHANGELOG [Unreleased] must mention ${s}`);
+    }
   });
 
   // ── Real browser (CDPILOT_E2E=1): every request the browser makes is signed ──
@@ -5741,10 +5833,16 @@ print("ok")
   test('bot-auth e2e: launch --bot-auth starts the signer; status shows bot-auth: on (keyid …)', () => {
     assert(HAS_CRYPTO, `the bot-auth e2e needs cryptography in ${PYB} (pip install cryptography)`);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-e2e-'));
+    // Two free ports in 58600-58699 (never the default CDP port).
     const [cdpPort, port] = JSON.parse(execFileSync(PYB, ['-c', [
-      'import json, socket', 'ss = [socket.socket() for _ in range(2)]',
-      '[s.bind(("127.0.0.1", 0)) for s in ss]',
-      'print(json.dumps([s.getsockname()[1] for s in ss]))', '[s.close() for s in ss]',
+      'import json, socket', 'got = []',
+      'for p in range(58600, 58700):',
+      '    s = socket.socket()',
+      '    try: s.bind(("127.0.0.1", p)); got.append(p)',
+      '    except OSError: pass',
+      '    finally: s.close()',
+      '    if len(got) == 2: break',
+      'print(json.dumps(got))',
     ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
     const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
       CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1', CDPILOT_LOG: '0' };
@@ -5760,9 +5858,18 @@ print("ok")
     const logFile = path.join(home, 'origin.jsonl');
     const srv = spawn(PYB, [path.join(__dirname, 'fixtures', 'bot_auth_server.py'), '--port', String(port),
       '--jwks-file', jwksFile, '--log-file', logFile], { stdio: 'ignore' });
+    // A stale signer state whose pid now belongs to an unrelated live process
+    // (a reused pid): launch must not trust it, and stop must not kill it.
+    const sleeper = spawn(process.platform === 'win32' ? PYB : 'sleep',
+      process.platform === 'win32' ? ['-c', 'import time; time.sleep(120)'] : ['120'], { stdio: 'ignore' });
+    fs.mkdirSync(path.join(home, 'bot-auth', 'signers'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'bot-auth', 'signers', `${cdpPort}.json`), JSON.stringify({
+      token: 'stale', pid: sleeper.pid, ready: true, port: cdpPort, keyid: 'OLDKEY',
+      browser_ws: `ws://127.0.0.1:${cdpPort}/devtools/browser/gone`, started: Date.now() / 1000 - 3600 }));
     const stop = () => {
       c('stop');
       try { srv.kill(); } catch (err) { /* already gone */ }
+      try { sleeper.kill(); } catch (err) { /* already gone */ }
     };
     try {
       execFileSync(PYB, ['-c', [
@@ -5774,17 +5881,21 @@ print("ok")
       r = c('launch', '--bot-auth');
       assert(r.status === 0 && /Bot Auth: signing every request as https:\/\/agent\.test/.test(r.stdout),
         `launch: ${r.status}\n${r.stdout}${r.stderr}`);
+      assert(/Signature-Agent legacy/.test(r.stdout), `legacy is the default wire format: ${r.stdout}`);
       const state = JSON.parse(fs.readFileSync(path.join(home, 'bot-auth', 'signers', `${cdpPort}.json`), 'utf-8'));
       assert(state.pid && state.ready, 'signer state names a ready pid');
+      assert(state.pid !== sleeper.pid && state.token !== 'stale' && state.keyid === keyid,
+        `launch trusted a stale state with a reused pid: ${JSON.stringify(state)}`);
       const st = c('status');
       assert(st.stdout.includes(`bot-auth: on (keyid ${keyid})`), `status: ${st.stdout}`);
+      assert(!/requests go out unsigned/.test(st.stderr), `no stale warning while signing: ${st.stderr}`);
     } catch (err) {
       stop();
       throw err;
     }
     const readLog = () => fs.readFileSync(logFile, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
       .filter((e) => e.path !== '/ping');
-    e2e = { c, port, keyid, stop, readLog, home, cdpPort };
+    e2e = { c, port, keyid, stop, readLog, home, cdpPort, sleeper };
   });
   const need = () => { assert(e2e, 'bot-auth e2e setup failed'); return e2e; };
   const waitFor = (fn, ms) => {
@@ -5795,8 +5906,10 @@ print("ok")
       spawnSync(PYB, ['-c', 'import time; time.sleep(0.2)']);
     }
   };
+  // The legacy wire format, verified by the fixture in its default (legacy) mode.
   const signedBy = (e, keyid) => e.verified === true
-    && e.signature_agent === 'sig1="https://agent.test"'
+    && e.signature_agent === '"https://agent.test"'
+    && e.signature_input.startsWith('sig1=("@authority" "signature-agent");')
     && e.signature_input.includes(`keyid="${keyid}"`) && e.signature_input.includes('tag="web-bot-auth"');
   try {
     let goDone = 0;
@@ -5847,7 +5960,7 @@ print("ok")
       assert.deepStrictEqual(bad, [], 'unsigned or unverified requests');
     });
     test('bot-auth e2e: stop ends the signer process and status says off', () => {
-      const { c, home, cdpPort } = need();
+      const { c, home, cdpPort, sleeper } = need();
       const state = JSON.parse(fs.readFileSync(path.join(home, 'bot-auth', 'signers', `${cdpPort}.json`), 'utf-8'));
       const r = c('stop');
       assert.strictEqual(r.status, 0, r.stderr);
@@ -5855,6 +5968,7 @@ print("ok")
       assert(waitFor(() => !alive(state.pid), 5000), `signer pid ${state.pid} still alive after stop`);
       assert(!fs.existsSync(path.join(home, 'bot-auth', 'signers', `${cdpPort}.json`)), 'signer state cleared');
       assert(/bot-auth: off/.test(c('bot-auth', 'status').stdout), 'bot-auth status: off');
+      assert(alive(sleeper.pid), 'the process that reused the stale pid must survive launch and stop');
     });
   } finally {
     if (e2e) e2e.stop();
