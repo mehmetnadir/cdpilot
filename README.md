@@ -931,8 +931,9 @@ and exits with code 2 and the start command above instead of half-working.
 **What cdpilot does with a connected browser:**
 
 - Page commands (`go`, `click`, `fill`, `shot`, …) run in a tab cdpilot opens
-  for itself in the background (`Target.createTarget`, so your tab keeps the
-  focus) on the first page command, and keep using that tab. `close`,
+  for itself in a new window that does not take the focus
+  (`Target.createTarget` with `newWindow` + `background`, so your window and
+  tab keep it) on the first page command, and keep using that tab. `close`,
   `session-close` and the idle session cleanup close only such tabs, the ones
   cdpilot opened in this browser run, never the last one. Your own tabs are
   never navigated or typed into; only a command that names a tab touches it

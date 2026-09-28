@@ -6350,7 +6350,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     } finally { fake.stop(); }
   });
 
-  test('connect: close / session-close / idle cleanup close only the tabs cdpilot opened (background), never a user tab', () => {
+  test('connect: close / session-close / idle cleanup close only the tabs cdpilot opened (inactive window), never a user tab', () => {
     const fake = startFake();
     try {
       const home = mkHome();
@@ -6365,7 +6365,8 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       fs.writeFileSync(path.join(home, 'profile', 'owned-tabs.json'), JSON.stringify({ owned: ['PAGE1'] }));
       assert.strictEqual(cli(['go', 'https://a.test/'], env).status, 0);
       const own = list().find((t) => t.id === 'PAGE2');
-      assert(own && own.background === true, `own tab opened in the background: ${JSON.stringify(list())}`);
+      assert(own && own.background === true && own.newWindow === true,
+        `own tab opened in a window of its own, without focus: ${JSON.stringify(list())}`);
       let r = cli(['session-close'], env);
       assert.strictEqual(r.status, 0, r.stdout + r.stderr);
       assert.deepStrictEqual(ids(), ['PAGE1'], 'session-close closed cdpilot\'s tab only');
