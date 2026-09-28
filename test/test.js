@@ -3618,19 +3618,21 @@ print(json.dumps([run(k, a) for k, a in json.load(sys.stdin)]))
     cases.forEach((c, i) => assert.deepStrictEqual(got[i], c[1], `${JSON.stringify(c[0])}`));
   });
 
-  test('frames: rewrite sends Runtime/DOM into the frame and shifts mouse x/y by the frame offset', () => {
+  test('frames: rewrite sends Runtime/DOM into the frame and maps mouse x/y by the frame scale and offset', () => {
     const src = extractPyFunc(PY_CONTENT, '_frame_route_rewrite');
     assert(src, '_frame_route_rewrite must be extractable');
     const out = execFileSync(PYB, ['-c', src + `
 
 import asyncio, json
 class Route:
-    context_id, session_id, chain, dirty, offset = 42, 'S1', [('p', 'o')], True, (0.0, 0.0)
+    context_id, session_id, chain, dirty, xform = 42, 'S1', [('p', 'o')], True, (1.0, 1.0, 0.0, 0.0)
 calls = []
+async def _frame_route_settle(route):
+    calls.append('settle')
 async def _frame_route_refresh_offset(route):
-    calls.append(1)
-    route.offset, route.dirty = (100.0, 1000.0), False
-    return route.offset
+    calls.append('measure')
+    route.xform, route.dirty = (0.5, 2.0, 100.0, 1000.0), False  # scale .5 / 2, then offset
+    return route.xform
 cmds = [
     (1, 'Runtime.evaluate', {'expression': '1'}),
     (2, 'DOM.describeNode', {'objectId': 'o'}),
@@ -3643,22 +3645,44 @@ cmds = [
     (9, 'Input.dispatchMouseEvent', {'type': 'mouseMoved', 'x': 5, 'y': 5}),
 ]
 res = asyncio.run(_frame_route_rewrite(Route(), cmds))
-print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
+print(json.dumps({'out': res, 'calls': calls, 'orig': cmds[2][2]}))
 `], { encoding: 'utf-8', timeout: 10000 });
     const r = JSON.parse(out.trim());
     assert.deepStrictEqual(r.out, [
       [1, 'Runtime.evaluate', { expression: '1', contextId: 42 }, 'S1'],
       [2, 'DOM.describeNode', { objectId: 'o' }, 'S1'],
-      [3, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: 110, y: 1020 }],
-      [4, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: 110, y: 1020 }],
+      [3, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: 105, y: 1040 }],
+      [4, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: 105, y: 1040 }],
       [5, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a' }],
       [6, 'Page.navigate', { url: 'about:blank' }],
       [7, 'Runtime.evaluate', { expression: '2', contextId: 99 }, 'S1'],
       [8, 'Runtime.evaluate', { expression: '3' }, 'EXPLICIT'],
-      [9, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 105, y: 1005 }],
+      [9, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 102.5, y: 1010 }],
     ]);
-    assert.strictEqual(r.refreshes, 2, 'offset re-measured once per page-JS run before mouse input, not per event');
+    // Once per page-JS run before mouse input, not per event; the page first
+    // settles (two drawn frames), then the offset is measured.
+    assert.deepStrictEqual(r.calls, ['settle', 'measure', 'settle', 'measure']);
     assert.deepStrictEqual(r.orig, { type: 'mousePressed', x: 10, y: 20 }, "caller's params must not be mutated");
+  });
+
+  test('frames: a frame point maps through every hop with its scale (transform: scale, zoom), nested', () => {
+    // Hop box: [left, top, border+padding x, y, scale x, y] (_FRAME_BOX_FN).
+    // Outer iframe at (100, 1000), 16 px border+padding, transform: scale(.5);
+    // inner at (10, 20), 6 px border, zoom: 2. The point (40, 50) in the inner
+    // frame: (10 + (6 + 40) * 2, 20 + (6 + 50) * 2) = (102, 132) in the outer
+    // frame, (100 + (16 + 102) * .5, 1000 + (16 + 132) * .5) = (159, 1074) on the page.
+    const src = pyFuncs(['_frame_points', '_frame_xform']) + `
+import json, sys
+boxes = [[100, 1000, 16, 16, 0.5, 0.5], [10, 20, 6, 6, 2, 2]]
+sx, sy, tx, ty = _frame_xform(boxes)
+print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, ty],
+                  'via_xform': [tx + sx * 40, ty + sy * 50], 'none': _frame_points([], 7, 8)}))
+`;
+    const r = JSON.parse(execFileSync(PYB, ['-c', src], { encoding: 'utf-8', timeout: 10000 }).trim());
+    assert.deepStrictEqual(r.points, [[159, 1074], [102, 132], [40, 50]], 'page, outer frame, inner frame');
+    assert.deepStrictEqual(r.via_xform, [159, 1074], 'the rewrite\'s single transform agrees');
+    assert.deepStrictEqual(r.xform, [1, 1, 119, 1024]);
+    assert.deepStrictEqual(r.none, [[7, 8]], 'no hops: the page point');
   });
 
   test('frames (fake CDP): element and smart-* commands are frame-aware; search limits 20 frames / 2 s', () => {
@@ -3875,20 +3899,127 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
     const sent = fakeResults._methods;
     assert(!sent['Runtime.enable'] && !sent['Runtime.disable'], `sent: ${JSON.stringify(sent)}`);
     assert(sent['DOM.resolveNode'] > 0, 'same-process frames: main world from the frame document');
-    assert.strictEqual(sent['Runtime.releaseObjectGroup'], sent['DOM.resolveNode'],
+    assert.strictEqual(fakeResults._released['cdpilot-frame'], sent['DOM.resolveNode'],
       'every resolved frame document is released');
+    assert(fakeResults._released['cdpilot-click'] > 0, 'real-click objects are released too');
     assert(sent['Target.attachToTarget'] > 0, 'out-of-process frames: flat session');
     const r = fake('routing');
     assert.strictEqual(r.css.context, r.contexts.card, 'the main-world context id');
     assert.strictEqual(r.nested.context, r.contexts.nested);
   });
 
-  test('frames (fake CDP): no usable main-world id: isolated world, and frame eval says so', () => {
+  test('frames (fake CDP): no usable main-world id: isolated world, one note line for every frame command', () => {
+    // A V8 objectId format change would land every frame command here: say so.
     const r = fake('isolated_fallback');
     assert.deepStrictEqual(r.eval.contexts, r.eval.isolated, 'eval ran in the isolated world');
     assert.strictEqual(r.eval.stdout, 'Result: card|z\n');
-    assert(/eval runs in an isolated world/.test(r.eval.stderr), r.eval.stderr);
-    assert.strictEqual(r.list.stderr, '', 'only frame eval (page globals) needs the note');
+    const note = "note: frame 'iframe#card': its page context was not reachable; using an isolated world"
+      + ' (same DOM, no page JS globals)\n';
+    for (const key of ['eval', 'list', 'click', 'twice']) {
+      assert.strictEqual(r[key].stderr, note, `${key}: exactly one note line`);
+    }
+    assert.deepStrictEqual(r.twice.res.map((x) => x[0]), ['ok', 'ok'], 'both commands ran');
+  });
+
+  test('frames (fake CDP): click is one click; real mouse input with --entropy=on and in frames', () => {
+    // clicks: el.click() calls cdpilot caused; pressed: Input mousePressed
+    // events; hits: hit-tests before the press, [object, x, y] per document
+    // (the <iframe> on the way, then the target). Main used el.click() and
+    // then the mouse with entropy (two clicks), el.click() in frames
+    // (isTrusted false), and put window.__cdpilot_waitFor on every page.
+    const r = fake('click_input');
+    const near = (p, x, y) => Math.abs(p[0] - x) <= 2 && Math.abs(p[1] - y) <= 2; // entropy jitter: +-2
+    for (const [key, at] of [['page_entropy', [40, 50]], ['frame', [140, 1050]],
+      ['frame_entropy', [150, 1070]], ['oopif', [45, 57]], ['scaled', [145, 1060]]]) {
+      const k = r[key];
+      assert.deepStrictEqual(k.res, ['ok', null], `${key}: ${k.stderr}`);
+      assert.deepStrictEqual(k.clicks, [], `${key}: no script click`);
+      assert.strictEqual(k.pressed.length, 1, `${key}: one mousePressed`);
+      assert.strictEqual(k.released.length, 1, `${key}: one mouseReleased`);
+      assert(near(k.pressed[0], ...at), `${key}: pressed at ${k.pressed[0]}, want ${at} (page coordinates)`);
+      assert.strictEqual(k.stderr, '', `${key}: no note`);
+    }
+    assert.deepStrictEqual(r.frame.hits, [['owner:card', 140, 1050], ['el:card:#btn', 40, 50]]);
+    assert.deepStrictEqual(r.oopif.hits, [['owner:pay', 45, 57], ['el:pay:#btn', 40, 50]]);
+    // #card: transform: scale(.5) at (100, 1000); #nested inside: zoom: 2 at (10, 20).
+    assert.deepStrictEqual(r.scaled.hits, [['owner:card', 145, 1060], ['owner:nested', 90, 120],
+      ['el:nested:#btn', 40, 50]], 'each hop checked at its own point');
+    assert.strictEqual(r.frame_entropy.hits.length, 3, 'nested: top, the outer frame, the target');
+    assert.deepStrictEqual(r.page_plain.clicks, [['top', 'script']], 'plain page click: unchanged (el.click())');
+    assert.strictEqual(r.page_plain.pressed.length + r.page_plain.hits.length, 0, 'plain page click: no mouse');
+    assert.deepStrictEqual(r.frame_nobox.clicks, [['card', 'script']], 'no box: el.click() is the fallback');
+    assert.strictEqual(r.frame_nobox.pressed.length, 0, 'no box: no mouse events');
+    for (const [key, k] of Object.entries(r)) {
+      if (typeof k !== 'object') continue;
+      assert.deepStrictEqual(k.leaks, [], `${key}: no helper on window`);
+      if (key !== 'blocker_error') assert(/^Clicked: BUTTON /.test(k.stdout), `${key}: ${k.stdout}`);
+    }
+  });
+
+  test('frames (fake CDP): hit-test fails (banner over the iframe or the target): script click + one note, no mouse', () => {
+    const r = fake('click_input');
+    const cases = [
+      ['covered_frame', 'card', 'iframe#card >>> #btn is covered by div#cookie.banner'],
+      ['covered_target', 'nested', 'iframe#card >>> iframe#nested >>> #btn is covered by div.overlay'],
+      ['covered_page', 'top', '#btn is covered by div#cookie'],  // --entropy=on on the page
+    ];
+    for (const [key, frame, what] of cases) {
+      const k = r[key];
+      assert.deepStrictEqual(k.res, ['ok', null], key);
+      assert.strictEqual(k.stderr, `note: ${what} at the click point; used a script click\n`, key);
+      assert.deepStrictEqual(k.clicks, [[frame, 'script']], `${key}: the target, by script`);
+      assert.deepStrictEqual(k.pressed, [], `${key}: no mouse press (it would hit the cover)`);
+      assert.strictEqual(k.stdout, 'Clicked: BUTTON #btn\n', key);
+    }
+    assert.strictEqual(r.covered_frame.hits.length, 2, 'the target frame is checked too, in one batch');
+  });
+
+  test("frames (fake CDP): cdpilot's input blocker is transparent only around the click, restored after an error", () => {
+    const r = fake('click_input');
+    for (const key of ['blocker', 'blocker_entropy']) {
+      assert.deepStrictEqual(r[key].blocker, ['none', ''], `${key}: opened, then restored`);
+      assert.strictEqual(r[key].pressed.length, 1, `${key}: the click went through`);
+    }
+    const e = r.blocker_error;  // the mouse press raises
+    assert.deepStrictEqual(e.res, ['raise', 'RuntimeError']);
+    assert.deepStrictEqual(e.blocker, ['none', ''], 'restored in finally');
+    assert.deepStrictEqual(r.frame.blocker, [], 'no blocker on the page: nothing toggled');
+  });
+
+  test('frames (fake CDP): the settle wait runs in isolated worlds and is cut off after 0.3 s', () => {
+    const r = fake('click_input');
+    assert.strictEqual(r.settle_timeout, 0.3);
+    // [frame, context is an isolated world]: the page's own rAF/setTimeout are never used.
+    assert.deepStrictEqual(r.frame.settles, [['card', true], ['top', true]], 'the frame, then the top page');
+    assert.deepStrictEqual(r.oopif.settles, [['pay', true], ['top', true]]);
+    assert.deepStrictEqual(r.frame_entropy.settles, [['nested', true], ['top', true]]);
+    assert.deepStrictEqual(r.page_entropy.settles, [['top', true]]);
+    assert.deepStrictEqual(r.page_plain.settles, [], 'plain page click: no wait');
+    const h = r.settle_hang;  // neither wait ever answers
+    assert.deepStrictEqual(h.pressed, [[140, 1050]], 'the click still happens');
+    assert(h.elapsed >= 0.55 && h.elapsed < 1.2, `two 0.3 s caps: ${h.elapsed}`);
+    assert(r.settle_ok.elapsed < 0.3, `answered waits cost nothing: ${r.settle_ok.elapsed}`);
+  });
+
+  test('frames (fake CDP): smart-click in a frame: the finder picks, the mouse clicks (hit-tested); page act unchanged', () => {
+    const r = fake('smart_real_click');
+    const f = r.smart_frame;
+    assert.deepStrictEqual(f.acts, [['card', 'strict']]);
+    assert.deepStrictEqual(f.act_real, [true], 'frame search act: __cdpilotRealClick');
+    assert.deepStrictEqual([f.res.x, f.res.y, f.res.via], [140, 1050, 'mouse'], 'page coordinates');
+    assert.deepStrictEqual(f.pressed, [[140, 1050]]);
+    assert.deepStrictEqual(f.clicks, []);
+    const c = r.smart_covered;
+    assert.strictEqual(c.res.via, 'script');
+    assert.deepStrictEqual(c.clicks, [['card', 'script']]);
+    assert.deepStrictEqual(c.pressed, []);
+    assert(c.stderr.includes('note: "Pay" is covered by div#cookie at the click point; used a script click'),
+      c.stderr);
+    assert.deepStrictEqual(r.smart_page.act_real, [false], 'page act unchanged');
+    assert.deepStrictEqual(r.smart_page.pressed, []);
+    assert.deepStrictEqual(r.smart_routed.acts, [['card', 'loose']]);
+    assert.deepStrictEqual(r.smart_routed.act_real, [true], '--frame act: __cdpilotRealClick');
+    assert.deepStrictEqual(r.smart_routed.pressed, [[140, 1050]]);
   });
 
   test('frames (fake CDP): CDPILOT_CDP_TRACE lists each CDP method sent, names only', () => {
@@ -3980,6 +4111,9 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
       CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1', CDPILOT_CDP_TRACE: trace };
     delete env.CDPILOT_TARGET;
     const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf-8', timeout: 60000, env });
+    // Visual feedback on (as in MCP sessions): cdpilot's input blocker covers the page.
+    const cShow = (...args) => spawnSync(process.execPath, [CLI, ...args],
+      { encoding: 'utf-8', timeout: 60000, env: { ...env, CDPILOT_SHOW: '1' } });
     const stop = () => {
       c('stop');
       servers.forEach((s) => { try { s.kill(); } catch (err) { /* already gone */ } });
@@ -3999,7 +4133,7 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
       stop();
       throw err;
     }
-    e2e = { c, p1, p2, stop, trace };
+    e2e = { c, cShow, p1, p2, stop, trace };
   });
   const ok = (r, re, what) => assert(re.test(r.stdout + r.stderr),
     `${what}: exit ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
@@ -4096,6 +4230,121 @@ print(json.dumps({'out': res, 'refreshes': len(calls), 'orig': cmds[2][2]}))
       const r = c('frame', 'list');
       assert.strictEqual(r.stdout.trimEnd(), ['iframes (2):', '  [0] src=about:blank name= id=hidden-frame',
         `  [1] src=http://localhost:${p2}/widget.html name= id=child`].join('\n'));
+    });
+
+    test('frames e2e: clicks are single and trusted (--entropy=on, frames, smart-click); no helper global on window', () => {
+      const { c, p1, p2 } = needE2E();
+      const child = `http://localhost:${p2}/inner.html?nested=http://127.0.0.1:${p1}/nested.html`;
+      const count = (log, re) => (log.match(re) || []).length;
+      for (const url of [`http://127.0.0.1:${p1}/top.html`,
+        `http://127.0.0.1:${p1}/top.html?child=${encodeURIComponent(child)}`]) {
+        c('go', url);
+        const pageLog = () => c('eval', 'document.body.dataset.log').stdout;
+        ok(c('click', '#top-btn', '--entropy=on'), /Clicked: BUTTON Top button/, `entropy click ${url}`);
+        assert.strictEqual(pageLog().trim(), 'top-click:trusted;', 'one trusted click');
+        assert.strictEqual(c('eval', 'typeof window.__cdpilot_waitFor').stdout.trim(), 'undefined',
+          'no page global after click');
+
+        ok(c('click', '#card >>> #pay-btn'), /Clicked: BUTTON Pay now/, 'frame click');
+        const payLog = c('frame', 'eval', '--frame', '#card', 'document.body.dataset.log').stdout;
+        assert.strictEqual(count(payLog, /pay-click:/g), 1, `one click: ${payLog}`);
+        assert(payLog.includes('pay-click:trusted'), `real mouse input: ${payLog}`);
+        ok(c('frame', 'eval', '--frame', '#card', 'typeof window.__cdpilot_waitFor'), /Result: undefined\s*$/,
+          'no global in the frame');
+
+        const deepLog = () => c('frame', 'eval', '--frame', '#card >>> #nested', 'document.body.dataset.log').stdout;
+        ok(c('click', '#card >>> #nested >>> #deep-btn', '--entropy=on'), /Clicked: BUTTON Deep button/, 'nested');
+        assert.strictEqual(count(deepLog(), /deep-click:/g), 1, `entropy: one click: ${deepLog()}`);
+        ok(c('smart-click', 'Deep button'), /matched inside frame iframe#card >>> iframe#nested/, 'smart-click');
+        const log = deepLog();
+        assert.strictEqual(count(log, /deep-click:trusted/g), 2, `smart-click in a frame is trusted: ${log}`);
+        assert.strictEqual(count(log, /deep-click:script/g), 0, log);
+        assert.strictEqual(pageLog().trim(), 'top-click:trusted;', 'frame clicks stayed in the frames');
+      }
+    });
+
+    // Each page on its own origin, and with its frame cross-origin (out of process).
+    const bothOrigins = (p1, p2, page) => {
+      const child = `http://localhost:${p2}/inner.html?nested=http://127.0.0.1:${p1}/nested.html`;
+      return [`http://127.0.0.1:${p1}/${page}`, `http://127.0.0.1:${p1}/${page}?child=${encodeURIComponent(child)}`];
+    };
+    const count = (log, re) => (log.match(re) || []).length;
+    const inFrame = (c, frame, js) => c('frame', 'eval', '--frame', frame, js).stdout;
+
+    test('frames e2e: a cookie banner over the iframe: script click on the target, note, banner not clicked', () => {
+      const { c, p1, p2 } = needE2E();
+      for (const url of bothOrigins(p1, p2, 'covered.html')) {
+        c('go', url);
+        const r = c('click', '#card >>> #pay-btn');
+        ok(r, /Clicked: BUTTON Pay now/, `click ${url}`);
+        assert(r.stderr.includes('note: iframe#card >>> #pay-btn is covered by div#cookie.banner.consent'
+          + ' at the click point; used a script click'), r.stderr);
+        assert(/Result: pay-click:script;\s*$/.test(inFrame(c, '#card', 'document.body.dataset.log')),
+          'the target, clicked once by the script fallback');
+        assert.strictEqual(c('eval', 'document.body.dataset.log').stdout.trim(), '', 'the banner was not clicked');
+      }
+    });
+
+    test('frames e2e: iframes with transform: scale(.5) and zoom: 2: a trusted click lands on the target', () => {
+      const { c, p1, p2 } = needE2E();
+      for (const url of bothOrigins(p1, p2, 'scaled.html')) {
+        c('go', url);
+        for (const frame of ['#scaled', '#zoomed']) {
+          const r = c('click', `${frame} >>> #pay-btn`);
+          ok(r, /Clicked: BUTTON Pay now/, `${frame} ${url}`);
+          assert(!/note:/.test(r.stderr), r.stderr);
+          const log = inFrame(c, frame, 'document.body.dataset.log');
+          assert.strictEqual(count(log, /pay-click:/g), 1, `${frame}: one click: ${log}`);
+          assert(log.includes('pay-click:trusted'), `${frame}: real mouse input: ${log}`);
+        }
+        const page = c('eval', 'document.body.dataset.log').stdout;
+        assert(!/page-click/.test(page), `no click landed on the page: ${page}`);
+      }
+    });
+
+    test('frames e2e: a page whose requestAnimationFrame/setTimeout never call back: frame click within 1 s of normal', () => {
+      const { c, p1, p2 } = needE2E();
+      const [plain, stubbed] = [bothOrigins(p1, p2, 'top.html'), bothOrigins(p1, p2, 'raf.html')];
+      for (let i = 0; i < 2; i++) {
+        const timed = (url) => {
+          c('go', url);
+          const t0 = Date.now();
+          const r = c('click', '#card >>> #pay-btn');
+          const ms = Date.now() - t0;
+          ok(r, /Clicked: BUTTON Pay now/, url);
+          assert(inFrame(c, '#card', 'document.body.dataset.log').includes('pay-click:trusted'), `trusted: ${url}`);
+          return ms;
+        };
+        const normalMs = timed(plain[i]);
+        const stubbedMs = timed(stubbed[i]);
+        assert(stubbedMs < normalMs + 1000, `stubbed timers: ${stubbedMs} ms vs ${normalMs} ms`);
+      }
+    });
+
+    test('frames e2e: CDPILOT_SHOW=1 (input blocker): frame, smart and --entropy=on clicks land, trusted; blocker restored', () => {
+      const { c, cShow, p1, p2 } = needE2E();
+      for (const url of bothOrigins(p1, p2, 'top.html')) {
+        c('go', url);
+        const blocker = () => c('eval', 'document.body.dataset.blocker').stdout.trim();
+        const r = cShow('click', '#card >>> #pay-btn');
+        ok(r, /Clicked: BUTTON Pay now/, `click ${url}`);
+        assert(!/note:/.test(r.stderr), r.stderr);
+        const pay = inFrame(c, '#card', 'document.body.dataset.log');
+        assert.strictEqual(count(pay, /pay-click:/g), 1, pay);
+        assert(pay.includes('pay-click:trusted'), `landed in the frame, trusted: ${pay}`);
+        // Blocker added by the command, made transparent for the click only,
+        // restored, then removed when the command ended.
+        assert.strictEqual(blocker(), 'added;pe:none;pe:auto;removed;');
+
+        ok(cShow('click', '#top-btn', '--entropy=on'), /Clicked: BUTTON Top button/, 'entropy on the page');
+        assert.strictEqual(c('eval', 'document.body.dataset.log').stdout.trim(), 'top-click:trusted;');
+        ok(cShow('click', '#card >>> #nested >>> #deep-btn', '--entropy=on'), /Clicked: BUTTON Deep button/, 'nested');
+        ok(cShow('smart-click', 'Deep button'), /Clicked: BUTTON "Deep button"/, 'smart-click in a frame');
+        const deep = inFrame(c, '#card >>> #nested', 'document.body.dataset.log');
+        assert.strictEqual(count(deep, /deep-click:trusted/g), 2, deep);
+        assert.strictEqual(count(deep, /deep-click:script/g), 0, deep);
+        assert.strictEqual(blocker(), 'added;pe:none;pe:auto;removed;'.repeat(4), 'every click restored it');
+      }
     });
 
     test('frames e2e: no command above sent Runtime.enable (CDPILOT_CDP_TRACE)', () => {
