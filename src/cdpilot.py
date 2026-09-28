@@ -35,6 +35,9 @@ Environment:
                        `launch --idle-close <min>`; 0 = never)
   CDPILOT_LOG=0        Do not write the session log
   CDPILOT_LOG_DAYS     Days of session log to keep (default: 14; 0 = forever)
+  CDPILOT_BOT_AUTH=1   Sign every browser request with RFC 9421 HTTP Message
+                       Signatures (Web Bot Auth). Requires 'cryptography' package.
+                       See: cdpilot bot-auth init --agent-url https://your-domain.com
 """
 
 __version__ = "0.9.3"
@@ -1737,6 +1740,376 @@ def _idle_status(port=None, now=None):
     last = _idle_last_activity(state) or time.time()
     left = max(0.0, minutes * 60 - ((time.time() if now is None else now) - last))
     return f"idle close in {-(-int(left) // 60)}m", int(left)
+
+
+# ─── Web Bot Auth (RFC 9421 HTTP Message Signatures) ───
+#
+# Signs every browser request with an Ed25519 signature so downstream
+# verifiers (Cloudflare Verified Bots, AWS WAF, Akamai, etc.) can confirm
+# the request comes from the declared agent.
+#
+# Headers per request:
+#   Signature-Agent: "<agent_url>"            — operator key directory
+#   Signature-Input: sig1=("@authority" "@method" "@path"
+#       "signature-agent");created=…;expires=…;keyid="…";alg="ed25519";
+#       nonce="…";tag="web-bot-auth"
+#   Signature: sig1=:<base64>:                — Ed25519 over the sig base
+#
+# Key directory (JWKS) at /.well-known/http-message-signatures-directory
+# on the operator's domain.
+#
+# Optional dependency: `cryptography` (pip install cryptography).
+# Imported only inside functions; all other cdpilot commands work without it.
+
+BOT_AUTH_DIR = os.path.join(CDPILOT_HOME, 'bot-auth')
+BOT_AUTH_PRIVATE_KEY_FILE = os.path.join(BOT_AUTH_DIR, 'ed25519.key')
+BOT_AUTH_CONFIG_FILE = os.path.join(BOT_AUTH_DIR, 'config.json')
+BOT_AUTH_ENV = 'CDPILOT_BOT_AUTH'
+BOT_AUTH_SIGNER_FLAG = '--_bot-auth-signer'  # hidden — re-entrant fork
+
+
+def _bot_auth_require_crypto():
+    """Lazy-import cryptography; exit 2 with install hint if missing."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed
+        from cryptography.hazmat.primitives import serialization as _ser
+        return _ed, _ser
+    except ImportError:
+        print("cdpilot: Web Bot Auth requires the 'cryptography' package.\n"
+              "  pip install cryptography", file=sys.stderr)
+        sys.exit(2)
+
+
+def _b64url(data):
+    """base64url without padding (RFC 7515 §2)."""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _bot_auth_jwk_thumbprint_raw(x_b64url):
+    """RFC 7638 JWK thumbprint for an Ed25519 public key.
+
+    x_b64url is the base64url-encoded 32-byte public key.
+    Returns the base64url-encoded SHA-256 hash of the canonical JWK:
+      {"crv":"Ed25519","kty":"OKP","x":"…"}
+    (members sorted lexicographically, no whitespace — §3.2 of RFC 7638).
+    """
+    canon = f'{{"crv":"Ed25519","kty":"OKP","x":"{x_b64url}"}}'.encode("utf-8")
+    return _b64url(hashlib.sha256(canon).digest())
+
+
+def _bot_auth_generate_keypair(agent_url):
+    """Create Ed25519 keypair, save to BOT_AUTH_DIR, print summary."""
+    _ed, _ser = _bot_auth_require_crypto()
+    os.makedirs(BOT_AUTH_DIR, exist_ok=True)
+    try:
+        os.chmod(BOT_AUTH_DIR, 0o700)
+    except OSError:
+        pass
+
+    private_key = _ed.Ed25519PrivateKey.generate()
+    pem = private_key.private_bytes(
+        encoding=_ser.Encoding.PEM,
+        format=_ser.PrivateFormat.PKCS8,
+        encryption_algorithm=_ser.NoEncryption(),
+    )
+    with open(BOT_AUTH_PRIVATE_KEY_FILE, "wb") as f:
+        f.write(pem)
+    os.chmod(BOT_AUTH_PRIVATE_KEY_FILE, 0o600)
+
+    pub_raw = private_key.public_key().public_bytes(
+        encoding=_ser.Encoding.Raw, format=_ser.PublicFormat.Raw)
+    x_b64 = _b64url(pub_raw)
+    keyid = _bot_auth_jwk_thumbprint_raw(x_b64)
+
+    config = {"agent_url": agent_url, "keyid": keyid,
+              "created_at": time.time()}
+    with open(BOT_AUTH_CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+    print(f"Generated Ed25519 keypair.")
+    print(f"  Agent URL   : {agent_url}")
+    print(f"  Key ID (kid): {keyid}")
+    print(f"  Private key : {BOT_AUTH_PRIVATE_KEY_FILE}")
+    print()
+    print("Next steps:")
+    print(f"  1. Run  cdpilot bot-auth directory  to get the JWKS JSON.")
+    print(f"  2. Host that JSON at:")
+    print(f"       {agent_url.rstrip('/')}/.well-known/http-message-signatures-directory")
+    print(f"  3. Launch with  cdpilot launch --bot-auth  (or CDPILOT_BOT_AUTH=1).")
+
+
+def _bot_auth_load_private_key():
+    """Load Ed25519 private key + config; warn on unsafe permissions."""
+    _ed, _ser = _bot_auth_require_crypto()
+    if not os.path.exists(BOT_AUTH_PRIVATE_KEY_FILE):
+        print("cdpilot: bot-auth key not found. Run 'cdpilot bot-auth init "
+              "--agent-url https://your-domain.com' first.", file=sys.stderr)
+        sys.exit(1)
+    # Permission check (POSIX only)
+    if os.name != "nt":
+        st = os.stat(BOT_AUTH_PRIVATE_KEY_FILE)
+        if st.st_mode & 0o077:
+            print("Warning: bot-auth private key has unsafe permissions "
+                  f"({oct(st.st_mode & 0o777)}). Should be 0600.",
+                  file=sys.stderr)
+    with open(BOT_AUTH_PRIVATE_KEY_FILE, "rb") as f:
+        pem = f.read()
+    private_key = _ser.load_pem_private_key(pem, password=None)
+    if not os.path.exists(BOT_AUTH_CONFIG_FILE):
+        print("cdpilot: bot-auth config missing.", file=sys.stderr)
+        sys.exit(1)
+    with open(BOT_AUTH_CONFIG_FILE) as f:
+        config = json.load(f)
+    return private_key, config
+
+
+def _bot_auth_build_directory():
+    """Build JWKS directory JSON from the stored keypair."""
+    private_key, config = _bot_auth_load_private_key()
+    _, _ser = _bot_auth_require_crypto()
+    pub_raw = private_key.public_key().public_bytes(
+        encoding=_ser.Encoding.Raw, format=_ser.PublicFormat.Raw)
+    x_b64 = _b64url(pub_raw)
+    keyid = config.get("keyid") or _bot_auth_jwk_thumbprint_raw(x_b64)
+    return {"keys": [{"kid": keyid, "kty": "OKP", "crv": "Ed25519",
+                      "x": x_b64}]}
+
+
+def _bot_auth_signature_base(method, authority, path, agent_url, params_str):
+    """RFC 9421 §2.5 — canonical signature base for web-bot-auth.
+
+    Each line: `"<component>": <value>` terminated by a single LF.
+    The last line is `"@signature-params": <params>` (no trailing LF).
+    """
+    lines = [
+        f'"@authority": {authority}',
+        f'"@method": {method}',
+        f'"@path": {path}',
+        f'"signature-agent": "{agent_url}"',
+        f'"@signature-params": {params_str}',
+    ]
+    return "\n".join(lines).encode("utf-8")
+
+
+def _bot_auth_sign_request(method, url, agent_url, private_key, keyid):
+    """Sign one HTTP request.  Returns dict of three header name→value pairs."""
+    parsed = urllib.parse.urlparse(url)
+    authority = parsed.netloc.lower()
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    created = int(time.time())
+    expires = created + 300
+    nonce = _b64url(os.urandom(16))
+
+    params_str = (
+        f'("@authority" "@method" "@path" "signature-agent")'
+        f';created={created};expires={expires}'
+        f';keyid="{keyid}";alg="ed25519"'
+        f';nonce="{nonce}";tag="web-bot-auth"'
+    )
+
+    sig_base = _bot_auth_signature_base(
+        method.upper(), authority, path, agent_url, params_str)
+    sig_bytes = private_key.sign(sig_base)
+    sig_b64 = base64.b64encode(sig_bytes).decode("ascii")
+
+    return {
+        "Signature-Agent": f'"{agent_url}"',
+        "Signature-Input": f"sig1={params_str}",
+        "Signature": f"sig1=:{sig_b64}:",
+    }
+
+
+def cmd_bot_auth(subcmd=None, *args):
+    """CLI: cdpilot bot-auth <init|status|directory>."""
+    if not subcmd:
+        print("Usage: cdpilot bot-auth <init|status|directory>")
+        print("  init --agent-url <url>   Generate Ed25519 keypair")
+        print("  status                   Show key info and readiness")
+        print("  directory                Print JWKS JSON for publishing")
+        sys.exit(1)
+
+    if subcmd == "init":
+        agent_url = None
+        i = 0
+        while i < len(args):
+            if args[i] == "--agent-url" and i + 1 < len(args):
+                agent_url = args[i + 1]; i += 2; continue
+            if args[i].startswith("--agent-url="):
+                agent_url = args[i].split("=", 1)[1]; i += 1; continue
+            # bare positional (legacy compat)
+            if not agent_url and args[i].startswith("https://"):
+                agent_url = args[i]
+            i += 1
+        if not agent_url:
+            print("Usage: cdpilot bot-auth init --agent-url https://your-domain.com",
+                  file=sys.stderr)
+            sys.exit(1)
+        if not agent_url.startswith("https://"):
+            print("cdpilot: agent-url must start with https://", file=sys.stderr)
+            sys.exit(1)
+        _bot_auth_generate_keypair(agent_url)
+
+    elif subcmd == "status":
+        if not os.path.exists(BOT_AUTH_PRIVATE_KEY_FILE):
+            print("Bot Auth: not configured (run 'cdpilot bot-auth init').")
+            return
+        _, config = _bot_auth_load_private_key()
+        enabled = os.environ.get(BOT_AUTH_ENV, "") in ("1", "true", "yes", "on")
+        print(f"Bot Auth: configured")
+        print(f"  agent-url: {config.get('agent_url', '?')}")
+        print(f"  keyid    : {config.get('keyid', '?')}")
+        print(f"  enabled  : {'yes (CDPILOT_BOT_AUTH=1)' if enabled else 'no (use launch --bot-auth)'}")
+
+    elif subcmd == "directory":
+        directory = _bot_auth_build_directory()
+        print(json.dumps(directory, indent=2))
+
+    else:
+        print(f"cdpilot: unknown bot-auth subcommand: {subcmd}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _bot_auth_enabled():
+    """True when bot-auth signing should be active."""
+    return os.environ.get(BOT_AUTH_ENV, "") in ("1", "true", "yes", "on")
+
+
+def _bot_auth_check_stealth_conflict():
+    """Warn if --bot-auth and --stealth/--undetected are both requested.
+
+    Signing your identity and hiding it are contradictory.  Bot-auth wins;
+    stealth patches are skipped.  Returns True if there is a conflict.
+    """
+    tier = os.environ.get('CDPILOT_MODE', '').lower()
+    if not tier:
+        mode_file = os.path.join(PROFILE_DIR, 'mode.json')
+        try:
+            with open(mode_file) as f:
+                tier = json.load(f).get('mode', 'regular')
+        except (OSError, ValueError):
+            tier = 'regular'
+    if tier in ('stealth', 'undetected'):
+        print("Warning: --bot-auth and stealth/undetected mode are contradictory.\n"
+              "  Signing your identity while hiding it defeats the purpose.\n"
+              "  Bot-auth is active; stealth patches are NOT applied.",
+              file=sys.stderr)
+        return True
+    return False
+
+
+def _bot_auth_spawn_signer(port=None, project_id=None):
+    """Start the detached bot-auth signer for a browser launch with --bot-auth.
+
+    Same self-fork + detach pattern as _idle_spawn_watcher.  The signer
+    connects to the browser's CDP, enables Fetch interception, and adds
+    signature headers to every Document/XHR/Fetch request.  It exits when
+    the WebSocket disconnects (browser closed).
+    """
+    port = int(port or CDP_PORT)
+    project_id = project_id or PROJECT_ID
+    env = os.environ.copy()
+    env.update(CDP_PORT=str(port), CDPILOT_PROJECT_ID=project_id,
+               CDPILOT_HOME=CDPILOT_HOME)
+    env.pop("CDPILOT_TIMEOUT", None)
+    kwargs = {
+        "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL, "env": env, "close_fds": True,
+        "cwd": CDPILOT_HOME,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__),
+             BOT_AUTH_SIGNER_FLAG, str(port)],
+            **kwargs)
+        return proc.pid
+    except OSError:
+        return None
+
+
+def _bot_auth_signer_entry(args):
+    """Hidden '--_bot-auth-signer <port>' entry: the detached signing loop.
+
+    Connects to the browser via the CDP debugger WebSocket, enables
+    Fetch.enable for Document/XHR/Fetch resources, and signs each paused
+    request before continuing it.  Exits when the browser disconnects.
+    """
+    import asyncio
+    import websockets
+    if len(args) < 1:
+        return
+    port = int(args[0])
+
+    private_key, config = _bot_auth_load_private_key()
+    agent_url = config["agent_url"]
+    keyid = config["keyid"]
+
+    async def _signer_loop():
+        # Get the browser-level WS URL
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/json/version", timeout=5) as r:
+                info = json.loads(r.read().decode())
+            ws_url = info["webSocketDebuggerUrl"]
+        except Exception:
+            return
+
+        async with websockets.connect(ws_url, max_size=100 * 1024 * 1024) as ws:
+            msg_id = 1
+            # Enable Fetch interception for navigations + API calls only.
+            # Images, stylesheets, fonts, media are not signed — they add
+            # no security value and would add latency to every sub-resource.
+            await ws.send(json.dumps({"id": msg_id, "method": "Fetch.enable",
+                "params": {"patterns": [
+                    {"requestStage": "Request", "resourceType": "Document"},
+                    {"requestStage": "Request", "resourceType": "XHR"},
+                    {"requestStage": "Request", "resourceType": "Fetch"},
+                ]}}))
+            msg_id += 1
+
+            while True:
+                try:
+                    raw = await ws.recv()
+                    msg = json.loads(raw)
+                    if msg.get("method") != "Fetch.requestPaused":
+                        continue
+                    params = msg["params"]
+                    req_id = params["requestId"]
+                    request = params["request"]
+                    method = request.get("method", "GET")
+                    url = request.get("url", "")
+                    existing = request.get("headers", {})
+
+                    try:
+                        sig_hdrs = _bot_auth_sign_request(
+                            method, url, agent_url, private_key, keyid)
+                        # Merge existing + signature headers
+                        hdr_list = [{"name": k, "value": v}
+                                    for k, v in existing.items()]
+                        for k, v in sig_hdrs.items():
+                            hdr_list.append({"name": k, "value": v})
+                        await ws.send(json.dumps({"id": msg_id,
+                            "method": "Fetch.continueRequest",
+                            "params": {"requestId": req_id,
+                                       "headers": hdr_list}}))
+                    except Exception:
+                        # Never block a request — continue unsigned on error
+                        await ws.send(json.dumps({"id": msg_id,
+                            "method": "Fetch.continueRequest",
+                            "params": {"requestId": req_id}}))
+                    msg_id += 1
+                except Exception:
+                    break  # WS disconnected → browser gone → exit
+
+    asyncio.run(_signer_loop())
 
 
 def get_tabs():
@@ -3886,12 +4259,13 @@ def _minimize_browser_window():
     asyncio.run(_do())
 
 
-def cmd_launch(auto=False, idle_close=None):
+def cmd_launch(auto=False, idle_close=None, bot_auth=False):
     """Launch the browser with CDP enabled (isolated session — does not touch existing browser).
 
     auto=True: started by a page command (auto-launch) — idle close on by
     default; so is any launch from the MCP server (CDPILOT_MCP_SESSION=1).
     idle_close: the `--idle-close <min>` value of an explicit launch.
+    bot_auth: when True, spawn a detached signer that adds RFC 9421 headers.
     """
     global CHROME_BIN, CDP_PORT, CDP_BASE
     auto = auto or IS_MCP_SESSION
@@ -4085,6 +4459,14 @@ def cmd_launch(auto=False, idle_close=None):
                     pass
             proj_label = f' [{PROJECT_ID}]' if PROJECT_ID else ''
             print(f'CDP ready! (port {CDP_PORT}){proj_label}')
+            # ─── Bot Auth signer ───
+            if bot_auth or _bot_auth_enabled():
+                if _bot_auth_check_stealth_conflict():
+                    pass  # warning printed, stealth skipped
+                if _bot_auth_spawn_signer(CDP_PORT, PROJECT_ID):
+                    print(f'  Bot Auth: signer started (requests will be signed)')
+                else:
+                    print(f'  Bot Auth: failed to start signer', file=sys.stderr)
             return
     print('Failed to start CDP (timeout).', file=sys.stderr)
     sys.exit(1)
@@ -14775,7 +15157,7 @@ SLOG_JS_LITERAL_CHARS = 40
 SLOG_MAX_FILES = 20
 # Long-running servers (their tool calls are logged), the reader itself
 # (reading the log must not grow it) and help.
-SLOG_SKIP_CMDS = frozenset({'mcp', 'serve', 'log', 'help', '--help', '-h'})
+SLOG_SKIP_CMDS = frozenset({'mcp', 'serve', 'log', 'help', '--help', '-h', 'bot-auth'})
 SLOG_CMD_ALIASES = {'open': 'go', '--version': 'version', '-v': 'version'}
 SLOG_VALUE_CMDS = frozenset({'fill', 'type'})  # <selector> <value...>, flags anywhere
 SLOG_VALUE_CMD_FLAGS = frozenset({'--no-heal'})  # their bare flags; --name=value is kept
@@ -15629,6 +16011,9 @@ if __name__ == "__main__":
     if cmd == IDLE_WATCHER_FLAG:  # detached idle auto-close watcher (see cmd_launch)
         _idle_watcher_entry(args)
         sys.exit(0)
+    if cmd == BOT_AUTH_SIGNER_FLAG:  # detached bot-auth request signer
+        _bot_auth_signer_entry(args)
+        sys.exit(0)
     _idle_touch_activity(cmd)
 
     _AUTOLAUNCH["cmd"] = cmd
@@ -15641,7 +16026,8 @@ if __name__ == "__main__":
         _arm_timeout_watchdog(_timeout_s, cmd)
 
     sync_cmds = {
-        'launch': lambda: cmd_launch(idle_close=_idle_close_flag(args)),
+        'launch': lambda: cmd_launch(idle_close=_idle_close_flag(args),
+                                      bot_auth='--bot-auth' in args),
         'tabs': lambda: cmd_tabs(
             reap='--reap' in args,
             max_tabs=next((int(a.split('=')[1]) for a in args
@@ -15677,6 +16063,7 @@ if __name__ == "__main__":
         'trace': lambda: cmd_trace_dispatch(args),
         'blog': lambda: _dispatch_blog_cmd(args),
         'watch': lambda: _dispatch_watch_cmd(args),
+        'bot-auth': lambda: cmd_bot_auth(*args),
         'log': lambda: cmd_log(*args),
     }
 

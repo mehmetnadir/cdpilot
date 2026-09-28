@@ -458,6 +458,18 @@ function showHelp() {
     cookies load <file>
                        Import previously-saved cookies into the current jar.
 
+  WEB BOT AUTH (verified agent — signs requests with RFC 9421)
+    bot-auth init --agent-url <url>
+                       Generate Ed25519 keypair. Saves to CDPILOT_HOME/bot-auth/.
+                       JWKS directory JSON printed for publishing.
+    bot-auth status    Show key info, keyid, agent-url, enabled state
+    bot-auth directory Print JWKS JSON for /.well-known/http-message-signatures-directory
+    launch --bot-auth  Launch browser with request signing enabled (or CDPILOT_BOT_AUTH=1)
+                       Spawns a detached signer that adds Signature/Signature-Input/
+                       Signature-Agent headers to every Document/XHR/Fetch request.
+                       Contradicts stealth — warns and skips stealth if both are set.
+                       Requires: pip install cryptography
+
   RELIABILITY
     browser [name]     Show or set preferred browser (chrome|brave|chromium|edge|vivaldi|auto)
     health             JSON status: alive, port, tabs, browser, today's crashes

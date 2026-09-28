@@ -505,6 +505,57 @@ cdpilot adaptive clear        # Drop the stealth host memory entirely
 > when it sees one — adds the host to a persistent list, retries once with
 > stealth on. Never auto-demotes. Conservative by design.
 
+### Web Bot Auth (Signed Agent)
+
+The opposite of stealth: instead of hiding, your agent identifies itself as a
+verified, legitimate bot by signing every HTTP request with
+[RFC 9421 HTTP Message Signatures](https://datatracker.ietf.org/doc/rfc9421/).
+Verifiers (Cloudflare, AWS WAF, Akamai, Vercel, Shopify) check the Ed25519
+signature against your published public key and treat the agent as a trusted
+crawler — no CAPTCHA, no block, no rate-limit.
+
+```bash
+# 1. Generate an Ed25519 keypair
+cdpilot bot-auth init --agent-url https://your-domain.com
+
+# 2. Publish the JWKS directory on your domain
+cdpilot bot-auth directory > directory.json
+# Host directory.json at:
+#   https://your-domain.com/.well-known/http-message-signatures-directory
+
+# 3. Launch with request signing
+cdpilot launch --bot-auth
+# Or set globally:
+export CDPILOT_BOT_AUTH=1
+cdpilot launch
+
+# Check status
+cdpilot bot-auth status
+```
+
+Every Document, XHR, and Fetch request gets three headers:
+
+| Header | Value |
+|--------|-------|
+| `Signature-Agent` | `"https://your-domain.com"` |
+| `Signature-Input` | `sig1=("@authority" "@method" "@path" "signature-agent");created=…;expires=…;keyid="…";alg="ed25519";nonce="…";tag="web-bot-auth"` |
+| `Signature` | `sig1=:<base64-ed25519-signature>:` |
+
+**Stealth conflict:** `--bot-auth` and `--stealth`/`--undetected` are
+contradictory (you can't sign your identity and hide it). If both are set,
+cdpilot warns and applies bot-auth without stealth patches.
+
+**Optional dependency:** Ed25519 signing requires the `cryptography` package:
+```bash
+pip install cryptography
+```
+All other cdpilot commands work without it. If the package is missing and you
+try to use bot-auth, cdpilot prints a helpful message and exits 2.
+
+**Cloudflare registration:** After publishing your JWKS directory, register
+your agent at [Cloudflare Verified Bots](https://developers.cloudflare.com/bots/reference/verified-bots-policy/).
+You can test your setup at `https://crawltest.com/cdn-cgi/web-bot-auth`.
+
 ### Friction Ladder (progressive anti-bot detection)
 
 Real sites don't just throw a CAPTCHA — they stack defenses incrementally.
