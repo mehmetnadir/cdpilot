@@ -6427,8 +6427,7 @@ async def cmd_go(url):
         try:
             cached = _load_host_cookies(expected_host)
             if cached:
-                await cdp_send(active_ws, [(910, 'Network.setCookies', {'cookies': cached})])
-                sys.stderr.write(f"🍪 Cookie auto: injected {len(cached)} cached cookies for {expected_host}\n")
+                await _cookies_auto_inject(active_ws, cached, expected_host)
         except Exception:
             pass
     # --- END COOKIES AUTO PRE-NAVIGATE ---
@@ -7693,6 +7692,14 @@ def _cookies_auto_should_apply(host):
     return False
 
 
+async def _cookies_auto_inject(ws, cookies, host):
+    """Inject cached cookies before navigating. Never into a connected browser."""
+    if _is_external():
+        return
+    await cdp_send(ws, [(910, 'Network.setCookies', {'cookies': cookies})])
+    sys.stderr.write(f"🍪 Cookie auto: injected {len(cookies)} cached cookies for {host}\n")
+
+
 def _set_cookies_auto(enabled):
     """Enable or disable cookie auto-persistence (preserves safe_hosts)."""
     cfg = _cookies_auto_config()
@@ -7789,6 +7796,12 @@ async def cmd_cookies(*args):
         return
 
     if sub == 'load':
+        allow_external = '--allow-external' in args
+        args = [a for a in args if a != '--allow-external']
+        if _is_external() and not allow_external:
+            print("cookies load writes into your own browser's cookie jar; add --allow-external to do it anyway",
+                  file=sys.stderr)
+            sys.exit(1)
         # Per-host mode: cookies load --host <hostname>
         if len(args) >= 3 and args[1] == '--host':
             host = args[2]
@@ -7935,6 +7948,12 @@ async def cmd_cookies(*args):
         return
 
     if sub == 'cf-replay':
+        allow_external = '--allow-external' in args
+        args = [a for a in args if a != '--allow-external']
+        if _is_external() and not allow_external:
+            print("cf-replay writes into your own browser's cookie jar; add --allow-external to do it anyway",
+                  file=sys.stderr)
+            sys.exit(1)
         if len(args) < 2:
             print("Usage: cdpilot cookies cf-replay <url>", file=sys.stderr)
             return
