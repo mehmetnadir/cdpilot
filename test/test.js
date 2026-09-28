@@ -6442,37 +6442,48 @@ print("ok")
   });
 
   test('bot-auth: status prints a bot-auth line only when bot-auth is set up (default output unchanged)', () => {
-    // A stand-in CDP endpoint: /json/version served from a directory.
+    // A stand-in CDP endpoint (a node child serving /json/version) on a free
+    // port in 58680-58699: the child tries them in turn and prints the one it got.
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-status-'));
-    fs.mkdirSync(path.join(root, 'json'));
     const ws = 'ws://127.0.0.1/devtools/browser/status-test';
-    fs.writeFileSync(path.join(root, 'json', 'version'), JSON.stringify({
-      Browser: 'Chrome/150.0.0.0', 'Protocol-Version': '1.3', webSocketDebuggerUrl: ws }));
-    const port = JSON.parse(execFileSync(PYB, ['-c', [
-      'import json, socket', 'got = None',
-      'for p in range(58680, 58700):',
-      '    s = socket.socket()',
-      '    try: s.bind(("127.0.0.1", p)); got = p',
-      '    except OSError: pass',
-      '    finally: s.close()',
-      '    if got: break',
-      'print(json.dumps(got))'].join('\n')], { encoding: 'utf-8', timeout: 30000 }).trim());
-    const srv = spawn(PYB, ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+    const version = JSON.stringify({ Browser: 'Chrome/150.0.0.0', 'Protocol-Version': '1.3',
+      webSocketDebuggerUrl: ws });
+    const portFile = path.join(root, 'port');
+    const srv = spawn(process.execPath, ['-e', `
+      const http = require('http'), fs = require('fs');
+      const body = ${JSON.stringify(version)};
+      const tryPort = (p) => {
+        if (p > 58699) process.exit(3);
+        const s = http.createServer((req, res) => {
+          res.writeHead(req.url === '/json/version' ? 200 : 404, { 'Content-Type': 'application/json' });
+          res.end(req.url === '/json/version' ? body : '');
+        });
+        s.once('error', () => tryPort(p + 1));
+        s.listen(p, '127.0.0.1', () => fs.writeFileSync(${JSON.stringify(portFile)}, String(p)));
+      };
+      tryPort(58680);
+      setTimeout(() => process.exit(0), 120000);`], { stdio: 'ignore' });
+    let port = null;
+    const probe = spawnSync(process.execPath, ['-e', `
+      const fs = require('fs'), http = require('http');
+      const end = Date.now() + 30000;
+      const again = () => (Date.now() > end ? process.exit(3) : setTimeout(tick, 100));
+      const tick = () => {
+        let p;
+        try { p = fs.readFileSync(${JSON.stringify(portFile)}, 'utf8'); } catch (e) { return again(); }
+        http.get({ host: '127.0.0.1', port: Number(p), path: '/json/version', timeout: 3000 }, (res) => {
+          res.resume(); res.on('end', () => { process.stdout.write(p); process.exit(0); });
+        }).on('error', again).on('timeout', function () { this.destroy(); });
+      };
+      tick();`], { encoding: 'utf-8', timeout: 60000 });
+    if (probe.status === 0) port = Number(probe.stdout.trim());
     const home = path.join(root, 'home');
     const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(root, 'profile'),
       CDP_PORT: String(port), CDPILOT_LOG: '0' };
     for (const k of ['CDPILOT_WEBMCP', 'CDPILOT_BOT_AUTH', 'CDPILOT_TIMEOUT']) delete env[k];
     const status = () => spawnSync(process.execPath, [CLI, 'status'], { encoding: 'utf-8', timeout: 30000, env });
     try {
-      // Bounded by its own deadline (a slow CI runner must fail with a reason, not ETIMEDOUT).
-      const up = spawnSync(PYB, ['-c', [
-        'import sys, time, urllib.request',
-        'deadline = time.time() + 30',
-        'while time.time() < deadline:',
-        `    try: urllib.request.urlopen("http://127.0.0.1:${port}/json/version", timeout=3).read(); sys.exit(0)`,
-        '    except Exception: time.sleep(0.2)',
-        'sys.exit(3)'].join('\n')], { encoding: 'utf-8', timeout: 60000 });
-      assert.strictEqual(up.status, 0, `stand-in /json/version on ${port} never answered: ${up.stderr}`);
+      assert(port, `stand-in /json/version never answered (exit ${probe.status}): ${probe.stderr}`);
       const plain = `\n  cdpilot status (port ${port})\n\n  ✓ Connected\n  Browser: Chrome/150.0.0.0\n`
         + `  Protocol: 1.3\n  WebSocket: ${ws}\n  idle close off\n\n`;
       assert.strictEqual(status().stdout, plain, 'no bot-auth set up: status output unchanged');
@@ -6485,8 +6496,8 @@ print("ok")
         token: 'dead', pid: 2 ** 22 + 12345, ready: true, port, keyid: 'K', browser_ws: ws }));
       let r = status();
       assert(r.stdout.includes('  idle close off\n  bot-auth: off\n\n'), r.stdout);
-      assert.strictEqual(r.stderr, 'bot-auth: signer not running, requests go out unsigned — '
-        + 'run `cdpilot launch --bot-auth` again\n');
+      assert.strictEqual(r.stderr.replace(/\r\n/g, '\n'), 'bot-auth: signer not running, requests go '
+        + 'out unsigned — run `cdpilot launch --bot-auth` again\n');
       assert(!fs.existsSync(path.join(home, 'bot-auth', 'signers', `${port}.json`)), 'stale state dropped');
       r = status();
       assert(/requests go out unsigned/.test(r.stderr), 'still warns until launch --bot-auth or stop');
