@@ -2,6 +2,18 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Web Bot Auth (RFC 9421 HTTP Message Signatures).** Sign every browser request with an Ed25519 signature so downstream verifiers (Cloudflare, AWS WAF, Akamai, Vercel, Shopify) recognize the agent as a verified, legitimate bot. Three headers per request: `Signature`, `Signature-Input`, `Signature-Agent`. Implements `draft-ietf-webbotauth-httpsig-protocol`.
+  - `cdpilot bot-auth init --agent-url <url>` — generate Ed25519 keypair, save private key (0600 perms) to `CDPILOT_HOME/bot-auth/`, print JWKS publishing steps.
+  - `cdpilot bot-auth status` — show key readiness, keyid, agent-url, enabled state.
+  - `cdpilot bot-auth directory` — print the JWKS JSON to host at `/.well-known/http-message-signatures-directory`.
+  - `cdpilot launch --bot-auth` (or `CDPILOT_BOT_AUTH=1`) — spawn a detached signer process that intercepts Document/XHR/Fetch requests via CDP `Fetch.enable` and adds signature headers. The signer exits when the browser disconnects.
+  - **Stealth conflict warning:** `--bot-auth` with `--stealth`/`--undetected` warns that signing your identity while hiding it is contradictory. Bot-auth wins; stealth patches are not applied.
+  - **Security:** private key never logged or printed to stdout; `bot-auth` commands are excluded from the session log.
+  - **Optional dependency:** Ed25519 operations require `pip install cryptography`. The import is lazy (function-level `try/except ImportError`); all other cdpilot commands work without it. Missing package → clear hint + exit 2.
+
 ## [0.9.3] - 2026-09-28
 
 ### Added
