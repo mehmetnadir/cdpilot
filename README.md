@@ -44,7 +44,7 @@ two-axis policy — extension workload × platform stability:
 
 | Your workload | Auto-pick order |
 |---|---|
-| Has extensions registered (`ext-install`) | vivaldi → brave → edge → chromium → chrome |
+| Has extensions registered (`ext-install`) | vivaldi → brave → edge → chromium → chrome (→ Chrome for Testing, if installed) |
 | No extensions (pure automation) | chrome → vivaldi → edge → chromium → brave |
 
 Override anytime:
@@ -52,19 +52,55 @@ Override anytime:
 ```bash
 cdpilot browser            # show current pick + reason
 cdpilot browser vivaldi    # pin to Vivaldi
+cdpilot browser chrome-for-testing   # pin to Chrome for Testing (after installing it, below)
 cdpilot browser auto       # restore smart default
 ```
 
 **Why the split?**
-- **Chrome 147+ silently drops `--load-extension`** for unpacked extensions
-  (no error, no warning). Verified — `chrome://extensions` shows 0 items.
-- **Vivaldi, Brave, Edge, Chromium** honor `--load-extension` (tested).
+- **Chrome 137+ silently drops `--load-extension`** for unpacked extensions
+  (no error, no warning) — Google removed it from branded Chrome builds
+  ([PSA](https://groups.google.com/a/chromium.org/g/chromium-extensions/c/1-g8EFx2BBY/m/S0ET5wPjCAAJ)).
+  Verified — `chrome://extensions` shows 0 items.
+- **Vivaldi, Brave, Edge, Chromium and Chrome for Testing** honor `--load-extension` (tested).
 - On **macOS 26 (Tahoe)** Brave 1.89 crashes deterministically at ~7min
   uptime (SIGTRAP in ThreadPoolForegroundWorker). cdpilot detects the OS
   and demotes Brave automatically until a fixed Brave release ships.
 
 Each browser gets its own isolated profile (`~/.cdpilot/.../profile-vivaldi`
 etc.) so switching never causes prefs corruption.
+
+### Extension development: Chrome for Testing
+
+If you develop an extension against Chrome itself, install
+[Chrome for Testing](https://developer.chrome.com/blog/chrome-for-testing) (CfT) —
+the Chrome team's versioned, non-auto-updating Chrome build for automation, which
+still loads unpacked extensions:
+
+```bash
+cdpilot browser install chrome-for-testing                    # latest Stable
+cdpilot browser install chrome-for-testing --channel beta     # stable | beta | dev | canary
+cdpilot browser install chrome-for-testing --version 154      # a milestone, or a full version (154.0.8037.57)
+cdpilot ext-install ./my-extension/                           # register your unpacked extension
+cdpilot browser status                                        # shows the CfT version and path
+```
+
+- **Download only on that command.** It is a one-time ~150-190 MB zip (mac-arm64 at
+  154.0.8037.57: 191,429,663 bytes); cdpilot never fetches it by itself. The build comes
+  from the official [CfT JSON endpoints](https://googlechromelabs.github.io/chrome-for-testing/)
+  (`last-known-good-versions-with-downloads.json`, per-version and per-milestone files).
+  Those list URLs only, no hash, so the download is checked against the server's
+  `Content-Length` and its `x-goog-hash` md5; the zip's SHA-256 is recorded.
+- It is extracted to `$CDPILOT_HOME/browsers/chrome-for-testing/<version>/` (on macOS the
+  quarantine attribute is cleared on that directory only) and recorded in `installed.json`.
+- **Used automatically for extension work:** while dev extensions are registered, a
+  branded Chrome pick (`cdpilot browser chrome`, or `auto` with Chrome the only
+  extension-capable choice) becomes Chrome for Testing, with one stderr line saying so.
+  Without CfT installed, `ext-install` on Chrome prints the install command and keeps
+  Vivaldi/Brave as the alternative. `cdpilot browser chrome-for-testing` selects it
+  always. An explicit `CHROME_BIN` is never replaced.
+- It runs with cdpilot's usual per-project isolated profile (`profile-cft`).
+- **It is for extension development and testing — not a stealth browser.** cdpilot
+  makes no anti-bot claims for it; use your regular browser setup for that.
 
 ## Installation
 
@@ -784,6 +820,7 @@ Earlier figures on this page (sannysoft 24/24, intoli 6/6) were measured on v0.4
 
 ```bash
 cdpilot browser [name|auto]   # workload-aware browser selection
+cdpilot browser install chrome-for-testing   # for extension development (see above)
 cdpilot health                # JSON: alive, port, tabs, browser, today's crashes, idle close
 ```
 

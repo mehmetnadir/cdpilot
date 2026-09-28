@@ -14,6 +14,13 @@ Elements inside iframes (same-origin or cross-origin; nest with >>>):
 WebMCP tools of the page (browser started with `launch --webmcp`):
   cdpilot tools list [--json] | tools call <name> [json | --arg k=v ...]
 
+Extension development (Chrome 137+ ignores --load-extension; Chrome for Testing does not):
+  cdpilot browser install chrome-for-testing [--channel stable|beta|dev|canary] [--version X]
+                       Download it (~150-190 MB, only on this command) into
+                       $CDPILOT_HOME/browsers/; it then replaces Chrome while
+                       dev extensions (`ext-install <dir>`) are registered
+  cdpilot browser chrome-for-testing   Always use it
+
 Global options:
   --timeout <seconds>  Abort the command after <seconds> (exit 124). Accepted
                        before or after the command name; 0 disables.
@@ -30,6 +37,7 @@ Environment:
   CDP_PORT             CDP debugging port (default: 9222)
   CHROME_BIN           Browser binary path (auto-detected if not set)
   CDPILOT_PROFILE      Isolated browser profile directory
+  CDPILOT_LOG=0        Do not write the session log
   CDPILOT_TIMEOUT      Default for --timeout (the flag wins)
   CDPILOT_NO_AUTOLAUNCH=1  Do not start the browser when a page command
                        finds it not running (print the error instead)
@@ -37,13 +45,14 @@ Environment:
                        a browser cdpilot launched closes itself (auto-launch
                        and MCP: default 15; explicit `launch`: off unless set or
                        `launch --idle-close <min>`; 0 = never)
-  CDPILOT_LOG=0        Do not write the session log
   CDPILOT_PRESS_MS     How long real mouse clicks hold the button: min-max in
                        ms (default: 40-120; 0-0 = instant)
   CDPILOT_LOG_DAYS     Days of session log to keep (default: 14; 0 = forever)
   CDPILOT_BOT_AUTH=1   Same as `launch --bot-auth` (Web Bot Auth, below)
   CDPILOT_WEBMCP=1|0   Overrides this project's WebMCP mode (set by
                        `launch --webmcp` / `launch --no-webmcp`)
+  CDPILOT_CFT_BASE_URL  Mirror of the Chrome for Testing JSON endpoints
+                       (default: https://googlechromelabs.github.io/chrome-for-testing)
 
 Web Bot Auth (signed agent — the opposite of stealth; optional dependency:
 pip install cryptography):
@@ -5052,6 +5061,8 @@ def _macos_major():
 def _resolve_browser_name(name):
     """Resolve a browser name to its binary path. Returns None if not installed."""
     name = (name or '').lower().strip()
+    if name in CFT_NAMES:  # installed by `cdpilot browser install chrome-for-testing`
+        return _cft_binary()
     if name not in BROWSER_BINARIES:
         return None
     candidates = BROWSER_BINARIES[name].get(platform.system(), [])
@@ -5079,8 +5090,12 @@ def _auto_browser_priority():
       1. Extension workload — `cdpilot ext-install` populates dev-extensions.json.
          If non-empty, the user is doing extension work, so prioritise browsers
          that honor --load-extension for unpacked extensions:
-           Vivaldi ✅, Brave ✅, Edge ✅, Chrome ❌ (silently drops, 147+),
-           Chromium ✅ (but rarely installed).
+           Vivaldi ✅, Brave ✅, Edge ✅, Chrome ❌ (silently drops, 137+),
+           Chromium ✅ (but rarely installed), Chrome for Testing ✅.
+         Whichever browser wins, branded Chrome is swapped for Chrome for
+         Testing when that is installed (`cdpilot browser install
+         chrome-for-testing`; never downloaded automatically) — see
+         _prefer_cft_for_extensions in _find_browser.
          If the registry is empty, prefer Chrome — most stable, fastest startup,
          no idiosyncratic background workers.
       2. Platform stability — macOS 26 (Tahoe) demotes Brave because the
@@ -5115,6 +5130,8 @@ def _find_browser():
     1. CHROME_BIN env var (full path, backward-compatible)
     2. ~/.cdpilot/browser.json preference (set via `cdpilot browser <name>`)
     3. Auto-detection per _auto_browser_priority()
+    With dev extensions registered, a branded Chrome result becomes an
+    installed Chrome for Testing (_prefer_cft_for_extensions).
     """
     # 1) PATH lookup for common command names (Linux/Brew installs)
     for b in ["brave-browser", "vivaldi", "google-chrome", "chromium-browser", "chromium"]:
@@ -5131,18 +5148,481 @@ def _find_browser():
     if pref and pref != 'auto':
         resolved = _resolve_browser_name(pref)
         if resolved:
-            return resolved
+            return _prefer_cft_for_extensions(resolved)
         # Configured browser not installed — fall through to auto with a warning.
-        sys.stderr.write(f"⚠️  Configured browser '{pref}' not found, falling back to auto-detect.\n")
+        hint = (" Install it: cdpilot browser install chrome-for-testing"
+                if pref in CFT_NAMES else "")
+        sys.stderr.write(f"⚠️  Configured browser '{pref}' not found, falling back to auto-detect.{hint}\n")
 
     # 3) Auto-detection in priority order
     order, _reason = _auto_browser_priority()
     for name in order:
         resolved = _resolve_browser_name(name)
         if resolved:
-            return resolved
+            return _prefer_cft_for_extensions(resolved)
 
-    return path_match  # Last resort
+    return _prefer_cft_for_extensions(path_match)  # Last resort
+
+
+# ─── Chrome for Testing (extension development) ──────────────────────────────
+# Since Chrome 137, branded Google Chrome ignores `--load-extension` (Chromium
+# extensions PSA "Removing --load-extension flag in Chrome branded builds").
+# Chrome for Testing (CfT) and unbranded Chromium still honor it. CfT is the
+# Chrome team's versioned, non-auto-updating Chrome build for automation
+# (https://developer.chrome.com/blog/chrome-for-testing), downloadable from the
+# JSON endpoints at https://googlechromelabs.github.io/chrome-for-testing/.
+#
+# `cdpilot browser install chrome-for-testing` is the ONLY path that downloads
+# it (~150-190 MB zip): nothing auto-downloads. Once installed, it replaces
+# branded Chrome whenever dev extensions are registered (see
+# _prefer_cft_for_extensions). It runs with the usual per-project isolated
+# profile (a `-cft` sibling). It is for extension development and testing;
+# cdpilot makes no stealth claims for it.
+#
+# Integrity: the JSON endpoints publish URLs only, no size or hash (checked
+# 2026-09-28). The download is verified against the storage server's
+# Content-Length (required) and its `x-goog-hash: md5=` header when sent
+# (storage.googleapis.com sends it); the zip's SHA-256 is recorded in
+# installed.json for provenance.
+CFT_BASE_URL = 'https://googlechromelabs.github.io/chrome-for-testing'
+CFT_BASE_URL_ENV = 'CDPILOT_CFT_BASE_URL'  # a mirror of the JSON endpoints (tests: a fake)
+CFT_PLATFORM_ENV = 'CDPILOT_CFT_PLATFORM'  # force a platform key (tests)
+CFT_CHANNELS = ('stable', 'beta', 'dev', 'canary')
+CFT_NAMES = ('chrome-for-testing', 'cft')
+CFT_ROOT = os.path.join(CDPILOT_HOME, 'browsers', 'chrome-for-testing')
+CFT_STATE_FILE = os.path.join(CFT_ROOT, 'installed.json')
+# bin/cdpilot.js fills CHROME_BIN with its own first-found browser when the
+# user set none, and flags that with this variable (see _refine_wrapper_browser).
+CHROME_BIN_AUTO_ENV = 'CDPILOT_CHROME_BIN_AUTO'
+_CFT_PLATFORM_DIR = _re.compile(r'^chrome-(mac-arm64|mac-x64|linux64|linux-arm64|win64|win32)$')
+_CFT_SWAP_NOTED = [False]
+
+
+class CftError(Exception):
+    """A Chrome for Testing install step failed; the message is for the user."""
+
+
+def _cft_platform():
+    """CfT platform key for this machine (mac-arm64, mac-x64, linux64,
+    linux-arm64, win64, win32), or None when CfT has no build for it."""
+    forced = os.environ.get(CFT_PLATFORM_ENV, '').strip()
+    if forced:
+        return forced
+    system, machine = platform.system(), platform.machine().lower()
+    if system == 'Darwin':
+        if machine in ('arm64', 'aarch64'):
+            return 'mac-arm64'
+        # An x86_64 Python under Rosetta on Apple Silicon: still the arm64 build.
+        try:
+            translated = subprocess.run(['sysctl', '-in', 'sysctl.proc_translated'],
+                                        capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            translated = ''
+        return 'mac-arm64' if translated == '1' else 'mac-x64'
+    if system == 'Linux':
+        if machine in ('x86_64', 'amd64'):
+            return 'linux64'
+        if machine in ('arm64', 'aarch64'):
+            return 'linux-arm64'
+        return None
+    if system == 'Windows':
+        # No Windows-on-ARM build: win64 runs under x64 emulation there.
+        return 'win32' if machine in ('x86', 'i386', 'i686') else 'win64'
+    return None
+
+
+def _cft_binary_relpath(plat):
+    """Path of the browser executable inside the extracted zip."""
+    top = f'chrome-{plat}'
+    if plat.startswith('mac'):
+        return os.path.join(top, 'Google Chrome for Testing.app', 'Contents', 'MacOS',
+                            'Google Chrome for Testing')
+    if plat.startswith('win'):
+        return os.path.join(top, 'chrome.exe')
+    return os.path.join(top, 'chrome')
+
+
+def _cft_read_state():
+    try:
+        with open(CFT_STATE_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _cft_installed():
+    """The current CfT install record ({version, path, ...}) or None when
+    nothing usable is installed (no record, or its binary is gone)."""
+    state = _cft_read_state()
+    rec = (state.get('installs') or {}).get(state.get('current') or '')
+    if isinstance(rec, dict) and rec.get('path') and os.path.isfile(rec['path']):
+        return rec
+    return None
+
+
+def _cft_binary():
+    rec = _cft_installed()
+    return rec['path'] if rec else None
+
+
+def _is_cft_path(path):
+    """True for a Chrome for Testing binary: ours, or any CfT zip layout
+    (e.g. a Puppeteer-installed one passed as CHROME_BIN)."""
+    if not path:
+        return False
+    if 'for testing' in os.path.basename(path).lower():
+        return True
+    try:
+        real, root = os.path.realpath(path), os.path.realpath(CFT_ROOT)
+        if real.startswith(root + os.sep):
+            return True
+    except (OSError, ValueError):
+        pass
+    parts = os.path.normpath(path).split(os.sep)
+    return any(_CFT_PLATFORM_DIR.match(p) for p in parts[:-1])
+
+
+def _is_branded_chrome(path):
+    """True for Google Chrome (stable/beta/dev/canary), which ignores
+    --load-extension since Chrome 137. Chrome for Testing and Chromium are not."""
+    if not path or _is_cft_path(path):
+        return False
+    base = os.path.basename(path).lower()
+    if base.startswith('google chrome') or base.startswith('google-chrome'):
+        return True
+    return base in ('chrome', 'chrome.exe') and 'google' in path.lower()
+
+
+def _prefer_cft_for_extensions(path):
+    """Swap branded Chrome for an installed Chrome for Testing while dev
+    extensions are registered (Chrome 137+ would drop them). One stderr line
+    per process. Never downloads anything: without an install, `path` stays."""
+    if not path or not _is_branded_chrome(path) or not get_dev_extensions():
+        return path
+    rec = _cft_installed()
+    if not rec:
+        return path
+    if not _CFT_SWAP_NOTED[0]:
+        _CFT_SWAP_NOTED[0] = True
+        sys.stderr.write(
+            f"cdpilot: dev extensions registered and Chrome ignores --load-extension — "
+            f"using Chrome for Testing {rec.get('version', '')} instead\n")
+    return rec['path']
+
+
+def _refine_wrapper_browser(path):
+    """Browser to launch when CHROME_BIN came from bin/cdpilot.js's own
+    detection (CDPILOT_CHROME_BIN_AUTO=1), not from the user.
+
+    That pick is the first installed of a fixed list and knows nothing of
+    `cdpilot browser <name>` or of dev extensions. Re-resolve here when either
+    matters (a saved preference; dev extensions with branded Chrome picked);
+    otherwise keep it, so the default browser does not change.
+    """
+    if not path or os.environ.get(CHROME_BIN_AUTO_ENV) != '1':
+        return path
+    if get_browser_preference() != 'auto':
+        return _find_browser() or path
+    if get_dev_extensions() and _is_branded_chrome(path):
+        return _find_browser() or path
+    return path
+
+
+def _active_browser_path():
+    """The binary the next launch would use (see cmd_launch)."""
+    env_bin = os.environ.get('CHROME_BIN')
+    if env_bin:
+        return _refine_wrapper_browser(env_bin)
+    return _find_browser()
+
+
+def _cft_base_url():
+    return (os.environ.get(CFT_BASE_URL_ENV) or CFT_BASE_URL).rstrip('/')
+
+
+def _cft_urlopen(url, timeout):
+    req = urllib.request.Request(url, headers={'User-Agent': f'cdpilot/{__version__}'})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _cft_fetch_json(url):
+    try:
+        with _cft_urlopen(url, timeout=30) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        raise CftError(f"{url}: HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise CftError(f"cannot reach {url}: {getattr(e, 'reason', e)}") from None
+    except ValueError:
+        raise CftError(f"{url}: not valid JSON") from None
+
+
+def _cft_resolve(channel='stable', version=None):
+    """Pick the CfT build: {'version', 'revision', 'platform', 'url', 'source'}.
+
+    version: a full version (per-version JSON, e.g. 154.0.8037.57.json) or a
+    milestone number (latest-versions-per-milestone-with-downloads.json);
+    otherwise the channel's last known good version
+    (last-known-good-versions-with-downloads.json).
+    """
+    base = _cft_base_url()
+    plat = _cft_platform()
+    if not plat:
+        raise CftError(f"Chrome for Testing has no build for {platform.system()} "
+                       f"{platform.machine()}")
+    if version:
+        if version.isdigit():
+            src = f"{base}/latest-versions-per-milestone-with-downloads.json"
+            entry = (_cft_fetch_json(src).get('milestones') or {}).get(version)
+            if not entry:
+                raise CftError(f"no Chrome for Testing build for milestone {version}")
+        else:
+            src = f"{base}/{version}.json"
+            try:
+                entry = _cft_fetch_json(src)
+            except CftError as e:
+                if 'HTTP 404' in str(e):
+                    raise CftError(f"Chrome for Testing has no version {version} "
+                                   f"(see {base}/known-good-versions.json)") from None
+                raise
+    else:
+        src = f"{base}/last-known-good-versions-with-downloads.json"
+        entry = (_cft_fetch_json(src).get('channels') or {}).get(channel.capitalize())
+        if not entry:
+            raise CftError(f"no {channel} channel in {src}")
+    ver = str(entry.get('version') or '')
+    if not _re.fullmatch(r'\d+(\.\d+){3}', ver):
+        raise CftError(f"{src}: unexpected version {ver!r}")
+    downloads = (entry.get('downloads') or {}).get('chrome') or []
+    url = next((d.get('url') for d in downloads
+                if isinstance(d, dict) and d.get('platform') == plat), None)
+    if not url:
+        raise CftError(f"Chrome for Testing {ver} has no {plat} download")
+    # The official list only has https URLs; plain http only from a mirror
+    # the user pointed CDPILOT_CFT_BASE_URL at.
+    if not url.startswith('https://') and not (
+            os.environ.get(CFT_BASE_URL_ENV) and url.startswith('http://')):
+        raise CftError(f"refusing a non-https download URL: {url}")
+    return {'version': ver, 'revision': str(entry.get('revision') or ''),
+            'platform': plat, 'url': url, 'source': src}
+
+
+def _goog_md5(headers):
+    """base64 md5 from the storage server's x-goog-hash header(s), or None."""
+    for value in headers.get_all('x-goog-hash') or []:
+        for part in value.split(','):
+            key, _, val = part.strip().partition('=')
+            if key.lower() == 'md5' and val:
+                return val
+    return None
+
+
+def _cft_download(url, dest):
+    """Stream `url` to `dest`. Verifies the byte count against Content-Length
+    (required) and md5 against x-goog-hash when the server sends it."""
+    import http.client
+    try:
+        resp = _cft_urlopen(url, timeout=60)
+    except urllib.error.HTTPError as e:
+        raise CftError(f"{url}: HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise CftError(f"cannot download {url}: {getattr(e, 'reason', e)}") from None
+    with resp:
+        length = resp.headers.get('Content-Length', '')
+        if not length.isdigit():
+            raise CftError("the server sent no Content-Length; refusing a download "
+                           "whose size cannot be verified")
+        expected = int(length)
+        want_md5 = _goog_md5(resp.headers)
+        free = shutil.disk_usage(os.path.dirname(dest)).free
+        if free < expected * 4:
+            raise CftError(f"not enough disk space in {os.path.dirname(dest)}: "
+                           f"{expected * 4 // 1_000_000} MB needed (zip + extracted), "
+                           f"{free // 1_000_000} MB free")
+        sys.stderr.write(f"Downloading {url} ({expected / 1_000_000:.1f} MB)\n")
+        md5 = hashlib.md5(usedforsecurity=False)
+        sha256 = hashlib.sha256()
+        got, next_mark = 0, 25
+        try:
+            with open(dest, 'wb') as out:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    md5.update(chunk)
+                    sha256.update(chunk)
+                    got += len(chunk)
+                    if expected and got * 100 >= expected * next_mark and next_mark < 100:
+                        sys.stderr.write(f"  {next_mark}%\n")
+                        next_mark += 25
+        except (OSError, http.client.HTTPException) as e:  # e.g. IncompleteRead
+            raise CftError(f"download interrupted after {got} of {expected} bytes: {e}") from None
+    if got != expected:
+        raise CftError(f"size mismatch: got {got} bytes, Content-Length said {expected}")
+    got_md5 = base64.b64encode(md5.digest()).decode('ascii')
+    if want_md5 and got_md5 != want_md5:
+        raise CftError(f"md5 mismatch: x-goog-hash says {want_md5}, the download is {got_md5}")
+    return {'bytes': got, 'md5': got_md5, 'md5_verified': bool(want_md5),
+            'sha256': sha256.hexdigest()}
+
+
+def _cft_extract(zip_path, dest):
+    """Extract the CfT zip into `dest`, keeping Unix modes and symlinks (a
+    macOS .app bundle needs both). Refuses any entry or symlink that would
+    land outside `dest`."""
+    import stat
+    import zipfile
+    root = os.path.realpath(dest)
+
+    def inside(p):
+        return p == root or p.startswith(root + os.sep)
+
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except zipfile.BadZipFile as e:
+        raise CftError(f"the download is not a valid zip: {e}") from None
+    with zf:
+        for info in zf.infolist():
+            target = os.path.realpath(os.path.join(root, info.filename))
+            if not inside(target):
+                raise CftError(f"unsafe path in zip: {info.filename!r}")
+            mode = (info.external_attr >> 16) & 0xFFFF
+            if info.is_dir():
+                os.makedirs(target, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if stat.S_ISLNK(mode) and os.name != 'nt':
+                link = zf.read(info).decode('utf-8')
+                if os.path.isabs(link) or not inside(
+                        os.path.realpath(os.path.join(os.path.dirname(target), link))):
+                    raise CftError(f"unsafe symlink in zip: {info.filename!r} -> {link!r}")
+                os.symlink(link, target)
+                continue
+            with zf.open(info) as src, open(target, 'wb') as out:
+                shutil.copyfileobj(src, out, 1 << 20)
+            if os.name != 'nt' and mode & 0o777:
+                os.chmod(target, mode & 0o777)
+
+
+def _cft_clear_quarantine(path):
+    """macOS: drop com.apple.quarantine from OUR extracted tree only, so
+    Gatekeeper does not call the app damaged (CfT README). urllib does not
+    set the attribute, so this is usually a no-op."""
+    if platform.system() != 'Darwin':
+        return
+    try:
+        subprocess.run(['xattr', '-dr', 'com.apple.quarantine', path],
+                       capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def cmd_browser_install(args):
+    """cdpilot browser install chrome-for-testing [--channel stable|beta|dev|canary] [--version X]
+
+    Downloads Chrome for Testing into $CDPILOT_HOME/browsers/chrome-for-testing/<version>/
+    and records it. The only command that downloads a browser.
+    """
+    usage = ("Usage: cdpilot browser install chrome-for-testing "
+             "[--channel stable|beta|dev|canary] [--version <version|milestone>]")
+    rest = list(args)
+    if not rest or rest[0].lower() not in CFT_NAMES:
+        print(f"cdpilot can install one browser: chrome-for-testing.\n{usage}", file=sys.stderr)
+        sys.exit(2)
+    rest = rest[1:]
+    channel, version = None, None
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        key, eq, val = a.partition('=')
+        if key in ('--channel', '--version'):
+            if not eq:
+                if i + 1 >= len(rest):
+                    print(f"{key} needs a value.\n{usage}", file=sys.stderr)
+                    sys.exit(2)
+                val = rest[i + 1]
+                i += 1
+            if key == '--channel':
+                channel = val.strip().lower()
+            else:
+                version = val.strip()
+        else:
+            print(f"Unknown option: {a}\n{usage}", file=sys.stderr)
+            sys.exit(2)
+        i += 1
+    if channel and version:
+        print(f"Use --channel or --version, not both.\n{usage}", file=sys.stderr)
+        sys.exit(2)
+    if channel and channel not in CFT_CHANNELS:
+        print(f"Invalid channel: {channel}. Use one of: {', '.join(CFT_CHANNELS)}.", file=sys.stderr)
+        sys.exit(2)
+    if version and not _re.fullmatch(r'\d+(\.\d+){3}|\d+', version):
+        print(f"Invalid version: {version!r} (a full version like 154.0.8037.57, "
+              f"or a milestone like 154).", file=sys.stderr)
+        sys.exit(2)
+    channel = channel or 'stable'
+
+    try:
+        build = _cft_resolve(channel, version)
+        ver, plat = build['version'], build['platform']
+        final_dir = os.path.join(CFT_ROOT, ver)
+        binary = os.path.join(final_dir, _cft_binary_relpath(plat))
+        os.makedirs(CFT_ROOT, exist_ok=True)
+        info = None
+        if os.path.isfile(binary):
+            print(f"Chrome for Testing {ver} is already installed.")
+        else:
+            if os.path.exists(final_dir):
+                raise CftError(f"{final_dir} exists but has no {_cft_binary_relpath(plat)}; "
+                               f"move it away and install again")
+            stamp = f"{ver}-{os.getpid()}"
+            part = os.path.join(CFT_ROOT, f".download-{stamp}.zip")
+            staging = os.path.join(CFT_ROOT, f".staging-{stamp}")
+            try:
+                info = _cft_download(build['url'], part)
+                os.makedirs(staging)
+                _cft_extract(part, staging)
+                if not os.path.isfile(os.path.join(staging, _cft_binary_relpath(plat))):
+                    raise CftError(f"unexpected zip layout: no {_cft_binary_relpath(plat)}")
+                _cft_clear_quarantine(staging)
+                try:
+                    os.replace(staging, final_dir)
+                except OSError:
+                    if not os.path.isfile(binary):  # not a concurrent install that won
+                        raise
+            finally:
+                for leftover in (part,):
+                    with contextlib.suppress(OSError):
+                        os.remove(leftover)
+                if os.path.isdir(staging):
+                    shutil.rmtree(staging, ignore_errors=True)
+            print(f"Downloaded {info['bytes']} bytes "
+                  f"(size verified; md5 {'verified' if info['md5_verified'] else 'not published'}; "
+                  f"sha256 {info['sha256']})")
+    except CftError as e:
+        print(f"Chrome for Testing install failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    state = _cft_read_state()
+    installs = state.get('installs') if isinstance(state.get('installs'), dict) else {}
+    rec = dict(installs.get(ver) or {})
+    rec.update({'version': ver, 'revision': build['revision'], 'platform': plat,
+                'channel': None if version else channel, 'path': binary, 'dir': final_dir,
+                'url': build['url']})
+    if info:
+        rec.update({'bytes': info['bytes'], 'md5': info['md5'], 'sha256': info['sha256'],
+                    'installed_at': datetime.datetime.now(datetime.timezone.utc)
+                    .strftime('%Y-%m-%dT%H:%M:%SZ')})
+    installs[ver] = rec
+    _atomic_write_json(CFT_STATE_FILE, {'current': ver, 'installs': installs})
+    print(f"Chrome for Testing {ver} ({plat}): {binary}")
+    print("  For extension development and testing (it loads unpacked extensions; "
+          "Chrome 137+ does not). Not a stealth browser.")
+    print("  Used instead of Chrome while dev extensions are registered; "
+          "select it always with: cdpilot browser chrome-for-testing")
+
 
 
 def _is_port_in_use(port):
@@ -5840,6 +6320,9 @@ def cmd_launch(auto=False, idle_close=None):
             print(f'Error: Port {CDP_PORT} is in use. Set CDP_PORT to a different port.', file=sys.stderr)
             sys.exit(1)
 
+    # CHROME_BIN from bin/cdpilot.js's own detection: honor `cdpilot browser
+    # <name>` and the dev-extension rule (Chrome -> Chrome for Testing).
+    CHROME_BIN = _refine_wrapper_browser(CHROME_BIN)
     if not CHROME_BIN:
         bin_path = _find_browser()
         if not bin_path:
@@ -5867,7 +6350,10 @@ def cmd_launch(auto=False, idle_close=None):
     # so each browser gets its own subdir. Brave keeps the original path for
     # backward compatibility — existing users don't lose state on upgrade.
     browser_basename = os.path.basename(CHROME_BIN).lower()
-    if 'brave' in browser_basename:
+    if _is_cft_path(CHROME_BIN):
+        # Chrome for Testing: its own sibling, like every other browser.
+        profile_dir = PROFILE_DIR + '-cft'
+    elif 'brave' in browser_basename:
         profile_dir = PROFILE_DIR
     elif 'vivaldi' in browser_basename:
         profile_dir = PROFILE_DIR + '-vivaldi'
@@ -8447,15 +8933,26 @@ def cmd_ext_install(source):
         print(f'   Path: {abs_source}')
 
         # Warn if the active browser silently drops --load-extension.
-        # Chrome 147+ does this without any console message, easily wasting
-        # hours of "why isn't my extension loading?" debugging.
-        active = os.environ.get('CHROME_BIN') or _find_browser() or ''
-        active_lower = os.path.basename(active).lower()
-        if 'google chrome' in active_lower or active_lower == 'chrome' or 'google-chrome' in active_lower:
-            sys.stderr.write(
-                "⚠️  Active browser is Chrome — Chrome 147+ silently ignores --load-extension\n"
-                "   for unpacked extensions. Switch with: cdpilot browser vivaldi\n"
-            )
+        # Chrome 137+ does this without any console message, easily wasting
+        # hours of "why isn't my extension loading?" debugging. With Chrome
+        # for Testing installed, _find_browser already swapped Chrome for it
+        # (one info line); only an explicit CHROME_BIN can still be Chrome.
+        active = _active_browser_path() or ''
+        if _is_branded_chrome(active):
+            if _cft_installed():
+                sys.stderr.write(
+                    "⚠️  CHROME_BIN is Chrome — Chrome 137+ silently ignores --load-extension\n"
+                    "   for unpacked extensions. Unset CHROME_BIN to use the installed\n"
+                    f"   Chrome for Testing ({_cft_binary()}).\n"
+                )
+            else:
+                sys.stderr.write(
+                    "⚠️  Active browser is Chrome — Chrome 137+ silently ignores --load-extension\n"
+                    "   for unpacked extensions. Install Chrome for Testing (one-time download,\n"
+                    "   ~150-190 MB), which loads them and is then used automatically:\n"
+                    "     cdpilot browser install chrome-for-testing\n"
+                    "   Or switch to a browser that loads them: cdpilot browser vivaldi (or brave)\n"
+                )
 
         print('   Restarting browser...')
         cmd_stop()
@@ -9012,7 +9509,8 @@ def cmd_headless(state=None):
 
 
 def cmd_browser(name=None):
-    """Show or set the preferred browser (chrome|brave|chromium|edge|vivaldi|auto).
+    """Show or set the preferred browser
+    (chrome|brave|chromium|edge|vivaldi|chrome-for-testing|auto).
 
     The choice is persisted in ~/.cdpilot/browser.json and applies to all
     projects. `auto` (default) picks per-platform priority — on macOS 26
@@ -9022,13 +9520,18 @@ def cmd_browser(name=None):
     Usage:
       cdpilot browser                # show current + which is detected
       cdpilot browser vivaldi        # force Vivaldi
+      cdpilot browser chrome-for-testing   # after `browser install chrome-for-testing`
       cdpilot browser auto           # restore platform default
+    Downloading Chrome for Testing is cmd_browser_install (`browser install`).
     """
     if name is None or name.lower() == 'status':
         pref = get_browser_preference()
         resolved = _resolve_browser_name(pref) if pref != 'auto' else None
         auto_resolved = _find_browser()
         installed = [n for n in BROWSER_BINARIES if _resolve_browser_name(n)]
+        cft = _cft_installed()
+        if cft:
+            installed.append('chrome-for-testing')
         order, reason = _auto_browser_priority()
         ext_count = len(get_dev_extensions())
         print(f"Preference:  {pref}")
@@ -9039,12 +9542,27 @@ def cmd_browser(name=None):
         print(f"  order:     {' > '.join(order)}")
         print(f"Installed:   {', '.join(installed) or '(none detected)'}")
         print(f"Dev exts:    {ext_count} registered (run `cdpilot extensions` to list)")
+        if cft:
+            print(f"Chrome for Testing: {cft.get('version')} ({cft.get('platform')})")
+            print(f"  path:      {cft.get('path')}")
+            print("  use:       replaces Chrome while dev extensions are registered; "
+                  "extension development/testing, not stealth")
+        else:
+            print("Chrome for Testing: not installed "
+                  "(cdpilot browser install chrome-for-testing, ~150-190 MB)")
         return
 
     name = name.lower().strip()
-    if name not in BROWSER_BINARIES and name != 'auto':
-        valid = ', '.join(['auto'] + list(BROWSER_BINARIES.keys()))
+    if name == 'cft':
+        name = 'chrome-for-testing'
+    if name not in BROWSER_BINARIES and name not in ('auto', 'chrome-for-testing'):
+        valid = ', '.join(['auto'] + list(BROWSER_BINARIES.keys()) + ['chrome-for-testing'])
         print(f"Invalid browser: {name}. Valid: {valid}", file=sys.stderr)
+        sys.exit(1)
+
+    if name == 'chrome-for-testing' and not _cft_installed():
+        print("⚠️  Chrome for Testing is not installed. Install it first (~150-190 MB):\n"
+              "   cdpilot browser install chrome-for-testing", file=sys.stderr)
         sys.exit(1)
 
     if name != 'auto' and not _resolve_browser_name(name):
@@ -18367,7 +18885,8 @@ if __name__ == "__main__":
         'fast': lambda: cmd_fast(args[0] if args else None),
         'adaptive': (lambda: cmd_adaptive_forget(args[1])) if (len(args) >= 2 and args[0].lower() == 'forget') else (lambda: cmd_adaptive(args[0] if args else None)),
         'entropy': lambda: cmd_entropy(args[0] if args else None),
-        'browser': lambda: cmd_browser(args[0] if args else None),
+        'browser': (lambda: cmd_browser_install(args[1:])) if (args and args[0].lower() == 'install')
+                   else (lambda: cmd_browser(args[0] if args else None)),
         'health': cmd_health,
         'session': cmd_session,
         'sessions': cmd_sessions,
