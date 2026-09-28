@@ -9,7 +9,8 @@
   },
   "scripts": {
     "test": "node test/test.js",
-    "start": "node bin/cdpilot.js"
+    "start": "node bin/cdpilot.js",
+    "build:mcpb": "bash scripts/build-mcpb.sh"
   },
   "keywords": [
     "browser-automation",

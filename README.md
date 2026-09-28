@@ -86,6 +86,37 @@ npx cdpilot launch    # Start browser with CDP enabled
 npx cdpilot status    # Check connection
 ```
 
+### Claude Code plugin marketplace
+
+Install cdpilot's MCP server and its skill straight into Claude Code, no
+`.mcp.json` editing required:
+
+```bash
+/plugin marketplace add mehmetnadir/cdpilot
+/plugin install cdpilot@cdpilot
+```
+
+This registers the `cdpilot` MCP server (`npx cdpilot mcp`) and a short skill
+that teaches Claude Code when and how to reach for cdpilot's commands. See
+[`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json) and
+[`plugins/cdpilot/`](plugins/cdpilot/).
+
+### MCP Bundle (.mcpb)
+
+For MCP clients that support one-click local server installation (Claude
+Desktop and others), download the `.mcpb` file attached to the
+[latest release](https://github.com/mehmetnadir/cdpilot/releases/latest) and
+open it, or build it yourself:
+
+```bash
+npm run build:mcpb   # writes cdpilot.mcpb at the repo root
+```
+
+The bundle still needs the same runtime on the machine that runs it: Node.js
+18+, Python 3.10+, and Brave/Chrome/Chromium installed. See
+[`manifest.json`](manifest.json) for the bundle's MCP Bundle manifest
+([spec](https://github.com/modelcontextprotocol/mcpb)).
+
 ### Upgrading from 0.4.x → 0.5.0 — read this first
 
 **One breaking change**, the rest is additive.
