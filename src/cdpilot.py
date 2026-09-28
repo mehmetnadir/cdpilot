@@ -2053,9 +2053,7 @@ atexit.register(_ws_pool_close_all)
 
 # Frame targeting hooks read by cdp_send (machinery: see _FrameRoute below).
 # _FRAME_ROUTE: the iframe the current command acts in, or None (top page).
-# _CDP_EVENT_SINK: a list that collects CDP events received during a call.
 _FRAME_ROUTE = contextvars.ContextVar("cdpilot_frame_route", default=None)
-_CDP_EVENT_SINK = contextvars.ContextVar("cdpilot_cdp_event_sink", default=None)
 # _CDP_KEEP_SOCKET: a timed-out call keeps its pooled socket (flat sessions
 # live on it) and its recv waits end at its timeout; only set by _frame_cdp,
 # whose ids are never reused.
@@ -2076,8 +2074,26 @@ def _cdp_recv_wait(start, timeout):
     return min(2, max(0.01, timeout - (time.time() - start)))
 
 
+_CDP_TRACE_PATH = os.environ.get("CDPILOT_CDP_TRACE") or None
+
+
+def _cdp_trace(method):
+    """CDPILOT_CDP_TRACE=<file>: append each CDP method name sent (debug aid).
+
+    Method names only, never params (they carry typed values and URLs).
+    Best effort: a failed write never breaks the command.
+    """
+    try:
+        with open(_CDP_TRACE_PATH, "a", encoding="utf-8") as f:
+            f.write(method + "\n")
+    except OSError:
+        pass
+
+
 def _cdp_wire(cmd):
     """JSON frame for (id, method, params) or (id, method, params, session_id)."""
+    if _CDP_TRACE_PATH:
+        _cdp_trace(cmd[1])
     msg = {"id": cmd[0], "method": cmd[1], "params": cmd[2] or {}}
     if len(cmd) > 3 and cmd[3]:
         msg["sessionId"] = cmd[3]  # flat Target session (out-of-process iframe)
@@ -2096,7 +2112,6 @@ async def cdp_send(ws_url, commands, timeout=15):
     _route = _FRAME_ROUTE.get()
     if _route is not None and not _route.busy and ws_url == _route.root_ws:
         commands = await _frame_route_rewrite(_route, commands)
-    _sink = _CDP_EVENT_SINK.get()
 
     # ── Non-pooled path (CDPILOT_WS_POOL=0) — identical to original ──
     if not _WS_POOL_ENABLED:
@@ -2114,8 +2129,6 @@ async def cdp_send(ws_url, commands, timeout=15):
                         if "id" in data and data["id"] in pending:
                             pending.discard(data["id"])
                             results[data["id"]] = data.get("result", data.get("error", {}))
-                        elif _sink is not None and "method" in data:
-                            _sink.append(data)
                     except asyncio.TimeoutError:
                         continue
             return results
@@ -2172,8 +2185,6 @@ async def cdp_send(ws_url, commands, timeout=15):
                     if "id" in data and data["id"] in pending:
                         pending.discard(data["id"])
                         results[data["id"]] = data.get("result", data.get("error", {}))
-                    elif _sink is not None and "method" in data:
-                        _sink.append(data)
                 except asyncio.TimeoutError:
                     continue
 
@@ -2230,8 +2241,6 @@ async def cdp_send(ws_url, commands, timeout=15):
                             if "id" in data2 and data2["id"] in pending2:
                                 pending2.discard(data2["id"])
                                 results2[data2["id"]] = data2.get("result", data2.get("error", {}))
-                            elif _sink is not None and "method" in data2:
-                                _sink.append(data2)
                         except asyncio.TimeoutError:
                             continue
                     # Same invariant as the main path: only re-pool on full drain.
@@ -2263,9 +2272,12 @@ async def cdp_send(ws_url, commands, timeout=15):
 # is resolved over CDP:
 #   1. find the <iframe> element in the current frame (CSS selector, index,
 #      name/id or src substring); DOM.describeNode gives its child frameId;
-#   2. same-process frame -> its main-world execution context, read from the
-#      Runtime.executionContextCreated events that Runtime.enable replays
-#      (enable + disable back to back: nothing stays subscribed);
+#   2. same-process frame -> its main-world execution context:
+#      DOM.resolveNode on the frame's document (from DOM.describeNode's
+#      contentDocument) gives a main-world object whose id carries the
+#      context id, verified by identity. Runtime.enable is never sent: it
+#      is the best-known CDP detection signal, and anti-bot checks such as
+#      Turnstile run inside iframes;
 #   3. out-of-process frame (site-isolated cross-origin, e.g. a payment
 #      iframe) -> Target.attachToTarget(targetId=frameId, flatten=True);
 #      every message for that frame then carries the returned sessionId.
@@ -2480,12 +2492,13 @@ class _FrameRoute:
         self.busy = False          # the route's own CDP traffic is never rewritten
         self.pool_was = None       # WS-pool flag to restore (owner route only)
         self.deadline = None       # time.monotonic() cap for every CDP call (search)
+        self.isolated = False      # context is an isolated world (no page JS globals)
 
     def fork(self):
         child = _FrameRoute(self.root_ws, self.sessions)
         child.session_id, child.context_id = self.session_id, self.context_id
         child.chain, child.labels, child.src = list(self.chain), list(self.labels), self.src
-        child.deadline = self.deadline
+        child.deadline, child.isolated = self.deadline, self.isolated
         return child
 
     def describe(self):
@@ -2530,38 +2543,84 @@ async def _frame_list(route):
     return val if isinstance(val, list) else []
 
 
-async def _frame_context_for(route, frame_id, allow_oopif=True):
-    """(session_id, context_id) of child frame `frame_id` of route's frame."""
+_FRAME_OBJECT_GROUP = "cdpilot-frame"
+
+
+def _frame_context_from_object_id(object_id):
+    """Execution-context id inside a V8 remote-object id, or None.
+
+    V8 formats RemoteObjectId as "<isolate>.<context>.<object>". That layout
+    is an implementation detail, so the caller verifies the result.
+    """
+    parts = str(object_id or "").split(".")
+    if len(parts) == 3 and parts[1].isdigit():
+        return int(parts[1])
+    return None
+
+
+async def _frame_main_world(route, sid, doc_backend_id):
+    """Main-world context id of a same-process frame, without Runtime.enable.
+
+    DOM.resolveNode on the frame's document returns an object in the frame's
+    main world (no DOM.enable needed); its id carries the context id, which
+    is checked by evaluating `document` there and comparing identity (a
+    different world or frame fails the check). None if anything disagrees.
+    """
+    g = _FRAME_OBJECT_GROUP
+    release = (9, "Runtime.releaseObjectGroup", {"objectGroup": g}, sid)
+    r = await _frame_cdp(route, [(1, "DOM.resolveNode", {"backendNodeId": doc_backend_id, "objectGroup": g}, sid)])
+    doc_oid = r.get(1, {}).get("object", {}).get("objectId")
+    ctx = _frame_context_from_object_id(doc_oid)
+    probe_oid = None
+    if ctx is not None:
+        r = await _frame_cdp(route, [(2, "Runtime.evaluate", {"expression": "document", "contextId": ctx,
+                                                              "objectGroup": g}, sid)])
+        probe_oid = r.get(2, {}).get("result", {}).get("objectId")
+    if not probe_oid:
+        await _frame_cdp(route, [release])  # the resolved document, if any
+        return None
+    r = await _frame_cdp(route, [
+        (3, "Runtime.callFunctionOn", {"objectId": doc_oid, "returnByValue": True,
+                                       "functionDeclaration": "function (d) { return this === d; }",
+                                       "arguments": [{"objectId": probe_oid}]}, sid),
+        release])
+    return ctx if r.get(3, {}).get("result", {}).get("value") is True else None
+
+
+async def _frame_context_for(route, frame_id, node, allow_oopif=True):
+    """(session_id, context_id, isolated) of child frame `frame_id`.
+
+    `node` is DOM.describeNode of its <iframe>. Runtime.enable is never sent:
+    it is the best-known CDP detection signal (Turnstile, DataDome), and
+    Turnstile runs in an iframe.
+      - same-process frame (describeNode has its contentDocument): the main
+        world's context id, via _frame_main_world;
+      - out-of-process frame (no contentDocument here): its own target, a
+        flat session whose default context is that frame's main world;
+      - otherwise an isolated world (Page.createIsolatedWorld): same DOM,
+        without the page's own JS globals.
+    """
     sid = route.session_id
-    events = []
-    token = _CDP_EVENT_SINK.set(events)
-    try:
-        await _frame_cdp(route, [(1, "Runtime.enable", {}, sid), (2, "Runtime.disable", {}, sid)])
-    finally:
-        _CDP_EVENT_SINK.reset(token)
-    for ev in events:
-        if ev.get("method") != "Runtime.executionContextCreated" or ev.get("sessionId") != sid:
-            continue
-        ctx = ev.get("params", {}).get("context", {})
-        aux = ctx.get("auxData") or {}
-        if aux.get("frameId") == frame_id and aux.get("isDefault"):
-            return sid, ctx.get("id")
-    if not allow_oopif:
+    doc = node.get("contentDocument") or {}
+    if doc.get("backendNodeId"):
+        ctx = await _frame_main_world(route, sid, doc["backendNodeId"])
+        if ctx is not None:
+            return sid, ctx, False
+    elif not allow_oopif:
         # Out of process = another site: never the page's origin.
         raise _FrameError(f"frame {frame_id} is cross-origin (out of process)")
-    # Not in this renderer: an out-of-process iframe is its own target.
-    r = await _frame_cdp(route, [(3, "Target.attachToTarget",
-                                  {"targetId": frame_id, "flatten": True})])
-    new_sid = r.get(3, {}).get("sessionId")
-    if new_sid:
-        route.sessions.append(new_sid)
-        return new_sid, None
-    # Frame without a main world yet (e.g. still about:blank): isolated world.
-    r = await _frame_cdp(route, [(4, "Page.createIsolatedWorld", {
+    else:
+        r = await _frame_cdp(route, [(3, "Target.attachToTarget",
+                                      {"targetId": frame_id, "flatten": True})])
+        new_sid = r.get(3, {}).get("sessionId")
+        if new_sid:
+            route.sessions.append(new_sid)
+            return new_sid, None, False
+    r = await _frame_cdp(route, [(5, "Page.createIsolatedWorld", {
         "frameId": frame_id, "worldName": "cdpilot", "grantUniveralAccess": True}, sid)])
-    ctx_id = r.get(4, {}).get("executionContextId")
+    ctx_id = r.get(5, {}).get("executionContextId")
     if ctx_id:
-        return sid, ctx_id
+        return sid, ctx_id, True
     raise _FrameError(f"cannot enter frame {frame_id} (no execution context, no target)")
 
 
@@ -2597,10 +2656,11 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
         raise _FrameError(f"'{shown}' is not a loaded frame in {route.describe()}")
     attrs = node.get("attributes") or []
     src = next((attrs[i + 1] for i in range(0, len(attrs) - 1, 2) if attrs[i] == "src"), "")
-    sid, ctx = await _frame_context_for(route, frame_id, allow_oopif)
+    sid, ctx, isolated = await _frame_context_for(route, frame_id, node, allow_oopif)
     route.chain.append((route.session_id, oid))
     route.labels.append(obj.get("description") or shown)
     route.session_id, route.context_id, route.src = sid, ctx, src
+    route.isolated = isolated
     route.dirty = True
     if r.get(3, {}).get("result", {}).get("value") is True:
         print(f"note: '{hop['value']}' is not an iframe; using the iframe inside it", file=sys.stderr)
@@ -12646,6 +12706,9 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
             print("Usage: frame eval [--frame <selector|index|url>] <js>")
             sys.exit(1)
         js_code = " ".join(subcmd_args)
+        if route is not None and route.isolated:
+            print("note: this frame's page context was not reachable; eval runs in an isolated world"
+                  " (same DOM, no page JS globals)", file=sys.stderr)
         res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js_code, "returnByValue": True})])
         val = res.get(1, {})
         if "error" in val or val.get("exceptionDetails"):
