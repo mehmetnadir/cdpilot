@@ -254,6 +254,8 @@ class Browser:
             el = self.element(oid)
             if el and el[0].target_cover == "ERR":  # the page navigated away: the object is gone
                 return err("Cannot find context with specified id")
+            if el and el[0].target_cover == "HANG":  # no reply (a timeout under load)
+                return []
             return value(el[0].target_cover) if el else err("Could not find object with given id")
         el = self.element(oid)
         if el is not None:
@@ -447,6 +449,8 @@ def run(mod, top, body, pool=True):
     mod._WS_POOL.clear()
     mod._WS_LOCKS.clear()
     mod._FRAME_FLAG = None
+    if hasattr(mod, "_CLICK_MISSES"):
+        mod._CLICK_MISSES.clear()  # per command process
     if hasattr(mod, "_FRAME_ISOLATED_NOTED"):
         mod._FRAME_ISOLATED_NOTED[0] = False  # once per process: a run is a process
     mod._WS_POOL_ENABLED = pool
@@ -874,7 +878,7 @@ def run_click(mod, top, target, entropy=False, blocker=False, fail_on=None):
                 "settles": b.settles, "blocker": b.blocker_log,
                 "pressed": [m[1:] for m in b.mouse if m[0] == "mousePressed"],
                 "released": [m[1:] for m in b.mouse if m[0] == "mouseReleased"],
-                "press": press_info(b)})
+                "press": press_info(b), "misses": list(getattr(mod, "_CLICK_MISSES", []))})
     return res
 
 
@@ -1077,6 +1081,76 @@ def scenario_press_hold(mod):
     return out
 
 
+def click_exit(mod):
+    """The exit code main() ends with after the command (_click_missed_exit)."""
+    try:
+        mod._click_missed_exit()
+    except SystemExit as e:
+        return e.code
+    return 0
+
+
+def scenario_click_outcome(mod):
+    """A real click whose release misses: exit 3 (moved / no reply), 0 (gone);
+    a target detached before the press: exit 1, nothing clicked; MCP, batch."""
+    out = {}
+    for key, cfg in [("moved", {"card.cover_after_press": "div#wrap"}),
+                     ("gone", {"card.cover_after_press": "-"}),
+                     ("navigated", {"card.cover_after_press": "ERR"}),
+                     ("clicked", {}),
+                     ("detached", {"card.target_cover": "-"})]:
+        r = run_click(mod, click_page(**cfg), "#card >>> #btn", blocker=True)
+        r["exit"] = click_exit(mod)
+        out[key] = {k: r[k] for k in ("res", "stdout", "stderr", "clicks", "pressed", "released", "misses",
+                                      "exit", "blocker")}
+    # The release batch gets no reply (a timeout under load): unknown, not gone.
+    real_cdp = mod._frame_cdp
+
+    async def short(route, commands, timeout=10):
+        return await real_cdp(route, commands, min(timeout, 0.4))
+    mod._frame_cdp = short
+    try:
+        r = run_click(mod, click_page(**{"card.cover_after_press": "HANG"}), "#card >>> #btn", blocker=True)
+    finally:
+        mod._frame_cdp = real_cdp
+    r["exit"] = click_exit(mod)
+    out["no_reply"] = {k: r[k] for k in ("res", "stdout", "stderr", "clicks", "misses", "exit", "blocker")}
+
+    # batch: every step runs; the not-clicked one is recorded; the batch exits 3.
+    real_stdin = sys.stdin
+
+    async def batch(b):
+        sys.stdin = io.StringIO(json.dumps([{"cmd": "click", "args": ["#card >>> #btn"]},
+                                            {"cmd": "eval", "args": ["1 + 1"]}]))
+        try:
+            return await call(mod.cmd_batch)
+        finally:
+            sys.stdin = real_stdin
+    b, res, stdout, err = run(mod, click_page(**{"card.cover_after_press": "div#wrap"}), batch)
+    out["batch"] = {"res": res, "steps": json.loads(stdout[stdout.index("["):]), "exit": click_exit(mod),
+                    "stderr": err}
+
+    # MCP: the CLI's exit code and stdout, as the server sees them.
+    real_run = mod.subprocess.run
+    server = mod.MCPServer()
+    mcp = {}
+    for key, code, stdout_, stderr_ in [
+            ("moved", 3, "Pressed (released elsewhere, not clicked): BUTTON Menu", "note: #m was no longer ..."),
+            ("gone", 0, "Pressed (the page replaced or left it, not clicked): BUTTON Next", "note: #n was gone ..."),
+            ("unknown", 3, "Pressed (release not confirmed, not clicked): BUTTON Pay", "note: #p could not ..."),
+            ("clicked", 0, "Clicked: BUTTON Pay", ""),
+            ("error", 1, "", "Error: selector '#x' not resolved.")]:
+        mod.subprocess.run = (lambda *a, code=code, o=stdout_, e=stderr_, **k:
+                              types.SimpleNamespace(returncode=code, stdout=o, stderr=e))
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                mcp[key] = server._execute_tool(1, "browser_click", {"selector": "#x"})["result"]
+        finally:
+            mod.subprocess.run = real_run
+    out["mcp"] = mcp
+    return out
+
+
 def scenario_timeout_hold(mod):
     """--timeout fires while a real click holds the button (CDPILOT_PRESS_MS=1000-1000):
     the watchdog restores the blocker before os._exit (patched to record the exit,
@@ -1224,6 +1298,7 @@ SCENARIOS = {
     "timeout_restore": scenario_timeout_restore,
     "press_hold": scenario_press_hold,
     "timeout_hold": scenario_timeout_hold,
+    "click_outcome": scenario_click_outcome,
 }
 
 
