@@ -86,6 +86,37 @@ npx cdpilot launch    # Start browser with CDP enabled
 npx cdpilot status    # Check connection
 ```
 
+### Claude Code plugin marketplace
+
+Install cdpilot's MCP server and its skill straight into Claude Code, no
+`.mcp.json` editing required:
+
+```bash
+/plugin marketplace add mehmetnadir/cdpilot
+/plugin install cdpilot@cdpilot
+```
+
+This registers the `cdpilot` MCP server (`npx cdpilot mcp`) and a short skill
+that teaches Claude Code when and how to reach for cdpilot's commands. See
+[`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json) and
+[`plugins/cdpilot/`](plugins/cdpilot/).
+
+### MCP Bundle (.mcpb)
+
+For MCP clients that support one-click local server installation (Claude
+Desktop and others), download the `.mcpb` file attached to the
+[latest release](https://github.com/mehmetnadir/cdpilot/releases/latest) and
+open it, or build it yourself:
+
+```bash
+npm run build:mcpb   # writes cdpilot.mcpb at the repo root
+```
+
+The bundle still needs the same runtime on the machine that runs it: Node.js
+18+, Python 3.10+, and Brave/Chrome/Chromium installed. See
+[`manifest.json`](manifest.json) for the bundle's MCP Bundle manifest
+([spec](https://github.com/modelcontextprotocol/mcpb)).
+
 ### Upgrading from 0.4.x → 0.5.0 — read this first
 
 **One breaking change**, the rest is additive.
@@ -921,7 +952,10 @@ cdpilot launch --no-webmcp     # turn it off again (applies at the next start)
   (`required`, `type` — `true` is not an integer —, `enum`, `const`, nested
   `properties` and `items`; other keywords are left to the page) and exits 1
   on a mismatch, an unknown tool or a tool error. It passes an `AbortSignal`
-  and aborts it when `--timeout` (default 20 s) runs out, then exits 124.
+  and aborts it when `--timeout` (default 20 s) runs out, then exits 124
+  with `timed out after <N>s (--timeout); its execution was aborted`. The
+  signal fires at the `--timeout` deadline; the watchdog waits 3 s more so
+  that report is printed.
   A form tool without `toolautosubmit` waits for a person to submit the form.
   When several frames register the same name, `--frame <url-part>` picks one
   (an exact frame URL wins); without it the top document's tool is used, and
