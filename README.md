@@ -101,6 +101,10 @@ cdpilot browser status                                        # shows the CfT ve
 - It runs with cdpilot's usual per-project isolated profile (`profile-cft`).
 - **It is for extension development and testing — not a stealth browser.** cdpilot
   makes no anti-bot claims for it; use your regular browser setup for that.
+- **Linux (Ubuntu 23.10+):** AppArmor blocks unprivileged user namespaces, and CfT
+  (unlike the distro's Chrome package) has no profile allowing them, so it exits at
+  start. cdpilot prints this hint; allow them with
+  `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
 
 ## Installation
 
