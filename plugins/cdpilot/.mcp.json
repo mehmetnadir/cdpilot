@@ -2,7 +2,7 @@
   "mcpServers": {
     "cdpilot": {
       "command": "npx",
-      "args": ["cdpilot", "mcp"]
+      "args": ["-y", "cdpilot", "mcp"]
     }
   }
 }
