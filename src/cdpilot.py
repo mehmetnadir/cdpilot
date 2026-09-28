@@ -5231,6 +5231,28 @@ def _cft_platform():
     return None
 
 
+def _linux_sandbox_hint():
+    """After a failed start on Linux: say why, when it is the usual cause.
+
+    Ubuntu 23.10+ blocks unprivileged user namespaces through AppArmor. A
+    distro-packaged Chrome ships an AppArmor profile that allows them; a
+    browser unpacked elsewhere (Chrome for Testing) has none, so its sandbox
+    cannot start and the browser exits at once.
+    """
+    if not sys.platform.startswith('linux'):
+        return
+    try:
+        with open('/proc/sys/kernel/apparmor_restrict_unprivileged_userns') as f:
+            restricted = f.read().strip() == '1'
+    except OSError:
+        return
+    if restricted:
+        sys.stderr.write(
+            "Hint: this Linux blocks unprivileged user namespaces (AppArmor), so a browser\n"
+            "outside the distro packages (e.g. Chrome for Testing) cannot start its sandbox.\n"
+            "Allow it for this boot: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n")
+
+
 def _cft_binary_relpath(plat):
     """Path of the browser executable inside the extracted zip."""
     top = f'chrome-{plat}'
@@ -6515,6 +6537,7 @@ def cmd_launch(auto=False, idle_close=None):
                 sys.exit(1)
             return
     print('Failed to start CDP (timeout).', file=sys.stderr)
+    _linux_sandbox_hint()
     sys.exit(1)
 
 

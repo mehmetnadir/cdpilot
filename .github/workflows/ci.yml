@@ -87,6 +87,10 @@ jobs:
         run: python -m pip install websockets cryptography
       - name: Browser
         run: google-chrome --version
+      - name: Allow user namespaces (Chrome for Testing sandbox)
+        # Ubuntu 24.04 restricts them via AppArmor; the packaged google-chrome
+        # has a profile, the downloaded Chrome for Testing in the cft e2e does not.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Run npm tests with the browser test
         run: npm test
         env:
