@@ -8,8 +8,21 @@
   <h1>Page two</h1>
   <a id="back" href="shop.html">Back to the shop</a>
   <script>
+    // The e2e tests wait on this instead of guessing: window.__registered is
+    // 'pending' until the browser has answered every registerTool() below,
+    // then 'ok' (or 'error: <name>').
+    function track(p) {
+      var regs = (window.__regs = window.__regs || []);
+      regs.push(p);
+      window.__registered = 'pending';
+      var n = regs.length;
+      Promise.all(regs.slice()).then(function() {
+        if (regs.length === n) window.__registered = 'ok';
+      }, function(e) { window.__registered = 'error: ' + e.name; });
+    }
+
     if (window.isSecureContext && document.modelContext) {
-      document.modelContext.registerTool({
+      track(document.modelContext.registerTool({
         name: 'lookup_order',
         description: 'Look up an order by its id',
         inputSchema: {
@@ -21,7 +34,7 @@
         execute: async function(input, options) {
           return { id: input.id, state: 'shipped' };
         }
-      });
+      }));
     }
   </script>
 </body>

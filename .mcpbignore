@@ -1,0 +1,35 @@
+# Extra excludes for `mcpb pack .` — combined with mcpb's default exclusion
+# list (.git, node_modules/.cache, .DS_Store, etc.) and .gitignore.
+# Keep this in sync with package.json's "files" allowlist: the bundle should
+# ship the same runtime files npm does (bin/, src/cdpilot.py, README.md,
+# LICENSE), plus manifest.json and package.json for the mcpb metadata.
+
+.claude/
+.claude-plugin/
+plugins/
+.github/
+docs/
+test/
+tests/
+xbot/
+scripts/
+*.mcpb
+
+CHANGELOG.md
+CONTRIBUTING.md
+AGENTS.md
+GEMINI.md
+CLAUDE.md
+project-switch.md
+glama.json
+package-lock.json
+server.json
+.npmignore
+.mcpbignore
+.gitattributes
+
+cdpilot-demo.gif
+cdpilot-video.mp4
+cdpilot-poster.png
+logo.afdesign
+logo.svg
