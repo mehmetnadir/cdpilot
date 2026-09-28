@@ -175,6 +175,8 @@ cdpilot scroll-to <selector>  # Scroll element into view
 cdpilot drag <from> <to>      # Drag and drop
 ```
 
+A real mouse click (inside a frame, or `--entropy=on`) whose target moves or gets covered while the button is held is not clicked again by script: `click` prints `Pressed (released elsewhere, not clicked): …` and ends with **exit 3** (pressed, release missed the target, not clicked; `1` stays "error"). A target the page replaced or navigated away from on mousedown prints `Pressed (the page replaced or left it, not clicked): …` and exits 0. MCP (`browser_click`, `browser_smart_click`) returns `isError: false` with a first line `{"clicked": false, "reason": "moved"|"gone"|"unknown"}`. `batch` and `run` finish every step, then exit 1 if a step failed, else 3 if a click was not clicked, else 0.
+
 ### Element targeting inside iframes
 
 Card forms (Stripe/iyzico-style), embedded login widgets and the reCAPTCHA
@@ -501,6 +503,8 @@ At launch, cdpilot also passes `--disable-blink-features=AutomationControlled`,
 which closes the Blink runtime flag that Cloudflare and DataDome probe to detect
 an automated browser.
 
+Real mouse clicks (frames, `--entropy=on`, `click @ref`, `dblclick`, `rightclick`) hold the button 40-120 ms like a person's press; `CDPILOT_PRESS_MS=min-max` changes the range (`0-0` = instant).
+
 #### Three-tier stealth mode
 
 `cdpilot mode` is the recommended entry point — one switch that sets how much
@@ -543,6 +547,145 @@ cdpilot adaptive clear        # Drop the stealth host memory entirely
 > runs in the open lane by default, detects CAPTCHA after each navigation, and
 > when it sees one — adds the host to a persistent list, retries once with
 > stealth on. Never auto-demotes. Conservative by design.
+
+### Web Bot Auth (signed agent)
+
+The opposite of stealth. Stealth tries to make the browser look like a person;
+Web Bot Auth says "this is an automated agent, and here is proof of which one".
+Every request the browser makes carries an Ed25519
+[HTTP Message Signature (RFC 9421)](https://www.rfc-editor.org/rfc/rfc9421)
+that a site, or Cloudflare in front of it, checks against a key directory you
+publish on your own domain. The format follows
+[draft-meunier-web-bot-auth-architecture](https://datatracker.ietf.org/doc/draft-meunier-web-bot-auth-architecture/)
+and [draft-meunier-http-message-signatures-directory](https://datatracker.ietf.org/doc/draft-meunier-http-message-signatures-directory/),
+and reproduces the Ed25519 test vectors of Cloudflare's reference
+implementation ([cloudflare/web-bot-auth](https://github.com/cloudflare/web-bot-auth)).
+
+**Optional dependency.** Signing needs the `cryptography` package, for the Python cdpilot runs
+on (`CDPILOT_PYTHON` if you set it):
+
+```bash
+pip install cryptography
+```
+
+Without it, the `bot-auth` commands and `launch --bot-auth` print that hint and exit 2. Every
+other command works as before.
+
+**1. Generate the key** (once):
+
+```bash
+cdpilot bot-auth init --agent-url https://your-domain.com
+```
+
+This writes an Ed25519 private key to `CDPILOT_HOME/bot-auth/ed25519.key` (default
+`~/.cdpilot`), created with mode `0600`. cdpilot never prints or logs the key, and it warns
+when the file is readable by others. The agent URL must be an `https://` origin (no path). A
+second `init` refuses to replace the key unless you pass `--force`, because the new key would no
+longer match the directory you published.
+
+**2. Host the directory on your own domain, signed.** `cdpilot bot-auth directory` prints the
+public key as a JWKS, where `kid` is the key's RFC 7638 JWK thumbprint. Cloudflare also requires
+the directory *response* to be signed, so `--headers` prints the headers to serve with it:
+
+```bash
+cdpilot bot-auth directory --headers        # headers, a blank line, then the JSON body
+cdpilot bot-auth directory --headers --json # the same as {"authority", "headers", "body"}
+```
+
+```
+Content-Type: application/http-message-signatures-directory+json
+Signature-Input: sig1=("@authority";req);created=…;keyid="<thumbprint>";alg="ed25519";expires=…;nonce="…";tag="http-message-signatures-directory"
+Signature: sig1=:<base64 Ed25519 signature>:
+
+{ "keys": [ … ] }
+```
+
+Serve that body at `https://your-domain.com/.well-known/http-message-signatures-directory` with
+those three headers. The signature covers `("@authority";req)`, the host the directory is fetched
+from: by default the agent URL's host, or `--authority <host>`. There is one signature per key in
+the directory. It is valid for 24 hours (`--ttl <seconds>`), so a static host needs it refreshed
+daily, from cron or an edge function that runs the same signing. A cron example that rewrites the
+headers file and the body your web server serves:
+
+```bash
+# m h dom mon dow  — every day at 03:17, 48 h validity so one missed run does not break it
+17 3 * * *  cdpilot bot-auth directory --headers --ttl 172800 --json > /var/www/wba/directory.json.tmp \
+            && mv /var/www/wba/directory.json.tmp /var/www/wba/directory.json
+```
+
+Your server (or an edge function) reads `headers` and `body` from that JSON and serves them at
+the well-known path. `--content-digest` also covers the body (`Content-Digest`, RFC 9530), as
+in Cloudflare's reference vector; then the body must be served byte for byte as printed.
+
+**3. Launch a signing browser:**
+
+```bash
+cdpilot launch --bot-auth        # or: CDPILOT_BOT_AUTH=1 cdpilot launch
+cdpilot status                   # ... bot-auth: on (keyid <thumbprint>)
+cdpilot go https://example.com   # this request is signed, and so is everything after it
+cdpilot stop                     # stops the browser and the signer
+```
+
+`launch --bot-auth` starts a small detached signer next to the browser. It uses the same
+self-fork as the idle-close watcher and lives exactly as long as the browser. It holds one CDP
+connection and auto-attaches to every page, popup, new tab, out-of-process iframe and worker. It
+signs each request at the Fetch "Request" stage, including every redirect hop. So requests the page makes on its own are
+signed as well: timers, `fetch()` after your cdpilot command has returned, a tab the page opens.
+`data:`, `blob:` and `chrome-extension:` requests never leave the browser, so they pass through
+unchanged. If signing a request fails, that request goes out unsigned, one line is written to
+`CDPILOT_HOME/bot-auth/signers/<port>.log` (host only), and the page is never held up. Running
+`launch --bot-auth` against a browser that is already up adds the signer to it.
+
+Each request gets three headers:
+
+| Header | Value |
+|--------|-------|
+| `Signature-Agent` | `"https://your-domain.com"` |
+| `Signature-Input` | `sig1=("@authority" "signature-agent");created=…;keyid="<thumbprint>";alg="ed25519";expires=…;nonce="…";tag="web-bot-auth"` |
+| `Signature` | `sig1=:<base64 Ed25519 signature>:` |
+
+`expires` is `created` + 5 minutes. The `nonce` is 64 random bytes, base64-encoded, and new for
+every request.
+
+This is the **legacy** `Signature-Agent` form (draft-05 A.2.3), and it is the default because it
+is the form Cloudflare's verifier accepts: Cloudflare rejects the dictionary form of later drafts.
+To send the dictionary form instead (`Signature-Agent: sig1="https://your-domain.com"`, covered as
+`"signature-agent";key="sig1"`), run `cdpilot bot-auth format dict` (`bot-auth format legacy`
+switches back, `bot-auth format` shows it, `bot-auth init --agent-format dict` sets it at
+creation). It applies from the next `launch --bot-auth`.
+
+**What is not signed.** WebSocket handshakes are not signed: the browser does not pass them
+through CDP's `Fetch` domain, so a `wss://` connection the page opens goes out without the
+headers. Service-worker-internal cache hits and `data:`/`blob:` URLs never reach a server.
+
+**If the signer dies or hangs.** While it runs, the signer holds every request of the browser at
+the Fetch stage until it has added the headers. If it is killed, requests go out unsigned; `cdpilot
+status` and `cdpilot go` then print one stderr line (signer not running, requests go out unsigned,
+run `cdpilot launch --bot-auth` again) until you do, or `stop`. If it is frozen (a
+stopped process, a debugger), requests hang: `cdpilot stop` and `launch --bot-auth` again.
+cdpilot trusts its signer state only for the process whose command line is that port's signer and
+only for the browser it attached to, so a stale state file whose pid was reused by another program
+is dropped, never signalled.
+
+**Idle close** still works while the signer runs: the signer is attached to every page, so instead
+of "a page is attached" cdpilot counts the CDP clients other than the signer (by socket owner:
+`netstat` on macOS and Windows, `ss` on Linux), and a `watch` daemon or a Playwright session keeps
+the browser open. On Linux, `ss -tnp` shows only your own processes' sockets, so a client running
+as another user is not counted and idle close may close the browser under it.
+
+**Stealth conflict.** Signing says "I am an agent", and stealth says "I am not". If you pass
+`--bot-auth` together with `--stealth`/`--undetected`, or while `cdpilot mode` is `stealth` or
+`undetected`, cdpilot prints one warning line and applies bot-auth. While the signer runs, no
+stealth script or user-agent override is injected, and adaptive escalation does not retry at a
+stealth tier.
+
+**Register with Cloudflare.** Once the directory is live, submit it through the Bot Submission
+Form in the Cloudflare dashboard as a *signed agent* (an agent acting for its users) or a
+*verified bot*; see Cloudflare's
+[signed agents](https://blog.cloudflare.com/signed-agents/) and
+[verified bots with cryptography](https://blog.cloudflare.com/verified-bots-with-cryptography/)
+posts. Sites behind Cloudflare then see your requests as coming from your agent. Sites that
+don't check Web Bot Auth ignore the headers.
 
 ### Friction Ladder (progressive anti-bot detection)
 
@@ -809,7 +952,10 @@ cdpilot launch --no-webmcp     # turn it off again (applies at the next start)
   (`required`, `type` — `true` is not an integer —, `enum`, `const`, nested
   `properties` and `items`; other keywords are left to the page) and exits 1
   on a mismatch, an unknown tool or a tool error. It passes an `AbortSignal`
-  and aborts it when `--timeout` (default 20 s) runs out, then exits 124.
+  and aborts it when `--timeout` (default 20 s) runs out, then exits 124
+  with `timed out after <N>s (--timeout); its execution was aborted`. The
+  signal fires at the `--timeout` deadline; the watchdog waits 3 s more so
+  that report is printed.
   A form tool without `toolautosubmit` waits for a person to submit the form.
   When several frames register the same name, `--frame <url-part>` picks one
   (an exact frame URL wins); without it the top document's tool is used, and

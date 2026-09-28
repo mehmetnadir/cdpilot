@@ -23,6 +23,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import traceback
 import types
 
@@ -203,6 +205,37 @@ def scenario_call_timeout(mod, node):
         mod.WEBMCP_CALL_TIMEOUT = saved
 
 
+def scenario_call_deadline(mod, node):
+    """With --timeout the tool is aborted AT the deadline and the watchdog waits
+    WEBMCP_REPORT_GRACE more, so the "aborted" report is never cut off."""
+    fired = []
+    t0 = time.monotonic()
+    seconds, grace = 1.5, 0.6
+
+    def mark(who):
+        return lambda: fired.append([who, round(time.monotonic() - t0, 2)])
+
+    timer = threading.Timer(seconds, mark("watchdog"))
+    timer.daemon = True
+    mod._TIMEOUT_WATCH.update(timer=timer, expire=mark("watchdog after grace"),
+                              seconds=seconds, deadline=t0 + seconds)
+    saved = mod.WEBMCP_REPORT_GRACE
+    mod.WEBMCP_REPORT_GRACE = grace
+    timer.start()
+    try:
+        res = run(mod, node, "hang",
+                  lambda: mod.cmd_tools_call("add_to_cart", {"sku": "A1", "qty": 1}))
+        res["returned_at"] = round(time.monotonic() - t0, 2)
+        time.sleep(max(0.0, t0 + seconds + grace + 0.5 - time.monotonic()))
+        res["fired"] = fired
+        res["seconds"], res["grace"] = seconds, grace
+        return res
+    finally:
+        mod._TIMEOUT_WATCH["timer"].cancel()
+        mod._TIMEOUT_WATCH.clear()
+        mod.WEBMCP_REPORT_GRACE = saved
+
+
 def scenario_call_refusals(mod, node):
     """Bad args and unknown tools stop before executeTool; no API -> diagnosis."""
     return {
@@ -320,6 +353,7 @@ SCENARIOS = {
     "list_routing": scenario_list_routing,
     "call_routing": scenario_call_routing,
     "call_timeout": scenario_call_timeout,
+    "call_deadline": scenario_call_deadline,
     "hostile_page": scenario_hostile_page,
     "world_fallback": scenario_world_fallback,
     "two_frames": scenario_two_frames,

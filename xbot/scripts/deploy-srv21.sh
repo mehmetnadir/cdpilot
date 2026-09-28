@@ -1,5 +1,8 @@
 #!/bin/bash
-# deploy-srv21.sh — xbot/ kodunu srv21'e push, daemon restart, smoke test.
+# deploy-srv21.sh — xbot/ kodunu srv21'e push, ntfy smoke test.
+#
+# 2026-09-28: Telegram onay daemon'u (cdpilot-telegram-daemon) emekli. Bu betik
+# artık onu yeniden BAŞLATMAZ; bildirimler ntfy'den (ops/_notify.py).
 #
 # Önkoşullar:
 #  - VPN bağlı (blok2 / 10.0.0.* erişimi)
@@ -7,9 +10,9 @@
 #
 # Kullanım:
 #   ./deploy-srv21.sh           # full deploy + smoke test
-#   ./deploy-srv21.sh diag      # sadece teşhis (claude binary, daemon status)
-#   ./deploy-srv21.sh sync      # sadece rsync (restart yok)
-#   ./deploy-srv21.sh restart   # sadece daemon restart
+#   ./deploy-srv21.sh diag      # sadece teşhis (claude binary, zamanlayıcılar)
+#   ./deploy-srv21.sh sync      # sadece rsync
+#   ./deploy-srv21.sh smoke     # yalnız ntfy test bildirimi (cdpilot-x, Click'li)
 #
 # Çıktıların hepsi Türkçe — kullanıcı için.
 
@@ -40,16 +43,16 @@ diag() {
     ssh "$SRV" 'claude --version 2>&1 | head -3 || echo "claude çalışmıyor"' || true
 
     echo ""
-    echo "[3/5] Daemon durumu:"
-    ssh "$SRV" 'systemctl is-active cdpilot-telegram-daemon 2>&1; systemctl status cdpilot-telegram-daemon --no-pager 2>&1 | head -15' || true
+    echo "[3/5] Zamanlayıcılar:"
+    ssh "$SRV" 'systemctl list-timers --all --no-pager 2>&1 | grep -E "cdpilot-(cycle|poster|sentinel)"' || true
 
     echo ""
-    echo "[4/5] Daemon log (son 20 satır):"
-    ssh "$SRV" 'journalctl -u cdpilot-telegram-daemon --no-pager -n 20 2>&1' || true
+    echo "[4/5] Telegram daemon (emekli olmalı: inactive/disabled):"
+    ssh "$SRV" 'systemctl is-active cdpilot-telegram-daemon 2>&1; systemctl is-enabled cdpilot-telegram-daemon 2>&1' || true
 
     echo ""
-    echo "[5/5] Pending json son güncelleme:"
-    ssh "$SRV" "ls -la $SRV_PATH/telegram-pending.json 2>/dev/null; stat -c '%y' $SRV_PATH/telegram-pending.json 2>/dev/null" || true
+    echo "[5/5] ntfy rutin sınırlayıcı durumu:"
+    ssh "$SRV" "ls -la $SRV_PATH/state/ntfy-routine.json 2>/dev/null || echo 'henüz yok'" || true
     echo ""
 }
 
@@ -69,18 +72,10 @@ sync_code() {
     echo "✅ Sync tamam (eski runtime data korundu)"
 }
 
-restart_daemon() {
+smoke_ntfy() {
     echo ""
-    echo "═══ DAEMON RESTART ═══"
-    ssh "$SRV" "systemctl restart cdpilot-telegram-daemon && sleep 2 && systemctl is-active cdpilot-telegram-daemon"
-    echo "✅ Daemon ayakta"
-}
-
-smoke_strategy() {
-    echo ""
-    echo "═══ SMOKE — STRATEJİ KARTI ═══"
-    echo "Test stratejisi srv21'den manuel tetikleniyor..."
-    ssh "$SRV" "cd $SRV_PATH && CDPILOT_STRATEGIST_FORCE=1 ./twikit-venv/bin/python ops/daily_strategist.py 2>&1 | tail -10"
+    echo "═══ SMOKE — ntfy (cdpilot-x, Click → X profili) ═══"
+    ssh "$SRV" "cd $SRV_PATH/ops && /usr/bin/python3 -c 'import _notify,sys; ok=_notify._http_publish(_notify.build_payload(\"Deploy testi\", \"cdpilot xbot ntfy yolu çalışıyor — dokununca profil açılır.\", url=_notify.profile_url(_notify.HANDLE))); print(\"ntfy JSON API:\", ok); sys.exit(0 if ok else 1)'"
 }
 
 case "$MODE" in
@@ -92,17 +87,16 @@ case "$MODE" in
         ssh_check
         sync_code
         ;;
-    restart)
+    smoke)
         ssh_check
-        restart_daemon
+        smoke_ntfy
         ;;
     full|*)
         ssh_check
         diag
         sync_code
-        restart_daemon
-        smoke_strategy
+        smoke_ntfy
         echo ""
-        echo "✅ Deploy + smoke tamam. Telegram'a strateji kartı geldi mi kontrol et."
+        echo "✅ Deploy + smoke tamam. Telefonda cdpilot-x kanalına 'Deploy testi' geldi mi bak."
         ;;
 esac

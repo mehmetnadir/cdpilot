@@ -2,8 +2,11 @@
 """engagement_scanner.py — Tier 1/2 timeline scan → like/reply candidates.
 
 Reads xbot/tier1.json, fetches each handle's latest tweets via twikit, scores
-them against engagement-reciprocity heuristics, and emits draft proposals to
-Telegram for human approval. Soft-only: never auto-posts.
+them against engagement-reciprocity heuristics, and acts on them unattended
+(owner's call, 2026-09-28: "beğenmeleri falan tam otonom sen yapabilirsin"):
+high scores get an AI reply or a like, mid scores — which used to wait on a
+Telegram card — get a like. Every rail below still applies; the poster
+executes the queue and pushes the result to ntfy with the tweet link.
 
 Heuristic scoring:
   +5  recent (≤6h)
@@ -15,7 +18,8 @@ Heuristic scoring:
 
 Output:
   - ~/cdpilot-twitter-data/engagement/<date>.json  (candidates, scored)
-  - Optional Telegram drafts when --propose-top N (default 0 = scan only)
+  - Actions only when --propose-top N (default 0 = scan only); N bounds the
+    mid-score likes per run (what used to be N approval cards)
 
 Faz 0 caps (enforced):
   - like_per_day ≤ 5
@@ -44,7 +48,8 @@ import _twikit_patch  # noqa: F401
 from twikit import Client  # type: ignore
 
 sys.path.insert(0, str(Path(__file__).parent))
-from _sanitize import sanitize, wrap_external, render_flags  # type: ignore
+from _sanitize import sanitize, wrap_external  # type: ignore
+import _notify  # type: ignore  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -88,6 +93,7 @@ AUTO_QUOTE_THRESHOLD = int(os.environ.get("CDPILOT_AUTO_QUOTE_SCORE", "8"))  # m
 
 FREEZE_FLAG = DATA / "state" / "crisis-freeze.flag"
 QUEUE_DIR = DATA / "queue"
+REPLIED_STATE = DATA / "state" / "engagement-replied.json"
 
 
 def _log(msg: str) -> None:
@@ -124,7 +130,12 @@ def _audit_action_count(kind: str, day: str) -> int:
     for line in audit_file.read_text().splitlines():
         try:
             r = json.loads(line)
-            if r.get("kind") == kind and r.get("status") == "proposed":
+            # "proposed" = legacy approval card; auto-queued* = acted unattended.
+            # Both spend today's cap — counting only cards let auto actions
+            # from an earlier run slip past the cap on a second run.
+            if r.get("kind") == kind and (
+                    r.get("status") == "proposed"
+                    or str(r.get("status", "")).startswith("auto-queued")):
                 n += 1
         except ValueError:
             continue
@@ -197,80 +208,19 @@ async def _scan_handle(client: Client, handle: str, topic_hint: str) -> list[dic
     return out
 
 
-def _telegram_send(text: str) -> None:
-    try:
-        import subprocess
-        bridge = Path(__file__).parent / "telegram_bridge.py"
-        subprocess.run(
-            [sys.executable, str(bridge), "send", text],
-            timeout=15, check=False,
-        )
-    except Exception as e:
-        _log(f"telegram send failed: {e}")
-
-
-def _format_proposal(c: dict, action: str) -> str:
-    flag_str = render_flags(c["flags"])
-    action_tr = "💬 CEVAP ADAYI" if action == "reply-candidate" else "💛 LIKE ADAYI"
-    return (
-        f"💡 {action_tr} — @{c['handle']}\n"
-        f"⏰ {c['hours_old']} saat önce · ❤️ {c['like_count']} beğeni · skor {c['score']}/10\n"
-        f"🔗 {c['url']}\n"
-        f"{flag_str}\n\n"
-        f"📥 Tweet içeriği:\n{c['text'][:400]}\n\n"
-        f"👇 Aşağıdan karar ver:"
+def _notify_held(reason: str, held: list[dict]) -> None:
+    """ONE info push when candidates got no action (crisis freeze / cap)."""
+    if not held:
+        return
+    lines = [f"@{c.get('handle', '?')} · skor {c.get('score')} · {c.get('hours_old', '?')}s"
+             for c in held[:6]]
+    if len(held) > 6:
+        lines.append(f"… +{len(held) - 6}")
+    _notify.notify(
+        f"Etkileşim: {len(held)} aday işlemsiz",
+        f"{reason}\n" + "\n".join(lines),
+        url=held[0].get("url"), priority="dusuk", tags=["pause_button"],
     )
-
-
-def _send_proposal_card(c: dict, action: str) -> None:
-    """Send engagement proposal as a card with inline action buttons.
-
-    Reuses telegram_bridge daemon callbacks: replywrite / likemention / mskip.
-    Registers pending under the returned message_id so the daemon can route.
-    """
-    try:
-        bridge_dir = Path(__file__).parent
-        sys.path.insert(0, str(bridge_dir))
-        import telegram_bridge as tb  # type: ignore
-
-        env = tb._load_env()
-        if not env.get("TELEGRAM_CHAT_ID"):
-            _log("no TELEGRAM_CHAT_ID, skipping proposal card")
-            return
-
-        text = _format_proposal(c, action)
-        # Engagement proposals: 3-button card. The CEVAP option re-uses the
-        # "replywrite" callback (user types reply in chat as a Telegram reply).
-        # LIKE uses "likemention" — same action, just on a different target.
-        keyboard = {
-            "inline_keyboard": [[
-                {"text": "💬 Cevap yaz", "callback_data": f"replywrite:eng-{c['tweet_id']}"},
-                {"text": "💛 Like at", "callback_data": f"likemention:eng-{c['tweet_id']}"},
-                {"text": "⏭ Geç", "callback_data": f"mskip:eng-{c['tweet_id']}"},
-            ]]
-        }
-        result = tb._api(env, "sendMessage", {
-            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
-            "text": text,
-            "disable_web_page_preview": True,
-            "reply_markup": keyboard,
-        })
-        msg_id = result.get("message_id")
-        if msg_id:
-            # Register as engagement-proposal so daemon's existing replywrite/
-            # likemention handlers can use target_url + author.
-            tb._register_pending(msg_id, {
-                "id": f"eng-{c['tweet_id']}",
-                "kind": "engagement-proposal",
-                "tweet_id": c["tweet_id"],
-                "target_url": c["url"],
-                "author": c["handle"],
-                "source_text": c["text"][:280],
-            })
-    except Exception as e:
-        _log(f"proposal card send failed: {e}")
-        # Fallback to plain message so we don't lose the signal.
-        _telegram_send(_format_proposal(c, action))
 
 
 async def _scan_mutual_engagement(client: Client) -> list[dict]:
@@ -387,10 +337,23 @@ async def main_async(propose_top: int) -> None:
     if propose_top <= 0 or not top:
         return
 
-    # Crisis freeze respect — auto-execute YOK, sadece manual kart
+    act_on_candidates(top, propose_top)
+
+
+def act_on_candidates(top: list[dict], propose_top: int) -> dict:
+    """Decide + queue actions for scored candidates (no network, no human).
+
+    Rails, all unchanged: crisis freeze (hard block), off-limits veto,
+    learned veto (score ≤ -50), AUTO_REPLY_THRESHOLD + topic match + AI draft
+    for replies, AUTO_LIKE_THRESHOLD for likes, LIKE/REPLY daily caps. What
+    used to be a Telegram approval card (mid score) is now a like, at most
+    `propose_top` per run. Blocked candidates → one info push, no action.
+    """
+    today = _today_iso()
+    # Crisis freeze is a hard block: no action at all, one info push.
     crisis_active = FREEZE_FLAG.exists()
     if crisis_active:
-        _log("🔴 CRISIS FREEZE — auto-execute kapalı, sadece manual kart atılır")
+        _log("🔴 CRISIS FREEZE — no action this run, candidates reported only")
 
     likes_today = _audit_action_count("like", today)
     replies_today = _audit_action_count("reply", today)
@@ -400,7 +363,8 @@ async def main_async(propose_top: int) -> None:
 
     auto_like = 0
     auto_reply = 0
-    manual_cards = 0
+    card_likes = 0  # mid-score likes (formerly approval cards), ≤ propose_top
+    held: list[dict] = []  # got no action: crisis freeze or daily cap
 
     # Decision-learner adaptive bonus (Faz B): handle/pillar trust → score delta
     try:
@@ -431,13 +395,17 @@ async def main_async(propose_top: int) -> None:
             continue
 
         # === AUTO-REPLY: skor ≥ 7 + topic match + AI draft + cap altı + no crisis
+        # + never a second reply to the same tweet (persistent, any source)
         if (not crisis_active and topic_match and
                 score >= AUTO_REPLY_THRESHOLD and
                 replies_today < REPLY_PER_DAY):
+            if _already_replied(c["tweet_id"]):
+                _log(f"skip @{c.get('handle', '?')} {c['tweet_id']} — already replied/queued")
+                continue
             ai_draft = _ai_draft_for(c)
             if ai_draft:
                 _auto_queue_reply(c, ai_draft)
-                _notify_auto("💬", "Cevap kuyrukta", c, ai_draft)
+                _mark_replied(c["tweet_id"])
                 _audit_write(audit_file, "reply", c, score, status="auto-queued")
                 replies_today += 1
                 auto_reply += 1
@@ -449,30 +417,86 @@ async def main_async(propose_top: int) -> None:
                 score >= AUTO_LIKE_THRESHOLD and
                 likes_today < LIKE_PER_DAY):
             _auto_queue_like(c)
-            _notify_auto("💛", "Like kuyrukta", c, None)
             _audit_write(audit_file, "like", c, score, status="auto-queued")
             likes_today += 1
             auto_like += 1
             time.sleep(0.5)
             continue
 
-        # === MANUEL KART: orta skor (3-6) topic match → reply candidate manuel
-        if manual_cards >= propose_top:
+        # === ORTA SKOR (eski onay kartı): artık onay beklemez, BEĞENİ olur.
+        # Reply is never widened below AUTO_REPLY_THRESHOLD — a card's reply
+        # needed Nadir's own text, so unattended the safe action is a like.
+        # Same bound as before: at most `propose_top` of these per run.
+        if card_likes >= propose_top:
             continue
-        if topic_match and replies_today < REPLY_PER_DAY:
-            action = "reply-candidate"
-        elif likes_today < LIKE_PER_DAY:
-            action = "like-candidate"
-        else:
+        if crisis_active or likes_today >= LIKE_PER_DAY:
+            held.append(c)
             continue
-        _send_proposal_card(c, action)
-        _audit_write(audit_file, "like" if action == "like-candidate" else "reply",
-                     c, score, status="proposed")
-        manual_cards += 1
-        time.sleep(1.0)
+        _auto_queue_like(c)
+        _audit_write(audit_file, "like", c, score, status="auto-queued-card")
+        likes_today += 1
+        card_likes += 1
+        time.sleep(0.5)
 
-    _log(f"auto-like={auto_like} auto-reply={auto_reply} manual-cards={manual_cards} "
+    if crisis_active:
+        _notify_held("Kriz dondurması aktif — beğeni/yanıt yapılmadı.", held)
+    elif held:
+        _notify_held(f"Günlük beğeni sınırı ({LIKE_PER_DAY}) doldu.", held)
+
+    _log(f"auto-like={auto_like} auto-reply={auto_reply} card-likes={card_likes} "
+         f"held={len(held)} "
          f"(today caps: like {likes_today}/{LIKE_PER_DAY}, reply {replies_today}/{REPLY_PER_DAY})")
+    return {"auto_like": auto_like, "auto_reply": auto_reply,
+            "card_likes": card_likes, "held": len(held),
+            "crisis": crisis_active}
+
+
+def _status_id(url: str | None) -> str | None:
+    if not url or "/status/" not in str(url):
+        return None
+    tail = str(url).rstrip("/").split("/status/")[-1].split("?")[0].split("/")[0]
+    return tail if tail.isdigit() else None
+
+
+def _load_replied() -> dict:
+    try:
+        d = json.loads(REPLIED_STATE.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _mark_replied(tweet_id: str) -> None:
+    d = _load_replied()
+    d[str(tweet_id)] = int(time.time())
+    REPLIED_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = REPLIED_STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, indent=0))
+    os.replace(tmp, REPLIED_STATE)
+
+
+def _already_replied(tweet_id: str) -> bool:
+    """Persistent across runs and days: did ANY path already queue or send a
+    reply to this tweet? Checks our own state file plus every reply in
+    queue/, posted/, failed/ and queue-archive*/ (pain_hunter,
+    conversation_keeper, older runs). Without it a tweet whose reply was
+    posted and dequeued got a second, different AI draft the next day."""
+    tid = str(tweet_id)
+    if tid in _load_replied():
+        return True
+    for d in [QUEUE_DIR, DATA / "posted", DATA / "failed", *sorted(DATA.glob("queue-archive*"))]:
+        if not d.is_dir():
+            continue
+        for f in d.glob("*.json"):
+            if tid not in f.name and tid not in f.read_text(errors="ignore"):
+                continue
+            try:
+                it = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if it.get("kind") == "reply" and _status_id(it.get("to") or it.get("to_url")) == tid:
+                return True
+    return False
 
 
 def _audit_write(audit_file: Path, kind: str, c: dict, score: int, status: str) -> None:
@@ -490,7 +514,7 @@ def _ai_draft_for(c: dict) -> str | None:
     """Generate AI reply draft via reply_drafter subprocess.
 
     Returns the draft text or None on failure (skips auto-reply, falls through
-    to manual card flow).
+    to the mid-score like path).
     """
     try:
         import subprocess
@@ -569,36 +593,6 @@ def _auto_queue_reply(c: dict, draft_text: str) -> Path:
     path = QUEUE_DIR / f"{qid}.json"
     path.write_text(json.dumps(item, ensure_ascii=False, indent=2))
     return path
-
-
-def _notify_auto(emoji: str, action_tr: str, c: dict, draft: str | None) -> None:
-    """Inform Telegram an auto-action was queued (no buttons — just info)."""
-    try:
-        bridge_dir = Path(__file__).parent
-        sys.path.insert(0, str(bridge_dir))
-        import telegram_bridge as tb  # type: ignore
-        env = tb._load_env()
-        if not env.get("TELEGRAM_CHAT_ID"):
-            return
-        lines = [
-            f"{emoji} OTOMATİK — {action_tr}",
-            f"@{c.get('handle','?')}  ·  skor {c.get('score')}  ·  {c.get('hours_old','?')}h önce",
-            f"🔗 {c.get('url','')}",
-            "",
-            f"📥 Hedef tweet:",
-            c.get("text", "")[:240],
-        ]
-        if draft:
-            lines += ["", "✨ Bizim cevap:", draft]
-        lines.append("")
-        lines.append("ℹ️ Otomatik atıldı, onayın gerekmedi. Yanlışsa Telegram'da söyle, geri çekerim.")
-        tb._api(env, "sendMessage", {
-            "chat_id": int(env["TELEGRAM_CHAT_ID"]),
-            "text": "\n".join(lines),
-            "disable_web_page_preview": True,
-        })
-    except Exception as e:
-        _log(f"notify_auto fail: {e}")
 
 
 def main() -> None:

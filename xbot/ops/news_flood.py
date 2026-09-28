@@ -13,7 +13,8 @@ Shape (enforced, not suggested):
 
 Source: discoveries/<date>.json produced by discovery_scan.py.
 Output:  drafts/flood-<date>-<slug>.json (kind=thread) — never auto-posted;
-         Nadir approves it like any other thread.
+         Nadir approves it like any other thread. An ntfy "Onay bekliyor"
+         notice (tap = the source) tells him one is waiting.
 
 Usage:
   python news_flood.py                 # pick today's best item, draft a flood
@@ -33,6 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _novelty  # noqa: E402
 from _paths import bot_home  # noqa: E402
+import _notify  # noqa: E402
 from _relevance import off_limits, relevance  # noqa: E402
 from reply_drafter import generate, _voice_lint  # noqa: E402
 
@@ -244,6 +246,15 @@ def main() -> None:
             "texts": result["tweets"],
         }, ensure_ascii=False, indent=2))
         _log(f"wrote {out.name} ({len(result['tweets'])} tweets, {result.get('model')})")
+        try:
+            _notify.notify_waiting(
+                f"thread ({len(result['tweets'])} tweet)",
+                reason=f"Haber: {cand['title'][:120]}\nTaslak: drafts/{out.name}\n\n"
+                       + "\n\n".join(result["tweets"])[:1800],
+                context_url=cand.get("url") or None, compose=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            _log(f"ntfy notice failed: {e!r}")
         print(json.dumps({"draft": str(out), "tweets": result["tweets"]},
                          ensure_ascii=False, indent=2))
         return

@@ -7,8 +7,21 @@
 <body>
   <p id="frame-status">frame ready</p>
   <script>
+    // The e2e tests wait on this instead of guessing: window.__registered is
+    // 'pending' until the browser has answered every registerTool() below,
+    // then 'ok' (or 'error: <name>').
+    function track(p) {
+      var regs = (window.__regs = window.__regs || []);
+      regs.push(p);
+      window.__registered = 'pending';
+      var n = regs.length;
+      Promise.all(regs.slice()).then(function() {
+        if (regs.length === n) window.__registered = 'ok';
+      }, function(e) { window.__registered = 'error: ' + e.name; });
+    }
+
     if (window.isSecureContext && document.modelContext) {
-      document.modelContext.registerTool({
+      track(document.modelContext.registerTool({
         name: 'frame_echo',
         description: 'Echo a text back from the same-origin iframe',
         inputSchema: {
@@ -20,7 +33,7 @@
           document.getElementById('frame-status').textContent = 'echoed: ' + input.text;
           return { echo: input.text, from: new URLSearchParams(location.search).get('who') || 'frame' };
         }
-      });
+      }));
     }
   </script>
 </body>
