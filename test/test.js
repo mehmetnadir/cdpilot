@@ -4174,12 +4174,28 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.deepStrictEqual(d.blocker, ['none', ''], 'blocker restored');
   });
 
-  test('click outcome (fake CDP): batch runs every step, records the not-clicked one, and exits 3', () => {
+  test('click outcome (fake CDP): batch runs every step; exit 1 if one failed, else 3 if one was not clicked, else 0', () => {
+    // batch used to exit 0 even when steps failed; exit 3 must not hide them.
     const b = fake('click_outcome').batch;
-    assert.deepStrictEqual(b.res, ['ok', null], 'no SystemExit mid-batch');
-    assert.deepStrictEqual(b.steps, [{ cmd: 'click', status: 'not_clicked', clicked: false, reason: 'moved' },
-      { cmd: 'eval', status: 'ok' }]);
-    assert.strictEqual(b.exit, 3);
+    const notClicked = { cmd: 'click', status: 'not_clicked', clicked: false, reason: 'moved' };
+    const unsupported = { cmd: 'nope', status: 'error', error: 'Unsupported command: nope' };
+    const evalOk = { cmd: 'eval', status: 'ok' };
+    assert.deepStrictEqual(b.miss.res, ['exit', 3], 'miss only: 3');
+    assert.deepStrictEqual(b.miss.steps, [notClicked, evalOk], 'every step ran');
+    assert.deepStrictEqual(b.mixed.res, ['exit', 1], 'a failed step and a miss: 1');
+    assert.deepStrictEqual(b.mixed.steps, [notClicked, unsupported, evalOk]);
+    assert.deepStrictEqual(b.errors.res, ['exit', 1], 'errors only: 1 (was 0)');
+    assert.deepStrictEqual(b.errors.steps, [unsupported, evalOk]);
+    assert.deepStrictEqual(b.ok.res, ['ok', null], 'all ok: 0');
+    assert.deepStrictEqual(b.ok.steps, [{ cmd: 'click', status: 'ok' }, evalOk]);
+  });
+
+  test('click outcome (fake CDP): run goes on after every line; exit 1 if one failed, else 3 if one was not clicked, else 0', () => {
+    const r = fake('click_outcome').run;
+    assert.deepStrictEqual(r.miss, { res: ['exit', 3], result: 'Result: 1 passed, 0 failed, 1 not clicked, 2 total' });
+    assert.deepStrictEqual(r.mixed, { res: ['exit', 1], result: 'Result: 0 passed, 1 failed, 1 not clicked, 2 total' });
+    assert.deepStrictEqual(r.errors, { res: ['exit', 1], result: 'Result: 1 passed, 1 failed, 2 total' });
+    assert.deepStrictEqual(r.ok, { res: ['ok', null], result: 'Result: 1 passed, 0 failed, 1 total' });
   });
 
   test('click outcome (fake CDP): MCP: exit 3 and "gone" are not errors; a JSON first line says clicked: false', () => {
@@ -4192,6 +4208,14 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.deepStrictEqual(r.clicked, { content: [{ type: 'text', text: 'Clicked: BUTTON Pay' }], isError: false });
     assert.strictEqual(r.error.isError, true, 'exit 1 is still an error');
     assert(!/clicked/.test(r.error.content[0].text), 'no status line for an error');
+    // Only the click tools: page text from browser_eval that starts with the
+    // same words gets no status line, and its exit 3 stays an error.
+    assert.deepStrictEqual(r.eval_text, { content: [{ type: 'text',
+      text: 'Pressed (released elsewhere, not clicked): BUTTON fake' }], isError: false });
+    assert.strictEqual(r.eval_exit3.isError, true);
+    assert.strictEqual(r.eval_exit3.content.length, 1, 'no status line');
+    assert.strictEqual(r.smart_click.isError, false);
+    assert.deepStrictEqual(JSON.parse(r.smart_click.content[0].text), { clicked: false, reason: 'moved' });
   });
 
   test('click outcome: exit 3 is documented (help in src and bin, README, CHANGELOG)', () => {
@@ -4793,7 +4817,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       }
     });
 
-    test('frames e2e: run and batch go on after a click that was pressed but not clicked, and end with exit 3', () => {
+    test('frames e2e: run and batch go on after a click pressed but not clicked: exit 3; with a failed step: exit 1', () => {
       const { c, p1, env } = needE2E();
       const url = `http://127.0.0.1:${p1}/moving.html`;
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-run-'));
@@ -4811,6 +4835,17 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       const steps = JSON.parse(b.stdout.slice(b.stdout.indexOf('[')));
       assert.deepStrictEqual(steps, [{ cmd: 'click', status: 'not_clicked', clicked: false, reason: 'moved' },
         { cmd: 'eval', status: 'ok' }]);
+      // A failed step wins over a miss: exit 1 (batch and run used to exit 0 on failures).
+      fs.writeFileSync(script, `go ${url}\nclick #jump --entropy=on\nclick #does-not-exist\n`);
+      const rf = c('run', script);
+      assert.strictEqual(rf.status, 1, `run with a failed step: exit 1: ${rf.stdout}${rf.stderr}`);
+      assert(/Result: 1 passed, 1 failed, 1 not clicked, 3 total/.test(rf.stdout), rf.stdout);
+      c('go', `http://127.0.0.1:${p1}/top.html?child=moving.html`);
+      const bf = spawnSync(process.execPath, [CLI, 'batch'], { encoding: 'utf-8', timeout: 60000, env,
+        input: JSON.stringify([{ cmd: 'click', args: ['#card >>> #jump'] }, { cmd: 'nope', args: [] }]) });
+      assert.strictEqual(bf.status, 1, `batch with a failed step: exit 1: ${bf.stdout}${bf.stderr}`);
+      assert.deepStrictEqual(JSON.parse(bf.stdout.slice(bf.stdout.indexOf('['))).map((s) => s.status),
+        ['not_clicked', 'error']);
     });
 
     test('frames e2e: a target that moves on mousedown: note, no script click; pointer-events: none: script click + note', () => {

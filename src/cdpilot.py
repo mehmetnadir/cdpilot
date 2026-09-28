@@ -59,8 +59,8 @@ pip install cryptography):
                        (tabs, popups, iframes, workers), until `stop`
   cdpilot bot-auth status      Agent URL, keyid, signer on/off
 
-Exit codes: 0 ok, 1 error, 124 --timeout; exit 3 from click / smart-click
-  (and batch / run containing one):
+Exit codes: 0 ok, 1 error (batch / run: a step failed), 124 --timeout;
+  exit 3 from click / smart-click (batch / run: one, and no failed step):
   pressed, release missed the target, not clicked (a real mouse click whose
   target moved or got covered under the press; see the stderr note). A target
   the page replaced or navigated away from on mousedown prints
@@ -4563,6 +4563,7 @@ PRESSED_PREFIX = {
     "gone": "Pressed (the page replaced or left it, not clicked): ",
 }
 _CLICK_MISSES = []  # reasons of this process's real clicks that were not clicked
+MCP_CLICK_TOOLS = ("browser_click", "browser_smart_click")  # the MCP tools that report it
 
 
 def _click_missed_exit():
@@ -7231,8 +7232,12 @@ async def cmd_batch():
             results.append({"cmd": cmd_name, "status": "error", "error": str(exc)})
 
     print(json.dumps(results, indent=2, ensure_ascii=False))
-    # A step pressed but not clicked ("not_clicked") ends the batch with exit 3
-    # (main: _click_missed_exit), after every step ran.
+    # After every step ran: a failed step ends the batch with exit 1 (it used
+    # to exit 0), else a step pressed but not clicked with exit 3.
+    if any(r["status"] == "error" for r in results):
+        sys.exit(1)
+    if any(r["status"] == "not_clicked" for r in results):
+        sys.exit(CLICK_MISSED_EXIT_CODE)
 
 
 async def cmd_network(url=None):
@@ -12805,6 +12810,8 @@ async def cmd_run_script(script_path):
     print(f"Script: {script_path}")
     extra = f", {not_clicked} not clicked" if not_clicked else ""
     print(f"Result: {passed} passed, {failed} failed{extra}, {passed + failed + not_clicked} total")
+    if failed:  # a failed step is an error (it used to exit 0)
+        sys.exit(1)
     if not_clicked:
         sys.exit(CLICK_MISSED_EXIT_CODE)
 
@@ -15658,8 +15665,11 @@ class MCPServer:
             content = []
             # A click pressed but not clicked is no error (a retry could
             # click twice): a machine-readable first line tells the agent.
-            status = _pressed_status(output)
-            if result.returncode == CLICK_MISSED_EXIT_CODE and status is None:
+            # Only the click tools: other tools print page text, which could
+            # start with the same words, and exit 3 means other things there.
+            click_tool = tool_name in MCP_CLICK_TOOLS
+            status = _pressed_status(output) if click_tool else None
+            if click_tool and result.returncode == CLICK_MISSED_EXIT_CODE and status is None:
                 status = {"clicked": False, "reason": "moved"}
             if status is not None:
                 content.append({"type": "text", "text": json.dumps(status)})
@@ -15669,8 +15679,9 @@ class MCPServer:
                 content.append({"type": "text", "text": f"stderr: {errors}"})
             if not content:
                 content.append({"type": "text", "text": "Command executed successfully"})
+            ok_codes = (0, CLICK_MISSED_EXIT_CODE) if click_tool else (0,)
             return {"jsonrpc": "2.0", "id": req_id, "result": {
-                "content": content, "isError": result.returncode not in (0, CLICK_MISSED_EXIT_CODE)}}
+                "content": content, "isError": result.returncode not in ok_codes}}
         except subprocess.TimeoutExpired:
             _slog_record_external(cli_args, TIMEOUT_EXIT_CODE, started, int((time.monotonic() - t0) * 1000),
                                   "MCP tool call timed out (30s); the command was killed", via)

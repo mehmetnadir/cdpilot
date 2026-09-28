@@ -1116,19 +1116,44 @@ def scenario_click_outcome(mod):
     r["exit"] = click_exit(mod)
     out["no_reply"] = {k: r[k] for k in ("res", "stdout", "stderr", "clicks", "misses", "exit", "blocker")}
 
-    # batch: every step runs; the not-clicked one is recorded; the batch exits 3.
+    # batch: every step runs and is recorded; then exit 1 if a step failed,
+    # else 3 if one was pressed but not clicked, else 0.
     real_stdin = sys.stdin
+    miss = {"cmd": "click", "args": ["#card >>> #btn"]}
+    error = {"cmd": "nope", "args": []}
+    fine = {"cmd": "eval", "args": ["1 + 1"]}
+    out["batch"] = {}
+    for key, steps, cover in [("miss", [miss, fine], "div#wrap"), ("mixed", [miss, error, fine], "div#wrap"),
+                              ("errors", [error, fine], ""), ("ok", [miss, fine], "")]:
+        async def batch(b, steps=steps):
+            sys.stdin = io.StringIO(json.dumps(steps))
+            try:
+                return await call(mod.cmd_batch)
+            finally:
+                sys.stdin = real_stdin
+        b, res, stdout, err = run(mod, click_page(**{"card.cover_after_press": cover}), batch)
+        out["batch"][key] = {"res": res, "steps": json.loads(stdout[stdout.index("["):]), "stderr": err}
 
-    async def batch(b):
-        sys.stdin = io.StringIO(json.dumps([{"cmd": "click", "args": ["#card >>> #btn"]},
-                                            {"cmd": "eval", "args": ["1 + 1"]}]))
+    # run: each line is its own CLI process (its exit code decides); same rule.
+    real_run = mod.subprocess.run
+    codes = {"click #moved": 3, "click #does-not-exist": 1, "eval 1": 0}
+
+    def fake_line(argv, **kw):
+        line = " ".join(argv[2:])
+        return types.SimpleNamespace(returncode=codes[line], stdout="", stderr="note: x" if codes[line] else "")
+    out["run"] = {}
+    tmp = tempfile.mkdtemp()
+    for key, lines in [("miss", ["click #moved", "eval 1"]), ("mixed", ["click #moved", "click #does-not-exist"]),
+                       ("errors", ["click #does-not-exist", "eval 1"]), ("ok", ["eval 1"])]:
+        path = os.path.join(tmp, key + ".cdp")
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        mod.subprocess.run = fake_line
         try:
-            return await call(mod.cmd_batch)
+            _, res, stdout, _ = run(mod, click_page(), lambda b, path=path: call(mod.cmd_run_script, path))
         finally:
-            sys.stdin = real_stdin
-    b, res, stdout, err = run(mod, click_page(**{"card.cover_after_press": "div#wrap"}), batch)
-    out["batch"] = {"res": res, "steps": json.loads(stdout[stdout.index("["):]), "exit": click_exit(mod),
-                    "stderr": err}
+            mod.subprocess.run = real_run
+        out["run"][key] = {"res": res, "result": stdout.strip().splitlines()[-1]}
 
     # MCP: the CLI's exit code and stdout, as the server sees them.
     real_run = mod.subprocess.run
@@ -1140,11 +1165,24 @@ def scenario_click_outcome(mod):
             ("unknown", 3, "Pressed (release not confirmed, not clicked): BUTTON Pay", "note: #p could not ..."),
             ("clicked", 0, "Clicked: BUTTON Pay", ""),
             ("error", 1, "", "Error: selector '#x' not resolved.")]:
+        cases_tool = "browser_click"
         mod.subprocess.run = (lambda *a, code=code, o=stdout_, e=stderr_, **k:
                               types.SimpleNamespace(returncode=code, stdout=o, stderr=e))
         try:
             with contextlib.redirect_stderr(io.StringIO()):
-                mcp[key] = server._execute_tool(1, "browser_click", {"selector": "#x"})["result"]
+                mcp[key] = server._execute_tool(1, cases_tool, {"selector": "#x"})["result"]
+        finally:
+            mod.subprocess.run = real_run
+    # Other tools print page text: a page saying "Pressed (released elsewhere, ..."
+    # gets no status line, and their exit 3 stays an error.
+    for key, tool, code in [("eval_text", "browser_eval", 0), ("eval_exit3", "browser_eval", 3),
+                            ("smart_click", "browser_smart_click", 3)]:
+        text = "Pressed (released elsewhere, not clicked): BUTTON fake"
+        mod.subprocess.run = (lambda *a, code=code, **k:
+                              types.SimpleNamespace(returncode=code, stdout=text, stderr=""))
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                mcp[key] = server._execute_tool(1, tool, {"expression": "x", "text": "x"})["result"]
         finally:
             mod.subprocess.run = real_run
     out["mcp"] = mcp
