@@ -3549,7 +3549,7 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
       fakeTrace = path.join(home, 'cdp-trace.txt');
       const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
         CDP_PORT: '19224', CDPILOT_LOG: '0', CDPILOT_CDP_TRACE: fakeTrace };
-      for (const k of ['CDPILOT_WS_POOL', 'CDPILOT_TARGET', 'CDPILOT_TIMEOUT']) delete env[k];
+      for (const k of ['CDPILOT_WS_POOL', 'CDPILOT_TARGET', 'CDPILOT_TIMEOUT', 'CDPILOT_PRESS_MS']) delete env[k];
       const out = execFileSync(PYB, [path.join(__dirname, 'frames_fake_cdp.py'), PY_PATH], {
         encoding: 'utf-8', timeout: 60000, env,
       });
@@ -4076,6 +4076,125 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.deepStrictEqual(r.open_after, []);
   });
 
+  // Real clicks hold the button like a person (CDPILOT_PRESS_MS, default
+  // 40-120 ms): main sent mousePressed and mouseReleased 0.1-6 ms apart.
+  // The events' own timestamps (what the page's event.timeStamp shows) are
+  // exactly the drawn hold apart. On the wire, the fake stamps each event as
+  // it arrives: the hold starts at the press's reply, so the release is never
+  // early; a busy machine can wake it late, hence the slack above the maximum.
+  const HOLD_SLACK_MS = 60;
+  const heldOk = (press, what) => {
+    assert(press.gaps.length > 0, `${what}: a press and a release`);
+    assert.strictEqual(press.stamps.length, press.gaps.length, `${what}: every event carries a timestamp`);
+    for (const g of press.stamps) {
+      assert(g >= 40 && g <= 120, `${what}: timestamps ${g.toFixed(2)} ms apart, want 40-120`);
+    }
+    for (const g of press.gaps) {
+      assert(g >= 40 && g <= 120 + HOLD_SLACK_MS, `${what}: held ${g.toFixed(2)} ms on the wire, want 40-120`);
+    }
+  };
+
+  test('press hold (fake CDP): real clicks hold the button 40-120 ms (frames, OOPIF, --entropy=on, rightclick, bot clicks)', () => {
+    const r = fake('press_hold');
+    for (const key of ['frame', 'oopif', 'page_entropy', 'frame_entropy', 'rightclick', 'dblclick', 'dblclick_page',
+      'humanize_click', 'click_held']) {
+      const k = r[`default_${key}`];
+      if (k.res) assert.deepStrictEqual(k.res, ['ok', null], `${key}: ${k.stderr}`);
+      assert.strictEqual(k.stderr, '', `${key}: no note`);
+      heldOk(k.press, key);
+    }
+    assert.deepStrictEqual(r.default_rightclick.press.buttons, ['right']);
+    const [lo, median, hi] = r.draws.hold;  // 2000 draws of the hold itself
+    assert(lo >= 40 && hi <= 120, `draws inside 40-120: ${lo}..${hi}`);
+    assert(median > 55 && median < 90, `log-normal around the geometric mean (~69 ms): ${median}`);
+    assert(hi - lo > 60, `spread over the range: ${lo}..${hi}`);
+  });
+
+  test('press hold (fake CDP): the release re-hit-test and its script-click fallback still work after the hold', () => {
+    const k = fake('press_hold').default_moved;
+    heldOk(k.press, 'moved');
+    assert.deepStrictEqual(k.clicks, [['card', 'script']], 'the target, by script');
+    assert.strictEqual(k.stderr, 'note: iframe#card >>> #btn was no longer under the mouse when the button was released'
+      + ' (div#wrap was); used a script click\n');
+  });
+
+  test('press hold (fake CDP): dblclick is two held clicks, clickCount 1 then 2, 60-140 ms apart', () => {
+    const r = fake('press_hold');
+    for (const key of ['default_dblclick', 'default_dblclick_page']) {
+      const p = r[key].press;
+      assert.deepStrictEqual(p.counts, [1, 2], `${key}: clickCount 1, then 2`);
+      assert.strictEqual(p.gaps.length, 2, `${key}: two press/release pairs`);
+      heldOk(p, key);
+      assert.strictEqual(p.between.length, 1, key);
+      assert(p.between[0] >= 60 && p.between[0] <= 140 + HOLD_SLACK_MS,
+        `${key}: pause ${p.between[0]} ms, want 60-140`);
+    }
+    const [glo, ghi] = r.draws.gap;
+    assert(glo >= 60 && ghi <= 140, `gap draws inside 60-140: ${glo}..${ghi}`);
+  });
+
+  test("press hold (fake CDP): cdpilot's input blocker is transparent around the whole held press, and only then", () => {
+    const r = fake('press_hold');
+    for (const key of ['frame', 'oopif', 'page_entropy', 'frame_entropy', 'moved', 'dblclick', 'dblclick_page',
+      'rightclick']) {
+      const k = r[`default_${key}`];
+      assert.deepStrictEqual(k.blocker, ['none', ''], `${key}: opened once, restored once`);
+      assert.strictEqual(k.press.blocker, true, `${key}: press and release inside the open window`);
+    }
+  });
+
+  test('press hold (fake CDP): CDPILOT_PRESS_MS=0-0 restores the instant click (dblclick pause too)', () => {
+    const r = fake('press_hold');
+    const gaps = [];
+    for (const key of ['frame', 'oopif', 'page_entropy', 'frame_entropy', 'moved', 'rightclick', 'dblclick',
+      'dblclick_page', 'humanize_click', 'click_held']) {
+      const k = r[`instant_${key}`];
+      if (k.res) assert.deepStrictEqual(k.res, ['ok', null], key);
+      gaps.push(...k.press.gaps);
+    }
+    gaps.sort((a, b) => a - b);
+    assert(gaps[Math.floor(gaps.length / 2)] < 15, `median gap under 15 ms: ${gaps}`);
+    assert(gaps[0] < 15, `min gap under 15 ms: ${gaps}`);
+    for (const key of ['frame', 'dblclick', 'rightclick']) {
+      for (const g of r[`instant_${key}`].press.stamps) assert(g === 0, `${key}: timestamps equal: ${g}`);
+    }
+    assert.deepStrictEqual(r.instant_dblclick.press.counts, [1, 2]);
+    assert(r.instant_dblclick.press.between[0] < 15, `no dblclick pause: ${r.instant_dblclick.press.between}`);
+    assert.deepStrictEqual(r.instant_frame.blocker, ['none', '']);
+  });
+
+  test('press hold: CDPILOT_PRESS_MS min-max is validated; a bad value warns once and falls back to 40-120', () => {
+    const p = fake('press_hold').parse;
+    assert.deepStrictEqual(p.None.range, [40, 120]);
+    assert.deepStrictEqual(p['0-0'].range, [0, 0]);
+    assert.strictEqual(p['0-0'].zero_gap, 0, '0-0: no dblclick pause');
+    assert.deepStrictEqual(p[' 30 - 60 '].range, [30, 60]);
+    assert.deepStrictEqual(p['10.5-20'].range, [10.5, 20]);
+    assert.deepStrictEqual(p['0-2000'].range, [0, 2000]);
+    for (const good of ['None', '0-0', ' 30 - 60 ', '10.5-20', '0-2000']) assert.strictEqual(p[good].stderr, '', good);
+    for (const bad of ['abc', '50', '120-40', '5-3000', '-5-10']) {
+      assert.deepStrictEqual(p[bad].range, [40, 120], `${bad}: the default`);
+      assert.deepStrictEqual(p[bad].again, [40, 120], bad);
+      assert.strictEqual(p[bad].stderr, `cdpilot: warning: ignoring CDPILOT_PRESS_MS='${bad}' (min-max in ms,`
+        + ' 0 <= min <= max <= 2000); using 40-120\n', `${bad}: one warning`);
+    }
+  });
+
+  test('press hold (fake CDP): --timeout fires mid-hold: the watchdog restores the blocker before exiting', () => {
+    const r = fake('timeout_hold');  // CDPILOT_PRESS_MS=1000-1000, --timeout 0.3 s
+    for (const key of ['click', 'dblclick']) {
+      const k = r[key];
+      assert.strictEqual(k.exits.length, 1, `${key}: the watchdog fired`);
+      const e = k.exits[0];
+      assert.strictEqual(e.code, 124, key);
+      assert(e.mouse.includes('mousePressed') && !e.mouse.includes('mouseReleased'),
+        `${key}: the button was down when --timeout fired: ${e.mouse}`);
+      assert.deepStrictEqual(e.blocker, ['none', ''], `${key}: made opaque again by the watchdog`);
+      assert.deepStrictEqual(e.open, [], key);
+      assert.strictEqual(k.fd2, `cdpilot: timed out after 0.3s (${key})\n`);
+    }
+  });
+
   test('input blocker: a blocker left transparent is made opaque again by the next command', () => {
     // INPUT_BLOCKER_ON runs at the start of every command (visual feedback on).
     const js = fake('timeout_restore').blocker_on_js;
@@ -4373,6 +4492,34 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
         assert.strictEqual(count(log, /deep-click:script/g), 0, log);
         assert.strictEqual(pageLog().trim(), 'top-click:trusted;', 'frame clicks stayed in the frames');
       }
+    });
+
+    test('frames e2e: real clicks hold the button 40-120 ms (mousedown to mouseup in the page); dblclick is 1 then 2', () => {
+      const { c, p1 } = needE2E();
+      c('go', `http://127.0.0.1:${p1}/top.html`);
+      ok(c('eval', "document.body.dataset.presses = ''; ['mousedown', 'mouseup', 'dblclick', 'contextmenu']"
+        + ".forEach(function (t) { document.addEventListener(t, function (e) { document.body.dataset.presses += t"
+        + " + ':' + e.button + ':' + e.detail + ':' + e.timeStamp.toFixed(2) + ';'; }, true); }); 'listening'"),
+      /listening/, 'listeners');
+      ok(c('click', '#top-btn', '--entropy=on'), /Clicked: BUTTON Top button/, 'entropy click');
+      ok(c('dblclick', '#top-btn'), /Double-clicked/, 'dblclick');
+      ok(c('rightclick', '#top-btn'), /Right-clicked/, 'rightclick');
+      const log = c('eval', 'document.body.dataset.presses').stdout;
+      const ev = [...log.matchAll(/(mousedown|mouseup|dblclick|contextmenu):(\d):(\d):([\d.]+);/g)]
+        .map((m) => ({ t: m[1], button: +m[2], detail: +m[3], ts: +m[4] }));
+      const downs = ev.filter((e) => e.t === 'mousedown');
+      const ups = ev.filter((e) => e.t === 'mouseup');
+      assert.deepStrictEqual(downs.map((e) => [e.button, e.detail]), [[0, 1], [0, 1], [0, 2], [2, 1]], log);
+      assert.deepStrictEqual(ups.map((e) => [e.button, e.detail]), [[0, 1], [0, 1], [0, 2], [2, 1]], log);
+      downs.forEach((d, i) => {
+        const held = ups[i].ts - d.ts;
+        // The events carry their own timestamps; timeStamp is coarsened (0.1 ms).
+        assert(held >= 39.8 && held <= 120.2, `press ${i}: held ${held.toFixed(1)} ms, want 40-120`);
+      });
+      const pause = downs[2].ts - ups[1].ts;
+      assert(pause >= 59.8 && pause <= 140 + HOLD_SLACK_MS, `dblclick pause ${pause.toFixed(1)} ms, want 60-140`);
+      assert.strictEqual(ev.filter((e) => e.t === 'dblclick').length, 1, `one dblclick event: ${log}`);
+      assert.strictEqual(ev.filter((e) => e.t === 'contextmenu').length, 1, `one contextmenu event: ${log}`);
     });
 
     // Each page on its own origin, and with its frame cross-origin (out of process).

@@ -37,6 +37,8 @@ Environment:
                        and MCP: default 15; explicit `launch`: off unless set or
                        `launch --idle-close <min>`; 0 = never)
   CDPILOT_LOG=0        Do not write the session log
+  CDPILOT_PRESS_MS     How long real mouse clicks hold the button: min-max in
+                       ms (default: 40-120; 0-0 = instant)
   CDPILOT_LOG_DAYS     Days of session log to keep (default: 14; 0 = forever)
   CDPILOT_WEBMCP=1|0   Overrides this project's WebMCP mode (set by
                        `launch --webmcp` / `launch --no-webmcp`)
@@ -3279,6 +3281,109 @@ def _hit_failure(route, results, base, n, released=False):
     return None
 
 
+# ─── Press duration of real mouse clicks ───
+# A person holds a mouse button down for roughly 50-150 ms; cdpilot's real
+# clicks sent mousePressed and mouseReleased 0.1-6 ms apart, a plain bot
+# signal. Every real click now holds the button PRESS_MS_DEFAULT ms (a
+# log-normal draw kept inside the range), from the press's reply (mousedown
+# handled) to sending the release; the events' own timestamps are exactly
+# the draw apart. dblclick waits DBLCLICK_GAP_MS between its
+# two clicks. CDPILOT_PRESS_MS=min-max overrides the range (ms, 0 <= min <= max
+# <= PRESS_MS_MAX); `0-0` is the old instant click (dblclick gap included).
+# The el.click() paths (plain page click, script-click fallbacks) press
+# nothing and are unchanged.
+PRESS_MS_ENV = "CDPILOT_PRESS_MS"
+PRESS_MS_DEFAULT = (40.0, 120.0)
+PRESS_MS_MAX = 2000.0
+DBLCLICK_GAP_MS = (60.0, 140.0)
+_PRESS_MS_WARNED = set()  # bad CDPILOT_PRESS_MS values already warned about
+
+
+def _press_ms_range(env=None):
+    """The (min, max) press duration in ms: CDPILOT_PRESS_MS or the default.
+
+    A bad value (not `min-max`, negative, min > max, max over PRESS_MS_MAX)
+    gets one stderr warning per process and the default.
+    """
+    env = os.environ if env is None else env
+    raw = (env.get(PRESS_MS_ENV) or "").strip()
+    if not raw:
+        return PRESS_MS_DEFAULT
+    m = _re.fullmatch(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)", raw)
+    if m:
+        lo, hi = float(m.group(1)), float(m.group(2))
+        if lo <= hi <= PRESS_MS_MAX:
+            return lo, hi
+    if raw not in _PRESS_MS_WARNED:
+        _PRESS_MS_WARNED.add(raw)
+        print(f"cdpilot: warning: ignoring {PRESS_MS_ENV}={raw!r} (min-max in ms,"
+              f" 0 <= min <= max <= {PRESS_MS_MAX:g}); using"
+              f" {PRESS_MS_DEFAULT[0]:g}-{PRESS_MS_DEFAULT[1]:g}", file=sys.stderr)
+    return PRESS_MS_DEFAULT
+
+
+def _human_ms(lo, hi, rnd):
+    """A duration in [lo, hi] ms: log-normal around the geometric mean, with
+    [lo, hi] at two standard deviations; draws outside are drawn again."""
+    import math
+    if hi <= 0:
+        return 0.0
+    if lo <= 0 or lo == hi:
+        return rnd.uniform(lo, hi)
+    mu, sigma = math.log(lo * hi) / 2, math.log(hi / lo) / 4
+    for _ in range(20):
+        v = rnd.lognormvariate(mu, sigma)
+        if lo <= v <= hi:
+            return v
+    return rnd.uniform(lo, hi)
+
+
+def _press_hold_s(rnd=None):
+    """How long the next real click holds the button, in seconds."""
+    import random as _r
+    lo, hi = _press_ms_range()
+    return _human_ms(lo, hi, rnd or _r.Random()) / 1000.0
+
+
+def _dblclick_gap_s(rnd=None):
+    """Seconds between a double click's release and its second press (0 when
+    CDPILOT_PRESS_MS asks for instant clicks)."""
+    import random as _r
+    if _press_ms_range()[1] <= 0:
+        return 0.0
+    return _human_ms(*DBLCLICK_GAP_MS, rnd or _r.Random()) / 1000.0
+
+
+async def _sleep_until(deadline):
+    """Sleep until time.perf_counter() reaches `deadline`, without overshooting
+    much: asyncio.sleep may wake ~16 ms late (Windows timers), so the last
+    stretch yields to the loop in a tight loop."""
+    left = deadline - time.perf_counter()
+    if left > 0.02:
+        await asyncio.sleep(left - 0.02)
+    while time.perf_counter() < deadline:
+        await asyncio.sleep(0)
+
+
+async def _mouse_click_held(ws_url, x, y, button="left", click_count=1, rnd=None, cid=1):
+    """One real click at (x, y): mousePressed, hold (_press_hold_s), mouseReleased.
+
+    The hold starts at the press's reply (the page has handled mousedown), so
+    the button is never down for less than the drawn time; the events carry
+    their own timestamps (press now, release `hold` later), so the page's
+    mousedown/mouseup timeStamps are the drawn hold even when a busy machine
+    wakes the release late. Sent with cdp_send, so an active frame route
+    moves the point into its frame as before.
+    """
+    ev = {"x": x, "y": y, "button": button, "clickCount": click_count}
+    hold, down_at = _press_hold_s(rnd), time.time()
+    await cdp_send(ws_url, [(cid, "Input.dispatchMouseEvent",
+                             dict(ev, type="mousePressed", timestamp=down_at))])
+    await _sleep_until(time.perf_counter() + hold)
+    await cdp_send(ws_url, [(cid + 1, "Input.dispatchMouseEvent",
+                             dict(ev, type="mouseReleased", timestamp=down_at + hold))])
+
+
 async def _pointer_click(route, target_oid, label, humanize=False):
     """Click the element `target_oid` (an object in the route's frame, or in
     the page for a route without hops) with real mouse input, if it is hit.
@@ -3286,8 +3391,9 @@ async def _pointer_click(route, target_oid, label, humanize=False):
     Returns (how, x, y): how is "mouse", or "script" when the hit-test failed
     and el.click() clicked it (one stderr note says why); x, y is the click
     point in page coordinates. humanize: --entropy=on's approach, jitter and
-    pauses. The hit-test runs before the press and again, in one batch with
-    the release, after the page has handled the press: a target that moved
+    pauses. The button is held like a person's press (_press_hold_s). The
+    hit-test runs before the press and again, in one batch with the
+    release, after the page has handled the press: a target that moved
     or got covered meanwhile did not get the click, so after completing the
     release el.click() clicks it.
     """
@@ -3324,14 +3430,20 @@ async def _pointer_click(route, target_oid, label, humanize=False):
             why = _hit_failure(route, await _frame_cdp(route, checks(10)), 10, n)
             if why is None:
                 press = {"x": px, "y": py, "button": "left", "clickCount": 1}
+                hold, down_at = _press_hold_s(rnd), time.time()
                 # The press alone: its reply comes once the page handled mousedown.
                 await _frame_cdp(route, [
                     (20, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": px, "y": py}, None),
-                    (21, "Input.dispatchMouseEvent", dict(press, type="mousePressed"), None)])
+                    (21, "Input.dispatchMouseEvent", dict(press, type="mousePressed",
+                                                          timestamp=down_at), None)])
+                # Held like a person's press; the blocker stays open meanwhile
+                # (in _BLOCKER_OPEN, so --timeout restores it mid-hold too).
+                await _sleep_until(time.perf_counter() + hold)
                 # Same check again, then the release in the same batch (the
                 # button is down: it is released whatever the check says).
                 r = await _frame_cdp(route, checks(30) + [
-                    (29, "Input.dispatchMouseEvent", dict(press, type="mouseReleased"), None)])
+                    (29, "Input.dispatchMouseEvent", dict(press, type="mouseReleased",
+                                                          timestamp=down_at + hold), None)])
                 why = _hit_failure(route, r, 30, n, released=True)
         finally:
             if opened:
@@ -5208,20 +5320,14 @@ _CLICK_LABEL_FN = """function () {
 
 
 async def _humanize_click(ws_url, x, y):
-    """Pre-pause + Bezier move + jitter + mousePressed/Released + post-pause."""
+    """Pre-pause + Bezier move + jitter + held mousePressed/Released + post-pause."""
     import random as _r
     r = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
     await asyncio.sleep(r.uniform(0.05, 0.15))
     jx = x + r.randint(-2, 2)
     jy = y + r.randint(-2, 2)
     await _humanize_mouse_move(ws_url, jx, jy)
-    cmds = [
-        (991, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": jx, "y": jy,
-            "button": "left", "clickCount": 1}),
-        (992, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": jx, "y": jy,
-            "button": "left", "clickCount": 1}),
-    ]
-    await cdp_send(ws_url, cmds)
+    await _mouse_click_held(ws_url, jx, jy, rnd=r, cid=991)
     await asyncio.sleep(r.uniform(0.08, 0.20))
 
 
@@ -11745,14 +11851,8 @@ async def cmd_click_ref(ref_str):
 
     x, y = val["x"], val["y"]
     await _vfx_ripple(ws_url, x, y)
-    await cdp_send(ws_url, [
-        (3, "Input.dispatchMouseEvent", {
-            "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1
-        }),
-        (4, "Input.dispatchMouseEvent", {
-            "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1
-        }),
-    ])
+    async with _blocker_passthrough(ws_url):
+        await _mouse_click_held(ws_url, x, y, cid=3)
     print(f"Clicked @{ref_num} (backendNodeId={backend_node_id}): ({x}, {y})")
 
 
@@ -12179,10 +12279,7 @@ async def _tw_click_sel(ws, selector):
     if _TW_HUMANIZE():
         await _humanize_click(ws, int(x), int(y))
     else:
-        await cdp_send(ws, [
-            (803, 'Input.dispatchMouseEvent', {'type': 'mousePressed', 'x': int(x), 'y': int(y), 'button': 'left', 'clickCount': 1}),
-            (804, 'Input.dispatchMouseEvent', {'type': 'mouseReleased', 'x': int(x), 'y': int(y), 'button': 'left', 'clickCount': 1}),
-        ])
+        await _mouse_click_held(ws, int(x), int(y), cid=803)
     return True
 
 
@@ -12913,14 +13010,11 @@ async def cmd_dblclick(selector):
     ws_url, _ = get_page_ws()
     x, y = await _get_element_center(ws_url, selector)
     await _vfx_ripple(ws_url, x, y)
-    cmds = [
-        (1, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1}),
-        (2, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1}),
-        (3, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2}),
-        (4, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2}),
-    ]
+    # Two held clicks (clickCount 1, then 2) with a person's pause between.
     async with _blocker_passthrough(ws_url):
-        await cdp_send(ws_url, cmds)
+        await _mouse_click_held(ws_url, x, y, click_count=1, cid=1)
+        await _sleep_until(time.perf_counter() + _dblclick_gap_s())
+        await _mouse_click_held(ws_url, x, y, click_count=2, cid=3)
     print(f"Double-clicked: {selector}")
 
 
@@ -12930,12 +13024,8 @@ async def cmd_rightclick(selector):
     ws_url, _ = get_page_ws()
     x, y = await _get_element_center(ws_url, selector)
     await _vfx_ripple(ws_url, x, y)
-    cmds = [
-        (1, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "right", "clickCount": 1}),
-        (2, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "right", "clickCount": 1}),
-    ]
     async with _blocker_passthrough(ws_url):
-        await cdp_send(ws_url, cmds)
+        await _mouse_click_held(ws_url, x, y, button="right", cid=1)
     print(f"Right-clicked: {selector}")
 
 
