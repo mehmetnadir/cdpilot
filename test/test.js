@@ -4719,8 +4719,9 @@ print("RESULT=" + json.dumps([mod._idle_status(${port}), mod._idle_status(${port
     assert(/\| `CDPILOT_IDLE_CLOSE` \| `15` \|/.test(readme), 'README env table needs CDPILOT_IDLE_CLOSE');
     assert(/Idle auto-close/.test(readme), 'README Reliability section needs the idle auto-close note');
     const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    const unreleased = changelog.split(/^## \[/m)[1] || ''; // newest: [Unreleased] or the release
-    assert(unreleased.includes('CDPILOT_IDLE_CLOSE'), 'CHANGELOG [Unreleased] must describe CDPILOT_IDLE_CLOSE');
+    const sections = changelog.split(/^## \[/m);
+    const topTwo = (sections[1] || '') + (sections[2] || '');
+    assert(topTwo.includes('CDPILOT_IDLE_CLOSE'), 'CHANGELOG newest sections must describe CDPILOT_IDLE_CLOSE');
   });
 
   fs.rmSync(home, { recursive: true, force: true });
@@ -5160,6 +5161,400 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert(help.includes('log --md') && help.includes('CDPILOT_LOG'), 'bin help must document log');
     assert(PY_CONTENT.slice(0, 2000).includes('CDPILOT_LOG=0'), 'python __doc__ must document CDPILOT_LOG');
   });
+})();
+
+// ── Connect / Disconnect (human-in-the-loop) ──
+
+(function() {
+  const { spawnSync, spawn, execFileSync } = require('child_process');
+  const os = require('os');
+  const PY_BIN = process.platform === 'win32' ? 'python' : 'python3';
+
+  function freePort() {
+    const r = spawnSync(PY_BIN, ['-c',
+      'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); '
+      + 'print(s.getsockname()[1]); s.close()'], { encoding: 'utf-8', timeout: 10000 });
+    assert.strictEqual(r.status, 0, `freePort failed: ${r.stderr}`);
+    return r.stdout.trim();
+  }
+
+  // ── Unit: _parse_devtools_active_port ──
+
+  test('connect: _parse_devtools_active_port parses valid 2-line content', () => {
+    const r = spawnSync(PY_BIN, ['-c', [
+      'import sys; sys.path.insert(0, "src")',
+      'from cdpilot import _parse_devtools_active_port',
+      'port, ws_path = _parse_devtools_active_port("51234\\n/devtools/browser/abc-def-123\\n")',
+      'assert port == 51234, f"port: {port}"',
+      'assert ws_path == "/devtools/browser/abc-def-123", f"ws_path: {ws_path}"',
+      'print("OK")',
+    ].join('\n')], { encoding: 'utf-8', timeout: 10000, cwd: path.join(__dirname, '..'),
+      env: { ...process.env, CDP_PORT: '19999', CDPILOT_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-test-')) }
+    });
+    assert.strictEqual(r.status, 0, `parse valid: ${r.stderr}`);
+    assert(r.stdout.includes('OK'), r.stdout);
+  });
+
+  test('connect: _parse_devtools_active_port rejects single-line content', () => {
+    const r = spawnSync(PY_BIN, ['-c', [
+      'import sys; sys.path.insert(0, "src")',
+      'from cdpilot import _parse_devtools_active_port',
+      'try:',
+      '    _parse_devtools_active_port("51234\\n")',
+      '    print("ERROR: should have raised")',
+      'except ValueError as e:',
+      '    assert "need 2 lines" in str(e), str(e)',
+      '    print("OK")',
+    ].join('\n')], { encoding: 'utf-8', timeout: 10000, cwd: path.join(__dirname, '..'),
+      env: { ...process.env, CDP_PORT: '19999', CDPILOT_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-test-')) }
+    });
+    assert.strictEqual(r.status, 0, `parse single-line: ${r.stderr}`);
+    assert(r.stdout.includes('OK'), r.stdout);
+  });
+
+  test('connect: _parse_devtools_active_port rejects port out of range', () => {
+    const r = spawnSync(PY_BIN, ['-c', [
+      'import sys; sys.path.insert(0, "src")',
+      'from cdpilot import _parse_devtools_active_port',
+      'try:',
+      '    _parse_devtools_active_port("99999\\n/devtools/browser/x\\n")',
+      '    print("ERROR: should have raised")',
+      'except ValueError as e:',
+      '    assert "out of range" in str(e), str(e)',
+      '    print("OK")',
+    ].join('\n')], { encoding: 'utf-8', timeout: 10000, cwd: path.join(__dirname, '..'),
+      env: { ...process.env, CDP_PORT: '19999', CDPILOT_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-test-')) }
+    });
+    assert.strictEqual(r.status, 0, `parse out-of-range: ${r.stderr}`);
+    assert(r.stdout.includes('OK'), r.stdout);
+  });
+
+  // ── Unit: remote address rejection (exit 2) ──
+
+  test('connect: remote address exits 2', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-connect-test-'));
+    const r = spawnSync(process.execPath, [CLI, 'connect', 'ws://192.168.1.5:9222/devtools/browser/abc'], {
+      encoding: 'utf-8', timeout: 10000,
+      env: { ...process.env, CDPILOT_HOME: home, CDP_PORT: '19999', CDPILOT_LOG: '0' },
+    });
+    assert.strictEqual(r.status, 2, `exit: ${r.status}, stderr: ${r.stderr}`);
+    assert(/only 127\.0\.0\.1/.test(r.stdout + r.stderr), 'should mention localhost');
+  });
+
+  // ── Unit: external registry — stop doesn't kill ──
+
+  test('connect: stop on external registry disconnects without killing', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-connect-test-'));
+    const port = freePort();
+    // Write a fake external registry entry
+    const regDir = home;
+    fs.mkdirSync(regDir, { recursive: true });
+    const registry = {
+      version: 1,
+      projects: {
+        'test-proj': {
+          cwd: process.cwd(), port: parseInt(port), profile_dir: path.join(home, 'profile'),
+          pid: null, created: '2026-01-01T00:00:00', last_used: '2026-01-01T00:00:00',
+          status: 'running', external: true, browser_name: 'TestBrowser',
+        }
+      }
+    };
+    fs.writeFileSync(path.join(home, 'registry.json'), JSON.stringify(registry));
+    const r = spawnSync(process.execPath, [CLI, 'stop'], {
+      encoding: 'utf-8', timeout: 10000,
+      env: { ...process.env, CDPILOT_HOME: home, CDP_PORT: port,
+             CDPILOT_PROFILE: path.join(home, 'profile'),
+             CDPILOT_PROJECT_ID: 'test-proj', CDPILOT_LOG: '0' },
+    });
+    assert.strictEqual(r.status, 0, `stop exit: ${r.status}, stderr: ${r.stderr}`);
+    assert(/Disconnected.*TestBrowser/.test(r.stdout + r.stderr),
+      `should say disconnected: ${r.stdout}`);
+    assert(/your browser keeps running/.test(r.stdout + r.stderr),
+      `should say keeps running: ${r.stdout}`);
+    // Registry should be cleared
+    const reg2 = JSON.parse(fs.readFileSync(path.join(home, 'registry.json'), 'utf-8'));
+    assert(!reg2.projects['test-proj'], 'registry entry should be removed');
+  });
+
+  // ── Unit: autolaunch refuses when external browser is gone ──
+
+  test('connect: autolaunch refuses when external browser is registered but gone', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-connect-test-'));
+    const port = freePort();
+    const registry = {
+      version: 1,
+      projects: {
+        'test-ext': {
+          cwd: process.cwd(), port: parseInt(port), profile_dir: path.join(home, 'profile'),
+          pid: null, created: '2026-01-01T00:00:00', last_used: '2026-01-01T00:00:00',
+          status: 'running', external: true, browser_name: 'GoneChrome',
+        }
+      }
+    };
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, 'registry.json'), JSON.stringify(registry));
+    const r = spawnSync(process.execPath, [CLI, 'content'], {
+      encoding: 'utf-8', timeout: 15000,
+      env: { ...process.env, CDPILOT_HOME: home, CDP_PORT: port,
+             CDPILOT_PROFILE: path.join(home, 'profile'),
+             CDPILOT_PROJECT_ID: 'test-ext', CDPILOT_LOG: '0',
+             CHROME_BIN: '/no/such/browser' },
+    });
+    assert.notStrictEqual(r.status, 0, 'should fail');
+    assert(/your connected browser is gone/.test(r.stdout + r.stderr),
+      `should say browser is gone: ${r.stderr}`);
+  });
+
+  // ── Unit: --auto with fake DevToolsActivePort via CDPILOT_BROWSER_SEARCH_ROOT ──
+
+  test('connect: --auto finds DevToolsActivePort via CDPILOT_BROWSER_SEARCH_ROOT', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-connect-test-'));
+    const searchRoot = path.join(home, 'browsers');
+    const chromeDir = path.join(searchRoot, 'FakeChrome');
+    fs.mkdirSync(chromeDir, { recursive: true });
+    // We need a real CDP port to probe. Start a headless Chrome for this.
+    // Instead, test that the parsing works with a port that doesn't answer — it should fail gracefully.
+    fs.writeFileSync(path.join(chromeDir, 'DevToolsActivePort'), '19998\n/devtools/browser/fake-uuid\n');
+    const r = spawnSync(process.execPath, [CLI, 'connect', '--auto'], {
+      encoding: 'utf-8', timeout: 10000,
+      env: { ...process.env, CDPILOT_HOME: home, CDP_PORT: '19999',
+             CDPILOT_BROWSER_SEARCH_ROOT: searchRoot, CDPILOT_LOG: '0' },
+    });
+    // It finds the file but CDP won't be responding, so it should fail gracefully
+    assert.notStrictEqual(r.status, 0, 'should fail when CDP not responding');
+    assert(/FakeChrome.*port 19998.*not responding/.test(r.stdout + r.stderr)
+           || /CDP not responding/.test(r.stdout + r.stderr),
+      `should mention FakeChrome or not responding: ${r.stderr}`);
+  });
+
+  // ── Unit: connect wired into dispatch, documented ──
+
+  test('connect: wired into dispatch, documented (CHANGELOG, help, python __doc__)', () => {
+    assert(/'connect':\s*lambda:\s*cmd_connect\(\*args\)/.test(PY_CONTENT),
+      "'connect' must be in sync_cmds");
+    assert(/'disconnect':\s*cmd_disconnect/.test(PY_CONTENT),
+      "'disconnect' must be in sync_cmds");
+    const skip = PY_CONTENT.match(/AUTOLAUNCH_SKIP_CMDS = frozenset\(\{([\s\S]*?)\}\)/)[1];
+    assert(/'connect'/.test(skip), "'connect' must never launch the browser");
+    assert(/'disconnect'/.test(skip), "'disconnect' must never launch the browser");
+    const changelog = fs.readFileSync(path.join(__dirname, '..', 'CHANGELOG.md'), 'utf8');
+    const unreleased = changelog.split(/^## \[/m)[1] || '';
+    assert(unreleased && unreleased.includes('cdpilot connect'),
+      'CHANGELOG [Unreleased] must describe `cdpilot connect`');
+    const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+    assert(readme.includes('Use your own browser'), 'README must have connect section');
+    assert(readme.includes('cdpilot connect --auto'), 'README must mention --auto');
+    const help = run('--help');
+    assert(help.includes('connect'), 'help must mention connect');
+    assert(help.includes('disconnect'), 'help must mention disconnect');
+    assert(/browser_connect/.test(PY_CONTENT), 'MCP must have browser_connect tool');
+    assert(/browser_disconnect/.test(PY_CONTENT), 'MCP must have browser_disconnect tool');
+    assert(PY_CONTENT.slice(0, 2500).includes('CDPILOT_BROWSER_SEARCH_ROOT'),
+      'python __doc__ must document CDPILOT_BROWSER_SEARCH_ROOT');
+  });
+
+  // ── E2E: connect to a headless Chrome started by the test itself ──
+
+  if (process.env.CDPILOT_E2E !== '1') {
+    console.log('  - skipped: connect e2e (set CDPILOT_E2E=1)');
+  } else {
+    let e2eConnect = null;
+
+    test('connect e2e: start a headless Chrome and connect to it', () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-connect-e2e-'));
+      const userDataDir = path.join(home, 'chrome-profile');
+      fs.mkdirSync(userDataDir, { recursive: true });
+      const cdpPort = freePort();
+
+      // Find a browser binary (use the same logic as cdpilot setup)
+      const setupOut = spawnSync(process.execPath, [CLI, 'setup'], {
+        encoding: 'utf-8', timeout: 10000,
+        env: { ...process.env, CDPILOT_HOME: home, CDP_PORT: cdpPort },
+      });
+      const browserMatch = (setupOut.stdout + setupOut.stderr).match(/Browser:\s+(.+)/);
+      let browserBin = null;
+      if (browserMatch) {
+        // setup says "Browser: /path/to/chrome"
+        browserBin = browserMatch[1].trim();
+      }
+      if (!browserBin) {
+        // Fallback: try common paths
+        const candidates = [
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+          '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+          '/usr/bin/google-chrome',
+          '/usr/bin/chromium-browser',
+        ];
+        for (const c of candidates) {
+          if (fs.existsSync(c)) { browserBin = c; break; }
+        }
+      }
+      assert(browserBin, `No browser found for e2e connect test (setup: ${setupOut.stdout})`);
+
+      // Start the browser ourselves (NOT via cdpilot) with --user-data-dir and --remote-debugging-port
+      const chromeArgs = [
+        `--remote-debugging-port=${cdpPort}`,
+        `--user-data-dir=${userDataDir}`,
+        '--headless=new',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-background-networking',
+        '--remote-allow-origins=*',
+        'about:blank',
+      ];
+      const chrome = spawn(browserBin, chromeArgs, {
+        stdio: 'ignore', detached: true,
+      });
+      chrome.unref();
+
+      const env = {
+        ...process.env, CDPILOT_HOME: home, CDP_PORT: String(cdpPort),
+        CDPILOT_PROFILE: path.join(home, 'cdpilot-profile'),
+        CHROME_HEADLESS: '1', CDPILOT_LOG: '0',
+      };
+      delete env.CDPILOT_TARGET;
+
+      const c = (...cArgs) => spawnSync(process.execPath, [CLI, ...cArgs], {
+        encoding: 'utf-8', timeout: 60000, env,
+      });
+
+      // Wait for Chrome to be ready
+      let ready = false;
+      for (let i = 0; i < 40; i++) {
+        try {
+          execFileSync(PY_BIN, ['-c',
+            `import urllib.request; urllib.request.urlopen("http://127.0.0.1:${cdpPort}/json/version", timeout=1)`
+          ], { timeout: 5000 });
+          ready = true;
+          break;
+        } catch { /* not ready yet */ }
+        spawnSync('sleep', ['0.25']);
+      }
+      if (!ready) {
+        try { chrome.kill(); } catch {}
+        throw new Error('Chrome did not start in time');
+      }
+
+      e2eConnect = { c, chrome, cdpPort, home, env, pid: chrome.pid };
+    });
+
+    const needConnect = () => { assert(e2eConnect, 'connect e2e setup failed'); return e2eConnect; };
+
+    try {
+      test('connect e2e: connect <port> registers external browser', () => {
+        const { c, cdpPort } = needConnect();
+        const r = c('connect', String(cdpPort));
+        assert.strictEqual(r.status, 0, `connect exit: ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+        assert(/Connected to/.test(r.stdout), `should say Connected: ${r.stdout}`);
+        assert(/will never close/.test(r.stdout), `should say never close: ${r.stdout}`);
+        assert(/cookies and sessions/.test(r.stderr), `should warn about cookies: ${r.stderr}`);
+      });
+
+      test('connect e2e: go, content, smart-click work on the connected browser', () => {
+        const { c } = needConnect();
+        const g = c('go', 'data:text/html,<h1>Hello</h1><button onclick="document.title=\'clicked\'">Click me</button>');
+        assert.strictEqual(g.status, 0, `go: ${g.stdout}${g.stderr}`);
+        const t = c('content');
+        assert.strictEqual(t.status, 0, `content: ${t.stdout}${t.stderr}`);
+        assert(/Hello/.test(t.stdout), `content should have Hello: ${t.stdout}`);
+        const cl = c('smart-click', 'Click me');
+        assert.strictEqual(cl.status, 0, `smart-click: ${cl.stdout}${cl.stderr}`);
+        const title = c('eval', 'document.title');
+        assert(/clicked/.test(title.stdout), `title should be clicked: ${title.stdout}`);
+      });
+
+      test('connect e2e: stop disconnects without killing the browser process', () => {
+        const { c, pid } = needConnect();
+        const r = c('stop');
+        assert.strictEqual(r.status, 0, `stop exit: ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+        assert(/Disconnected/.test(r.stdout + r.stderr), `should say Disconnected: ${r.stdout}`);
+        assert(/keeps running/.test(r.stdout + r.stderr), `should say keeps running: ${r.stdout}`);
+        // The browser process should STILL be alive
+        let alive = false;
+        try { process.kill(pid, 0); alive = true; } catch {}
+        assert(alive, 'browser process should still be alive after stop');
+      });
+    } finally {
+      if (e2eConnect) {
+        try { e2eConnect.chrome.kill('SIGTERM'); } catch {}
+        // Wait briefly for cleanup
+        spawnSync('sleep', ['0.5']);
+        try { e2eConnect.chrome.kill('SIGKILL'); } catch {}
+      }
+    }
+
+    // ── E2E: --auto with fake DevToolsActivePort pointing at the test's Chrome ──
+
+    test('connect e2e: --auto finds DevToolsActivePort written by test', () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-connect-auto-e2e-'));
+      const userDataDir = path.join(home, 'chrome-profile');
+      fs.mkdirSync(userDataDir, { recursive: true });
+      const cdpPort = freePort();
+
+      // Find browser
+      let browserBin = null;
+      const candidates = [
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+        '/usr/bin/google-chrome', '/usr/bin/chromium-browser',
+      ];
+      for (const c of candidates) {
+        if (fs.existsSync(c)) { browserBin = c; break; }
+      }
+      if (!browserBin) {
+        console.log('  - skipped: connect --auto e2e (no browser found)');
+        return;
+      }
+
+      const chrome = spawn(browserBin, [
+        `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${userDataDir}`,
+        '--headless=new', '--no-first-run', '--no-default-browser-check',
+        '--disable-background-networking', '--remote-allow-origins=*', 'about:blank',
+      ], { stdio: 'ignore', detached: true });
+      chrome.unref();
+
+      try {
+        // Wait for Chrome
+        let ready = false, wsPath = '';
+        for (let i = 0; i < 40; i++) {
+          try {
+            const vr = execFileSync(PY_BIN, ['-c',
+              `import json, urllib.request; d = json.loads(urllib.request.urlopen("http://127.0.0.1:${cdpPort}/json/version", timeout=1).read()); print(d.get("webSocketDebuggerUrl",""))`
+            ], { encoding: 'utf-8', timeout: 5000 });
+            if (vr.trim()) {
+              wsPath = new URL(vr.trim()).pathname;
+              ready = true;
+              break;
+            }
+          } catch {}
+          spawnSync('sleep', ['0.25']);
+        }
+        assert(ready, 'Chrome did not start for --auto test');
+
+        // Write a fake DevToolsActivePort in a search root
+        const searchRoot = path.join(home, 'browsers');
+        const browserDir = path.join(searchRoot, 'TestChrome');
+        fs.mkdirSync(browserDir, { recursive: true });
+        fs.writeFileSync(path.join(browserDir, 'DevToolsActivePort'),
+          `${cdpPort}\n${wsPath}\n`);
+
+        const env = {
+          ...process.env, CDPILOT_HOME: home, CDP_PORT: String(cdpPort),
+          CDPILOT_BROWSER_SEARCH_ROOT: searchRoot, CDPILOT_LOG: '0',
+        };
+        const r = spawnSync(process.execPath, [CLI, 'connect', '--auto'], {
+          encoding: 'utf-8', timeout: 15000, env,
+        });
+        assert.strictEqual(r.status, 0, `--auto exit: ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+        assert(/Connected to/.test(r.stdout), `should say Connected: ${r.stdout}`);
+        assert(/will never close/.test(r.stdout), `should say never close: ${r.stdout}`);
+      } finally {
+        try { chrome.kill('SIGTERM'); } catch {}
+        spawnSync('sleep', ['0.5']);
+        try { chrome.kill('SIGKILL'); } catch {}
+      }
+    });
+  }
 })();
 
 // ── Summary ──

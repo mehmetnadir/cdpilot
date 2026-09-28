@@ -2,6 +2,15 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **`cdpilot connect` — use your own browser (human-in-the-loop).** Connect to an already-running Chromium browser so the agent works in the same session the user logged into. Three modes: `connect <port>` (CDP port), `connect <ws://url>` (WebSocket URL), `connect --auto` (scans DevToolsActivePort files in Chrome/Brave/Vivaldi/Edge profile directories; requires Chrome 144+ with remote debugging enabled via `chrome://inspect/#remote-debugging`, or any Chromium launched with `--remote-debugging-port --user-data-dir`). Only `127.0.0.1`/`localhost` accepted (exit 2 on remote addresses). On success: prints browser name/version, tab count, and "commands now run in YOUR browser; cdpilot will never close it".
+- **External browser rules.** A connected browser is registered with `external: true`. `stop` disconnects instead of killing the process ("disconnected; your browser keeps running"). Idle auto-close never touches it. Auto-launch never silently replaces it — if the browser is gone, a clear error says "your connected browser is gone; run `cdpilot connect` again or `cdpilot disconnect`". Stealth injections are NOT applied automatically (the user's real browser stays untouched). `status` shows "(external — your browser)" and "cdpilot will never close this browser".
+- **`cdpilot disconnect`** removes the external registration; the browser keeps running.
+- **MCP tools `browser_connect` / `browser_disconnect`** for agent-driven human-in-the-loop workflows (CAPTCHA handoff, login walls).
+- **Security warning** on connect: "This browser's cookies and sessions are accessible to cdpilot commands."
+
 ## [0.9.3] - 2026-09-28
 
 ### Added
