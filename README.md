@@ -470,6 +470,8 @@ At launch, cdpilot also passes `--disable-blink-features=AutomationControlled`,
 which closes the Blink runtime flag that Cloudflare and DataDome probe to detect
 an automated browser.
 
+Real mouse clicks (frames, `--entropy=on`, `click @ref`, `dblclick`, `rightclick`) hold the button 40-120 ms like a person's press; `CDPILOT_PRESS_MS=min-max` changes the range (`0-0` = instant).
+
 #### Three-tier stealth mode
 
 `cdpilot mode` is the recommended entry point — one switch that sets how much
