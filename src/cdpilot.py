@@ -972,7 +972,10 @@ GLOW_OFF_CSS = """
 
 INPUT_BLOCKER_ON = """
 (function() {
-  if (document.getElementById('cdpilot-input-blocker')) return 'blocker already active';
+  var old = document.getElementById('cdpilot-input-blocker');
+  // Left over by a command that ended mid-click (--timeout exits without
+  // running cdpilot's `finally`): it may still be transparent to the mouse.
+  if (old) { old.style.pointerEvents = ''; return 'blocker already active'; }
   var overlay = document.createElement('div');
   overlay.id = 'cdpilot-input-blocker';
   overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483646;cursor:not-allowed;background:transparent;';
@@ -3155,13 +3158,17 @@ _BLOCKER_POINTER_JS = """(function (pe) {
 })(%s)"""
 
 # On an element: is it what the mouse hits at (x, y) of its own document?
-# '' if so (the target counts when one of its descendants is hit), else what
-# is on top, as tag#id.class.
+# '' if so (the target counts when one of its descendants is hit); '!' if the
+# element itself takes no mouse input (pointer-events: none, own or
+# inherited), so the mouse falls through to whatever is below; else what is
+# on top, as tag#id.class.
 _HIT_TEST_FN = """function (x, y) {
   var root = this.getRootNode ? this.getRootNode() : null;
   if (!root || !root.elementFromPoint) root = this.ownerDocument;
   var e = root.elementFromPoint(x, y);
   if (e && (e === this || this.contains(e))) return '';
+  var view = this.ownerDocument.defaultView;
+  if (view && view.getComputedStyle(this).pointerEvents === 'none') return '!';
   if (!e) return '(nothing)';
   var d = e.tagName.toLowerCase();
   if (e.id) d += '#' + e.id;
@@ -3173,6 +3180,11 @@ _CENTER_FN = ("function () { var r = this.getBoundingClientRect();"
               " return [r.left + r.width / 2, r.top + r.height / 2, r.width, r.height]; }")
 _SCRIPT_CLICK_FN = "function () { this.click(); }"
 _CLICK_GROUP = "cdpilot-click"
+# Pages whose input blocker cdpilot made transparent and has not restored yet
+# (page WebSocket URLs). --timeout ends the process with os._exit, which skips
+# `finally`; its watchdog restores these first (_blocker_restore_on_exit).
+_BLOCKER_OPEN = set()
+BLOCKER_EXIT_RESTORE_S = 0.5  # the watchdog's budget for that restore
 
 
 async def _blocker_pointer(route, value):
@@ -3181,8 +3193,85 @@ async def _blocker_pointer(route, value):
     ctx = await _frame_world(route, None, None)
     if ctx is not None:
         params["contextId"] = ctx
+    if value:
+        _BLOCKER_OPEN.add(route.root_ws)  # before the call: it may be cut off mid-way
     r = await _frame_cdp(route, [(1, "Runtime.evaluate", params, None)])
-    return r.get(1, {}).get("result", {}).get("value") is True
+    found = r.get(1, {}).get("result", {}).get("value") is True
+    if not value or not found:
+        _BLOCKER_OPEN.discard(route.root_ws)
+    return found
+
+
+@contextlib.asynccontextmanager
+async def _blocker_passthrough(ws_url):
+    """cdpilot's own mouse input (hover, dblclick, rightclick) through its input blocker.
+
+    Only with visual feedback on (`show on`, CDPILOT_SHOW=1, MCP sessions):
+    without it there is no blocker and nothing extra is sent. The blocker is
+    restored in `finally`.
+    """
+    if not get_visual_config():
+        yield
+        return
+    route = _FRAME_ROUTE.get() or _FrameRoute(ws_url)
+    opened = await _blocker_pointer(route, "none")
+    try:
+        yield
+    finally:
+        if opened:
+            await _blocker_pointer(route, "")
+
+
+def _blocker_restore_on_exit(budget_s=BLOCKER_EXIT_RESTORE_S):
+    """Make blockers in _BLOCKER_OPEN opaque again, from the --timeout watchdog.
+
+    Best effort within `budget_s`: its own event loop in a helper thread and a
+    fresh WebSocket per page (the main thread's socket may be the one that
+    hung). The page's main world is enough for a style reset.
+    """
+    pages = list(_BLOCKER_OPEN)
+    if not pages:
+        return
+
+    async def restore():
+        import websockets
+        for ws_url in pages:
+            async with websockets.connect(ws_url, max_size=16 * 1024 * 1024) as ws:
+                await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+                    "expression": _BLOCKER_POINTER_JS % json.dumps(""), "returnByValue": True}}))
+                while json.loads(await ws.recv()).get("id") != 1:
+                    pass
+            _BLOCKER_OPEN.discard(ws_url)
+
+    def run():
+        try:
+            asyncio.run(asyncio.wait_for(restore(), budget_s))
+        except BaseException:
+            pass
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(budget_s + 0.2)
+
+
+def _hit_failure(route, results, base, n, released=False):
+    """Why the hit-test in `results` (ids base..base+n-1) failed, as note text, or None.
+
+    Checks are ordered like route.chain, then the target. released: the
+    repeat of the check sent with mouseReleased.
+    """
+    for i in range(n):
+        v = results.get(base + i, {}).get("result", {}).get("value")
+        if v == "":
+            continue
+        if v == "!":
+            what = (f"is inside {route.labels[i]}, which has pointer-events: none"
+                    if i < len(route.chain) else "has pointer-events: none")
+            return what + (" by the time the mouse button was released" if released else "")
+        v = v if isinstance(v, str) and v else "(unknown)"
+        if released:
+            return f"was no longer under the mouse when the button was released ({v} was)"
+        return f"is covered by {v} at the click point"
+    return None
 
 
 async def _pointer_click(route, target_oid, label, humanize=False):
@@ -3190,9 +3279,12 @@ async def _pointer_click(route, target_oid, label, humanize=False):
     the page for a route without hops) with real mouse input, if it is hit.
 
     Returns (how, x, y): how is "mouse", or "script" when the hit-test failed
-    and el.click() clicked it (one stderr note says what covers it); x, y is
-    the click point in page coordinates. humanize: --entropy=on's approach,
-    jitter and pauses.
+    and el.click() clicked it (one stderr note says why); x, y is the click
+    point in page coordinates. humanize: --entropy=on's approach, jitter and
+    pauses. The hit-test runs before the press and again, in one batch with
+    the release, after the page has handled the press: a target that moved
+    or got covered meanwhile did not get the click, so after completing the
+    release el.click() clicks it.
     """
     import random as _r
     rnd = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
@@ -3210,7 +3302,7 @@ async def _pointer_click(route, target_oid, label, humanize=False):
         ly += rnd.uniform(-1, 1) * min(2, max(0, c[3] / 2 - 1))
     pts = _frame_points(boxes, lx, ly)
     px, py = round(pts[0][0]), round(pts[0][1])
-    cover = None
+    why = None
     token = _FRAME_ROUTE.set(None)  # page coordinates from here: no rewriting
     try:
         if humanize:
@@ -3218,30 +3310,31 @@ async def _pointer_click(route, target_oid, label, humanize=False):
             await _humanize_mouse_move(route.root_ws, px, py)
         opened = await _blocker_pointer(route, "none")
         try:
-            checks = [(10 + i, "Runtime.callFunctionOn", {
-                "objectId": oid, "functionDeclaration": _HIT_TEST_FN, "returnByValue": True,
-                "arguments": [{"value": x}, {"value": y}]}, s)
-                for i, ((s, oid), (x, y)) in enumerate(zip(route.chain + [(sid, target_oid)], pts))]
-            r = await _frame_cdp(route, checks)
-            for i in range(len(checks)):
-                v = r.get(10 + i, {}).get("result", {}).get("value")
-                if v != "":
-                    cover = v if isinstance(v, str) and v else "(unknown)"
-                    break
-            if cover is None:
+            def checks(base):
+                return [(base + i, "Runtime.callFunctionOn", {
+                    "objectId": oid, "functionDeclaration": _HIT_TEST_FN, "returnByValue": True,
+                    "arguments": [{"value": x}, {"value": y}]}, s)
+                    for i, ((s, oid), (x, y)) in enumerate(zip(route.chain + [(sid, target_oid)], pts))]
+            n = len(pts)
+            why = _hit_failure(route, await _frame_cdp(route, checks(10)), 10, n)
+            if why is None:
                 press = {"x": px, "y": py, "button": "left", "clickCount": 1}
+                # The press alone: its reply comes once the page handled mousedown.
                 await _frame_cdp(route, [
                     (20, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": px, "y": py}, None),
-                    (21, "Input.dispatchMouseEvent", dict(press, type="mousePressed"), None),
-                    (22, "Input.dispatchMouseEvent", dict(press, type="mouseReleased"), None)])
+                    (21, "Input.dispatchMouseEvent", dict(press, type="mousePressed"), None)])
+                # Same check again, then the release in the same batch (the
+                # button is down: it is released whatever the check says).
+                r = await _frame_cdp(route, checks(30) + [
+                    (29, "Input.dispatchMouseEvent", dict(press, type="mouseReleased"), None)])
+                why = _hit_failure(route, r, 30, n, released=True)
         finally:
             if opened:
                 await _blocker_pointer(route, "")
     finally:
         _FRAME_ROUTE.reset(token)
-    if cover is not None:
-        print(f"note: {label} is covered by {cover} at the click point; used a script click",
-              file=sys.stderr)
+    if why is not None:
+        print(f"note: {label} {why}; used a script click", file=sys.stderr)
         await _frame_cdp(route, [(1, "Runtime.callFunctionOn", {
             "objectId": target_oid, "functionDeclaration": _SCRIPT_CLICK_FN}, sid)])
         return "script", px, py
@@ -12779,12 +12872,14 @@ async def cmd_hover(selector, ladder=None, no_heal=False, entropy=None):
     if len(tried) > 1 or (tried and not tried[0]["hit"]):
         _log_heal("hover", selector, tried, dur, no_heal)
     x, y = await _get_element_center(ws_url, res_sel)
-    if entropy:
-        await _humanize_mouse_move(ws_url, x, y)
-    else:
+    if not entropy:
         await _vfx_move_cursor(ws_url, x, y)
-        await cdp_send(ws_url, [(1, "Input.dispatchMouseEvent",
-            {"type": "mouseMoved", "x": x, "y": y, "button": "none", "modifiers": 0})])
+    async with _blocker_passthrough(ws_url):
+        if entropy:
+            await _humanize_mouse_move(ws_url, x, y)
+        else:
+            await cdp_send(ws_url, [(1, "Input.dispatchMouseEvent",
+                {"type": "mouseMoved", "x": x, "y": y, "button": "none", "modifiers": 0})])
     # cleanup tmp attr if used
     await cdp_send(ws_url, [(2, "Runtime.evaluate", {
         "expression": f"(function(){{var e=document.querySelector({json.dumps(res_sel)});if(e)e.removeAttribute('data-cdpilot-tmp')}})()"})])
@@ -12803,7 +12898,8 @@ async def cmd_dblclick(selector):
         (3, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2}),
         (4, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2}),
     ]
-    await cdp_send(ws_url, cmds)
+    async with _blocker_passthrough(ws_url):
+        await cdp_send(ws_url, cmds)
     print(f"Double-clicked: {selector}")
 
 
@@ -12817,7 +12913,8 @@ async def cmd_rightclick(selector):
         (1, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "right", "clickCount": 1}),
         (2, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "right", "clickCount": 1}),
     ]
-    await cdp_send(ws_url, cmds)
+    async with _blocker_passthrough(ws_url):
+        await cdp_send(ws_url, cmds)
     print(f"Right-clicked: {selector}")
 
 
@@ -15096,6 +15193,10 @@ def _arm_timeout_watchdog(seconds, cmd):
         try:
             os.write(2, message)
         except OSError:
+            pass
+        try:  # os._exit skips `finally`: an input blocker opened for a click
+            _blocker_restore_on_exit()
+        except Exception:
             pass
         try:  # os._exit skips atexit: write the session log line here
             _slog_finish(TIMEOUT_EXIT_CODE, message.decode().strip())
