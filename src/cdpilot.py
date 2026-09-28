@@ -16103,11 +16103,11 @@ if __name__ == "__main__":
             and any(a == "--timeout" or a.startswith("--timeout=") for a in args)):
         _arm_timeout_watchdog(_timeout_s, cmd)
 
+    if cmd == 'launch' and '--webmcp' in args:
+        os.environ[WEBMCP_ENV] = '1'
+
     sync_cmds = {
-        'launch': lambda: (
-            os.environ.__setitem__(WEBMCP_ENV, '1') if '--webmcp' in args else None,
-            cmd_launch(idle_close=_idle_close_flag(args)),
-        )[-1],
+        'launch': lambda: cmd_launch(idle_close=_idle_close_flag(args)),
         'tabs': lambda: cmd_tabs(
             reap='--reap' in args,
             max_tabs=next((int(a.split('=')[1]) for a in args

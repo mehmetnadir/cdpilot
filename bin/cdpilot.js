@@ -730,7 +730,7 @@ if (cmd === 'status') {
   }
 
   // --webmcp flag: enable WebMCP bridge (tools list / tools call)
-  if (argv.includes('--webmcp')) {
+  if (args.includes('--webmcp')) {
     env.CDPILOT_WEBMCP = '1';
   }
 
