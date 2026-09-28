@@ -13,6 +13,16 @@ const os = require('os');
 const SCRIPT = path.join(__dirname, '..', 'src', 'cdpilot.py');
 const VERSION = require('../package.json').version;
 
+// CDPILOT_HOME resolution — must match src/cdpilot.py exactly:
+//   CDPILOT_HOME = os.environ.get("CDPILOT_HOME") or os.path.expanduser("~/.cdpilot")
+// A set-but-empty CDPILOT_HOME falls back to the default (empty string is
+// falsy in both Python's `or` and JS's `||`). A non-empty CDPILOT_HOME is
+// used verbatim — no `~` expansion — same as Python's os.environ.get() here
+// (expanduser is only applied to the hardcoded "~/.cdpilot" fallback).
+function cdpilotHome() {
+  return process.env.CDPILOT_HOME || path.join(os.homedir(), '.cdpilot');
+}
+
 // ── Browser Detection ──
 
 function findBrowser() {
@@ -161,7 +171,7 @@ function checkWebsockets(python) {
 }
 
 function preflight() {
-  const markerFile = path.join(os.homedir(), '.cdpilot', '.preflight-done');
+  const markerFile = path.join(cdpilotHome(), '.preflight-done');
 
   // Skip if already passed (not first run) and all deps present
   const python = findPython();
@@ -234,7 +244,7 @@ function runStatus() {
   let isExternal = false;
   let browserName = '';
   try {
-    const home = process.env.CDPILOT_HOME || path.join(os.homedir(), '.cdpilot');
+    const home = cdpilotHome();
     const regFile = path.join(home, 'registry.json');
     const data = JSON.parse(fs.readFileSync(regFile, 'utf-8'));
     const entry = (data.projects || {})[config.projectId];
@@ -262,7 +272,9 @@ function runStatus() {
           if (isExternal) {
             console.log(`  cdpilot will never close this browser.\n`);
           } else {
-            console.log(`  ${idleCloseLabel(port)}\n`);
+            const webmcp = webmcpLabel(config.profileDir);
+            console.log(`  ${idleCloseLabel(port)}${webmcp ? '' : '\n'}`);
+            if (webmcp) console.log(`  ${webmcp}\n`);
           }
         } catch {
           console.log('  ✓ CDP responding but version info unavailable\n');
@@ -275,6 +287,8 @@ function runStatus() {
         console.log('  Run: cdpilot connect again or cdpilot disconnect\n');
       } else {
         console.log('  ❌ No browser connected on this port.');
+        const webmcp = webmcpLabel(config.profileDir);
+        if (webmcp) console.log(`  ${webmcp}`);
         console.log('  Run: cdpilot launch\n');
       }
     });
@@ -292,7 +306,7 @@ function runStatus() {
 // _idle_status there): CDPILOT_HOME/idle/<port>.json names the watcher and its
 // minutes, CDPILOT_HOME/projects/<id>/last-activity the last command.
 function idleCloseLabel(port) {
-  const home = process.env.CDPILOT_HOME || path.join(os.homedir(), '.cdpilot');
+  const home = cdpilotHome();
   try {
     const st = JSON.parse(fs.readFileSync(path.join(home, 'idle', `${port}.json`), 'utf-8'));
     const minutes = Number(st.minutes) || 0;
@@ -313,6 +327,28 @@ function idleCloseLabel(port) {
   } catch {
     return 'idle close off';
   }
+}
+
+// This project's WebMCP mode, as src/cdpilot.py reads it (get_webmcp_config):
+// CDPILOT_WEBMCP=1|0 wins, else <profile>/webmcp.json written by
+// `launch --webmcp` / `launch --no-webmcp`.
+function webmcpMode(profileDir) {
+  const raw = (process.env.CDPILOT_WEBMCP || '').trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return { on: true, from: 'CDPILOT_WEBMCP' };
+  if (['0', 'false', 'no', 'off'].includes(raw)) return { on: false, from: 'CDPILOT_WEBMCP' };
+  try {
+    const st = JSON.parse(fs.readFileSync(path.join(profileDir, 'webmcp.json'), 'utf-8'));
+    return { on: st.webmcp === true, from: 'launch --webmcp' };
+  } catch {
+    return { on: false, from: null };
+  }
+}
+
+// Printed by `status` only while the mode is on (the default output is unchanged).
+function webmcpLabel(profileDir) {
+  const m = webmcpMode(profileDir);
+  if (!m.on) return null;
+  return `WebMCP: on (${m.from}; browsers start with --enable-features=WebMCP)`;
 }
 
 // ── Version ──
@@ -341,8 +377,8 @@ function resolveProjectConfig() {
   }
 
   const projectId = getProjectId();
-  const registryFile = path.join(os.homedir(), '.cdpilot', 'registry.json');
-  const defaultProfile = path.join(os.homedir(), '.cdpilot', 'projects', projectId, 'profile');
+  const registryFile = path.join(cdpilotHome(), 'registry.json');
+  const defaultProfile = path.join(cdpilotHome(), 'projects', projectId, 'profile');
 
   let registry = {};
   try {
@@ -388,8 +424,11 @@ function showHelp() {
 
   SETUP
     setup              Auto-detect browser, create isolated profile
-    launch [--idle-close <min>]  Start browser with CDP enabled (--idle-close or
-                       CDPILOT_IDLE_CLOSE: close it after <min> idle minutes)
+    launch [--idle-close <min>] [--webmcp|--no-webmcp]
+                       Start browser with CDP enabled (--idle-close or
+                       CDPILOT_IDLE_CLOSE: close it after <min> idle minutes;
+                       --webmcp: this project's browsers start with WebMCP on,
+                       saved until --no-webmcp; see WEBMCP below)
     status             Check browser connection
     stop [--smart]     Stop browser (--smart = close owned tabs, quit if empty)
     connect [<port> | <ws-url> | --auto]
@@ -510,6 +549,17 @@ function showHelp() {
                        Typed values, secret-looking args and token/key/secret URL
                        params are redacted. CDPILOT_LOG=0 turns it off;
                        CDPILOT_LOG_DAYS (default 14) sets how many days are kept.
+
+  WEBMCP (tools a page registers on document.modelContext; needs launch --webmcp)
+    tools list [--json] The page's tools from getTools(): imperative, <form
+                        toolname> and same-origin iframe tools, with title,
+                        annotations, inputSchema. None: says why (WebMCP off,
+                        insecure page, old browser, none registered); exit 0.
+    tools call <name> [json-args | --arg k=v ...] [--frame <url-part>]
+                        Check args against inputSchema, run executeTool() with
+                        an abort signal (--timeout, default 20s), print the
+                        result. Bad args / tool error: exit 1; timeout: 124.
+                        Runs the page's own code: its result is untrusted.
 
   WATCH (continuous screencast for AI video understanding)
     watch start <url>  Begin JPEG screencast at N fps to a disk ring buffer
