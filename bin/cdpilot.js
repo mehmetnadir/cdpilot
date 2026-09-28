@@ -243,8 +243,9 @@ function runStatus() {
           console.log(`  Browser: ${info.Browser || 'Unknown'}`);
           console.log(`  Protocol: ${info['Protocol-Version'] || 'Unknown'}`);
           console.log(`  WebSocket: ${info.webSocketDebuggerUrl || 'N/A'}`);
-          console.log(`  ${idleCloseLabel(port)}`);
-          console.log(`  ${webmcpLabel(config.profileDir)}\n`);
+          const webmcp = webmcpLabel(config.profileDir);
+          console.log(`  ${idleCloseLabel(port)}${webmcp ? '' : '\n'}`);
+          if (webmcp) console.log(`  ${webmcp}\n`);
         } catch {
           console.log('  ✓ CDP responding but version info unavailable\n');
         }
@@ -252,7 +253,8 @@ function runStatus() {
     });
     req.on('error', () => {
       console.log('  ❌ No browser connected on this port.');
-      console.log(`  ${webmcpLabel(config.profileDir)}`);
+      const webmcp = webmcpLabel(config.profileDir);
+      if (webmcp) console.log(`  ${webmcp}`);
       console.log('  Run: cdpilot launch\n');
     });
     req.on('timeout', () => {
@@ -307,9 +309,10 @@ function webmcpMode(profileDir) {
   }
 }
 
+// Printed by `status` only while the mode is on (the default output is unchanged).
 function webmcpLabel(profileDir) {
   const m = webmcpMode(profileDir);
-  if (!m.on) return 'WebMCP: off (launch --webmcp turns it on)';
+  if (!m.on) return null;
   return `WebMCP: on (${m.from}; browsers start with --enable-features=WebMCP)`;
 }
 
