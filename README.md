@@ -948,7 +948,7 @@ and exits with code 2 and the start command above instead of half-working.
   `browser_close` close at most cdpilot's own tabs (above) and print
   "connected browser left running; run `cdpilot disconnect` to forget it".
   The idle auto-close never touches it,
-  `tabs --reap` closes nothing, `wipe` and `permission` are refused,
+  `tabs --reap` closes nothing, `wipe`, `permission`, `cookies load` and `cf-replay` are refused (add `--allow-external` to load/replay cookies anyway),
   `context close` only destroys a context `context create` made, and `launch` /
   MCP `browser_launch` start nothing.
 - `close-tab` is an explicit command and **can close your tabs**: the active

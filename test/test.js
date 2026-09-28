@@ -1031,7 +1031,7 @@ test('cmd_cookies save: writes JSON array via Network.getCookies', () => {
 });
 
 test('cmd_cookies load: round-trips via Network.setCookies and verifies count', () => {
-  const m = PY_CONTENT.match(/sub == 'load'[\s\S]{0,1500}?Network\.setCookies[\s\S]{0,500}?Network\.getCookies/);
+  const m = PY_CONTENT.match(/sub == 'load'[\s\S]{0,2500}?Network\.setCookies[\s\S]{0,500}?Network\.getCookies/);
   assert(m, "cookies load must call Network.setCookies and verify via Network.getCookies");
 });
 
@@ -2634,14 +2634,14 @@ test('v0.6.1: cookies auto add/remove/list CLI subcommands', () => {
 
 test('cmd_cookies: save --host mode writes per-host via _save_host_cookies', () => {
   // Check that per-host branch and _save_host_cookies both appear in cmd_cookies body
-  const fnBody = PY_CONTENT.match(/async def cmd_cookies[\s\S]{0,12000}?(?=\nasync def |\ndef [a-z])/);
+  const fnBody = PY_CONTENT.match(/async def cmd_cookies[\s\S]{0,20000}?(?=\nasync def |\ndef [a-z])/);
   assert(fnBody, "cmd_cookies function must be present");
   assert(fnBody[0].includes("'--host'") && fnBody[0].includes('_save_host_cookies'),
     "cookies save --host must call _save_host_cookies");
 });
 
 test('cmd_cookies: load --host mode calls _load_host_cookies', () => {
-  const m = PY_CONTENT.match(/sub == 'load'[\s\S]{0,300}?--host[\s\S]{0,300}?_load_host_cookies/);
+  const m = PY_CONTENT.match(/sub == 'load'[\s\S]{0,600}?--host[\s\S]{0,300}?_load_host_cookies/);
   assert(m, "cookies load --host must call _load_host_cookies");
 });
 
@@ -2661,7 +2661,7 @@ test('cmd_cookies: auto on|off toggles _set_cookies_auto', () => {
 });
 
 test('cmd_cookies: cf-replay injects cookies via Network.setCookies', () => {
-  const m = PY_CONTENT.match(/sub == 'cf-replay'[\s\S]{0,800}?Network\.setCookies/);
+  const m = PY_CONTENT.match(/sub == 'cf-replay'[\s\S]{0,1500}?Network\.setCookies/);
   assert(m, "cookies cf-replay must inject via Network.setCookies");
 });
 
@@ -6373,6 +6373,45 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     } finally { fake.stop(); }
   });
 
+  test('external guard: `cookies load` is refused on a connected browser unless --allow-external', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { 'ext-proj': externalEntry(fake.port) });
+      const cookieFile = path.join(home, 'cookies.json');
+      fs.writeFileSync(cookieFile, JSON.stringify([{ name: 'test_c', value: '123', domain: 'user.example', path: '/' }]));
+
+      // Without --allow-external: refused with exit 1
+      const r1 = cli(['cookies', 'load', cookieFile], isoEnv(home, fake.port, 'ext-proj'));
+      assert.strictEqual(r1.status, 1, `exit ${r1.status}: ${r1.stdout}${r1.stderr}`);
+      assert(/cookies load writes into your own browser's cookie jar; add --allow-external to do it anyway/.test(r1.stderr), r1.stderr);
+      assert(!fake.methods().some((m) => /setCookie/i.test(m)), `no cookie injection allowed: ${fake.methods()}`);
+
+      // With --allow-external: allowed to proceed
+      const r2 = cli(['cookies', 'load', cookieFile, '--allow-external'], isoEnv(home, fake.port, 'ext-proj'));
+      assert.strictEqual(r2.status, 0, `exit ${r2.status}: ${r2.stdout}${r2.stderr}`);
+      assert(fake.methods().includes('Network.setCookies'), `Network.setCookies expected: ${fake.methods()}`);
+    } finally { fake.stop(); }
+  });
+
+  test('external guard: `cookies cf-replay` is refused on a connected browser unless --allow-external', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { 'ext-proj': externalEntry(fake.port) });
+
+      // Without --allow-external: refused with exit 1
+      const r1 = cli(['cookies', 'cf-replay', 'https://user.example/'], isoEnv(home, fake.port, 'ext-proj'));
+      assert.strictEqual(r1.status, 1, `exit ${r1.status}: ${r1.stdout}${r1.stderr}`);
+      assert(/cf-replay writes into your own browser's cookie jar; add --allow-external to do it anyway/.test(r1.stderr), r1.stderr);
+      assert(!fake.methods().some((m) => /setCookie/i.test(m)), `no cookie injection allowed: ${fake.methods()}`);
+
+      // With --allow-external: allowed to proceed
+      const r2 = cli(['cookies', 'cf-replay', 'https://user.example/', '--allow-external'], isoEnv(home, fake.port, 'ext-proj'));
+      assert.strictEqual(r2.status, 0, `exit ${r2.status}: ${r2.stdout}${r2.stderr}`);
+    } finally { fake.stop(); }
+  });
+
   test('external guard: MCP browser_close {force:true} leaves a connected browser alive', () => {
     const fake = startFake();
     try {
@@ -6987,6 +7026,8 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       // Network.deleteCookies + Storage.clearDataForOrigin: cmd_wipe (above).
       'cmd_context_close',  // disposeBrowserContext: only contexts `context create` made
       'cmd_permission',     // Browser.resetPermissions (+ grant/deny): refused
+      'cmd_cookies',        // Network.setCookies: refused/guarded unless --allow-external
+      '_cookies_auto_inject', // Network.setCookies: guarded by _is_external()
     ];
     // Target.disposeBrowserContext that cannot reach a user context: each one
     // disposes a context the same function created a moment earlier (a
@@ -7007,7 +7048,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       // (checked below).
       '_bot_auth_acquire_lock', '_bot_auth_spawn_locked', '_bot_auth_stop_helper',
     ];
-    const PAT = /Browser\.close|os\.kill\(|taskkill|Target\.closeTarget|\/json\/close|Page\.close|_stop_browser_on_port\(|_cdp_browser_close\(|_browser_close_graceful\(|_close_target\(|\.kill\(\)|\.terminate\(\)|SIGKILL|SIGTERM|Target\.disposeBrowserContext|Storage\.clearDataForOrigin|Network\.deleteCookies|Network\.clearBrowserCookies|Storage\.clearCookies|Browser\.resetPermissions/;
+    const PAT = /Browser\.close|os\.kill\(|taskkill|Target\.closeTarget|\/json\/close|Page\.close|_stop_browser_on_port\(|_cdp_browser_close\(|_browser_close_graceful\(|_close_target\(|\.kill\(\)|\.terminate\(\)|SIGKILL|SIGTERM|Target\.disposeBrowserContext|Storage\.clearDataForOrigin|Network\.deleteCookies|Network\.clearBrowserCookies|Storage\.clearCookies|Browser\.resetPermissions|Network\.setCookie|Network\.setCookies|Storage\.setCookies|DOMStorage|Storage\.clear|Browser\.grantPermissions|Browser\.setPermission/;
     const lines = PY_CONTENT.split('\n');
     const bodies = {};
     const hits = {};
