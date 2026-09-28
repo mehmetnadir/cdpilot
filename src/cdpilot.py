@@ -2295,8 +2295,8 @@ def _bot_auth_pid_is_signer(state, port):
 
 
 _BOT_AUTH_UNSET = object()
-# Not proof of staleness: a spawn in progress, a browser that does not answer now.
-_BOT_AUTH_SOFT_REASONS = ("pending", "unreachable")
+# Not proof of staleness: a spawn in progress.
+_BOT_AUTH_SOFT_REASONS = ("pending",)
 
 
 def _bot_auth_stale_reason(state, port, version=_BOT_AUTH_UNSET):
@@ -2313,7 +2313,11 @@ def _bot_auth_stale_reason(state, port, version=_BOT_AUTH_UNSET):
     if version is _BOT_AUTH_UNSET:
         version = _idle_version(port)
     if not version:
-        return "unreachable"
+        # /json/version timed out (a busy browser) or the browser is going
+        # away: unknown, not stale. The verified signer is still serving (or
+        # exits by itself with the browser), so bot-auth stays active: no
+        # stealth injection, no escalation, no warning.
+        return None
     ws = version.get("webSocketDebuggerUrl")
     if not ws or ws != state.get("browser_ws"):
         return "the browser on this port is not the one the signer attached to"
@@ -2349,6 +2353,14 @@ def _bot_auth_status_label(port=None, version=_BOT_AUTH_UNSET):
     if state:
         return f"bot-auth: on (keyid {state.get('keyid', '?')})"
     return "bot-auth: off"
+
+
+def _bot_auth_configured(port=None):
+    """True once bot-auth is set up: a key config, or signer state / stale
+    marker for `port`. status and health mention bot-auth only then."""
+    port = int(port or CDP_PORT)
+    return any(os.path.exists(p) for p in (
+        BOT_AUTH_CONFIG_FILE, _bot_auth_state_path(port), _bot_auth_stale_marker_path(port)))
 
 
 BOT_AUTH_STALE_WARNING = ("bot-auth: signer not running, requests go out unsigned — "
@@ -2492,50 +2504,48 @@ def _bot_auth_lock_path(port):
 
 
 def _bot_auth_acquire_lock(port, timeout):
-    """Exclusive spawn lock for `port` (O_EXCL file with our pid): two
-    `launch --bot-auth` must not start two signers or clear each other's
-    state. A lock whose holder died, or older than a spawn can take, is taken
-    over. False on timeout."""
-    path = _bot_auth_lock_path(port)
+    """Exclusive spawn lock for `port`: two `launch --bot-auth` must not start
+    two signers or clear each other's state. An OS lock on a lock file that is
+    never removed (flock on POSIX, msvcrt.locking on Windows): the kernel
+    drops it when its holder exits, even by SIGKILL, so there is no
+    "take over a dead holder's lock" step that two waiters could both win.
+    Returns the held fd, or None on timeout."""
     os.makedirs(BOT_AUTH_SIGNERS_DIR, exist_ok=True)
+    fd = os.open(_bot_auth_lock_path(port), os.O_RDWR | os.O_CREAT, 0o600)
     deadline = time.time() + timeout
     while True:
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            try:
-                with open(path) as f:
-                    holder = json.load(f)
-            except (OSError, ValueError):
-                holder = {}  # being written: judge by age only
-            try:
-                age = time.time() - os.path.getmtime(path)
-            except OSError:
-                continue  # released meanwhile
-            pid = holder.get("pid") if isinstance(holder, dict) else None
-            if (pid is not None and not _pid_alive(pid)) or age > BOT_AUTH_READY_TIMEOUT_S + 5:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-            elif time.time() >= deadline:
-                return False
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.time() >= deadline:
+                os.close(fd)
+                return None
             time.sleep(0.05)
-            continue
-        with os.fdopen(fd, "w") as f:
-            json.dump({"pid": os.getpid(), "t": time.time()}, f)
-        return True
 
 
-def _bot_auth_release_lock(port):
-    path = _bot_auth_lock_path(port)
+def _bot_auth_release_lock(fd):
     try:
-        with open(path) as f:
-            holder = json.load(f)
-        if isinstance(holder, dict) and holder.get("pid") == os.getpid():
-            os.remove(path)
-    except (OSError, ValueError):
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
         pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _bot_auth_spawn_helper(port=None, browser_pid=None, config=None):
@@ -2553,7 +2563,8 @@ def _bot_auth_spawn_helper(port=None, browser_pid=None, config=None):
         return running.get("pid"), None
     if config is None:
         config = _bot_auth_load_private_key()[1]  # fail here, not in the child
-    if not _bot_auth_acquire_lock(port, BOT_AUTH_READY_TIMEOUT_S + 5):
+    lock = _bot_auth_acquire_lock(port, BOT_AUTH_READY_TIMEOUT_S + 5)
+    if lock is None:
         running = _bot_auth_helper_state(port)
         if running:
             return running.get("pid"), None
@@ -2564,19 +2575,20 @@ def _bot_auth_spawn_helper(port=None, browser_pid=None, config=None):
             return running.get("pid"), None
         return _bot_auth_spawn_locked(port, browser_pid, config)
     finally:
-        _bot_auth_release_lock(port)
+        _bot_auth_release_lock(lock)
 
 
 def _bot_auth_spawn_locked(port, browser_pid, config):
     """The spawn proper (lock held). Same detach as _idle_spawn_watcher (own
     session on POSIX, DETACHED_PROCESS + own process group on Windows, all
     std streams DEVNULL)."""
-    version = cdp_get('/json/version', no_cache=True) or {}
     token = secrets.token_hex(8)
+    # browser_ws is left to the signer: it records the socket it actually
+    # attached to (see _bot_auth_signer_entry), which staleness checks against.
     _bot_auth_save_state(port, {
         "token": token, "pid": None, "ready": False, "port": port,
         "project_id": PROJECT_ID, "browser_pid": browser_pid,
-        "browser_ws": version.get("webSocketDebuggerUrl"),
+        "browser_ws": None,
         "keyid": config["keyid"], "agent_url": config.get("agent_url"),
         "agent_format": _bot_auth_agent_format(config),
         "started": time.time(),
@@ -2757,7 +2769,9 @@ def _bot_auth_signer_entry(args):
         return
     agent_url, keyid = config["agent_url"], config["keyid"]
     agent_format = _bot_auth_agent_format(config)
-    ws_url = state.get("browser_ws") or (_idle_version(port) or {}).get("webSocketDebuggerUrl")
+    # The browser now on the port, asked by the signer itself: the ws URL it
+    # connects to is the one it records (on_ready) and staleness checks use.
+    ws_url = (_idle_version(port) or {}).get("webSocketDebuggerUrl")
     if not ws_url:
         _bot_auth_log(port, "signer not started: no browser on this port")
         _bot_auth_clear_state(port, token)
@@ -8815,7 +8829,8 @@ def cmd_health():
       uptime_warning — str|null, hint when browser is alive but very old
       idle_close     — str, "idle close in <N>m" or "idle close off"
       idle_close_in_s — int|null, seconds until the idle auto-close
-      bot_auth       — str, "bot-auth: on (keyid …)" while the signer runs, else "bot-auth: off"
+      bot_auth       — str, "bot-auth: on (keyid …)" while the signer runs, else "bot-auth: off";
+                       only once bot-auth is set up (a key, or signer state for the port)
 
     Exit codes: 0 = alive, 2 = down. Designed for shell watchdog loops:
       `until cdpilot health >/dev/null; do cdpilot launch; sleep 2; done`
@@ -8841,7 +8856,8 @@ def cmd_health():
         info['tabs'] = sum(1 for t in targets if t.get('type') == 'page')
     info['idle_close'], info['idle_close_in_s'] = (
         _idle_status() if info['alive'] else ("idle close off", None))
-    info['bot_auth'] = _bot_auth_status_label() if info['alive'] else "bot-auth: off"
+    if _bot_auth_configured(CDP_PORT):  # like `status`: absent while bot-auth is unused
+        info['bot_auth'] = _bot_auth_status_label() if info['alive'] else "bot-auth: off"
 
     # Today's crash count from macOS DiagnosticReports (Brave only).
     if platform.system() == 'Darwin':

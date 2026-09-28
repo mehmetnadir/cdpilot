@@ -568,8 +568,18 @@ Signature: sig1=:<base64 Ed25519 signature>:
 Serve that body at `https://your-domain.com/.well-known/http-message-signatures-directory` with
 those three headers. The signature covers `("@authority";req)`, the host the directory is fetched
 from: by default the agent URL's host, or `--authority <host>`. There is one signature per key in
-the directory. It is valid for 24 hours (`--ttl <seconds>`), so re-run the command (by hand or
-from cron) to refresh it. `--content-digest` also covers the body (`Content-Digest`, RFC 9530), as
+the directory. It is valid for 24 hours (`--ttl <seconds>`), so a static host needs it refreshed
+daily, from cron or an edge function that runs the same signing. A cron example that rewrites the
+headers file and the body your web server serves:
+
+```bash
+# m h dom mon dow  — every day at 03:17, 48 h validity so one missed run does not break it
+17 3 * * *  cdpilot bot-auth directory --headers --ttl 172800 --json > /var/www/wba/directory.json.tmp \
+            && mv /var/www/wba/directory.json.tmp /var/www/wba/directory.json
+```
+
+Your server (or an edge function) reads `headers` and `body` from that JSON and serves them at
+the well-known path. `--content-digest` also covers the body (`Content-Digest`, RFC 9530), as
 in Cloudflare's reference vector; then the body must be served byte for byte as printed.
 
 **3. Launch a signing browser:**
@@ -625,7 +635,8 @@ is dropped, never signalled.
 **Idle close** still works while the signer runs: the signer is attached to every page, so instead
 of "a page is attached" cdpilot counts the CDP clients other than the signer (by socket owner:
 `netstat` on macOS and Windows, `ss` on Linux), and a `watch` daemon or a Playwright session keeps
-the browser open.
+the browser open. On Linux, `ss -tnp` shows only your own processes' sockets, so a client running
+as another user is not counted and idle close may close the browser under it.
 
 **Stealth conflict.** Signing says "I am an agent", and stealth says "I am not". If you pass
 `--bot-auth` together with `--stealth`/`--undetected`, or while `cdpilot mode` is `stealth` or

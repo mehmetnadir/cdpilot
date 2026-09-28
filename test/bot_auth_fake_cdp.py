@@ -489,6 +489,15 @@ def sc_state(mod):
         out["on"] = mod._bot_auth_status_label(port)
         out["active"] = mod._bot_auth_active(port)
         out["kept_while_on"] = mod._bot_auth_load_state(port) is not None and not marker()
+        # /json/version times out under load: unknown, not stale — the verified
+        # signer keeps bot-auth active (no stealth, no escalation), no warning.
+        mod._idle_version = lambda p: None
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            out["unreachable"] = [mod._bot_auth_active(port), mod._bot_auth_status_label(port),
+                                  mod._bot_auth_warn_if_stale(port), err.getvalue(),
+                                  mod._bot_auth_load_state(port) is not None, marker()]
+        mod._idle_version = lambda p: {"webSocketDebuggerUrl": ws}
         # POSIX tells tokens apart by command line; Windows only by the creation
         # time the signer recorded, which a state from elsewhere does not carry.
         save(signer.pid, token="other", ctime=os.name != "nt")
@@ -528,6 +537,75 @@ def sc_state(mod):
             except Exception:
                 pass
     return out
+
+
+LOCK_HOLDER = r"""
+import importlib.util, sys, time
+spec = importlib.util.spec_from_file_location("m", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+fd = m._bot_auth_acquire_lock(int(sys.argv[2]), 5)
+print("held" if fd is not None else "no", flush=True)
+time.sleep(60)
+"""
+LOCK_TAKER = r"""
+import importlib.util, json, os, sys, time
+spec = importlib.util.spec_from_file_location("m", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+port, rec, start = int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
+
+def helper_state(p=None, version=None):
+    try:
+        with open(rec) as f:
+            lines = [ln for ln in f.read().splitlines() if ln]
+    except OSError:
+        return None
+    return {"pid": int(lines[0])} if lines else None
+
+def spawn_locked(p, browser_pid, config):
+    time.sleep(0.5)  # a spawn takes a while: the others wait, then reuse it
+    with open(rec, "a") as f:
+        f.write(f"{os.getpid()}\n")
+    return os.getpid(), None
+
+m._bot_auth_helper_state = helper_state
+m._bot_auth_spawn_locked = spawn_locked
+while time.time() < start:
+    time.sleep(0.002)
+print(json.dumps(m._bot_auth_spawn_helper(port, None, {"keyid": "K"})), flush=True)
+"""
+
+
+def sc_lock(mod):
+    """Spawn lock: its holder is SIGKILLed (the lock file stays behind), then
+    three `launch --bot-auth` take it at the same moment: exactly one signer
+    is spawned and all three report it."""
+    port = 58691
+    path = sys.argv[1]
+    home = os.environ["CDPILOT_HOME"]
+    rec = os.path.join(home, "lock-spawns.txt")
+    holder = subprocess.Popen([sys.executable, "-c", LOCK_HOLDER, path, str(port)],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    held = holder.stdout.readline().strip()
+    holder.kill()  # SIGKILL on POSIX, TerminateProcess on Windows: no cleanup runs
+    holder.wait(10)
+    lock_left = os.path.exists(mod._bot_auth_lock_path(port))
+    start = time.time() + 4
+    takers = [subprocess.Popen([sys.executable, "-c", LOCK_TAKER, path, str(port), rec, str(start)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              for _ in range(3)]
+    results, errors = [], []
+    for t in takers:
+        so, se = t.communicate(timeout=60)
+        try:
+            results.append(json.loads(so.strip().splitlines()[-1]))
+        except (ValueError, IndexError):
+            errors.append(se[-500:])
+    with open(rec) as f:
+        spawned = [int(x) for x in f.read().split()]
+    return {"held": held, "lock_left": lock_left, "spawned": len(spawned), "errors": errors,
+            "all_same": len(results) == 3 and all(r[0] == spawned[0] and r[1] is None for r in results)}
 
 
 def sc_clients(mod):
@@ -596,7 +674,7 @@ def sc_clients(mod):
 
 
 SCENARIOS = [sc_vectors, sc_thumbprint, sc_helper, sc_helper_real_signature, sc_directory,
-             sc_navigate_skips_stealth, sc_conflict_and_log, sc_state, sc_clients]
+             sc_navigate_skips_stealth, sc_conflict_and_log, sc_state, sc_lock, sc_clients]
 
 
 def main():
