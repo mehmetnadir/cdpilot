@@ -505,56 +505,98 @@ cdpilot adaptive clear        # Drop the stealth host memory entirely
 > when it sees one — adds the host to a persistent list, retries once with
 > stealth on. Never auto-demotes. Conservative by design.
 
-### Web Bot Auth (Signed Agent)
+### Web Bot Auth (signed agent)
 
-The opposite of stealth: instead of hiding, your agent identifies itself as a
-verified, legitimate bot by signing every HTTP request with
-[RFC 9421 HTTP Message Signatures](https://datatracker.ietf.org/doc/rfc9421/).
-Verifiers (Cloudflare, AWS WAF, Akamai, Vercel, Shopify) check the Ed25519
-signature against your published public key and treat the agent as a trusted
-crawler — no CAPTCHA, no block, no rate-limit.
+The opposite of stealth. Stealth tries to make the browser look like a person;
+Web Bot Auth says "this is an automated agent, and here is proof of which one".
+Every request the browser makes carries an Ed25519
+[HTTP Message Signature (RFC 9421)](https://www.rfc-editor.org/rfc/rfc9421)
+that a site, or Cloudflare in front of it, checks against a key directory you
+publish on your own domain. The format follows
+[draft-meunier-web-bot-auth-architecture](https://datatracker.ietf.org/doc/draft-meunier-web-bot-auth-architecture/)
+and [draft-meunier-http-message-signatures-directory](https://datatracker.ietf.org/doc/draft-meunier-http-message-signatures-directory/),
+and reproduces the Ed25519 test vectors of Cloudflare's reference
+implementation ([cloudflare/web-bot-auth](https://github.com/cloudflare/web-bot-auth)).
 
-```bash
-# 1. Generate an Ed25519 keypair
-cdpilot bot-auth init --agent-url https://your-domain.com
+**Optional dependency.** Signing needs the `cryptography` package, for the Python cdpilot runs
+on (`CDPILOT_PYTHON` if you set it):
 
-# 2. Publish the JWKS directory on your domain
-cdpilot bot-auth directory > directory.json
-# Host directory.json at:
-#   https://your-domain.com/.well-known/http-message-signatures-directory
-
-# 3. Launch with request signing
-cdpilot launch --bot-auth
-# Or set globally:
-export CDPILOT_BOT_AUTH=1
-cdpilot launch
-
-# Check status
-cdpilot bot-auth status
-```
-
-Every Document, XHR, and Fetch request gets three headers:
-
-| Header | Value |
-|--------|-------|
-| `Signature-Agent` | `"https://your-domain.com"` |
-| `Signature-Input` | `sig1=("@authority" "@method" "@path" "signature-agent");created=…;expires=…;keyid="…";alg="ed25519";nonce="…";tag="web-bot-auth"` |
-| `Signature` | `sig1=:<base64-ed25519-signature>:` |
-
-**Stealth conflict:** `--bot-auth` and `--stealth`/`--undetected` are
-contradictory (you can't sign your identity and hide it). If both are set,
-cdpilot warns and applies bot-auth without stealth patches.
-
-**Optional dependency:** Ed25519 signing requires the `cryptography` package:
 ```bash
 pip install cryptography
 ```
-All other cdpilot commands work without it. If the package is missing and you
-try to use bot-auth, cdpilot prints a helpful message and exits 2.
 
-**Cloudflare registration:** After publishing your JWKS directory, register
-your agent at [Cloudflare Verified Bots](https://developers.cloudflare.com/bots/reference/verified-bots-policy/).
-You can test your setup at `https://crawltest.com/cdn-cgi/web-bot-auth`.
+Without it, the `bot-auth` commands and `launch --bot-auth` print that hint and exit 2. Every
+other command works as before.
+
+**1. Generate the key** (once):
+
+```bash
+cdpilot bot-auth init --agent-url https://your-domain.com
+```
+
+This writes an Ed25519 private key to `CDPILOT_HOME/bot-auth/ed25519.key` (default
+`~/.cdpilot`), created with mode `0600`. cdpilot never prints or logs the key, and it warns
+when the file is readable by others. The agent URL must be an `https://` origin (no path). A
+second `init` refuses to replace the key unless you pass `--force`, because the new key would no
+longer match the directory you published.
+
+**2. Host the directory on your own domain.** `cdpilot bot-auth directory` prints the public key
+as a JWKS, where `kid` is the key's RFC 7638 JWK thumbprint:
+
+```bash
+cdpilot bot-auth directory > http-message-signatures-directory
+# serve it at   https://your-domain.com/.well-known/http-message-signatures-directory
+# with          Content-Type: application/http-message-signatures-directory+json
+```
+
+The directory draft also recommends signing the directory response itself (tag
+`http-message-signatures-directory`). cdpilot doesn't produce that response signature;
+Cloudflare's [Workers example](https://github.com/cloudflare/web-bot-auth/tree/main/examples)
+shows how to serve a signed directory.
+
+**3. Launch a signing browser:**
+
+```bash
+cdpilot launch --bot-auth        # or: CDPILOT_BOT_AUTH=1 cdpilot launch
+cdpilot status                   # ... bot-auth: on (keyid <thumbprint>)
+cdpilot go https://example.com   # this request is signed, and so is everything after it
+cdpilot stop                     # stops the browser and the signer
+```
+
+`launch --bot-auth` starts a small detached signer next to the browser. It uses the same
+self-fork as the idle-close watcher and lives exactly as long as the browser. It holds one CDP
+connection and auto-attaches to every page, popup, new tab, out-of-process iframe and worker. It
+signs each request at the Fetch "Request" stage, including every redirect hop. So requests the page makes on its own are
+signed as well: timers, `fetch()` after your cdpilot command has returned, a tab the page opens.
+`data:`, `blob:` and `chrome-extension:` requests never leave the browser, so they pass through
+unchanged. If signing a request fails, that request goes out unsigned, one line is written to
+`CDPILOT_HOME/bot-auth/signers/<port>.log` (host only), and the page is never held up. Running
+`launch --bot-auth` against a browser that is already up adds the signer to it.
+
+Each request gets three headers:
+
+| Header | Value |
+|--------|-------|
+| `Signature-Agent` | `sig1="https://your-domain.com"` |
+| `Signature-Input` | `sig1=("@authority" "signature-agent";key="sig1");created=…;keyid="<thumbprint>";alg="ed25519";expires=…;nonce="…";tag="web-bot-auth"` |
+| `Signature` | `sig1=:<base64 Ed25519 signature>:` |
+
+`expires` is `created` + 5 minutes. The `nonce` is 64 random bytes, base64-encoded, and new for
+every request.
+
+**Stealth conflict.** Signing says "I am an agent", and stealth says "I am not". If you pass
+`--bot-auth` together with `--stealth`/`--undetected`, or while `cdpilot mode` is `stealth` or
+`undetected`, cdpilot prints one warning line and applies bot-auth. While the signer runs, no
+stealth script or user-agent override is injected, and adaptive escalation does not retry at a
+stealth tier.
+
+**Register with Cloudflare.** Once the directory is live, submit it through the Bot Submission
+Form in the Cloudflare dashboard as a *signed agent* (an agent acting for its users) or a
+*verified bot*; see Cloudflare's
+[signed agents](https://blog.cloudflare.com/signed-agents/) and
+[verified bots with cryptography](https://blog.cloudflare.com/verified-bots-with-cryptography/)
+posts. Sites behind Cloudflare then see your requests as coming from your agent. Sites that
+don't check Web Bot Auth ignore the headers.
 
 ### Friction Ladder (progressive anti-bot detection)
 
