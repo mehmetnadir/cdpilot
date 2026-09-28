@@ -37,6 +37,7 @@ Environment:
                        a browser cdpilot launched closes itself (auto-launch
                        and MCP: default 15; explicit `launch`: off unless set or
                        `launch --idle-close <min>`; 0 = never)
+  CDPILOT_BROWSER_SEARCH_ROOT  Override DevToolsActivePort search root (tests)
   CDPILOT_LOG=0        Do not write the session log
   CDPILOT_PRESS_MS     How long real mouse clicks hold the button: min-max in
                        ms (default: 40-120; 0-0 = instant)
@@ -179,20 +180,142 @@ def _save_registry(projects):
         raise
 
 
-def _register_project(project_id, port, profile_dir, pid=None):
-    """Register or update a project in the global registry."""
+@contextlib.contextmanager
+def _registry_lock():
+    """Exclusive lock around a registry read-modify-write (another cdpilot
+    process may register at the same moment; without it one of the two
+    writes, e.g. a connect's `external` flag, was silently lost). Best
+    effort: if the lock file cannot be opened the block still runs."""
+    os.makedirs(os.path.dirname(REGISTRY_FILE), exist_ok=True)
+    try:
+        fd = os.open(REGISTRY_FILE + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        yield
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+            for _ in range(100):
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(fd, 0, 0)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        os.close(fd)  # releases a flock too
+
+
+def _register_project(project_id, port, profile_dir, pid=None,
+                      external=False, browser_name=None, browser_guid=None):
+    """Register or update a project in the global registry.
+
+    external=True marks a browser that cdpilot connected to but does not own:
+    stop will not kill it, idle-close will not close it, and auto-launch will
+    not replace it with a new browser. browser_guid is the id in the
+    browser's /json/version webSocketDebuggerUrl (new on every browser run):
+    `launch` records it as proof that the browser on the port is the one it
+    started (see _owned_browser).
+    """
+    with _registry_lock():
+        _register_project_locked(project_id, port, profile_dir, pid, external,
+                                 browser_name, browser_guid)
+
+
+def _register_project_locked(project_id, port, profile_dir, pid, external,
+                             browser_name, browser_guid):
     registry = _load_registry()
     existing = registry.get(project_id, {})
-    registry[project_id] = {
+    entry = {
         "cwd": os.getcwd(),
         "port": port,
         "profile_dir": profile_dir,
         "pid": pid,
         "created": existing.get("created", time.strftime("%Y-%m-%dT%H:%M:%S")),
         "last_used": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "status": "running" if pid else "stopped",
+        "status": "running" if pid else ("connected" if external else "stopped"),
     }
+    if external:
+        entry["external"] = True
+    if browser_name:
+        entry["browser_name"] = browser_name
+    if browser_guid:
+        entry["browser_guid"] = browser_guid
+    registry[project_id] = entry
     _save_registry(registry)
+
+
+# ─── External (connected) browsers: the one guard ───
+# `cdpilot connect` registers a browser the user started as {"external": true}.
+# cdpilot never owns it: every path that sends Browser.close, closes targets en
+# masse or kills a pid asks _is_external() first and, on an external browser,
+# only disconnects (prints EXTERNAL_LEFT_RUNNING, touches nothing). The test
+# suite has a tripwire listing every such call site (test/test.js, "external
+# guard: tripwire").
+EXTERNAL_LEFT_RUNNING = ("connected browser left running; "
+                         "run `cdpilot disconnect` to forget it")
+EXTERNAL_GONE = ("your connected browser is gone; "
+                 "run `cdpilot connect` again or `cdpilot disconnect`")
+
+
+def _refuse_external(action, what="clears its cookies, storage or tabs"):
+    """On a connected (external) browser, exit 1: `action` would clear, close
+    or change something in the user's own browser."""
+    if _is_external():
+        print(f"{action} refused: this is your connected browser; cdpilot never {what}",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def _browser_guid(version):
+    """The browser id in a /json/version answer's webSocketDebuggerUrl
+    (/devtools/browser/<id>, new on every browser run), or None."""
+    ws = (version or {}).get("webSocketDebuggerUrl") if isinstance(version, dict) else None
+    if not ws or "/devtools/browser/" not in ws:
+        return None
+    return ws.rsplit("/devtools/browser/", 1)[1].strip("/") or None
+
+
+def _as_port(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_external(port_or_entry=None, registry=None):
+    """True when the browser in question is one cdpilot connected to, not one
+    it launched — so it must never be closed, killed or modified.
+
+    port_or_entry:
+      dict  — a registry entry: its own "external" flag;
+      int   — a CDP port: any registry entry that is external on that port;
+      None  — this process's browser: the current project is external, or
+              CDP_PORT is an external entry's port.
+    Reads the registry each call (another cdpilot process may have connected).
+    """
+    if isinstance(port_or_entry, dict):
+        return bool(port_or_entry.get("external"))
+    reg = _load_registry() if registry is None else registry
+    if port_or_entry is None:
+        if (reg.get(globals().get("PROJECT_ID")) or {}).get("external"):
+            return True
+        port_or_entry = globals().get("CDP_PORT")
+    port = _as_port(port_or_entry)
+    if port is None:
+        return False
+    return any(isinstance(e, dict) and e.get("external") and _as_port(e.get("port")) == port
+               for e in reg.values())
 
 
 def _pid_alive(pid):
@@ -243,7 +366,14 @@ def _is_registry_entry_dead(info):
     never call it dead even if our own bookkeeping (status/pid) looks
     stale — it may be another project's live browser instance, and a
     live entry must never be pruned.
+
+    An external (connected) entry is never dead: it has no pid by design, and
+    pruning it would drop the "your connected browser is gone" guard, after
+    which auto-launch would silently start a cdpilot browser in its place.
+    Only `cdpilot disconnect` removes it.
     """
+    if _is_external(info):
+        return False
     port = info.get("port")
     if port and not _is_port_free(port):
         return False
@@ -261,11 +391,12 @@ def _cleanup_registry():
     9222-9322 port range — the root cause of the "No free port" failure
     documented in .claude/docs/vaat-denetimi-2026-09-27.md.
     """
-    registry = _load_registry()
-    alive = {pid_key: info for pid_key, info in registry.items()
-             if not _is_registry_entry_dead(info)}
-    if len(alive) != len(registry):
-        _save_registry(alive)
+    with _registry_lock():
+        registry = _load_registry()
+        alive = {pid_key: info for pid_key, info in registry.items()
+                 if not _is_registry_entry_dead(info)}
+        if len(alive) != len(registry):
+            _save_registry(alive)
     return alive
 
 
@@ -1187,6 +1318,8 @@ async def _control_start(ws_url):
     # get_visual_config() honoring CDPILOT_MCP_SESSION=1 and CDPILOT_SHOW=1.
     if not get_visual_config():
         return
+    if _is_external():
+        return  # the user's own (connected) browser: no glow, no input blocker
     try:
         # NOTE: addScriptToEvaluateOnNewDocument registered here is session-bound
         # to the WS connection cdp_send opens — it dies when this call returns.
@@ -1226,6 +1359,8 @@ async def _control_end(ws_url):
     # belt-and-braces in case some other path invokes _control_end directly.
     if not get_visual_config():
         return
+    if _is_external():
+        return  # nothing is injected into a connected browser
     try:
         cmds = [
             (903, "Runtime.evaluate", {"expression": INPUT_BLOCKER_OFF, "returnByValue": True}),
@@ -1326,7 +1461,7 @@ AUTOLAUNCH_SKIP_CMDS = frozenset({
     'status', 'health', 'setup', 'help', '--help', '-h', 'version', '--version', '-v',
     'tabs', 'session', 'sessions', 'projects', 'heal',
     'headless', 'proxy', 'browser', 'extensions', 'ext-install', 'ext-remove',
-    'mcp', 'serve', 'log',
+    'mcp', 'serve', 'log', 'connect', 'disconnect',
 })
 # cmd is set by the CLI dispatcher; None (module imported) means never launch.
 _AUTOLAUNCH = {"cmd": None, "attempted": False, "failure": None}
@@ -1344,7 +1479,15 @@ def _autolaunch_if_down():
     after their usual error, so CDPILOT_NO_AUTOLAUNCH=1 output stays identical.
     """
     cmd = _AUTOLAUNCH["cmd"]
-    if (cmd is None or cmd in AUTOLAUNCH_SKIP_CMDS or _AUTOLAUNCH["attempted"]
+    if cmd is None:
+        return False
+    if _is_external():
+        # A connected browser that stopped answering is never replaced by a
+        # cdpilot browser, whatever the command or CDPILOT_NO_AUTOLAUNCH says.
+        if cdp_get("/json/version", no_cache=True):
+            return True
+        _external_gone_exit()
+    if (cmd in AUTOLAUNCH_SKIP_CMDS or _AUTOLAUNCH["attempted"]
             or _autolaunch_disabled()):
         return False
     _AUTOLAUNCH["attempted"] = True
@@ -1369,6 +1512,13 @@ def _autolaunch_if_down():
     reason = err.getvalue().strip() or out.getvalue().strip() or "browser did not answer on the CDP port"
     _AUTOLAUNCH["failure"] = " / ".join(ln.strip() for ln in reason.splitlines() if ln.strip())
     return False
+
+
+def _external_gone_exit():
+    """The connected (external) browser stopped answering: say so, exit 1.
+    Never launches a replacement."""
+    print(f"cdpilot: {EXTERNAL_GONE}", file=sys.stderr)
+    sys.exit(1)
 
 
 def _print_autolaunch_failure():
@@ -1419,7 +1569,7 @@ IDLE_POLL_MAX_S = 30.0
 # `until cdpilot health; do ...` watchdog loop would pin it forever).
 IDLE_PASSIVE_CMDS = frozenset({
     'status', 'health', 'projects', 'version', '--version', '-v',
-    'help', '--help', '-h', 'setup',
+    'help', '--help', '-h', 'setup', 'connect', 'disconnect',
 })
 _IDLE_WARNED = []
 
@@ -1706,7 +1856,9 @@ def _idle_watcher_step(port, token, now=None, memo=None):
     version = _idle_version(port)
     if version is None and _pid_alive(state.get("browser_pid")) and not _is_port_free(port):
         return "wait"  # busy, not gone
-    if not _idle_owns_browser(state, _load_registry(), version):
+    registry = _load_registry()
+    if _is_external(port, registry) or not _idle_owns_browser(state, registry, version):
+        # A connected (external) browser on the port is never ours to close.
         _idle_clear_state(port, token)
         return "exit"
     if memo is not None:
@@ -2996,6 +3148,8 @@ def get_tabs():
     result = cdp_get("/json")
     if result is None and _autolaunch_if_down():
         result = cdp_get("/json", no_cache=True)
+    if result is None and _is_external():
+        _external_gone_exit()
     if result is None:
         print("CDP connection error. Is the browser running?", file=sys.stderr)
         _print_autolaunch_failure()
@@ -3022,12 +3176,17 @@ def _cleanup_idle_sessions():
         return
     now = time.time()
     to_remove = []
+    # A session tab in a connected (external) browser may be the user's own
+    # tab (the session reuses an open page): forget the session, keep the tab.
+    external = _is_external()
     for sid, info in sessions.items():
         last_used = info.get("last_used", 0)
         if last_used and (now - last_used) > SESSION_IDLE_TIMEOUT:
             to_remove.append(sid)
             target_id = info.get("target_id")
-            if target_id:
+            if target_id and external:
+                _external_close_own_tabs({target_id})  # only if cdpilot opened it
+            elif target_id:
                 try:
                     urllib.request.urlopen(
                         f"{CDP_BASE}/json/close/{target_id}", timeout=2)
@@ -3055,6 +3214,21 @@ def _create_session_window():
     (does not steal focus). newWindow: False — no new window is opened.
     """
     sid = _get_session_id()
+
+    # A connected (external) browser's open tabs are the user's own: never
+    # adopt one (a `go` would navigate it away, unsaved form and all). The
+    # session gets a tab of its own, opened with Target.createTarget.
+    if _is_external():
+        target_id = _external_create_tab()
+        if target_id:
+            sessions = _load_sessions()
+            sessions[sid] = {
+                "target_id": target_id,
+                "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "last_used": time.time(),
+            }
+            _save_sessions(sessions)
+        return target_id
 
     # Check existing tabs — reuse if already open
     tabs = cdp_get("/json")
@@ -3100,10 +3274,119 @@ def _create_session_window():
 
     return target_id
 
+EXTERNAL_TABS_FILE = os.path.join(PROFILE_DIR, 'external-tabs.json')
+
+
+def _external_tabs_load():
+    """(browser guid, set of tab ids) cdpilot opened in a connected browser."""
+    try:
+        with open(EXTERNAL_TABS_FILE) as f:
+            data = json.load(f)
+        return data.get("guid"), set(data.get("tabs") or [])
+    except (OSError, ValueError, AttributeError):
+        return None, set()
+
+
+def _external_tabs_save(guid, tabs):
+    try:
+        _atomic_write_json(EXTERNAL_TABS_FILE, {"guid": guid, "tabs": sorted(tabs)})
+    except OSError:
+        pass
+
+
+def _external_own_tabs():
+    """Ids of the tabs cdpilot itself opened in the connected browser that
+    answers the port now: bound to that browser's GUID, so a set recorded
+    for another browser (or run) never matches. owned-tabs.json is not used
+    here: CDPILOT_TARGET and a smart-click can put user tabs in it."""
+    guid, tabs = _external_tabs_load()
+    live = _browser_guid(cdp_get("/json/version"))
+    return tabs if guid and guid == live else set()
+
+
+def _browser_ws_call(method, params, timeout=10):
+    """One CDP command on the browser socket; its result dict, or None.
+
+    Runs on a worker thread with its own loop, like _cdp_browser_close, so a
+    caller inside a running loop (an async command's get_page_ws) works too.
+    """
+    ver = cdp_get("/json/version", no_cache=True) or {}
+    browser_ws = ver.get("webSocketDebuggerUrl")
+    if not browser_ws:
+        return None
+    out = []
+
+    def _send():
+        try:
+            r = asyncio.run(cdp_send(browser_ws, [(1, method, params)], timeout=timeout))
+            out.append(r.get(1) or {})
+        except BaseException:  # cdp_send exits when it cannot connect at all
+            pass
+
+    worker = threading.Thread(target=_send, daemon=True)
+    worker.start()
+    worker.join(timeout + 5)
+    cdp_cache_invalidate()
+    return out[0] if out else None
+
+
+def _external_create_tab(url="about:blank"):
+    """Open a tab of cdpilot's own in the connected (external) browser:
+    Target.createTarget in a new window shown inactive (newWindow +
+    background: the user's window and tab keep the focus), recorded in the
+    GUID-bound set. Returns its target id, or None.
+
+    Not a background tab in the user's window: that page is hidden, and a
+    Runtime.evaluate right after a navigation there went unanswered for the
+    full 15 s timeout (measured, headless Chrome: 3 of 12 `go` + `eval`
+    pairs; 0 of 16 in an inactive window, 0 of 12 in a foreground tab)."""
+    guid = _browser_guid(cdp_get("/json/version", no_cache=True))
+    r = _browser_ws_call("Target.createTarget", {"url": url, "newWindow": True, "background": True})
+    target_id = (r or {}).get("targetId")
+    if target_id and guid:
+        old_guid, tabs = _external_tabs_load()
+        tabs = (tabs if old_guid == guid else set()) | {target_id}
+        _external_tabs_save(guid, tabs)
+    return target_id
+
+
+def _external_close_own_tabs(only=None):
+    """Close tabs cdpilot opened in the connected browser (_external_own_tabs;
+    `only` narrows them), never a user tab and never the last page (closing
+    it would quit the browser on Windows/Linux). Returns how many closed."""
+    if not _is_external():
+        return 0
+    own = _external_own_tabs()
+    if only is not None:
+        own &= set(only)
+    if not own:
+        return 0
+    pages = [t for t in (cdp_get("/json", no_cache=True) or []) if t.get("type") == "page"]
+    left = len(pages)
+    closed = set()
+    for t in pages:
+        if t.get("id") in own and left > 1:
+            r = _browser_ws_call("Target.closeTarget", {"targetId": t["id"]})
+            if r is not None:
+                closed.add(t["id"])
+                left -= 1
+    guid, tabs = _external_tabs_load()
+    live_ids = {t.get("id") for t in pages}
+    _external_tabs_save(guid, (tabs & live_ids) - closed)
+    return len(closed)
+
+
+def _session_target_usable(target_id):
+    """On a connected (external) browser only a tab cdpilot opened itself in
+    that browser (_external_own_tabs) may serve as the session tab; anywhere
+    else any recorded target does."""
+    return bool(target_id) and (not _is_external() or target_id in _external_own_tabs())
+
+
 def _ensure_session_window():
     """Create a session window if none exists, or validate the existing one."""
     target_id = _get_session_window_target_id()
-    if target_id:
+    if target_id and _session_target_usable(target_id):
         # Verify target still exists
         tabs = cdp_get("/json") or []
         if any(t.get("id") == target_id for t in tabs):
@@ -3149,6 +3432,9 @@ def get_page_ws(prefer_url=None):
 
     # Get target ID for the current session window
     session_target_id = _get_session_window_target_id()
+    external = _is_external()
+    if external and not _session_target_usable(session_target_id):
+        session_target_id = None  # never a user tab of a connected browser
 
     if session_target_id and pages:
         session_page = None
@@ -3177,6 +3463,12 @@ def get_page_ws(prefer_url=None):
                 for t in tabs:
                     if t.get("id") == new_target_id:
                         return t["webSocketDebuggerUrl"], t
+
+    if external:
+        # Never fall back to one of the user's own tabs.
+        print("Could not open a tab of cdpilot's own in the connected browser; "
+              "your tabs were left untouched.", file=sys.stderr)
+        sys.exit(1)
 
     # Fallback: use any available page
     if pages:
@@ -4512,7 +4804,13 @@ BLOCKER_EXIT_RESTORE_S = 0.5  # the watchdog's budget for that restore
 
 
 async def _blocker_pointer(route, value):
-    """Set pointer-events on cdpilot's input blocker (top page); True if there is one."""
+    """Set pointer-events on cdpilot's input blocker (top page); True if there is one.
+
+    Never on a connected (external) browser: cdpilot puts no blocker there
+    (see _control_start), so a click or press there sends nothing but the
+    click itself."""
+    if _is_external():
+        return False
     params = {"expression": _BLOCKER_POINTER_JS % json.dumps(value), "returnByValue": True}
     ctx = await _frame_world(route, None, None)
     if ctx is not None:
@@ -4532,9 +4830,10 @@ async def _blocker_passthrough(ws_url):
 
     Only with visual feedback on (`show on`, CDPILOT_SHOW=1, MCP sessions):
     without it there is no blocker and nothing extra is sent. The blocker is
-    restored in `finally`.
+    restored in `finally`. Never on a connected (external) browser: cdpilot
+    puts no blocker there (see _control_start).
     """
-    if not get_visual_config():
+    if not get_visual_config() or _is_external():
         yield
         return
     route = _FRAME_ROUTE.get() or _FrameRoute(ws_url)
@@ -4939,6 +5238,11 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
         # toggle and the CDPILOT_STEALTH env var (set during adaptive
         # escalation) so existing behavior is preserved.
         stealth_source = stealth_js_for_tier(get_mode_config())
+        # A connected (external) browser is the user's own: no stealth, no
+        # UA override, whatever mode.json / CDPILOT_MODE / CDPILOT_STEALTH say.
+        external = _is_external()
+        if external:
+            stealth_source = None
         if stealth_source and _bot_auth_active():
             # Web Bot Auth declares the agent; hiding it would contradict the
             # signature (warned once at launch). No stealth script, no UA spoof.
@@ -5016,7 +5320,7 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
         # Default OFF since 0.4.4 — the glow/cursor animations made cdpilot
         # feel sluggish in real automation. Re-enable with `cdpilot show on`
         # or via CDPILOT_MCP_SESSION=1 / CDPILOT_SHOW=1.
-        if glow and get_visual_config():
+        if glow and get_visual_config() and not external:
             await ws.send(json.dumps({
                 "id": 200, "method": "Runtime.evaluate",
                 "params": {"expression": GLOW_CSS, "returnByValue": True}
@@ -5028,7 +5332,7 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
             }))
 
         # Inject dev extension content scripts via the existing WS connection
-        ext_scripts = _get_dev_extension_scripts(url)
+        ext_scripts = [] if external else _get_dev_extension_scripts(url)
         ext_injected = []
         for ext_name, filename, code, _ in ext_scripts:
             try:
@@ -5357,6 +5661,8 @@ async def inject_dev_extension_scripts(ws_url, page_url):
 
     For use outside navigate_collect (e.g. after cmd_eval).
     """
+    if _is_external():
+        return  # never inject into the user's own (connected) browser
     scripts = _get_dev_extension_scripts(page_url)
     if not scripts:
         return
@@ -5881,6 +6187,15 @@ def cmd_launch(auto=False, idle_close=None):
     except ValueError as e:
         print(f"cdpilot: {e}", file=sys.stderr)
         sys.exit(2)
+    if _is_external():
+        # This project is connected to the user's own browser: launching would
+        # replace its registry entry (only `disconnect` may drop it).
+        if cdp_get('/json/version', no_cache=True):
+            print(f'Connected browser in use on port {CDP_PORT} (external); '
+                  'no cdpilot browser launched. `cdpilot disconnect` to use one.')
+            return
+        print(EXTERNAL_GONE, file=sys.stderr)
+        sys.exit(1)
     # This command's own flags (sys.argv minus --timeout); none for auto-launch.
     launch_args = sys.argv[2:] if sys.argv[1:2] == ['launch'] else []
     bot_auth = _bot_auth_enabled(launch_args)
@@ -5900,8 +6215,15 @@ def cmd_launch(auto=False, idle_close=None):
             # Chrome reads feature flags only at startup.
             print(f'  WebMCP mode saved ({"on" if webmcp else "off"}); the running browser '
                   f'keeps its flags until `cdpilot stop` and `cdpilot launch`.')
-        if bot_auth and not _bot_auth_start_for_launch(CDP_PORT, None, bot_auth_config):
-            sys.exit(1)
+        if bot_auth:
+            # The signer intercepts every request of the browser it attaches
+            # to: only a browser cdpilot can prove it launched gets one.
+            if _owned_browser(CDP_PORT) is None:
+                print(f'cdpilot: Bot Auth: the browser on port {CDP_PORT} is not one cdpilot '
+                      'launched (no ownership proof); no signer attached.', file=sys.stderr)
+                sys.exit(1)
+            if not _bot_auth_start_for_launch(CDP_PORT, None, bot_auth_config):
+                sys.exit(1)
         return
     if _is_port_in_use(CDP_PORT):
         if PROJECT_ID:
@@ -6068,7 +6390,8 @@ def cmd_launch(auto=False, idle_close=None):
         time.sleep(0.5)
         if cdp_get('/json/version'):
             if PROJECT_ID:
-                _register_project(PROJECT_ID, CDP_PORT, PROFILE_DIR, pid=proc.pid)
+                _register_project(PROJECT_ID, CDP_PORT, PROFILE_DIR, pid=proc.pid,
+                                  browser_guid=_browser_guid(cdp_get('/json/version', no_cache=True)))
                 # Only browsers started right here get a watcher (see Idle auto-close).
                 if _idle_spawn_watcher(proc.pid, minutes=idle_minutes):
                     print(f'  Idle close: after {idle_minutes:g} min without a cdpilot '
@@ -6178,8 +6501,7 @@ async def cmd_go(url):
         try:
             cached = _load_host_cookies(expected_host)
             if cached:
-                await cdp_send(active_ws, [(910, 'Network.setCookies', {'cookies': cached})])
-                sys.stderr.write(f"🍪 Cookie auto: injected {len(cached)} cached cookies for {expected_host}\n")
+                await _cookies_auto_inject(active_ws, cached, expected_host)
         except Exception:
             pass
     # --- END COOKIES AUTO PRE-NAVIGATE ---
@@ -7424,8 +7746,9 @@ def _cookies_auto_should_apply(host):
     A host matches if it equals a safe-list entry OR ends with `.<entry>`.
     Empty safe-list means auto is a no-op (safe default — prevents bench-style
     cross-task cookie pollution observed in v0.6.0).
+    Never on a connected (external) browser: its cookies are the user's own.
     """
-    if not host:
+    if not host or _is_external():
         return False
     cfg = _cookies_auto_config()
     if not cfg['enabled']:
@@ -7441,6 +7764,14 @@ def _cookies_auto_should_apply(host):
         if h == e or h.endswith('.' + e):
             return True
     return False
+
+
+async def _cookies_auto_inject(ws, cookies, host):
+    """Inject cached cookies before navigating. Never into a connected browser."""
+    if _is_external():
+        return
+    await cdp_send(ws, [(910, 'Network.setCookies', {'cookies': cookies})])
+    sys.stderr.write(f"🍪 Cookie auto: injected {len(cookies)} cached cookies for {host}\n")
 
 
 def _set_cookies_auto(enabled):
@@ -7539,6 +7870,12 @@ async def cmd_cookies(*args):
         return
 
     if sub == 'load':
+        allow_external = '--allow-external' in args
+        args = [a for a in args if a != '--allow-external']
+        if _is_external() and not allow_external:
+            print("cookies load writes into your own browser's cookie jar; add --allow-external to do it anyway",
+                  file=sys.stderr)
+            sys.exit(1)
         # Per-host mode: cookies load --host <hostname>
         if len(args) >= 3 and args[1] == '--host':
             host = args[2]
@@ -7685,6 +8022,12 @@ async def cmd_cookies(*args):
         return
 
     if sub == 'cf-replay':
+        allow_external = '--allow-external' in args
+        args = [a for a in args if a != '--allow-external']
+        if _is_external() and not allow_external:
+            print("cf-replay writes into your own browser's cookie jar; add --allow-external to do it anyway",
+                  file=sys.stderr)
+            sys.exit(1)
         if len(args) < 2:
             print("Usage: cdpilot cookies cf-replay <url>", file=sys.stderr)
             return
@@ -7751,6 +8094,7 @@ async def cmd_wipe(*args):
 
     Returns JSON: {cookies_removed, storage_cleared_origins, tabs_closed}
     """
+    _refuse_external("wipe")
     only_cookies = '--cookies' in args
     only_storage = '--storage' in args
     only_tabs = '--tabs' in args
@@ -8009,6 +8353,10 @@ async def cmd_emulate(device):
 
 
 async def cmd_glow(state="on"):
+    if state == "on" and _is_external():
+        print("Visual indicator not injected: this is your connected browser "
+              "(cdpilot never injects into it).", file=sys.stderr)
+        return
     ws, page = get_page_ws()
     if state == "on":
         await cdp_send(ws, [
@@ -8125,9 +8473,7 @@ def _load_owned_tabs():
 def _save_owned_tabs(owned):
     """Persist the owned target_id set."""
     try:
-        os.makedirs(os.path.dirname(OWNED_TABS_FILE), exist_ok=True)
-        with open(OWNED_TABS_FILE, "w") as f:
-            json.dump({"owned": sorted(owned)}, f)
+        _atomic_write_json(OWNED_TABS_FILE, {"owned": sorted(owned)})
     except OSError:
         pass
 
@@ -8157,7 +8503,10 @@ def _is_chrome_internal_url(url):
 
 
 def _close_target(target_id):
-    """Close one CDP target. Returns True when the browser accepted it."""
+    """Close one CDP target. Returns True when the browser accepted it.
+    Never in a connected (external) browser: returns False, sends nothing."""
+    if _is_external():
+        return False
     try:
         urllib.request.urlopen(f"{CDP_BASE}/json/close/{target_id}", timeout=2)
         return True
@@ -8178,7 +8527,11 @@ def _reap_tabs(max_tabs=1, include_real=False, dry_run=False):
     a real URL are never touched unless include_real is set, because on a shared
     browser they may belong to somebody else. The session's own tab and the last
     remaining page always survive.
+
+    Never on a connected (external) browser: its tabs are the user's.
     """
+    if _is_external():
+        return {"closed": [], "kept": 0, "reason": EXTERNAL_LEFT_RUNNING}
     tabs = cdp_get("/json", no_cache=True)
     if not tabs:
         return {"closed": [], "kept": 0, "reason": "no CDP connection"}
@@ -8241,7 +8594,11 @@ async def _browser_close_graceful():
     """Ask the browser to shut down gracefully via the CDP Browser.close
     command (cleanest cross-platform path — flushes state, no orphaned procs).
     Returns True if the command was acknowledged. Falls back to a SIGTERM-based
-    process stop (never kill -9) when the WebSocket path fails."""
+    process stop (never kill -9) when the WebSocket path fails.
+    Never on a connected (external) browser, nor on one without ownership
+    proof (_owned_browser): returns False, sends nothing."""
+    if _is_external() or _owned_browser(CDP_PORT) is None:
+        return False
     try:
         browser_ws = await _get_browser_ws()
         if browser_ws:
@@ -8272,9 +8629,28 @@ async def cmd_close(force_browser=False, keep_browser=False):
     Flags:
       keep_browser  — never close the browser, only the owned tabs.
       force_browser — close the browser even if user tabs remain.
+
+    A connected (external) browser is the user's own: with or without
+    --force, nothing is closed — one line says so and the entry stays.
     """
+    if _is_external():
+        # Only the tabs cdpilot opened in it (GUID-bound set); never the
+        # browser, never a user tab, never the last page.
+        n = _external_close_own_tabs() if cdp_get("/json/version", no_cache=True) else 0
+        sessions = _load_sessions()
+        if sessions.pop(_get_session_id(), None) is not None:
+            _save_sessions(sessions)
+        if n:
+            print(f"Closed {n} cdpilot tab(s).")
+        print(EXTERNAL_LEFT_RUNNING)
+        return
     if not cdp_get("/json/version"):
         print("No browser running.")
+        return
+    if _owned_browser(CDP_PORT) is None:
+        # A busy port is no proof: this may be the user's own browser.
+        print(f"The browser on port {CDP_PORT} is not one cdpilot launched (no ownership "
+              "proof); nothing closed. Use `cdpilot connect` for your own browser.")
         return
 
     tabs = get_tabs()
@@ -8384,6 +8760,15 @@ def cmd_session_close(session_id=None):
     sid = session_id or _get_session_id()
     sessions = _load_sessions()
     info = sessions.get(sid)
+    if _is_external():
+        # Close the session tab only if cdpilot opened it in this browser
+        # (never a user tab, never the last page); forget the session.
+        if info:
+            _external_close_own_tabs({info.get("target_id")})
+            sessions.pop(sid, None)
+            _save_sessions(sessions)
+        print(f"Session {'forgotten' if info else 'not found'}: {sid}; {EXTERNAL_LEFT_RUNNING}")
+        return
     if not info:
         print(f"Session not found: {sid}")
         return
@@ -8664,6 +9049,7 @@ async def cmd_context_create(url='about:blank'):
         print(f'createTarget failed: {r2.get(2)}', file=sys.stderr)
         sys.exit(1)
     cdp_cache_invalidate()
+    _mark_owned_context(ctx_id)
     print(json.dumps({
         "context_id": ctx_id,
         "target_id": tgt_id,
@@ -8709,13 +9095,39 @@ async def cmd_context_list():
     }, indent=2))
 
 
+OWNED_CONTEXTS_FILE = os.path.join(PROFILE_DIR, 'owned-contexts.json')
+
+
+def _load_owned_contexts():
+    try:
+        with open(OWNED_CONTEXTS_FILE) as f:
+            return set(json.load(f).get("owned", []))
+    except (OSError, ValueError, AttributeError):
+        return set()
+
+
+def _mark_owned_context(ctx_id):
+    """Record a browser context `context create` made (see cmd_context_close)."""
+    owned = _load_owned_contexts() | {ctx_id}
+    try:
+        _atomic_write_json(OWNED_CONTEXTS_FILE, {"owned": sorted(owned)})
+    except OSError:
+        pass
+
+
 async def cmd_context_close(context_id):
     """Destroy a browser context. All tabs inside it close automatically.
 
     Refuses to destroy the default context (which has no context_id anyway).
+    On a connected (external) browser only a context `context create` made is
+    destroyed: any other one holds the user's own tabs.
     """
     if not context_id or context_id == 'default':
         print('Cannot destroy the default context.', file=sys.stderr)
+        sys.exit(1)
+    if _is_external() and context_id not in _load_owned_contexts():
+        print(f"context close refused: {context_id} was not created by cdpilot and this is "
+              f"your connected browser; {EXTERNAL_LEFT_RUNNING}", file=sys.stderr)
         sys.exit(1)
     ver = cdp_get('/json/version')
     browser_ws = ver.get('webSocketDebuggerUrl') if ver else None
@@ -8762,7 +9174,19 @@ async def cmd_new_tab(url='about:blank'):
     safe_chars = ":/?#[]@!$&'()*+,;="
     if not cdp_get('/json/version'):
         _autolaunch_if_down()
-    data = cdp_get(f'/json/new?{urllib.parse.quote(url, safe=safe_chars)}')
+    if _is_external():
+        tid = _external_create_tab(url)  # background, recorded as cdpilot's own
+        data = {"id": tid, "url": url} if tid else None
+    else:
+        # PUT: Chrome refuses GET /json/new ("unsafe HTTP verb"), so the old
+        # cdp_get here always printed "Failed to open tab".
+        try:
+            req = urllib.request.Request(
+                f'{CDP_BASE}/json/new?{urllib.parse.quote(url, safe=safe_chars)}', method='PUT')
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+        except Exception:
+            data = None
     cdp_cache_invalidate()
     if data:
         _mark_owned_tab(data.get("id"))
@@ -8798,7 +9222,16 @@ def cmd_switch_tab(index_or_id):
         cmd_tabs()
 
 async def cmd_close_tab(index_or_id=None):
-    """Close a specific tab by index or ID (active tab if omitted)."""
+    """Close a specific tab by index or ID (active tab if omitted).
+
+    On a connected (external) browser the last page is never closed: closing
+    it quits the user's browser on Windows/Linux.
+    """
+    if _is_external():
+        pages = [t for t in get_tabs() if t.get('type') == 'page']
+        if len(pages) <= 1:
+            print(f"Last tab kept open; {EXTERNAL_LEFT_RUNNING}")
+            return
     if index_or_id is None:
         ws, page = get_page_ws()
         r = await cdp_send(ws, [(1, 'Page.close', {})])
@@ -9383,10 +9816,20 @@ def _atomic_write_json(path, data):
     off for a single command. os.replace is POSIX-atomic on the same fs.
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(data, f)
-    os.replace(tmp, path)
+    # A unique temp name: two writers sharing "<path>.tmp" could replace
+    # each other's half-written file.
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + '.', suffix='.tmp',
+                               dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def get_visual_config():
@@ -11147,7 +11590,10 @@ def _cdp_browser_close(port):
     Same command the smart close sends, through the same cdp_send. It runs on
     a worker thread with its own loop, so callers inside a running loop
     (_browser_close_graceful) work too. True once the command went out.
+    Never on a connected (external) browser: returns False, sends nothing.
     """
+    if _is_external(port) or _owned_browser(port) is None:
+        return False
     try:
         url = f"http://127.0.0.1:{int(port)}/json/version"
         with urllib.request.urlopen(url, timeout=2) as resp:
@@ -11222,17 +11668,84 @@ def _debug_port_pids(port):
     return pids
 
 
+def _cdp_version_on(port, timeout=2):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/json/version",
+                                    timeout=timeout) as resp:
+            data = json.loads(resp.read())
+            return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _owned_browser(port, registry=None):
+    """POSITIVE proof that the browser on `port` is one cdpilot launched.
+
+    Returns {"project": key, "entry": ..., "cdp": bool, "pids": set} or None.
+    A busy port proves nothing: 9222 is both cdpilot's first port and the
+    most common manual debug port, and a registry entry whose browser died
+    once made the user's own Chrome on that port look like cdpilot's (and
+    `stop` killed it). Proof, per non-external registry entry on the port:
+      - browser_guid (recorded by `launch`): the browser answering the port
+        has that GUID -> ours; answers with another GUID -> not ours;
+      - no answer, or an entry without a GUID (older cdpilot): the recorded
+        pid is alive AND it is a process carrying
+        --remote-debugging-port=<port> (_debug_port_pids).
+    "cdp" says whether the CDP shutdown may go to the answering browser; "pids"
+    are the only processes that may be signalled. No proof -> None.
+    """
+    port = int(port)
+    reg = _load_registry() if registry is None else registry
+    candidates = [(k, e) for k, e in reg.items()
+                  if isinstance(e, dict) and not _is_external(e) and _as_port(e.get("port")) == port]
+    if not candidates:
+        return None
+    version = _cdp_version_on(port)
+    live_guid = _browser_guid(version)
+    debug_pids = None
+    for key, entry in candidates:
+        pid = entry.get("pid")
+        pid_proof = False
+        if pid and _pid_alive(pid):
+            if debug_pids is None:
+                debug_pids = _debug_port_pids(port)
+            pid_proof = int(pid) in debug_pids
+        guid = entry.get("browser_guid")
+        if version is not None and guid:
+            if guid != live_guid:
+                continue  # another browser answers the port
+            return {"project": key, "entry": entry, "cdp": True,
+                    "pids": {int(pid)} if pid_proof else set()}
+        if pid_proof:
+            return {"project": key, "entry": entry, "cdp": version is not None,
+                    "pids": {int(pid)}}
+    return None
+
+
 def _stop_browser_on_port(port, verbose=False):
     """Stop cdpilot's browser on `port` and its Web Bot Auth signer (if any);
-    True if a browser was stopped. See _stop_browser_processes_on_port."""
+    True if a browser was stopped. See _stop_browser_processes_on_port.
+
+    The signer is ended only next to a browser with ownership proof
+    (_owned_browser), or once nothing holds the port any more (an orphan
+    signer): never while a browser cdpilot cannot prove is its own answers
+    the port, never on a connected (external) browser."""
+    port = int(port)
+    if _is_external(port):
+        return False
+    proven = _owned_browser(port) is not None
     try:
         return _stop_browser_processes_on_port(port, verbose)
     finally:
-        _bot_auth_stop_helper(port)
+        if proven or _is_port_free(port):
+            _bot_auth_stop_helper(port)
 
 
 def _stop_browser_processes_on_port(port, verbose=False):
     """Stop cdpilot's browser on `port`; True if one was stopped.
+
+    Only with positive ownership proof (_owned_browser): otherwise nothing is
+    sent or signalled and the result is False.
 
     1. Graceful: CDP Browser.close, then wait up to 5 s for the port to free
        and up to 10 s more for the browser's processes to exit.
@@ -11241,13 +11754,23 @@ def _stop_browser_processes_on_port(port, verbose=False):
        POSIX; `taskkill /PID <pid> /T /F` on Windows. Never by image name:
        killing every chrome.exe/brave.exe also took the user's own browser.
     Every subprocess call has a timeout (a hung `lsof` froze `cdpilot stop`).
+    A connected (external) browser on `port` is the user's own: nothing is
+    sent or signalled, and the result is False (nothing stopped).
     """
     port = int(port)
-    closed = _cdp_browser_close(port)
+    if _is_external(port):
+        return False
+    own = _owned_browser(port)
+    if own is None:
+        if verbose and not _is_port_free(port):
+            print(f"  The browser on port {port} is not one cdpilot launched "
+                  "(no ownership proof); left running.", file=sys.stderr)
+        return False
+    closed = _cdp_browser_close(port) if own["cdp"] else False
     deadline = time.time() + 5
     while closed and time.time() < deadline and not _is_port_free(port):
         time.sleep(0.1)
-    pids = _debug_port_pids(port)
+    pids = {p for p in own["pids"] if _pid_alive(p)}
     if closed and _is_port_free(port):
         # The main process outlives its socket while it shuts down (measured
         # on macOS: 0.5-2 s warm, ~7 s on a fresh profile). Let it exit rather
@@ -11506,8 +12029,16 @@ def cmd_serve(api: bool = False, port: int = 9333):
 def cmd_stop():
     """Stop the browser instance managed by cdpilot (only that one: never the
     user's own Brave/Chrome — see _stop_browser_on_port)."""
+    # A connected (external) browser: close nothing, kill nothing, keep the
+    # registry entry (only `cdpilot disconnect` removes it).
+    if _is_external():
+        print(EXTERNAL_LEFT_RUNNING)
+        return
+
     if _stop_browser_on_port(CDP_PORT, verbose=True):
         print(f"Browser stopped (port {CDP_PORT}).")
+    elif not _is_port_free(CDP_PORT):
+        pass  # _stop_browser_on_port said why: not provably cdpilot's browser
     else:
         print(f"No browser process found (port {CDP_PORT}).", file=sys.stderr)
 
@@ -11542,13 +12073,16 @@ def cmd_projects():
         status = info.get("status", "?")
         cwd = info.get("cwd", "?")
         # Live check
-        if status == "running" and _is_port_free(port):
+        if _is_external(info):
+            status = "gone" if _is_port_free(port) else "connected"
+        elif status == "running" and _is_port_free(port):
             status = "stopped"
-        icon = "\U0001f7e2" if status == "running" else "\u26ab"
+        icon = "\U0001f7e2" if status in ("running", "connected") else "\u26ab"
+        ext_tag = " (ext)" if info.get("external") else ""
         marker = " \u2190 current" if pid == current else ""
         if len(cwd) > 45:
             cwd = "..." + cwd[-42:]
-        print(f"  {pid:<26} {port:<7} {icon} {status:<8} {cwd}{marker}")
+        print(f"  {pid:<26} {port:<7} {icon} {status:<8}{ext_tag} {cwd}{marker}")
 
     print(f"\nTotal: {len(registry)} project(s)")
 
@@ -11568,9 +12102,15 @@ def cmd_project_stop(name):
 
     info = registry[target_id]
     port = info.get("port")
+    if _is_external(info) or _is_external(port, registry):
+        print(f"{target_id}: {EXTERNAL_LEFT_RUNNING}")
+        return
     if port and not _is_port_free(port):
-        _stop_browser_on_port(port)
-        print(f"Stopped: {target_id} (port {port})")
+        if _stop_browser_on_port(port):
+            print(f"Stopped: {target_id} (port {port})")
+        else:
+            print(f"{target_id}: the browser on port {port} is not one cdpilot launched "
+                  "(no ownership proof); left running")
     else:
         print(f"Project already stopped: {target_id}")
 
@@ -11585,8 +12125,14 @@ def cmd_stop_all():
     stopped = 0
     for pid, info in registry.items():
         port = info.get("port")
+        if _is_external(info) or _is_external(port, registry):
+            print(f"  {pid}: {EXTERNAL_LEFT_RUNNING}")
+            continue
         if port and info.get("status") == "running" and not _is_port_free(port):
-            _stop_browser_on_port(port)
+            if not _stop_browser_on_port(port):
+                print(f"  {pid}: the browser on port {port} is not one cdpilot launched "
+                      "(no ownership proof); left running")
+                continue
             info["status"] = "stopped"
             info["pid"] = None
             stopped += 1
@@ -11596,6 +12142,452 @@ def cmd_stop_all():
         print(f"\n{stopped} instance(s) stopped.")
     else:
         print("No active instances.")
+
+
+# ─── Connect to an Existing Browser ───
+# `cdpilot connect` attaches to a Chromium the user started themselves with
+# --remote-debugging-port=<p> --user-data-dir=<dir>. It is registered as
+# external (see _is_external): cdpilot never closes, kills or injects into it.
+#
+# Not supported yet: Chrome 144+'s chrome://inspect/#remote-debugging mode
+# (the user's default, logged-in profile). That mode serves only the browser
+# WebSocket (the /json HTTP endpoints answer 404) and may ask the user to allow
+# every new debugging connection, while cdpilot discovers tabs over /json and
+# opens a fresh WebSocket per command. `connect --auto` detects the mode and
+# says so (exit 2) instead of half-working.
+
+# DevToolsActivePort default search directories, per browser and platform.
+# The env var CDPILOT_BROWSER_SEARCH_ROOT overrides the platform root (tests).
+_LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
+_DEVTOOLS_ACTIVE_PORT_DIRS = {
+    "darwin": {
+        "cdpilot-chrome": "~/cdpilot-chrome",  # the README's recommended profile
+        "Chrome": "~/Library/Application Support/Google/Chrome",
+        "Chrome Beta": "~/Library/Application Support/Google/Chrome Beta",
+        "Chrome Dev": "~/Library/Application Support/Google/Chrome Dev",
+        "Chrome Canary": "~/Library/Application Support/Google/Chrome Canary",
+        "Chromium": "~/Library/Application Support/Chromium",
+        "Brave": "~/Library/Application Support/BraveSoftware/Brave-Browser",
+        "Vivaldi": "~/Library/Application Support/Vivaldi",
+        "Edge": "~/Library/Application Support/Microsoft Edge",
+    },
+    "linux": {
+        "cdpilot-chrome": "~/cdpilot-chrome",  # the README's recommended profile
+        "Chrome": "~/.config/google-chrome",
+        "Chrome Beta": "~/.config/google-chrome-beta",
+        "Chrome Dev": "~/.config/google-chrome-unstable",
+        "Chrome Canary": "~/.config/google-chrome-canary",
+        "Chromium": "~/.config/chromium",
+        "Chromium (snap)": "~/snap/chromium/common/chromium",
+        "Brave": "~/.config/BraveSoftware/Brave-Browser",
+        "Vivaldi": "~/.config/vivaldi",
+        "Edge": "~/.config/microsoft-edge",
+    },
+    "win32": {
+        "cdpilot-chrome": os.path.join(os.environ.get("USERPROFILE", "~"), "cdpilot-chrome"),
+        "Chrome": os.path.join(_LOCALAPPDATA, "Google", "Chrome", "User Data"),
+        "Chrome Beta": os.path.join(_LOCALAPPDATA, "Google", "Chrome Beta", "User Data"),
+        "Chrome Dev": os.path.join(_LOCALAPPDATA, "Google", "Chrome Dev", "User Data"),
+        "Chrome Canary": os.path.join(_LOCALAPPDATA, "Google", "Chrome SxS", "User Data"),
+        "Chromium": os.path.join(_LOCALAPPDATA, "Chromium", "User Data"),
+        "Brave": os.path.join(_LOCALAPPDATA, "BraveSoftware", "Brave-Browser", "User Data"),
+        "Vivaldi": os.path.join(_LOCALAPPDATA, "Vivaldi", "User Data"),
+        "Edge": os.path.join(_LOCALAPPDATA, "Microsoft", "Edge", "User Data"),
+    },
+}
+
+
+def _parse_devtools_active_port(content):
+    """Parse a DevToolsActivePort file's content.
+
+    Returns (port: int, ws_path: str) on success, raises ValueError on bad
+    format.  Pure function — no I/O, no side effects.  Format:
+        Line 1: TCP port number (e.g. 51234)
+        Line 2: /devtools/browser/<uuid>
+    """
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise ValueError(f"DevToolsActivePort: need 2 lines, got {len(lines)}")
+    raw_port, ws_path = lines[0], lines[1]
+    try:
+        port = int(raw_port)
+    except ValueError:
+        raise ValueError(f"DevToolsActivePort: bad port {raw_port!r}")
+    if port <= 0 or port > 65535:
+        raise ValueError(f"DevToolsActivePort: port {port} out of range")
+    if not ws_path.startswith("/"):
+        raise ValueError(f"DevToolsActivePort: path must start with '/', got {ws_path!r}")
+    return port, ws_path
+
+
+def _find_devtools_active_port():
+    """Every parseable DevToolsActivePort file in the known profile dirs.
+
+    Returns [(browser_name, port, ws_path, file_path)], in search order. A file
+    only says a browser once listened there — it outlives a crash — so the
+    caller probes each one (_probe_devtools_candidate). Uses
+    CDPILOT_BROWSER_SEARCH_ROOT (every subdirectory of it) instead of the
+    platform dirs when set (tests).
+    """
+    override_root = os.environ.get("CDPILOT_BROWSER_SEARCH_ROOT")
+    if override_root:
+        dirs = []
+        if os.path.isdir(override_root):
+            dirs = [(name, os.path.join(override_root, name))
+                    for name in sorted(os.listdir(override_root))]
+    else:
+        dirs = [(name, os.path.expanduser(d))
+                for name, d in _DEVTOOLS_ACTIVE_PORT_DIRS.get(sys.platform, {}).items()]
+    results = []
+    for browser_name, profile_dir in dirs:
+        port_file = os.path.join(profile_dir, "DevToolsActivePort")
+        if not os.path.isfile(port_file):
+            continue
+        try:
+            with open(port_file) as f:
+                port, ws_path = _parse_devtools_active_port(f.read())
+        except (OSError, ValueError):
+            continue
+        results.append((browser_name, port, ws_path, port_file))
+    return results
+
+
+def _cdp_http_json(port, path, timeout=3):
+    """(status, parsed JSON or None) for GET http://127.0.0.1:<port><path>;
+    status None when nothing answers HTTP there."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}{path}",
+                                    timeout=timeout) as r:
+            body = r.read()
+            try:
+                return r.status, json.loads(body)
+            except ValueError:
+                return r.status, None
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except Exception:
+        return None, None
+
+
+def _ws_upgrade_ok(port, ws_path, timeout=3):
+    """True when 127.0.0.1:<port> accepts a WebSocket upgrade on ws_path.
+
+    A bare handshake with stdlib sockets, closed right after the 101: no CDP
+    command is sent, so nothing in the browser is touched.
+    """
+    key = base64.b64encode(secrets.token_bytes(16)).decode()
+    req = (f"GET {ws_path} HTTP/1.1\r\nHost: 127.0.0.1:{int(port)}\r\n"
+           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(req.encode())
+            head = b""
+            while b"\r\n" not in head and len(head) < 4096:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                head += chunk
+    except OSError:
+        return False
+    status_line = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+    return status_line.split(" ")[1:2] == ["101"]
+
+
+def _ws_guid(ws_url_or_path):
+    """'/devtools/browser/<guid>' (or a full ws:// URL) -> the path part."""
+    s = ws_url_or_path or ""
+    if "://" in s:
+        rest = s.split("://", 1)[1]
+        s = "/" + rest.split("/", 1)[1] if "/" in rest else ""
+    return s.rstrip("/")
+
+
+def _probe_devtools_candidate(port, ws_path, ws_probe=True):
+    """Classify one DevToolsActivePort candidate.
+
+    ('live', version)  — /json/version answers with this file's browser GUID;
+    ('stale', why)     — something answers, but with another GUID (the file is
+                         left over and the port was reused), or nothing answers;
+    ('ws-only', None)  — HTTP says 404 / does not answer, but the WebSocket on
+                         the file's path accepts an upgrade: Chrome's
+                         chrome://inspect remote-debugging mode.
+    """
+    status, version = _cdp_http_json(port, "/json/version")
+    if status == 200 and isinstance(version, dict):
+        if _ws_guid(version.get("webSocketDebuggerUrl")) == _ws_guid(ws_path):
+            return "live", version
+        return "stale", "another browser answers there"
+    if ws_probe and _ws_upgrade_ok(port, ws_path):  # a bare upgrade; no CDP command is sent
+        return "ws-only", None
+    return "stale", "not responding"
+
+
+def _print_ws_only_unsupported(where):
+    """chrome://inspect remote-debugging mode: honest refusal + the supported way."""
+    lines = [
+        f"{where}: this looks like Chrome's chrome://inspect remote-debugging mode",
+        "(the browser answers only on its WebSocket; /json/version is 404).",
+        "cdpilot does not support that mode yet: it lists tabs over /json and",
+        "opens a new debugging connection per command.",
+        "",
+        "Supported: start a browser yourself with a debugging port and a",
+        "separate profile (log into it once; it keeps its cookies):",
+        "  macOS:   \"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" "
+        "--remote-debugging-port=9450 --user-data-dir=\"$HOME/cdpilot-chrome\"",
+        "  Linux:   google-chrome --remote-debugging-port=9450 "
+        "--user-data-dir=\"$HOME/cdpilot-chrome\"",
+        "  Windows: \"%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe\" "
+        "--remote-debugging-port=9450 --user-data-dir=\"%USERPROFILE%\\cdpilot-chrome\"",
+        "then: cdpilot connect 9450",
+    ]
+    for ln in lines:
+        print(ln, file=sys.stderr)
+
+
+def _validate_localhost(addr):
+    """Ensure the address targets 127.0.0.1 or localhost; sys.exit(2) otherwise.
+
+    IPv6 loopback ([::1]) is not accepted: cdpilot talks to the browser over
+    http://127.0.0.1:<port>, so an IPv6-only endpoint could never be used.
+    """
+    lower = addr.lower()
+    hostport = lower.split("://", 1)[1].split("/", 1)[0] if "://" in lower else lower
+    if hostport.startswith("["):  # [v6]:port
+        host = hostport.split("]", 1)[0] + "]"
+    else:
+        host = hostport.split(":")[0]
+    if host not in ("127.0.0.1", "localhost"):
+        print(f"Error: only 127.0.0.1/localhost accepted (got {host!r}).", file=sys.stderr)
+        print("Remote debugging over the network is not supported for security.", file=sys.stderr)
+        sys.exit(2)
+
+
+def _cdp_tab_count(port):
+    """Return the number of page targets on a CDP port, or 0."""
+    status, targets = _cdp_http_json(port, "/json")
+    if status != 200 or not isinstance(targets, list):
+        return 0
+    return sum(1 for t in targets if isinstance(t, dict) and t.get("type") == "page")
+
+
+def _connect_refuse_cdpilot_browser(port):
+    """Exit 1 when connecting would take over a browser cdpilot launched.
+
+    Overwriting such an entry with an external one orphaned the browser: its
+    idle watcher no longer recognised it and exited without closing it.
+    Only with positive ownership proof (_owned_browser): a registry entry
+    whose browser died while another browser (the user's) took its port is
+    stale, and connect replaces it.
+    """
+    registry = _load_registry()
+    own = registry.get(PROJECT_ID)
+    if (own and not _is_external(own) and own.get("port")
+            and _owned_browser(own["port"], {PROJECT_ID: own})):
+        print(f"Error: this project already has a cdpilot browser running "
+              f"(port {own.get('port')}). Stop it first (`cdpilot stop`) or use "
+              "another project.", file=sys.stderr)
+        sys.exit(1)
+    others = {k: v for k, v in registry.items() if k != PROJECT_ID}
+    proof = _owned_browser(port, others)
+    if proof:
+        print(f"Error: port {port} is cdpilot's own browser for project "
+              f"{proof['project']}; use that project, or stop it first.", file=sys.stderr)
+        sys.exit(1)
+
+
+def _connect_to_port(port, where, expect_ws_path=None, browser_name=None):
+    """Probe 127.0.0.1:<port> and register it as this project's external browser."""
+    status, version = _cdp_http_json(port, "/json/version")
+    if status == 200 and isinstance(version, dict):
+        if expect_ws_path and _ws_guid(version.get("webSocketDebuggerUrl")) != _ws_guid(expect_ws_path):
+            print(f"Error: {where} names browser {_ws_guid(expect_ws_path)}, but port "
+                  f"{port} is answered by {_ws_guid(version.get('webSocketDebuggerUrl'))}.",
+                  file=sys.stderr)
+            sys.exit(1)
+        _connect_refuse_cdpilot_browser(port)
+        ws_url = version.get("webSocketDebuggerUrl") or f"ws://127.0.0.1:{port}"
+        _do_connect(port, ws_url, version, browser_name or version.get("Browser", "Unknown"))
+        return
+    if (expect_ws_path and _ws_upgrade_ok(port, expect_ws_path)) or status == 404:
+        _print_ws_only_unsupported(where)
+        sys.exit(2)
+    print(f"Error: CDP not responding on 127.0.0.1:{port}.", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_connect(*args):
+    """Connect to the user's own browser for human-in-the-loop automation.
+
+    Usage:
+        cdpilot connect <port>        Connect via CDP port (127.0.0.1:<port>)
+        cdpilot connect <ws-url>      Connect via WebSocket URL
+        cdpilot connect --auto        Find a live DevToolsActivePort in profile dirs
+
+    The browser is registered as external: cdpilot never closes, kills or
+    injects into it. Exit 2: remote address, or the chrome://inspect
+    remote-debugging mode (not supported yet).
+    """
+    mode, target = None, None
+    for a in args:
+        if a == "--auto":
+            mode = "auto"
+        elif a.startswith("ws://") or a.startswith("wss://"):
+            mode, target = "ws", a
+        elif a.isdigit():
+            mode, target = "port", int(a)
+        elif not a.startswith("-"):
+            # Could be host:port
+            mode, target = "addr", a
+
+    if mode is None:
+        print("Usage: cdpilot connect <port> | <ws://url> | --auto", file=sys.stderr)
+        sys.exit(1)
+
+    # ── --auto: probe every DevToolsActivePort file, use the first live one ──
+    if mode == "auto":
+        hits = _find_devtools_active_port()
+        live, ws_only, stale, http_dead = [], [], [], []
+        # Pass 1, HTTP only: stops at the first live browser. A WebSocket
+        # upgrade can make Chrome's chrome://inspect mode ask the user for
+        # permission, so none is sent while a live candidate exists.
+        for browser_name, port, ws_path, port_file in hits:
+            kind, version = _probe_devtools_candidate(port, ws_path, ws_probe=False)
+            if kind == "live":
+                live.append((browser_name, port, ws_path, version))
+                break
+            if version == "another browser answers there":
+                stale.append((browser_name, port, port_file, version))
+            else:
+                http_dead.append((browser_name, port, ws_path, port_file))
+        # Pass 2, only when nothing is live: tell chrome://inspect mode (WS
+        # only) from a file left over by a browser that is gone; stops at
+        # the first WS-only one.
+        if live:
+            stale += [(n, p, f, "not responding") for n, p, _w, f in http_dead]
+        for browser_name, port, ws_path, port_file in ([] if live else http_dead):
+            if ws_only:
+                break
+            if _ws_upgrade_ok(port, ws_path):  # a bare upgrade; no CDP command is sent
+                ws_only.append((browser_name, port, port_file))
+            else:
+                stale.append((browser_name, port, port_file, "not responding"))
+        for browser_name, port, port_file, why in stale:
+            print(f"  skipped {browser_name} (port {port}): {why} — stale "
+                  f"DevToolsActivePort ({port_file})", file=sys.stderr)
+        if live:
+            browser_name, port, ws_path, version = live[0]
+            _connect_refuse_cdpilot_browser(port)
+            ws_url = version.get("webSocketDebuggerUrl") or f"ws://127.0.0.1:{port}{ws_path}"
+            _do_connect(port, ws_url, version, browser_name)
+            return
+        if ws_only:
+            browser_name, port, _ = ws_only[0]
+            _print_ws_only_unsupported(f"{browser_name} (port {port})")
+            sys.exit(2)
+        print("No running browser with remote debugging found.", file=sys.stderr)
+        print("(Chrome's chrome://inspect/#remote-debugging mode is not supported yet.)",
+              file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Start one with a debugging port and a separate profile, e.g.:", file=sys.stderr)
+        print("  chrome --remote-debugging-port=9450 --user-data-dir=\"$HOME/cdpilot-chrome\"",
+              file=sys.stderr)
+        print("then: cdpilot connect 9450   (or: cdpilot connect --auto)", file=sys.stderr)
+        sys.exit(1)
+
+    # ── ws:// URL mode ──
+    if mode == "ws":
+        _validate_localhost(target)
+        try:
+            after_scheme = target.split("://", 1)[1]
+            host_port = after_scheme.split("/", 1)[0]
+            port = int(host_port.split(":")[1])
+        except (IndexError, ValueError):
+            print(f"Error: cannot parse port from {target!r}", file=sys.stderr)
+            sys.exit(1)
+        path = "/" + after_scheme.split("/", 1)[1] if "/" in after_scheme else None
+        _connect_to_port(port, target, expect_ws_path=path)
+        return
+
+    # ── port mode ──
+    if mode == "port":
+        _connect_to_port(target, f"127.0.0.1:{target}")
+        return
+
+    # ── addr mode (host:port) ──
+    _validate_localhost(target)
+    port_str = target.split(":")[-1] if ":" in target else target
+    try:
+        port = int(port_str)
+    except ValueError:
+        print(f"Error: cannot parse port from {target!r}", file=sys.stderr)
+        sys.exit(1)
+    _connect_to_port(port, target)
+
+
+def _do_connect(port, ws_url, version_info, browser_name):
+    """Finalize the connection: register as external, print status."""
+    global CDP_PORT, CDP_BASE
+
+    tab_count = _cdp_tab_count(port)
+
+    # Security warning
+    print("⚠  This browser's cookies and sessions are accessible to cdpilot commands.",
+          file=sys.stderr)
+
+    CDP_PORT = port
+    CDP_BASE = f"http://127.0.0.1:{CDP_PORT}"
+    _register_project(PROJECT_ID, port, PROFILE_DIR, pid=None,
+                      external=True, browser_name=browser_name,
+                      browser_guid=_browser_guid(version_info))
+    _forget_project_tabs()
+
+    product = version_info.get("Browser") or browser_name
+    print(f"✓ Connected to {product} on port {port}")
+    print(f"  WebSocket: {ws_url}")
+    print(f"  Tabs: {tab_count}")
+    print("  Commands now run in YOUR browser; cdpilot will never close it.")
+
+
+def _forget_project_tabs():
+    """Drop this project's session and tab records. A session made before
+    `connect` (e.g. with CDP_PORT pointing at that browser) may name a user
+    tab, which later commands would otherwise keep using."""
+    try:
+        _save_sessions({})
+    except OSError:
+        pass
+    _save_owned_tabs(set())
+    _external_tabs_save(None, set())
+
+
+def cmd_disconnect():
+    """Forget this project's connected (external) browser.
+
+    The only command that removes an external registry entry; the browser
+    keeps running and nothing is sent to it.
+    """
+    registry = _load_registry()
+    entry = registry.get(PROJECT_ID, {})
+    if not _is_external(entry):
+        print("No external browser connected for this project.", file=sys.stderr)
+        sys.exit(1)
+
+    port = entry.get("port", "?")
+    browser_name = entry.get("browser_name", "browser")
+    with _registry_lock():
+        registry = _load_registry()
+        registry.pop(PROJECT_ID, None)
+        _save_registry(registry)
+    _forget_project_tabs()
+    # This project's screencast daemon holds a socket into the user's tab.
+    state = _watch_load_state()
+    if state and state.get("pid") and _watch_pid_alive(state.get("pid")):
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_watch_stop("--keep-frames")
+        print("  Stopped this project's watch daemon.")
+    print(f"Disconnected from {browser_name} (port {port}); your browser keeps running.")
 
 
 # ─── New CDP Commands ───
@@ -14890,7 +15882,9 @@ async def cmd_geo(lat_or_preset, lng=None, accuracy=None):
 
 
 async def cmd_permission(subcmd, perm=None):
-    """Manage browser permissions."""
+    """Manage browser permissions. Refused on a connected (external) browser:
+    grant/deny/reset would change the user's own browser for every origin."""
+    _refuse_external("permission", "changes its permissions")
     browser_ws = await _get_browser_ws()
     ws_url, page_info = get_page_ws()
 
@@ -15627,6 +16621,10 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"tier": {"type": "string", "enum": ["regular", "stealth", "undetected"], "description": "Tier to set. Omit to get the current tier."}}}},
             {"name": "browser_log", "description": "Read this project's cdpilot session log (read-only; reading does not add to it). Every cdpilot command and browser_* tool call is recorded locally: command, redacted arguments, exit code, duration, page URL and title, a short result summary, the error line and the files it wrote (screenshots, PDFs). Values typed into pages, secret-looking arguments and token/key/secret URL parameters are redacted before they are written. Call it when a browser task is finished to report what was done and found: format 'md' returns a Markdown report (pages visited, actions, errors, files produced) ready to paste into an issue or PR, 'table' (default) a compact table, 'json' the raw JSON lines. Covers today unless 'days' is given.",
              "inputSchema": {"type": "object", "properties": {"format": {"type": "string", "enum": ["table", "md", "json"], "description": "Output format (default: table)."}, "days": {"type": "integer", "minimum": 1, "description": "Include the last N days (1 = today, the default)."}}}},
+            {"name": "browser_connect", "description": "Connect to the user's own browser for human-in-the-loop automation. Use when the user needs to solve a CAPTCHA or log in manually, then the agent continues in that browser. The user starts Chrome/Chromium with --remote-debugging-port=<p> --user-data-dir=<dir>. Accepts that CDP port number, a ws:// URL, or '--auto' to scan DevToolsActivePort files. The browser is registered as external: cdpilot never closes, kills or injects into it (browser_close only disconnects). Only 127.0.0.1/localhost accepted. Chrome's chrome://inspect remote-debugging mode is not supported yet (exit 2).",
+             "inputSchema": {"type": "object", "properties": {"target": {"type": "string", "description": "CDP port number, ws:// URL, or '--auto' to auto-detect."}}, "required": ["target"]}},
+            {"name": "browser_disconnect", "description": "Forget the connected (external) browser: removes its registration; the browser keeps running. The only way to drop a connection. Use after the human-in-the-loop workflow is complete.",
+             "inputSchema": {"type": "object", "properties": {}}},
         ]
 
     def _handle_request(self, request):
@@ -15706,6 +16704,8 @@ class MCPServer:
             "browser_watch_status": lambda a: ["watch", "status"],
             "browser_mode": lambda a: ["mode"] + ([a["tier"]] if a.get("tier") else []),
             "browser_log": lambda a: ["log"] + ([f"--{a['format']}"] if a.get("format") in ("md", "json") else []) + ([f"--days={a['days']}"] if a.get("days") else []),
+            "browser_connect": lambda a: ["connect", a.get("target", "--auto")],
+            "browser_disconnect": lambda a: ["disconnect"],
         }
         if get_webmcp_config():
             tool_map["browser_site_tools"] = lambda a: ["tools", "list", "--json"]
@@ -18483,6 +19483,8 @@ if __name__ == "__main__":
         'watch': lambda: _dispatch_watch_cmd(args),
         'bot-auth': lambda: cmd_bot_auth(*args),
         'log': lambda: cmd_log(*args),
+        'connect': lambda: cmd_connect(*args),
+        'disconnect': cmd_disconnect,
     }
 
     if cmd == "serve":
