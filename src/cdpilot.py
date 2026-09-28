@@ -15885,6 +15885,7 @@ WEBMCP_CONFIG_FILE = os.path.join(PROFILE_DIR, 'webmcp.json')
 WEBMCP_FEATURE = 'WebMCP'
 WEBMCP_MIN_CHROMIUM = 146
 WEBMCP_CALL_TIMEOUT = 20.0  # seconds for `tools call` without --timeout
+WEBMCP_REPORT_GRACE = 3.0   # seconds after --timeout to report the aborted call
 _WEBMCP_LAUNCH_FLAG = [None]  # this process's `launch --webmcp` (True) / `--no-webmcp` (False)
 _WEBMCP_TRUE = ('1', 'true', 'yes', 'on')
 _WEBMCP_FALSE = ('0', 'false', 'no', 'off')
@@ -16332,18 +16333,14 @@ async def cmd_tools_list(as_json=False):
         print(f"No WebMCP tools on {facts.get('url') or 'this page'}.\n  {hint}")
 
 
-def _webmcp_call_budget(now=None):
-    """Seconds the page gets to run the tool: the rest of --timeout, else the default."""
-    raw = os.environ.get(TIMEOUT_ENV, "").strip()
-    try:
-        total = float(raw) if raw else 0.0
-    except ValueError:
-        total = 0.0
-    if total <= 0 or _TIMEOUT_ARMED_AT[0] is None:
+def _webmcp_call_budget():
+    """Seconds the page gets to run the tool: up to the --timeout deadline, else
+    WEBMCP_CALL_TIMEOUT. With --timeout, the watchdog is moved WEBMCP_REPORT_GRACE
+    past the deadline, so the abort (at the deadline) is always reported."""
+    left = _timeout_grace(WEBMCP_REPORT_GRACE)
+    if left is None:
         return WEBMCP_CALL_TIMEOUT
-    now = time.monotonic() if now is None else now
-    # Leave the watchdog (exit 124 at --timeout) time to see our own report.
-    return max(0.1, total - (now - _TIMEOUT_ARMED_AT[0]) - 0.75)
+    return max(0.1, left)
 
 
 async def cmd_tools_call(name, call_args, frame=None):
@@ -16399,7 +16396,9 @@ async def cmd_tools_call(name, call_args, frame=None):
         print(f"Error: tool '{name}' is no longer registered on this page", file=sys.stderr)
         sys.exit(1)
     if status == "timeout":
-        print(f"cdpilot: tool '{name}' timed out after {budget:.1f}s; its execution was "
+        limit = (f"{_TIMEOUT_WATCH['seconds']:g}s (--timeout)" if _TIMEOUT_WATCH
+                 else f"{budget:.1f}s")
+        print(f"cdpilot: tool '{name}' timed out after {limit}; its execution was "
               f"aborted (executeTool signal)", file=sys.stderr)
         sys.exit(TIMEOUT_EXIT_CODE)
     if status != "ok":
@@ -18236,6 +18235,8 @@ TIMEOUT_EXEMPT_CMDS = frozenset({'mcp', 'serve'})
 COMMANDS_WITH_OWN_TIMEOUT = frozenset()
 _TIMEOUT_CHILDREN = weakref.WeakSet()
 _TIMEOUT_ARMED_AT = [None]  # time.monotonic() when the watchdog started
+# The armed watchdog: {"timer", "expire", "deadline"} (see _timeout_grace).
+_TIMEOUT_WATCH = {}
 
 
 def _parse_timeout_seconds(raw, source):
@@ -18352,9 +18353,32 @@ def _arm_timeout_watchdog(seconds, cmd):
     timer = threading.Timer(seconds, _expire)
     timer.daemon = True
     _TIMEOUT_ARMED_AT[0] = time.monotonic()
+    _TIMEOUT_WATCH.update(timer=timer, expire=_expire, seconds=seconds,
+                          deadline=_TIMEOUT_ARMED_AT[0] + seconds)
     timer.start()
-    atexit.register(timer.cancel)  # finished in time: never fire during shutdown
+    # Finished in time: never fire during shutdown.
+    atexit.register(lambda: _TIMEOUT_WATCH["timer"].cancel())
     return timer
+
+
+def _timeout_grace(extra):
+    """Move the armed watchdog `extra` seconds past the --timeout deadline.
+
+    For a command that itself stops its work AT the deadline and then only
+    has to report it (tools call aborts the tool's signal): without the
+    grace, the watchdog and that report race, and a slow machine gets the
+    bare "timed out" line instead of what was aborted. Returns the seconds
+    left until the original deadline, or None when no watchdog is armed.
+    """
+    if not _TIMEOUT_WATCH:
+        return None
+    left = _TIMEOUT_WATCH["deadline"] - time.monotonic()
+    _TIMEOUT_WATCH["timer"].cancel()
+    timer = threading.Timer(max(0.0, left) + extra, _TIMEOUT_WATCH["expire"])
+    timer.daemon = True
+    _TIMEOUT_WATCH["timer"] = timer
+    timer.start()
+    return left
 
 
 # ─── Session log ───
