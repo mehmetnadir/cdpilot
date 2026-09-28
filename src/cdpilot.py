@@ -12271,7 +12271,7 @@ async def _tw_click_sel(ws, selector):
         'expression': f'(function(){{var e=document.querySelector({json.dumps(selector)});if(!e)return null;var r=e.getBoundingClientRect();return {{x:r.x,y:r.y,w:r.width,h:r.height}};}})();',
         'returnByValue': True,
     })])
-    box = res.get(802, {}).get('value')
+    box = res.get(802, {}).get('result', {}).get('value')
     if not box:
         return False
     x = box['x'] + box['w'] / 2
