@@ -14,7 +14,12 @@ const CLI = path.join(__dirname, '..', 'bin', 'cdpilot.js');
 let passed = 0;
 let failed = 0;
 
+// CDPILOT_TEST_ONLY=<text>: run only the tests whose name contains <text>
+// (e.g. "webmcp e2e" to repeat one block while chasing a flake).
+const ONLY = process.env.CDPILOT_TEST_ONLY || '';
+
 function test(name, fn) {
+  if (ONLY && !name.includes(ONLY)) return;
   try {
     fn();
     passed++;
@@ -110,6 +115,9 @@ test('setup detects python websockets', () => {
         // os.homedir() reads USERPROFILE first on Windows — override both
         // so this test isolates HOME on every CI platform.
         USERPROFILE: fakeUserHome,
+        // An explicit CDPILOT_PROFILE (a caller isolating its run) would put
+        // the profile elsewhere; this test is about the default location.
+        CDPILOT_PROFILE: '',
       },
     });
 
@@ -3662,7 +3670,7 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
       fakeTrace = path.join(home, 'cdp-trace.txt');
       const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
         CDP_PORT: '19224', CDPILOT_LOG: '0', CDPILOT_CDP_TRACE: fakeTrace };
-      for (const k of ['CDPILOT_WS_POOL', 'CDPILOT_TARGET', 'CDPILOT_TIMEOUT']) delete env[k];
+      for (const k of ['CDPILOT_WS_POOL', 'CDPILOT_TARGET', 'CDPILOT_TIMEOUT', 'CDPILOT_PRESS_MS']) delete env[k];
       const out = execFileSync(PYB, [path.join(__dirname, 'frames_fake_cdp.py'), PY_PATH], {
         encoding: 'utf-8', timeout: 60000, env,
       });
@@ -4110,6 +4118,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     for (const [key, k] of Object.entries(r)) {
       if (typeof k !== 'object') continue;
       assert.deepStrictEqual(k.leaks, [], `${key}: no helper on window`);
+      if (key === 'moved' || key === 'moved_entropy') continue;  // released elsewhere: not claimed
       if (key !== 'blocker_error') assert(/^Clicked: BUTTON /.test(k.stdout), `${key}: ${k.stdout}`);
     }
   });
@@ -4132,20 +4141,23 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.strictEqual(r.covered_frame.hits.length, 2, 'the target frame is checked too, in one batch');
   });
 
-  test('frames (fake CDP): the hit-test is repeated with the release; a target that moved gets a script click + note', () => {
+  test('frames (fake CDP): the hit-test is repeated with the release; a target that moved: note, no script click', () => {
     // The target moves once the page handled mousedown: the press is
-    // completed (one press, one release), the mouse click is not claimed,
-    // and el.click() clicks the target.
+    // completed (one press, one release) and the mouse click is not claimed.
+    // No el.click(): the page already got a trusted mousedown/mouseup (and,
+    // on a menu that opens on mousedown, a native click on a common
+    // ancestor), so a script click would click twice.
     const r = fake('click_input');
-    for (const [key, frame, label, was] of [['moved', 'card', 'iframe#card >>> #btn', 'div#wrap'],
-      ['moved_entropy', 'top', '#btn', 'body']]) {
+    for (const [key, label, was] of [['moved', 'iframe#card >>> #btn', 'div#wrap'],
+      ['moved_entropy', '#btn', 'body']]) {
       const k = r[key];
       assert.deepStrictEqual(k.res, ['ok', null], key);
       assert.strictEqual(k.pressed.length, 1, `${key}: one press`);
       assert.strictEqual(k.released.length, 1, `${key}: the release completed`);
-      assert.deepStrictEqual(k.clicks, [[frame, 'script']], `${key}: the target, by script`);
+      assert.deepStrictEqual(k.clicks, [], `${key}: no script click`);
       assert.strictEqual(k.stderr, `note: ${label} was no longer under the mouse when the button was released`
-        + ` (${was} was); used a script click\n`, key);
+        + ` (${was} was); the press and release reached the page, so no script click (it could click twice)\n`, key);
+      assert.strictEqual(k.stdout, 'Pressed (released elsewhere, not clicked): BUTTON #btn\n', `${key}: not "Clicked"`);
       assert.strictEqual(k.hits.length % 2, 0, `${key}: the same checks, twice`);
     }
   });
@@ -4187,6 +4199,261 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.deepStrictEqual(r.open_before, ['ws://fake/devtools/page/1']);
     assert.deepStrictEqual(r.blocker, ['none', ''], 'made opaque again by the watchdog');
     assert.deepStrictEqual(r.open_after, []);
+  });
+
+  // Real clicks hold the button like a person (CDPILOT_PRESS_MS, default
+  // 40-120 ms): main sent mousePressed and mouseReleased 0.1-6 ms apart.
+  // The events' own timestamps (what the page's event.timeStamp shows) are
+  // exactly the drawn hold apart. On the wire, the fake stamps each event as
+  // it arrives: the hold starts at the press's reply, so the release is never
+  // early; a busy machine can wake it late (240 ms seen under load), so the
+  // wire has only a sanity cap (a seconds-for-ms bug) above.
+  const HOLD_SLACK_MS = 1000;
+  const heldOk = (press, what) => {
+    assert(press.gaps.length > 0, `${what}: a press and a release`);
+    assert.strictEqual(press.stamps.length, press.gaps.length, `${what}: every event carries a timestamp`);
+    for (const g of press.stamps) {
+      assert(g >= 40 && g <= 120, `${what}: timestamps ${g.toFixed(2)} ms apart, want 40-120`);
+    }
+    for (const g of press.gaps) {
+      assert(g >= 40 && g <= HOLD_SLACK_MS, `${what}: held ${g.toFixed(2)} ms on the wire, want >= 40`);
+    }
+  };
+
+  test('press hold (fake CDP): real clicks hold the button 40-120 ms (frames, OOPIF, --entropy=on, rightclick, bot clicks)', () => {
+    const r = fake('press_hold');
+    for (const key of ['frame', 'oopif', 'page_entropy', 'frame_entropy', 'rightclick', 'dblclick', 'dblclick_page',
+      'humanize_click', 'click_held', 'tw_plain', 'tw_humanized']) {
+      const k = r[`default_${key}`];
+      if (Array.isArray(k.res)) assert.deepStrictEqual(k.res, ['ok', null], `${key}: ${k.stderr}`);
+      assert.strictEqual(k.stderr, '', `${key}: no note`);
+      heldOk(k.press, key);
+    }
+    assert.deepStrictEqual(r.default_rightclick.press.buttons, ['right']);
+    const [lo, median, hi] = r.draws.hold;  // 2000 draws of the hold itself
+    assert(lo >= 40 && hi <= 120, `draws inside 40-120: ${lo}..${hi}`);
+    assert(median > 55 && median < 90, `log-normal around the geometric mean (~69 ms): ${median}`);
+    assert(hi - lo > 60, `spread over the range: ${lo}..${hi}`);
+  });
+
+  test('press hold (fake CDP): a release that misses (moved, replaced, page navigated): note, no script click, not "Clicked"', () => {
+    const r = fake('press_hold');
+    const tail = '; the press and release reached the page, so no script click (it could click twice)\n';
+    const gone = 'was gone by the time the mouse button was released (the page replaced or left it)';
+    const moved = 'Pressed (released elsewhere, not clicked): BUTTON #btn\n';
+    const replaced = 'Pressed (the page replaced or left it, not clicked): BUTTON #btn\n';
+    for (const [key, why, line] of [
+      ['moved', 'was no longer under the mouse when the button was released (div#wrap was)', moved],
+      ['removed', gone, replaced], ['navigated', gone, replaced]]) {
+      for (const tag of ['default', 'instant']) {
+        const k = r[`${tag}_${key}`];
+        assert.deepStrictEqual(k.res, ['ok', null], `${tag} ${key}: ${k.stderr}`);
+        if (tag === 'default') heldOk(k.press, key);
+        assert.deepStrictEqual(k.clicks, [], `${tag} ${key}: no script click`);
+        assert.strictEqual(k.stderr, `note: iframe#card >>> #btn ${why}${tail}`, `${tag} ${key}`);
+        assert.strictEqual(k.stdout, line, `${tag} ${key}`);
+        assert.deepStrictEqual(k.blocker, ['none', ''], `${tag} ${key}: blocker restored`);
+      }
+    }
+  });
+
+  test('click outcome (fake CDP): release missed -> exit 3 ("moved"); target replaced / page left -> exit 0 ("gone")', () => {
+    // #30 script-clicked a target that moved; the held press made that a
+    // double click, so it is not clicked now, and exit 3 keeps `click && next`
+    // from going on as if it had been (1 stays "error").
+    const r = fake('click_outcome');
+    const m = r.moved;
+    assert.deepStrictEqual([m.res, m.exit, m.misses, m.clicks], [['ok', null], 3, ['moved'], []]);
+    assert.strictEqual(m.stdout, 'Pressed (released elsewhere, not clicked): BUTTON #btn\n');
+    for (const key of ['gone', 'navigated']) {
+      const g = r[key];
+      assert.deepStrictEqual([g.res, g.exit, g.misses, g.clicks], [['ok', null], 0, ['gone'], []], key);
+      assert.strictEqual(g.stdout, 'Pressed (the page replaced or left it, not clicked): BUTTON #btn\n', key);
+      assert.strictEqual(g.pressed.length + g.released.length, 2, `${key}: one press, one release`);
+    }
+    const c = r.clicked;
+    assert.deepStrictEqual([c.res, c.exit, c.misses, c.stdout], [['ok', null], 0, [], 'Clicked: BUTTON #btn\n']);
+  });
+
+  test('click outcome (fake CDP): no reply to the release check is "unknown" (exit 3), not "gone"', () => {
+    const u = fake('click_outcome').no_reply;
+    assert.deepStrictEqual([u.res, u.exit, u.misses, u.clicks], [['ok', null], 3, ['unknown'], []]);
+    assert.strictEqual(u.stdout, 'Pressed (release not confirmed, not clicked): BUTTON #btn\n');
+    assert.strictEqual(u.stderr, 'note: iframe#card >>> #btn could not be checked when the mouse button was released'
+      + ' (no reply from the page in time); the press and release were sent, so no script click (it could click twice)\n');
+    assert.deepStrictEqual(u.blocker, ['none', '']);
+  });
+
+  test('click outcome (fake CDP): a target detached before the press is an error (exit 1), no press, no script click', () => {
+    const d = fake('click_outcome').detached;
+    assert.deepStrictEqual(d.res, ['exit', 1]);
+    assert.strictEqual(d.stderr, 'Error: iframe#card >>> #btn: the target is no longer in the page\n');
+    assert.deepStrictEqual([d.clicks, d.pressed, d.stdout, d.misses], [[], [], '', []]);
+    assert.deepStrictEqual(d.blocker, ['none', ''], 'blocker restored');
+  });
+
+  test('click outcome (fake CDP): batch runs every step; exit 1 if one failed, else 3 if one was not clicked, else 0', () => {
+    // batch used to exit 0 even when steps failed; exit 3 must not hide them.
+    const b = fake('click_outcome').batch;
+    const notClicked = { cmd: 'click', status: 'not_clicked', clicked: false, reason: 'moved' };
+    const unsupported = { cmd: 'nope', status: 'error', error: 'Unsupported command: nope' };
+    const evalOk = { cmd: 'eval', status: 'ok' };
+    assert.deepStrictEqual(b.miss.res, ['exit', 3], 'miss only: 3');
+    assert.deepStrictEqual(b.miss.steps, [notClicked, evalOk], 'every step ran');
+    assert.deepStrictEqual(b.mixed.res, ['exit', 1], 'a failed step and a miss: 1');
+    assert.deepStrictEqual(b.mixed.steps, [notClicked, unsupported, evalOk]);
+    assert.deepStrictEqual(b.errors.res, ['exit', 1], 'errors only: 1 (was 0)');
+    assert.deepStrictEqual(b.errors.steps, [unsupported, evalOk]);
+    assert.deepStrictEqual(b.ok.res, ['ok', null], 'all ok: 0');
+    assert.deepStrictEqual(b.ok.steps, [{ cmd: 'click', status: 'ok' }, evalOk]);
+  });
+
+  test('click outcome (fake CDP): run goes on after every line; exit 1 if one failed, else 3 if one was not clicked, else 0', () => {
+    const r = fake('click_outcome').run;
+    assert.deepStrictEqual(r.miss, { res: ['exit', 3], result: 'Result: 1 passed, 0 failed, 1 not clicked, 2 total' });
+    assert.deepStrictEqual(r.mixed, { res: ['exit', 1], result: 'Result: 0 passed, 1 failed, 1 not clicked, 2 total' });
+    assert.deepStrictEqual(r.errors, { res: ['exit', 1], result: 'Result: 1 passed, 1 failed, 2 total' });
+    assert.deepStrictEqual(r.ok, { res: ['ok', null], result: 'Result: 1 passed, 0 failed, 1 total' });
+  });
+
+  test('click outcome (fake CDP): MCP: exit 3 and "gone" are not errors; a JSON first line says clicked: false', () => {
+    const r = fake('click_outcome').mcp;
+    for (const [key, reason] of [['moved', 'moved'], ['gone', 'gone'], ['unknown', 'unknown']]) {
+      assert.strictEqual(r[key].isError, false, key);
+      assert.deepStrictEqual(JSON.parse(r[key].content[0].text), { clicked: false, reason }, key);
+      assert(/^Pressed \(/.test(r[key].content[1].text), key);
+    }
+    assert.deepStrictEqual(r.clicked, { content: [{ type: 'text', text: 'Clicked: BUTTON Pay' }], isError: false });
+    assert.strictEqual(r.error.isError, true, 'exit 1 is still an error');
+    assert(!/clicked/.test(r.error.content[0].text), 'no status line for an error');
+    // Only the click tools: page text from browser_eval that starts with the
+    // same words gets no status line, and its exit 3 stays an error.
+    assert.deepStrictEqual(r.eval_text, { content: [{ type: 'text',
+      text: 'Pressed (released elsewhere, not clicked): BUTTON fake' }], isError: false });
+    assert.strictEqual(r.eval_exit3.isError, true);
+    assert.strictEqual(r.eval_exit3.content.length, 1, 'no status line');
+    assert.strictEqual(r.smart_click.isError, false);
+    assert.deepStrictEqual(JSON.parse(r.smart_click.content[0].text), { clicked: false, reason: 'moved' });
+  });
+
+  test('click outcome: exit 3 is documented (help in src and bin, README, CHANGELOG)', () => {
+    const root = path.join(__dirname, '..');
+    const bin = fs.readFileSync(path.join(root, 'bin', 'cdpilot.js'), 'utf8');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    const unreleased = changelog.slice(changelog.indexOf('## [Unreleased]'), changelog.indexOf('## [0.9.3]'));
+    for (const [name, text] of [['src help', PY_CONTENT.slice(0, PY_CONTENT.indexOf('__version__ = '))], ['bin help', bin], ['README', readme],
+      ['CHANGELOG [Unreleased]', unreleased]]) {
+      assert(/exit 3/i.test(text) && /release missed the target, not clicked/.test(text), `${name} documents exit 3`);
+    }
+  });
+
+  test('x bot (fake CDP): _tw_click_sel clicks the box it found (the reply\'s result.value), held', () => {
+    // _tw_click_sel read res[802].value, which is never there: it returned
+    // False and never clicked. It reads result.value now.
+    const r = fake('press_hold');
+    for (const key of ['tw_plain', 'tw_humanized']) {
+      const k = r[`default_${key}`];
+      assert.strictEqual(k.res, true, `${key}: found and clicked`);
+      assert.strictEqual(k.pressed.length, 1, key);
+      assert(Math.abs(k.pressed[0][0] - 25) <= 2 && Math.abs(k.pressed[0][1] - 40) <= 2,
+        `${key}: the centre of {x:10,y:20,w:30,h:40}: ${k.pressed[0]}`);
+      assert.strictEqual(k.press.gaps.length, 1, `${key}: one press and release`);
+    }
+    assert.strictEqual(r.instant_tw_plain.res, true);
+  });
+
+  test('press hold (fake CDP): dblclick is two held clicks, clickCount 1 then 2, 60-140 ms apart', () => {
+    const r = fake('press_hold');
+    for (const key of ['default_dblclick', 'default_dblclick_page']) {
+      const p = r[key].press;
+      assert.deepStrictEqual(p.counts, [1, 2], `${key}: clickCount 1, then 2`);
+      assert.strictEqual(p.gaps.length, 2, `${key}: two press/release pairs`);
+      heldOk(p, key);
+      assert.strictEqual(p.between.length, 1, key);
+      assert(p.between[0] >= 60 && p.between[0] <= HOLD_SLACK_MS,
+        `${key}: pause ${p.between[0]} ms, want 60-140`);
+    }
+    const [glo, ghi] = r.draws.gap;
+    assert(glo >= 60 && ghi <= 140, `gap draws inside 60-140: ${glo}..${ghi}`);
+  });
+
+  test("press hold (fake CDP): cdpilot's input blocker is transparent around the whole held press, and only then", () => {
+    const r = fake('press_hold');
+    for (const key of ['frame', 'oopif', 'page_entropy', 'frame_entropy', 'moved', 'dblclick', 'dblclick_page',
+      'rightclick']) {
+      const k = r[`default_${key}`];
+      assert.deepStrictEqual(k.blocker, ['none', ''], `${key}: opened once, restored once`);
+      assert.strictEqual(k.press.blocker, true, `${key}: press and release inside the open window`);
+    }
+  });
+
+  test('press hold (fake CDP): CDPILOT_PRESS_MS=0-0 restores the instant click (dblclick pause too)', () => {
+    const r = fake('press_hold');
+    const gaps = [];
+    for (const key of ['frame', 'oopif', 'page_entropy', 'frame_entropy', 'moved', 'rightclick', 'dblclick',
+      'dblclick_page', 'humanize_click', 'click_held']) {
+      const k = r[`instant_${key}`];
+      if (k.res) assert.deepStrictEqual(k.res, ['ok', null], key);
+      gaps.push(...k.press.gaps);
+    }
+    gaps.sort((a, b) => a - b);
+    assert(gaps[Math.floor(gaps.length / 2)] < 15, `median gap under 15 ms: ${gaps}`);
+    assert(gaps[0] < 15, `min gap under 15 ms: ${gaps}`);
+    for (const key of ['frame', 'dblclick', 'rightclick']) {
+      for (const g of r[`instant_${key}`].press.stamps) assert(g === 0, `${key}: timestamps equal: ${g}`);
+    }
+    assert.deepStrictEqual(r.instant_dblclick.press.counts, [1, 2]);
+    assert(r.instant_dblclick.press.between[0] < 15, `no dblclick pause: ${r.instant_dblclick.press.between}`);
+    assert.deepStrictEqual(r.instant_frame.blocker, ['none', '']);
+  });
+
+  test('press hold: CDPILOT_PRESS_MS min-max is validated; a bad value warns once and falls back to 40-120', () => {
+    const p = fake('press_hold').parse;
+    assert.deepStrictEqual(p.None.range, [40, 120]);
+    assert.deepStrictEqual(p['0-0'].range, [0, 0]);
+    assert.strictEqual(p['0-0'].zero_gap, 0, '0-0: no dblclick pause');
+    assert.deepStrictEqual(p[' 30 - 60 '].range, [30, 60]);
+    assert.deepStrictEqual(p['10.5-20'].range, [10.5, 20]);
+    assert.deepStrictEqual(p['0-2000'].range, [0, 2000]);
+    for (const good of ['None', '0-0', ' 30 - 60 ', '10.5-20', '0-2000']) assert.strictEqual(p[good].stderr, '', good);
+    for (const bad of ['abc', '50', '120-40', '5-3000', '-5-10']) {
+      assert.deepStrictEqual(p[bad].range, [40, 120], `${bad}: the default`);
+      assert.deepStrictEqual(p[bad].again, [40, 120], bad);
+      assert.strictEqual(p[bad].stderr, `cdpilot: warning: ignoring CDPILOT_PRESS_MS='${bad}' (min-max in ms,`
+        + ' 0 <= min <= max <= 2000); using 40-120\n', `${bad}: one warning`);
+    }
+  });
+
+  test('press hold (fake CDP): --timeout fires mid-hold: the watchdog releases the button, then restores the blocker', () => {
+    const r = fake('timeout_hold');  // CDPILOT_PRESS_MS=1000-1000, --timeout 0.3 s
+    for (const key of ['click', 'dblclick']) {
+      const k = r[key];
+      assert.strictEqual(k.exits.length, 1, `${key}: the watchdog fired`);
+      const e = k.exits[0];
+      assert.strictEqual(e.code, 124, key);
+      // The command was still inside its 1 s hold: this release is the watchdog's.
+      assert.deepStrictEqual(e.mouse.filter((m) => m !== 'mouseMoved'), ['mousePressed', 'mouseReleased'],
+        `${key}: the page is not left with the button down: ${e.mouse}`);
+      assert.strictEqual(e.released_before_restore, true, `${key}: released while the blocker was still open`);
+      assert.deepStrictEqual(e.blocker, ['none', ''], `${key}: made opaque again by the watchdog`);
+      assert.deepStrictEqual(e.open, [], key);
+      assert.deepStrictEqual(e.presses_open, [], key);
+      assert.strictEqual(k.fd2, `cdpilot: timed out after 0.3s (${key})\n`);
+    }
+  });
+
+  test('press hold (fake CDP): a command cancelled mid-hold releases the button in finally (page coordinates)', () => {
+    const r = fake('timeout_hold');
+    for (const key of ['cancel_click', 'cancel_dblclick']) {
+      const k = r[key];
+      const m = k.mouse.filter((e) => e[0] !== 'mouseMoved');
+      assert.deepStrictEqual(m.map((e) => e[0]), ['mousePressed', 'mouseReleased'], `${key}: ${JSON.stringify(k.mouse)}`);
+      assert.deepStrictEqual(m[1].slice(1).map(Number), [140, 1050], `${key}: released where it was pressed`);
+      assert.deepStrictEqual(k.blocker, ['none', ''], key);
+      assert.deepStrictEqual(k.presses_open, [], key);
+      assert.deepStrictEqual(k.open_after, [], key);
+    }
   });
 
   test('input blocker: a blocker left transparent is made opaque again by the next command', () => {
@@ -4358,7 +4625,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       stop();
       throw err;
     }
-    e2e = { c, cShow, p1, p2, stop, trace };
+    e2e = { c, cShow, p1, p2, stop, trace, env };
   });
   const ok = (r, re, what) => assert(re.test(r.stdout + r.stderr),
     `${what}: exit ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
@@ -4493,6 +4760,102 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       const child = `http://localhost:${p2}/inner.html?nested=http://127.0.0.1:${p1}/nested.html`;
       return [`http://127.0.0.1:${p1}/${page}`, `http://127.0.0.1:${p1}/${page}?child=${encodeURIComponent(child)}`];
     };
+
+    // Mouse events into <body data-presses> as type:button:detail:timeStamp;
+    // reading returns them with performance.now() of the same document.
+    const PRESS_TYPES = "['mousemove', 'pointerdown', 'mousedown', 'mouseup', 'dblclick', 'contextmenu']";
+    const LISTEN_JS = `document.body.dataset.presses = ''; ${PRESS_TYPES}.forEach(function (t) {`
+      + ' document.addEventListener(t, function (e) { document.body.dataset.presses += t + ":" + e.button'
+      + ' + ":" + e.detail + ":" + e.timeStamp.toFixed(2) + ";"; }, true); }); "listening"';
+    const READ_JS = 'document.body.dataset.presses + "|now:" + performance.now().toFixed(2)';
+    const pressEvents = (out) => {
+      const now = +(/\|now:([\d.]+)/.exec(out) || [])[1];
+      const ev = [...out.matchAll(/(mousemove|pointerdown|mousedown|mouseup|dblclick|contextmenu):(\d):(\d):([\d.]+);/g)]
+        .map((m) => ({ t: m[1], button: +m[2], detail: +m[3], ts: +m[4] }));
+      assert(now > 0 && ev.length > 0, `events read: ${out}`);
+      // No event is stamped in the future, and a press never precedes the move before it.
+      let lastMove = -Infinity;
+      for (const e of ev) {
+        assert(e.ts <= now, `${e.t} at ${e.ts} is after performance.now() ${now}`);
+        if (e.t === 'mousemove') lastMove = e.ts;
+        if (e.t === 'pointerdown' || e.t === 'mousedown') {
+          assert(e.ts >= lastMove, `${e.t} at ${e.ts} precedes the mousemove at ${lastMove}: ${out}`);
+        }
+      }
+      return ev;
+    };
+    const holds = (ev) => {
+      const downs = ev.filter((e) => e.t === 'mousedown');
+      const ups = ev.filter((e) => e.t === 'mouseup');
+      assert.strictEqual(downs.length, ups.length, 'a mouseup for every mousedown');
+      return downs.map((d, i) => {
+        const held = ups[i].ts - d.ts;
+        // The events carry their own timestamps; timeStamp is coarsened (0.1 ms).
+        assert(held >= 39.8 && held <= 120.2, `press ${i}: held ${held.toFixed(1)} ms, want 40-120`);
+        return held;
+      });
+    };
+
+    test('frames e2e: real clicks hold the button 40-120 ms, stamped after the last move (page, click @ref, dblclick 1/2)', () => {
+      const { c, p1 } = needE2E();
+      c('go', `http://127.0.0.1:${p1}/top.html`);
+      ok(c('eval', LISTEN_JS), /listening/, 'listeners');
+      ok(c('click', '#top-btn', '--entropy=on'), /Clicked: BUTTON Top button/, 'entropy click');
+      ok(c('dblclick', '#top-btn'), /Double-clicked/, 'dblclick');
+      ok(c('rightclick', '#top-btn'), /Right-clicked/, 'rightclick');
+      const snap = c('a11y-snapshot').stdout;
+      const ref = (/@(\d+) \[button\] "Top button"/.exec(snap) || [])[1];
+      assert(ref, `a11y-snapshot lists the button: ${snap}`);
+      ok(c('click', `@${ref}`), new RegExp(`Clicked @${ref}`), 'click @ref');
+      const out = c('eval', READ_JS).stdout;
+      const ev = pressEvents(out);
+      const downs = ev.filter((e) => e.t === 'mousedown');
+      assert.deepStrictEqual(downs.map((e) => [e.button, e.detail]), [[0, 1], [0, 1], [0, 2], [2, 1], [0, 1]], out);
+      holds(ev);
+      const ups = ev.filter((e) => e.t === 'mouseup');
+      const pause = downs[2].ts - ups[1].ts;
+      assert(pause >= 59.8 && pause <= HOLD_SLACK_MS, `dblclick pause ${pause.toFixed(1)} ms, want 60-140`);
+      assert.strictEqual(ev.filter((e) => e.t === 'dblclick').length, 1, `one dblclick event: ${out}`);
+      assert.strictEqual(ev.filter((e) => e.t === 'contextmenu').length, 1, `one contextmenu event: ${out}`);
+    });
+
+    test('frames e2e: frame clicks (same-origin and OOPIF) hold 40-120 ms, the press stamped after the last move', () => {
+      const { c, p1, p2 } = needE2E();
+      for (const url of bothOrigins(p1, p2, 'top.html')) {
+        c('go', url);
+        ok(c('frame', 'eval', '--frame', '#card', LISTEN_JS), /listening/, `listeners ${url}`);
+        ok(c('click', '#card >>> #pay-btn'), /Clicked: BUTTON Pay now/, `frame click ${url}`);
+        ok(c('click', '#card >>> #pay-btn', '--entropy=on'), /Clicked: BUTTON Pay now/, `entropy frame click ${url}`);
+        const out = c('frame', 'eval', '--frame', '#card', READ_JS).stdout;
+        assert.strictEqual(holds(pressEvents(out)).length, 2, `two presses in the frame: ${out}`);
+      }
+    });
+
+    test('frames e2e: a menu that opens on mousedown / a view replaced on mousedown: one native click, no script click, not "Clicked"', () => {
+      const { c, p1 } = needE2E();
+      const tail = '; the press and release reached the page, so no script click (it could click twice)';
+      for (const [url, prefix, flags, read] of [
+        [`http://127.0.0.1:${p1}/pressmenu.html`, '', ['--entropy=on'], (js) => c('eval', js).stdout],
+        [`http://127.0.0.1:${p1}/top.html?child=pressmenu.html`, '#card >>> ', [],
+          (js) => c('frame', 'eval', '--frame', '#card', js).stdout.replace(/^Result: /, '')]]) {
+        c('go', url);
+        const label = prefix ? 'iframe#card >>> ' : '';
+        const m = c('click', `${prefix}#menu-btn`, ...flags);
+        ok(m, /^Pressed \(released elsewhere, not clicked\): BUTTON Menu/m, `menu ${url}`);
+        assert.strictEqual(m.status, 3, `menu: exit 3 (pressed, release missed the target): ${m.stderr}`);
+        assert(!/Clicked/.test(m.stdout), m.stdout);
+        assert(m.stderr.includes(`note: ${label}#menu-btn was no longer under the mouse when the button was released`)
+          && m.stderr.includes(tail), m.stderr);
+        const s = c('click', `${prefix}#spa-btn`, ...flags);
+        ok(s, /^Pressed \(the page replaced or left it, not clicked\): BUTTON Next page/m, `spa ${url}`);
+        assert.strictEqual(s.status, 0, `spa: the page reacted, exit 0: ${s.stderr}`);
+        assert(s.stderr.includes(`note: ${label}#spa-btn was gone by the time the mouse button was released`), s.stderr);
+        // The release landed on the menu item; the browser's own click went
+        // to div#wrap once; nothing was clicked again by script.
+        assert.strictEqual(read('document.body.dataset.log').trim(), 'item-up;wrap-click:trusted;spa-down;', url);
+      }
+    });
+
     const count = (log, re) => (log.match(re) || []).length;
     const inFrame = (c, frame, js) => c('frame', 'eval', '--frame', frame, js).stdout;
 
@@ -4572,7 +4935,38 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       }
     });
 
-    test('frames e2e: a target that moves on mousedown or has pointer-events: none: script click + note', () => {
+    test('frames e2e: run and batch go on after a click pressed but not clicked: exit 3; with a failed step: exit 1', () => {
+      const { c, p1, env } = needE2E();
+      const url = `http://127.0.0.1:${p1}/moving.html`;
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-run-'));
+      const script = path.join(dir, 'jump.cdp');
+      fs.writeFileSync(script, `go ${url}\nclick #jump --entropy=on\neval document.body.dataset.log\n`);
+      const r = c('run', script);
+      assert.strictEqual(r.status, 3, `run: exit 3: ${r.stdout}${r.stderr}`);
+      assert(/NOT CLICKED \(exit 3\): note: #jump was no longer under the mouse/.test(r.stdout), r.stdout);
+      assert(/jump-down;/.test(r.stdout), 'the step after it ran');
+      assert(/Result: 2 passed, 0 failed, 1 not clicked, 3 total/.test(r.stdout), r.stdout);
+      c('go', `http://127.0.0.1:${p1}/top.html?child=moving.html`);
+      const b = spawnSync(process.execPath, [CLI, 'batch'], { encoding: 'utf-8', timeout: 60000, env,
+        input: JSON.stringify([{ cmd: 'click', args: ['#card >>> #jump'] }, { cmd: 'eval', args: ['1 + 1'] }]) });
+      assert.strictEqual(b.status, 3, `batch: exit 3: ${b.stdout}${b.stderr}`);
+      const steps = JSON.parse(b.stdout.slice(b.stdout.indexOf('[')));
+      assert.deepStrictEqual(steps, [{ cmd: 'click', status: 'not_clicked', clicked: false, reason: 'moved' },
+        { cmd: 'eval', status: 'ok' }]);
+      // A failed step wins over a miss: exit 1 (batch and run used to exit 0 on failures).
+      fs.writeFileSync(script, `go ${url}\nclick #jump --entropy=on\nclick #does-not-exist\n`);
+      const rf = c('run', script);
+      assert.strictEqual(rf.status, 1, `run with a failed step: exit 1: ${rf.stdout}${rf.stderr}`);
+      assert(/Result: 1 passed, 1 failed, 1 not clicked, 3 total/.test(rf.stdout), rf.stdout);
+      c('go', `http://127.0.0.1:${p1}/top.html?child=moving.html`);
+      const bf = spawnSync(process.execPath, [CLI, 'batch'], { encoding: 'utf-8', timeout: 60000, env,
+        input: JSON.stringify([{ cmd: 'click', args: ['#card >>> #jump'] }, { cmd: 'nope', args: [] }]) });
+      assert.strictEqual(bf.status, 1, `batch with a failed step: exit 1: ${bf.stdout}${bf.stderr}`);
+      assert.deepStrictEqual(JSON.parse(bf.stdout.slice(bf.stdout.indexOf('['))).map((s) => s.status),
+        ['not_clicked', 'error']);
+    });
+
+    test('frames e2e: a target that moves on mousedown: note, no script click; pointer-events: none: script click + note', () => {
       const { c, p1 } = needE2E();
       const cases = [
         [`http://127.0.0.1:${p1}/moving.html`, '', ['--entropy=on'], (js) => c('eval', js).stdout],
@@ -4583,14 +4977,15 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
         c('go', url);
         const label = prefix ? 'iframe#card >>> ' : '';
         const j = c('click', `${prefix}#jump`, ...flags);
-        ok(j, /Clicked: BUTTON/, `jump ${url}`);
-        assert(j.stderr.includes(`note: ${label}#jump was no longer under the mouse when the button was released`),
-          j.stderr);
+        ok(j, /Pressed \(released elsewhere, not clicked\): BUTTON/, `jump ${url}`);
+        assert.strictEqual(j.status, 3, `jump: exit 3: ${j.stderr}`);
+        assert(j.stderr.includes(`note: ${label}#jump was no longer under the mouse when the button was released`)
+          && j.stderr.includes('so no script click'), j.stderr);
         const g = c('click', `${prefix}#ghost`, ...flags);
         ok(g, /Clicked: BUTTON Ghost/, `ghost ${url}`);
         assert(g.stderr.includes(`note: ${label}#ghost has pointer-events: none; used a script click`), g.stderr);
-        // One click each, by the script: no trusted click was claimed, none landed elsewhere.
-        assert.strictEqual(read('document.body.dataset.log').trim(), 'jump-down;jump-click:script;ghost-click:script;');
+        // #jump: pressed, released elsewhere, not clicked again by script; #ghost: by script.
+        assert.strictEqual(read('document.body.dataset.log').trim(), 'jump-down;ghost-click:script;');
       }
     });
 
@@ -5877,6 +6272,17 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert(/timed out after 0\.3s; its execution was aborted/.test(r.stderr), r.stderr);
   });
 
+  test('webmcp: with --timeout the tool is aborted at the deadline and the watchdog lets that be reported', () => {
+    const r = fake('call_deadline');
+    assert.strictEqual(r.exit, 124, r.stderr);
+    assert.deepStrictEqual(r.calls[1].map((c) => c.fn), ['getTools', 'executeTool', 'aborted']);
+    assert(/timed out after 1\.5s \(--timeout\); its execution was aborted/.test(r.stderr), r.stderr);
+    // Aborted at the deadline, not before it (the old 0.75 s margin) and not by the watchdog.
+    assert(r.returned_at >= r.seconds - 0.05 && r.returned_at < r.seconds + r.grace, `${r.returned_at}`);
+    assert.deepStrictEqual(r.fired.map(([who]) => who), ['watchdog after grace'], JSON.stringify(r.fired));
+    assert(r.fired[0][1] >= r.seconds + r.grace - 0.05, JSON.stringify(r.fired));
+  });
+
   test('webmcp: a page that wraps getTools/executeTool cannot add tools, change results or see the calls', () => {
     const r = fake('hostile_page');
     for (const key of ['list', 'call', 'fake']) isolatedOnly(r[key], key);
@@ -6103,10 +6509,18 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   let e2e = null;
   test('webmcp e2e: headless browser started with `launch --webmcp` only, fixture server up', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-webmcp-e2e-'));
+    // Two free ports; CDPILOT_E2E_PORTS=<lo>-<hi> keeps them inside a range.
+    const [lo, hi] = (process.env.CDPILOT_E2E_PORTS || '0-0').split('-').map(Number);
     const [cdpPort, httpPort] = JSON.parse(execFileSync(PYB, ['-c', [
-      'import json, socket', 'ss = [socket.socket() for _ in range(2)]',
-      '[s.bind(("127.0.0.1", 0)) for s in ss]',
-      'print(json.dumps([s.getsockname()[1] for s in ss]))', '[s.close() for s in ss]',
+      'import json, random, socket', `lo, hi = ${lo}, ${hi}`, 'got = []',
+      'cands = random.sample(range(lo, hi + 1), hi - lo + 1) if lo else [0, 0]',
+      'for p in cands:',
+      '    s = socket.socket()',
+      '    try: s.bind(("127.0.0.1", p))',
+      '    except OSError: continue',
+      '    got.append(s)',
+      '    if len(got) == 2: break',
+      'print(json.dumps([s.getsockname()[1] for s in got]))', '[s.close() for s in got]',
     ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
     const server = spawn(PYB, ['-m', 'http.server', String(httpPort), '--bind', '127.0.0.1'],
       { cwd: fixtures, stdio: 'ignore' });
@@ -6137,7 +6551,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       stop();
       throw err;
     }
-    e2e = { c, httpPort, stop, trace, skip: null };
+    e2e = { c, cdpPort, httpPort, stop, trace, skip: null };
     // Skip (never fail) only when this browser really has no native WebMCP:
     // started with the flag, on a secure page, and document.modelContext is
     // still missing in the page itself.
@@ -6165,14 +6579,17 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert.strictEqual(r.status, 0, `tools list: ${r.stderr}`);
     return JSON.parse(r.stdout);
   };
-  // Poll `cmd` until pred(result) (a navigation lands between two commands).
-  const until = (fn, pred, what) => {
+  const nap = (ms) => execFileSync(process.execPath, ['-e', `setTimeout(() => {}, ${ms})`]);
+  // Poll fn() until pred(result), up to a time budget (not a count: under
+  // load every cdpilot process is slower).
+  const until = (fn, pred, what, budgetMs = 30000) => {
+    const deadline = Date.now() + budgetMs;
     let last;
-    for (let i = 0; i < 25; i++) {
+    do {
       last = fn();
       if (pred(last)) return last;
-      execFileSync(process.execPath, ['-e', 'setTimeout(() => {}, 200)']);
-    }
+      nap(200);
+    } while (Date.now() < deadline);
     assert.fail(`${what}: ${JSON.stringify(last)}`);
   };
   const evalJson = (c, js) => {
@@ -6180,12 +6597,60 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert.strictEqual(r.status, 0, r.stderr);
     return JSON.parse(r.stdout.trim());
   };
+  // The page and its iframes: document identity (timeOrigin), load state and
+  // the fixtures' window.__registered ('pending' until the browser answered
+  // every registerTool(), then 'ok'; 'none' on a page without tools).
+  const DOCS_JS = '(() => { const wins = [window, ...Array.from(document.querySelectorAll("iframe"), '
+    + '(f) => f.contentWindow)]; return { t0: performance.timeOrigin, url: location.href, '
+    + 'docs: wins.map((w, i) => { try { return { i, url: w.location.href, t0: w.performance.timeOrigin, '
+    + 'state: w.document.readyState, reg: w.__registered || "none" }; } '
+    + 'catch (e) { return { i, state: "unreadable" }; } }) }; })()';
+  const docs = (c) => {
+    try { return evalJson(c, DOCS_JS); } catch (err) { return null; }  // mid-navigation
+  };
+  // Wait until the page is a new document (timeOrigin != `after`, when given),
+  // loaded, and every registerTool() in it and in its iframes was answered.
+  // A "go" or a reload returning is not that: tools are registered by page
+  // scripts, and the browser answers each registration asynchronously.
+  // Chromium sometimes never answers an iframe's registerTool() (seen on
+  // 153: the promise stays pending and the tool never reaches getTools(),
+  // whoever asks). That is a browser bug, not cdpilot's: such a frame is
+  // reloaded (at most 3 times, with a note in the output) and waited on again.
+  // A stuck top-level registration is not worked around: it fails the test.
+  const settle = (c, what, after) => {
+    const deadline = Date.now() + 45000;
+    const pendingSince = new Map();
+    let last = null;
+    let reloads = 0;
+    while (Date.now() < deadline) {
+      last = docs(c);
+      const fresh = last && (after === undefined || last.t0 !== after);
+      if (fresh && last.docs.every((d) => d.state === 'complete' && (d.reg === 'ok' || d.reg === 'none'))) {
+        return last;
+      }
+      for (const d of fresh ? last.docs : []) {
+        if (d.i === 0 || d.state !== 'complete' || d.reg !== 'pending') continue;
+        const key = `${d.url} ${d.t0}`;
+        if (!pendingSince.has(key)) {
+          pendingSince.set(key, Date.now());
+        } else if (Date.now() - pendingSince.get(key) > 5000 && reloads < 3) {
+          reloads++;
+          console.log(`    note: ${what}: the browser never answered registerTool() in ${d.url}; `
+            + 'reloading that frame (Chromium bug)');
+          c('eval', `document.querySelectorAll("iframe")[${d.i - 1}].contentWindow.location.reload()`);
+        }
+      }
+      nap(200);
+    }
+    assert.fail(`${what}: page not settled: ${JSON.stringify(last)}`);
+  };
 
   try {
     test('webmcp e2e: go + tools list shows imperative, declarative and iframe tools with title/annotations', () => {
       const { c, httpPort, trace } = needE2E();
       ok(c('status'), /WebMCP: on/, 'status');
       ok(c('go', `http://127.0.0.1:${httpPort}/shop.html`), /WebMCP fixture shop/, 'go');
+      settle(c, 'shop');
       fs.writeFileSync(trace, '');
       const out = until(() => listJson(c), (o) => o.tools.length === 4, 'four tools');
       const byName = Object.fromEntries(out.tools.map((t) => [t.name, t]));
@@ -6248,6 +6713,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     test('webmcp e2e: a page that wraps getTools/executeTool gets no fake tool, no hijacked result, no view of the calls', () => {
       const { c, httpPort } = needE2E();
       ok(c('go', `http://127.0.0.1:${httpPort}/patched.html`), /Patched API/, 'go');
+      settle(c, 'patched page');
       const out = until(() => listJson(c), (o) => o.tools.length > 0, 'patched page tools');
       assert.deepStrictEqual(out.tools.map((t) => t.name), ['real_counter'], 'only the real tool');
       const r = c('tools', 'call', 'real_counter', '{"by":3}');
@@ -6269,6 +6735,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     test('webmcp e2e: one tool name in two same-origin frames: --frame picks which one runs', () => {
       const { c, httpPort } = needE2E();
       c('go', `http://127.0.0.1:${httpPort}/twoframes.html`);
+      settle(c, 'two frames');
       const out = until(() => listJson(c), (o) => o.tools.length === 2, 'two frame tools');
       assert.deepStrictEqual(out.tools.map((t) => t.name), ['frame_echo', 'frame_echo']);
       assert.deepStrictEqual(out.tools.map((t) => t.frame.replace(/^.*\//, '')).sort(),
@@ -6289,20 +6756,27 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     test('webmcp e2e: a --timeout aborts the running tool through its signal (exit 124)', () => {
       const { c, httpPort } = needE2E();
       c('go', `http://127.0.0.1:${httpPort}/shop.html`);
+      settle(c, 'shop');
       until(() => listJson(c), (o) => o.tools.length === 4, 'shop tools');
-      const r = c('--timeout', '4', 'tools', 'call', 'wait_for_abort');
+      // 10 s: connecting and listing (slow on a loaded CI runner) come out of the
+      // same budget, and the tool must have started before its signal aborts.
+      const r = c('--timeout', '10', 'tools', 'call', 'wait_for_abort');
       assert.strictEqual(r.status, 124, `${r.stdout}${r.stderr}`);
-      ok(r, /its execution was aborted/, 'timeout message');
+      ok(r, /timed out after 10s \(--timeout\); its execution was aborted/, 'timeout message');
       assert.strictEqual(evalJson(c, 'window.__slowAborted'), true, "the tool's signal was aborted");
     });
 
     test('webmcp e2e: the list follows a reload and a link navigation to another page', () => {
       const { c } = needE2E();
+      const shop = settle(c, 'shop');
       c('eval', 'location.reload()');
-      until(() => evalJson(c, 'window.__cart ? window.__cart.length : -1'), (n) => n === 0, 'reloaded');
+      const reloaded = settle(c, 'reload', shop.t0);  // a new document, not the old one
+      assert(/shop\.html$/.test(reloaded.url), reloaded.url);
       const again = until(() => listJson(c), (o) => o.tools.length === 4, 'tools after reload');
       assert(again.tools.some((t) => t.name === 'add_to_cart'));
       ok(c('click', '#next'), /Clicked/, 'click link');
+      const two = settle(c, 'page two', reloaded.t0);
+      assert(/page2\.html$/.test(two.url), two.url);
       const p2 = until(() => listJson(c), (o) => o.tools.length === 1, 'page two tools');
       assert.strictEqual(p2.tools[0].name, 'lookup_order');
       assert.strictEqual(p2.tools[0].annotations.readOnlyHint, true);
@@ -6318,6 +6792,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     test('webmcp e2e: bad arguments exit 1 before the tool runs', () => {
       const { c, httpPort } = needE2E();
       c('go', `http://127.0.0.1:${httpPort}/shop.html`);
+      settle(c, 'shop again');
       until(() => listJson(c), (o) => o.tools.length === 4, 'shop again');
       for (const [args, re] of [[['{"sku":"B1"}'], /missing required argument: qty/],
         [['{"sku":"B1","qty":true}'], /qty: expected integer, got boolean/],
@@ -6339,6 +6814,21 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert(!/WebMCP/.test(l.stdout), l.stdout);
       assert(!/WebMCP/.test(c('status').stdout), 'status: no WebMCP line while the mode is off');
       c('go', `http://127.0.0.1:${httpPort}/shop.html`);
+      settle(c, 'shop without the flag');
+      if (evalJson(c, 'typeof document.modelContext') === 'object') {
+        // Some builds turn WebMCP on without the flag (Chrome for Testing 153 does,
+        // through its field-trial config). Then there is nothing to diagnose; only
+        // make sure cdpilot did not pass the flag itself.
+        // chrome://version shows this browser's own command line.
+        const v = c('go', 'chrome://version');
+        assert.strictEqual(v.status, 0, v.stdout + v.stderr);
+        const cmdline = evalJson(c, 'document.getElementById("command_line").textContent');
+        assert(cmdline.includes(`--remote-debugging-port=${e2e.cdpPort}`), cmdline);
+        assert(!/--enable-features=\S*WebMCP/.test(cmdline), cmdline);
+        console.log('    note: this browser enables WebMCP without --enable-features=WebMCP; '
+          + 'the no-WebMCP diagnosis was not exercised');
+        return;
+      }
       const out = listJson(c);
       assert.deepStrictEqual(out.tools, []);
       assert.strictEqual(out.reason, 'flag-off');
@@ -6354,6 +6844,599 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     if (e2e) {
       try { e2e.stop(); } catch (err) { /* best effort */ }
     }
+  }
+})();
+
+// ── Web Bot Auth (signed agent) ──
+// Signing code, the draft's vectors and the signer helper's CDP loop run in
+// test/bot_auth_fake_cdp.py (the real cdpilot.py, a fake browser socket);
+// the CLI paths run through bin/cdpilot.js; the real browser path is the
+// opt-in e2e test (CDPILOT_E2E=1) with test/fixtures/bot_auth_server.py, an
+// origin that verifies every request it gets. `cryptography` is optional:
+// without it the bot-auth commands must print the install hint and exit 2.
+(function() {
+  const os = require('os');
+  const { spawnSync, spawn, execFileSync } = require('child_process');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  // HAS_CRYPTO is probed with PYB, so the CLI tests that need cryptography pin
+  // CDPILOT_PYTHON to PYB: bin/cdpilot.js otherwise may pick another interpreter
+  // (python3.13 before python3) that lacks it.
+  const HAS_CRYPTO = spawnSync(PYB, ['-c', 'import cryptography.hazmat.primitives.asymmetric.ed25519'],
+    { encoding: 'utf-8', timeout: 20000 }).status === 0;
+  const HINT = /needs the optional 'cryptography' package[\s\S]*pip install cryptography/;
+
+  test('bot auth signature base generation matches RFC 9421 test vector', () => {
+    const script = `
+import sys
+sys.path.insert(0, "./src")
+from cdpilot import _bot_auth_signature_base
+params_str = '("@authority");created=1735689600;keyid="poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U";alg="ed25519";expires=1735693200;nonce="mYotfW3CUjI68sbGw6oKd7kyXqPjZEtU8xFPGWFrqOAf5qC6MDe3pys3SWWCudB0MvwslHy32WXUpkR7u0lt/w==";tag="web-bot-auth"'
+expected_sig_base = b'"@authority": example.com' + bytes([10]) + b'"@signature-params": ' + params_str.encode()
+sig_base = _bot_auth_signature_base("GET", "example.com", "/path/to/resource", None, params_str)
+if sig_base != expected_sig_base:
+    sys.exit(1)
+print("ok")
+`;
+    const r = spawnSync(PYB, ['-c', script], { encoding: 'utf-8', timeout: 20000,
+      cwd: path.join(__dirname, '..'), env: { ...process.env, CDPILOT_LOG: '0' } });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.strictEqual(r.stdout.trim(), 'ok');
+  });
+
+  let fakeResults = null;
+  function fake(name) {
+    if (!fakeResults) {
+      const env = { ...process.env, CDP_PORT: '19226', CDPILOT_LOG: '0' };
+      for (const k of ['CDPILOT_MODE', 'CDPILOT_BOT_AUTH', 'CDPILOT_TIMEOUT']) delete env[k];
+      const out = execFileSync(PYB, [path.join(__dirname, 'bot_auth_fake_cdp.py'), PY_PATH], {
+        encoding: 'utf-8', timeout: 60000, env,
+      });
+      fakeResults = JSON.parse(out.trim().split('\n').pop());
+    }
+    const r = fakeResults[name];
+    assert(r, `bot-auth scenario ${name} missing`);
+    assert(!r.error, `bot-auth scenario ${name} crashed:\n${r.error}`);
+    return r;
+  }
+  const skipNote = (what) => console.log(`  - skipped: ${what} (cryptography not installed)`);
+
+  test('bot-auth: signature bases of draft-05 A.2 (legacy A.2.3 too), Cloudflare v2 and directory vectors', () => {
+    const v = fake('vectors');
+    for (const k of ['sig1_base', 'sig2_base', 'draft_a22_base', 'draft_a23_legacy_base', 'directory_base',
+      'directory_content_digest']) assert.strictEqual(v[k], true, k);
+  });
+
+  if (HAS_CRYPTO) {
+    test('bot-auth: Ed25519 vectors reproduce byte for byte (Signature, Signature-Input, Signature-Agent)', () => {
+      const v = fake('vectors');
+      for (const k of ['sig1_headers', 'sig2_headers', 'draft_a21_signature', 'draft_a23_legacy_signature']) {
+        assert.strictEqual(v[k], true, `${k}: ${JSON.stringify(v)}`);
+      }
+    });
+    test('bot-auth: the DEFAULT wire format is legacy — draft-05 A.2.3 headers byte for byte', () => {
+      // Signature-Agent: "https://…" covered as bare "signature-agent": the form
+      // Cloudflare's verifier accepts (it rejects the dictionary form).
+      assert.strictEqual(fake('vectors').draft_a23_legacy_headers, true);
+    });
+    test('bot-auth: signed directory response reproduces the reference vector (directory_response_v1)', () => {
+      assert.strictEqual(fake('vectors').directory_vector, true);
+    });
+  } else {
+    skipNote('bot-auth vector signatures');
+  }
+
+  test('bot-auth: RFC 7638 JWK thumbprint (RFC 8037 A.3, vector key) and RFC 9421 @authority', () => {
+    const t = fake('thumbprint');
+    assert.strictEqual(t.rfc8037_a3, true, 'RFC 8037 A.3 thumbprint');
+    assert.strictEqual(t.vector_key, true, 'vector key thumbprint');
+    assert.deepStrictEqual(t.authority, ['example.com', 'example.com', 'example.com',
+      '127.0.0.1:8080', 'example.com:8443', '[::1]:9000']);
+  });
+
+  test('bot-auth helper: flat auto-attach; Fetch (Request stage) before the paused target runs', () => {
+    const h = fake('helper');
+    const aa = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true };
+    assert.deepStrictEqual(h.first, ['Target.setAutoAttach', aa, null]);
+    assert.deepStrictEqual(h.ready, [null], 'ready once the browser accepted auto-attach');
+    assert.deepStrictEqual(h.attach, [
+      ['Fetch.enable', 'S1', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] }],
+      ['Target.setAutoAttach', 'S1', aa],
+      ['Runtime.runIfWaitingForDebugger', 'S1', {}],
+    ], 'a page gets Fetch + nested auto-attach, then runs; an "other" target gets nothing');
+  });
+
+  test('bot-auth helper: requestPaused -> continueRequest carries Signature, Signature-Input, Signature-Agent', () => {
+    const h = fake('helper');
+    assert.strictEqual(h.r1_session, 'S1', 'continued on the session that paused it');
+    assert.deepStrictEqual(h.r1_headers, ['Accept', 'X-Keep', 'Signature-Agent', 'Signature-Input', 'Signature'],
+      'page headers kept, a stale signature replaced, the three added');
+    assert.strictEqual(h.r1_values.Signature, 'sig1=:AAAA:');
+  });
+
+  test('bot-auth helper: data:/blob:/chrome-extension: and a signing error continue unsigned; one log line', () => {
+    const h = fake('helper');
+    for (const rid of ['R2', 'R3', 'R4', 'R5']) {
+      assert.deepStrictEqual(h.unsigned[rid] && h.unsigned[rid][1], ['requestId'], `${rid} continued without headers`);
+    }
+    assert.strictEqual(h.unsigned.R5[0], 'S2');
+    assert.deepStrictEqual(h.signed_urls, ['https://example.com/p?q=1', 'https://example.com/boom?token=SECRET123'],
+      'only http(s) reaches the signer');
+    assert.strictEqual(h.logs.length, 1, 'one line per failure');
+    assert(!/SECRET123|boom|token/.test(h.logs[0]), `the log line carries no path or query: ${h.logs[0]}`);
+    assert.strictEqual(h.finished, true, 'the helper returns when the browser socket closes');
+  });
+
+  if (HAS_CRYPTO) {
+    test('bot-auth helper: real signatures verify with the directory key; tampering fails; sign < 1 ms', () => {
+      const r = fake('helper_real_signature');
+      assert.deepStrictEqual(r.verified, [[true, 'sig1'], [true, 'sig1'], [true, 'sig1'], [true, 'sig1']]);
+      assert.deepStrictEqual(r.agents, Array(4).fill('"https://agent.example"'), 'legacy Signature-Agent');
+      assert.deepStrictEqual(r.dict, Array(4).fill([true, false]),
+        'dict format verifies with a dict verifier, and the legacy verifier rejects it');
+      assert.strictEqual(r.tampered[0], false, 'another Host must not verify');
+      assert(r.median_ms < 1, `median sign time ${r.median_ms} ms`);
+    });
+    test('bot-auth directory --headers: ("@authority";req), tag, one signature per key; verifies independently', () => {
+      const d = fake('directory');
+      assert(/^sig1=\("@authority";req\);created=\d+;keyid="[\w-]{43}";alg="ed25519";expires=\d+;nonce="[^"]{88}";tag="http-message-signatures-directory"$/
+        .test(d.input), d.input);
+      assert.deepStrictEqual(d.ok, [true, '1 key(s)']);
+      assert.deepStrictEqual(d.ok_digest, [true, '1 key(s)']);
+      assert.deepStrictEqual(d.two_keys, [true, '2 key(s)']);
+      for (const k of ['other_host', 'expired', 'edited_body', 'two_keys_one_signed']) {
+        assert.strictEqual(d[k], false, `${k} must not verify`);
+      }
+    });
+  } else {
+    skipNote('bot-auth real-signature helper test');
+  }
+
+  test('bot-auth: navigate sends no stealth script or UA override while the signer runs', () => {
+    const r = fake('navigate_skips_stealth');
+    assert.deepStrictEqual(r.off, { stealth_script: true, ua_override: true, navigated: true },
+      'stealth mode without bot-auth injects as before');
+    assert.deepStrictEqual(r.on, { stealth_script: false, ua_override: false, navigated: true });
+  });
+
+  test('bot-auth: stealth conflict is one warning line; the session log masks signatures', () => {
+    const r = fake('conflict_and_log');
+    assert.deepStrictEqual(r.flag, [true, 1, true], '--stealth with --bot-auth');
+    assert.deepStrictEqual(r.mode, [true, 1, true], 'undetected mode with --bot-auth');
+    assert.deepStrictEqual(r.none, [false, 0, false], 'regular mode: no warning');
+    assert.deepStrictEqual(r.slog, { signature_masked: true, input_masked: true, status_kept: true,
+      prose_kept: true, dump_masked: true }, 'only real header lines / header dumps are masked');
+  });
+
+  test('bot-auth: signer state is trusted only for this port\'s signer and browser; stale = dropped + warning', () => {
+    const r = fake('state');
+    assert.strictEqual(r.off, 'bot-auth: off');
+    assert.strictEqual(r.on, 'bot-auth: on (keyid KID123)', 'command line --_bot-auth-signer <port> <token> + same browser');
+    assert.strictEqual(r.active, true);
+    assert.strictEqual(r.kept_while_on, true);
+    assert.deepStrictEqual(r.unreachable, [true, 'bot-auth: on (keyid KID123)', false, '', true, false],
+      '/json/version timing out: still active (no stealth/escalation), no warning, state kept');
+    for (const k of ['other_token', 'browser_restarted', 'reused_pid']) {
+      assert.deepStrictEqual(r[k], ['bot-auth: off', null, true], `${k}: off, state file dropped, stale marker left`);
+    }
+    const w = 'bot-auth: signer not running, requests go out unsigned — run `cdpilot launch --bot-auth` again\n';
+    assert.deepStrictEqual(r.warning, [true, true, w + w], 'one line per command, until launch or stop');
+    assert.strictEqual(r.dead_pid, 'bot-auth: off');
+  });
+
+  test('bot-auth: stop never signals a reused pid (live sleep survives), ends a real signer, clears state', () => {
+    const r = fake('state');
+    assert.strictEqual(r.stop_reused, true);
+    assert.strictEqual(r.sleeper_alive_after_stop, true, 'stop killed an unrelated process');
+    assert.strictEqual(r.marker_after_stop, false, 'stop clears the stale marker');
+    assert.strictEqual(r.real_signer_stopped, true);
+    assert.strictEqual(r.state_after_stop, null);
+  });
+
+  test('bot-auth: spawn lock — holder SIGKILLed, three concurrent launches -> exactly one signer', () => {
+    const r = fake('lock');
+    assert.strictEqual(r.held, 'held');
+    assert.strictEqual(r.lock_left, true, 'the dead holder left its lock file behind');
+    assert.deepStrictEqual(r.errors, []);
+    assert.strictEqual(r.spawned, 1, `signers spawned: ${r.spawned}`);
+    assert.strictEqual(r.all_same, true, 'all three launches report the one signer');
+  });
+
+  test('bot-auth: health has no bot_auth key while bot-auth is unused (same keys as before), one once set up', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-health-'));
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: '19229', CDPILOT_LOG: '0', CDPILOT_NO_AUTOLAUNCH: '1' };
+    for (const k of ['CDPILOT_WEBMCP', 'CDPILOT_BOT_AUTH', 'CDPILOT_TIMEOUT']) delete env[k];
+    const health = () => {
+      const r = spawnSync(PYB, [PY_PATH, 'health'], { encoding: 'utf-8', timeout: 30000, env });
+      return JSON.parse(r.stdout.trim().split('\n').pop());
+    };
+    assert.deepStrictEqual(Object.keys(health()), ['alive', 'port', 'project_id', 'tabs', 'browser',
+      'crashes_today', 'stealth', 'uptime_warning', 'idle_close', 'idle_close_in_s'], 'health keys unchanged');
+    fs.mkdirSync(path.join(home, 'bot-auth'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'bot-auth', 'config.json'), '{"agent_url": "https://agent.test"}');
+    assert.strictEqual(health().bot_auth, 'bot-auth: off', 'configured: bot_auth key present');
+  });
+
+  test('bot-auth: idle close counts CDP clients other than the signer (socket owners per OS)', () => {
+    const r = fake('clients');
+    for (const k of ['lsof', 'netstat', 'bsd_netstat', 'ss']) assert.deepStrictEqual(r[k], [101, 303], k);
+    assert.strictEqual(typeof r.live, 'object', `live check: ${JSON.stringify(r.live)}`);
+    if (r.live.tool) {
+      assert.strictEqual(r.live.child_seen, true, 'a connected client is seen');
+      assert.strictEqual(r.live.server_side_not_counted, true);
+      assert.strictEqual(r.live.other_than_child, false, 'the signer alone is not a client');
+      assert.strictEqual(r.live.other_than_signer, true, 'another client keeps the browser open');
+    } else {
+      console.log('  - note: no socket-owner tool on this machine; idle close ignores clients while signing');
+    }
+  });
+
+  test('bot-auth: status prints a bot-auth line only when bot-auth is set up (default output unchanged)', () => {
+    // A stand-in CDP endpoint (a node child serving /json/version) on a free
+    // port in 58680-58699: the child tries them in turn and prints the one it got.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-status-'));
+    const ws = 'ws://127.0.0.1/devtools/browser/status-test';
+    const version = JSON.stringify({ Browser: 'Chrome/150.0.0.0', 'Protocol-Version': '1.3',
+      webSocketDebuggerUrl: ws });
+    const portFile = path.join(root, 'port');
+    const srv = spawn(process.execPath, ['-e', `
+      const http = require('http'), fs = require('fs');
+      const body = ${JSON.stringify(version)};
+      const tryPort = (p) => {
+        if (p > 58699) process.exit(3);
+        const s = http.createServer((req, res) => {
+          res.writeHead(req.url === '/json/version' ? 200 : 404, { 'Content-Type': 'application/json' });
+          res.end(req.url === '/json/version' ? body : '');
+        });
+        s.once('error', () => tryPort(p + 1));
+        s.listen(p, '127.0.0.1', () => fs.writeFileSync(${JSON.stringify(portFile)}, String(p)));
+      };
+      tryPort(58680);
+      setTimeout(() => process.exit(0), 120000);`], { stdio: 'ignore' });
+    let port = null;
+    const probe = spawnSync(process.execPath, ['-e', `
+      const fs = require('fs'), http = require('http');
+      const end = Date.now() + 30000;
+      const again = () => (Date.now() > end ? process.exit(3) : setTimeout(tick, 100));
+      const tick = () => {
+        let p;
+        try { p = fs.readFileSync(${JSON.stringify(portFile)}, 'utf8'); } catch (e) { return again(); }
+        http.get({ host: '127.0.0.1', port: Number(p), path: '/json/version', timeout: 3000 }, (res) => {
+          res.resume(); res.on('end', () => { process.stdout.write(p); process.exit(0); });
+        }).on('error', again).on('timeout', function () { this.destroy(); });
+      };
+      tick();`], { encoding: 'utf-8', timeout: 60000 });
+    if (probe.status === 0) port = Number(probe.stdout.trim());
+    const home = path.join(root, 'home');
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(root, 'profile'),
+      CDP_PORT: String(port), CDPILOT_LOG: '0' };
+    for (const k of ['CDPILOT_WEBMCP', 'CDPILOT_BOT_AUTH', 'CDPILOT_TIMEOUT']) delete env[k];
+    const status = () => spawnSync(process.execPath, [CLI, 'status'], { encoding: 'utf-8', timeout: 30000, env });
+    try {
+      assert(port, `stand-in /json/version never answered (exit ${probe.status}): ${probe.stderr}`);
+      const plain = `\n  cdpilot status (port ${port})\n\n  ✓ Connected\n  Browser: Chrome/150.0.0.0\n`
+        + `  Protocol: 1.3\n  WebSocket: ${ws}\n  idle close off\n\n`;
+      assert.strictEqual(status().stdout, plain, 'no bot-auth set up: status output unchanged');
+      fs.mkdirSync(path.join(home, 'bot-auth', 'signers'), { recursive: true });
+      fs.writeFileSync(path.join(home, 'bot-auth', 'config.json'), '{"agent_url": "https://agent.test"}');
+      assert.strictEqual(status().stdout, plain.replace('idle close off\n', 'idle close off\n  bot-auth: off\n'),
+        'configured, no signer: bot-auth: off');
+      // A signer that died without cleaning up: off, and the one-line warning.
+      fs.writeFileSync(path.join(home, 'bot-auth', 'signers', `${port}.json`), JSON.stringify({
+        token: 'dead', pid: 2 ** 22 + 12345, ready: true, port, keyid: 'K', browser_ws: ws }));
+      let r = status();
+      assert(r.stdout.includes('  idle close off\n  bot-auth: off\n\n'), r.stdout);
+      assert.strictEqual(r.stderr.replace(/\r\n/g, '\n'), 'bot-auth: signer not running, requests go '
+        + 'out unsigned — run `cdpilot launch --bot-auth` again\n');
+      assert(!fs.existsSync(path.join(home, 'bot-auth', 'signers', `${port}.json`)), 'stale state dropped');
+      r = status();
+      assert(/requests go out unsigned/.test(r.stderr), 'still warns until launch --bot-auth or stop');
+    } finally {
+      try { srv.kill(); } catch (err) { /* already gone */ }
+    }
+  });
+
+  // A `cryptography` that fails to import, whatever the interpreter has.
+  function noCryptoEnv(home) {
+    const shim = path.join(home, 'no-crypto');
+    fs.mkdirSync(path.join(shim, 'cryptography'), { recursive: true });
+    fs.writeFileSync(path.join(shim, 'cryptography', '__init__.py'),
+      'raise ImportError("cryptography blocked by the cdpilot test")\n');
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: '19227', CDPILOT_LOG: '0', PYTHONPATH: shim,
+      CHROME_BIN: path.join(home, 'no-such-browser', 'chrome'), CDPILOT_NO_AUTOLAUNCH: '1' };
+    for (const k of ['CDPILOT_MODE', 'CDPILOT_BOT_AUTH', 'CDPILOT_TIMEOUT']) delete env[k];
+    return env;
+  }
+
+  test('bot-auth without cryptography: init/status/directory/launch --bot-auth -> install hint, exit 2', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-nocrypto-'));
+    const env = noCryptoEnv(home);
+    // launch goes straight to Python: the node launcher's first-run preflight
+    // is about the browser and websockets, not this check.
+    for (const args of [['bot-auth', 'init', '--agent-url', 'https://agent.test'], ['bot-auth', 'status'],
+      ['bot-auth', 'directory'], ['launch', '--bot-auth']]) {
+      const r = args[0] === 'launch'
+        ? spawnSync(PYB, [PY_PATH, ...args], { env, encoding: 'utf-8', timeout: 30000 })
+        : spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf-8', timeout: 30000 });
+      assert.strictEqual(r.status, 2, `${args.join(' ')}: exit ${r.status}\n${r.stdout}${r.stderr}`);
+      assert(HINT.test(r.stderr), `${args.join(' ')}: install hint missing:\n${r.stderr}`);
+      assert(!/Launching browser/.test(r.stdout), `${args.join(' ')} must not start a browser`);
+    }
+    assert(!fs.existsSync(path.join(home, 'bot-auth', 'ed25519.key')), 'no key written');
+  });
+
+  test('bot-auth without cryptography: other commands are unaffected', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-nocrypto-'));
+    const env = noCryptoEnv(home);
+    const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf-8', timeout: 30000 });
+    let r = c('version');
+    assert(r.status === 0 && r.stdout.includes(require('../package.json').version), `version: ${r.stdout}${r.stderr}`);
+    r = c('mode');
+    assert(r.status === 0 && /Mode: regular/.test(r.stdout), `mode: ${r.stdout}${r.stderr}`);
+    r = c('bot-auth', '--help');
+    assert(r.status === 0 && /bot-auth <init\|status\|directory\|format>/.test(r.stdout), `bot-auth --help: ${r.stdout}${r.stderr}`);
+    r = c('status');
+    assert(r.status === 0, `status: ${r.stdout}${r.stderr}`);
+    assert(!HINT.test(r.stderr + r.stdout), 'no hint outside bot-auth');
+  });
+
+  if (HAS_CRYPTO) {
+    test('bot-auth init/directory/status: 0600 key, kid = RFC 7638 of x, key never printed, safe re-init', () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-cli-'));
+      const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+        CDP_PORT: '19228', CDPILOT_LOG: '0', CDPILOT_PYTHON: PYB };
+      const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf-8', timeout: 30000 });
+      for (const bad of ['http://agent.test', 'https://agent.test/bots', 'https://agent.test?a=1', 'agent.test']) {
+        const r = c('bot-auth', 'init', '--agent-url', bad);
+        assert.strictEqual(r.status, 1, `${bad} must be rejected: ${r.stdout}${r.stderr}`);
+      }
+      const init = c('bot-auth', 'init', '--agent-url', 'https://agent.test/');
+      assert.strictEqual(init.status, 0, init.stderr);
+      const keyFile = path.join(home, 'bot-auth', 'ed25519.key');
+      const pem = fs.readFileSync(keyFile, 'utf-8');
+      if (process.platform !== 'win32') {
+        assert.strictEqual(fs.statSync(keyFile).mode & 0o777, 0o600, 'key file 0600');
+      }
+      const dir = c('bot-auth', 'directory');
+      assert.strictEqual(dir.status, 0, dir.stderr);
+      const jwks = JSON.parse(dir.stdout);
+      assert.strictEqual(jwks.keys.length, 1);
+      const k = jwks.keys[0];
+      assert.deepStrictEqual([k.kty, k.crv, k.use], ['OKP', 'Ed25519', 'sig']);
+      assert(!('d' in k), 'the directory holds no private part');
+      const thumb = require('crypto').createHash('sha256')
+        .update(`{"crv":"Ed25519","kty":"OKP","x":"${k.x}"}`).digest('base64url');
+      assert.strictEqual(k.kid, thumb, 'kid is the RFC 7638 thumbprint');
+      const status = c('bot-auth', 'status');
+      assert(status.stdout.includes(`keyid     : ${thumb}`) && /agent URL : https:\/\/agent\.test$/m.test(status.stdout),
+        status.stdout);
+      assert(/bot-auth: off/.test(status.stdout), 'no signer running');
+      assert(/format    : Signature-Agent legacy$/m.test(status.stdout), `legacy is the default: ${status.stdout}`);
+      // The signed directory response: headers + the exact body, verified by the fixture.
+      const dh = c('bot-auth', 'directory', '--headers', '--json');
+      assert.strictEqual(dh.status, 0, dh.stderr);
+      const signed = JSON.parse(dh.stdout);
+      assert.strictEqual(signed.authority, 'agent.test', 'authority defaults to the agent URL host');
+      assert.strictEqual(signed.headers['Content-Type'], 'application/http-message-signatures-directory+json');
+      assert.deepStrictEqual(JSON.parse(signed.body), jwks, 'same JWKS as `bot-auth directory`');
+      const verifyDir = (headers, host, body) => JSON.parse(execFileSync(PYB, ['-c', [
+        'import json, sys', `sys.path.insert(0, ${JSON.stringify(path.join(__dirname, 'fixtures'))})`,
+        'import bot_auth_server as s', 'a = json.loads(sys.stdin.read())',
+        'print(json.dumps(s.verify_directory(a[0], a[1], a[2])))'].join('\n')],
+      { input: JSON.stringify([headers, host, body]), encoding: 'utf-8', timeout: 20000 }));
+      assert.deepStrictEqual(verifyDir(signed.headers, 'agent.test', signed.body), [true, '1 key(s)']);
+      assert.strictEqual(verifyDir(signed.headers, 'other.test', signed.body)[0], false);
+      const plain = c('bot-auth', 'directory', '--headers', '--authority', 'bots.agent.test', '--ttl', '60');
+      assert.strictEqual(plain.status, 0, plain.stderr);
+      const [head, ...rest] = plain.stdout.split('\n\n');
+      assert(/^Content-Type: application\/http-message-signatures-directory\+json$/m.test(head), head);
+      assert(/^Signature-Input: sig1=\("@authority";req\);created=(\d+);.*expires=(\d+);.*tag="http-message-signatures-directory"$/m
+        .test(head), head);
+      assert(/^Signature: sig1=:[A-Za-z0-9+/]{86}==:$/m.test(head), head);
+      const hdrs = Object.fromEntries(head.split('\n').map((l) => [l.slice(0, l.indexOf(':')), l.slice(l.indexOf(':') + 2)]));
+      assert.deepStrictEqual(verifyDir(hdrs, 'bots.agent.test', rest.join('\n\n')), [true, '1 key(s)']);
+      const [, created, expires] = head.match(/created=(\d+);.*expires=(\d+)/);
+      assert.strictEqual(Number(expires) - Number(created), 60, '--ttl');
+      // Opt-in dictionary format, and back.
+      let f = c('bot-auth', 'format', 'dict');
+      assert(f.status === 0 && /format: dict/.test(f.stdout), f.stdout + f.stderr);
+      assert(/format    : Signature-Agent dict$/m.test(c('bot-auth', 'status').stdout), 'format dict persisted');
+      f = c('bot-auth', 'format', 'bogus');
+      assert.strictEqual(f.status, 2, 'unknown format rejected');
+      f = c('bot-auth', 'format', 'legacy');
+      assert(f.status === 0 && /Signature-Agent format: legacy/.test(c('bot-auth', 'format').stdout));
+      const body = pem.split('\n').filter((l) => l && !l.startsWith('-----')).join('');
+      for (const r of [init, dir, status, dh, plain]) {
+        assert(!/PRIVATE KEY/.test(r.stdout + r.stderr) && !(r.stdout + r.stderr).includes(body.slice(0, 24)),
+          'the private key is never printed');
+      }
+      const again = c('bot-auth', 'init', '--agent-url', 'https://agent.test');
+      assert.strictEqual(again.status, 1, 're-init without --force must refuse');
+      assert.strictEqual(fs.readFileSync(keyFile, 'utf-8'), pem, 'key unchanged');
+      if (process.platform !== 'win32') {
+        fs.chmodSync(keyFile, 0o644);
+        const warn = c('bot-auth', 'status');
+        assert(/private key is 0o644, should be 0600/.test(warn.stderr), `perm warning: ${warn.stderr}`);
+      }
+    });
+  } else {
+    skipNote('bot-auth init/directory/status CLI test');
+  }
+
+  test('bot-auth docs: README section, bin help, __doc__, CHANGELOG [Unreleased]', () => {
+    const root = path.join(__dirname, '..');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    const sec = readme.split(/^### Web Bot Auth \(signed agent\)$/m)[1];
+    assert(sec, 'README needs a "### Web Bot Auth (signed agent)" section');
+    for (const s of ['bot-auth init --agent-url', 'bot-auth directory', 'launch --bot-auth',
+      '/.well-known/http-message-signatures-directory', 'application/http-message-signatures-directory+json',
+      'pip install cryptography', 'stealth', 'Signature-Agent', '"signature-agent";key="sig1"',
+      'bot-auth directory --headers', '("@authority" "signature-agent")', 'bot-auth format dict',
+      'WebSocket', 'requests go out unsigned']) {
+      assert(sec.includes(s), `README section must mention ${s}`);
+    }
+    const help = run('--help');
+    assert(help.includes('launch --bot-auth') && help.includes('bot-auth directory --headers')
+      && help.includes('bot-auth format'), 'bin help documents bot-auth');
+    assert(PY_CONTENT.slice(0, 3000).includes('launch --bot-auth'), 'python __doc__ documents bot-auth');
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    const secs = changelog.split(/^## \[/m);
+    assert((secs[1] || '').startsWith('Unreleased]') && secs[1].includes('launch --bot-auth'),
+      'CHANGELOG [Unreleased] describes Web Bot Auth');
+    for (const s of ['`bot-auth:` line', '`bot_auth` key', 'directory --headers', 'legacy']) {
+      assert(secs[1].includes(s), `CHANGELOG [Unreleased] must mention ${s}`);
+    }
+  });
+
+  // ── Real browser (CDPILOT_E2E=1): every request the browser makes is signed ──
+  if (process.env.CDPILOT_E2E !== '1') {
+    console.log('  - skipped: bot-auth e2e (set CDPILOT_E2E=1 to run it against a headless browser)');
+    return;
+  }
+  let e2e = null;
+  test('bot-auth e2e: launch --bot-auth starts the signer; status shows bot-auth: on (keyid …)', () => {
+    assert(HAS_CRYPTO, `the bot-auth e2e needs cryptography in ${PYB} (pip install cryptography)`);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-botauth-e2e-'));
+    // Two free ports in 58600-58699 (never the default CDP port).
+    const [cdpPort, port] = JSON.parse(execFileSync(PYB, ['-c', [
+      'import json, socket', 'got = []',
+      'for p in range(58600, 58700):',
+      '    s = socket.socket()',
+      '    try: s.bind(("127.0.0.1", p)); got.append(p)',
+      '    except OSError: pass',
+      '    finally: s.close()',
+      '    if len(got) == 2: break',
+      'print(json.dumps(got))',
+    ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1', CDPILOT_LOG: '0', CDPILOT_PYTHON: PYB };
+    for (const k of ['CDPILOT_TARGET', 'CDPILOT_MODE', 'CDPILOT_BOT_AUTH', 'CDPILOT_TIMEOUT']) delete env[k];
+    const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf-8', timeout: 60000, env });
+    let r = c('bot-auth', 'init', '--agent-url', 'https://agent.test');
+    assert.strictEqual(r.status, 0, r.stderr);
+    r = c('bot-auth', 'directory');
+    assert.strictEqual(r.status, 0, r.stderr);
+    const jwksFile = path.join(home, 'jwks.json');
+    fs.writeFileSync(jwksFile, r.stdout);
+    const keyid = JSON.parse(r.stdout).keys[0].kid;
+    const logFile = path.join(home, 'origin.jsonl');
+    const srv = spawn(PYB, [path.join(__dirname, 'fixtures', 'bot_auth_server.py'), '--port', String(port),
+      '--jwks-file', jwksFile, '--log-file', logFile], { stdio: 'ignore' });
+    // A stale signer state whose pid now belongs to an unrelated live process
+    // (a reused pid): launch must not trust it, and stop must not kill it.
+    const sleeper = spawn(process.platform === 'win32' ? PYB : 'sleep',
+      process.platform === 'win32' ? ['-c', 'import time; time.sleep(120)'] : ['120'], { stdio: 'ignore' });
+    fs.mkdirSync(path.join(home, 'bot-auth', 'signers'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'bot-auth', 'signers', `${cdpPort}.json`), JSON.stringify({
+      token: 'stale', pid: sleeper.pid, ready: true, port: cdpPort, keyid: 'OLDKEY',
+      browser_ws: `ws://127.0.0.1:${cdpPort}/devtools/browser/gone`, started: Date.now() / 1000 - 3600 }));
+    const stop = () => {
+      c('stop');
+      try { srv.kill(); } catch (err) { /* already gone */ }
+      try { sleeper.kill(); } catch (err) { /* already gone */ }
+    };
+    try {
+      execFileSync(PYB, ['-c', [
+        'import time, urllib.request',
+        'for _ in range(100):',
+        `    try: urllib.request.urlopen("http://127.0.0.1:${port}/ping", timeout=1); break`,
+        '    except Exception: time.sleep(0.1)',
+      ].join('\n')], { timeout: 20000 });
+      r = c('launch', '--bot-auth');
+      assert(r.status === 0 && /Bot Auth: signing every request as https:\/\/agent\.test/.test(r.stdout),
+        `launch: ${r.status}\n${r.stdout}${r.stderr}`);
+      assert(/Signature-Agent legacy/.test(r.stdout), `legacy is the default wire format: ${r.stdout}`);
+      const state = JSON.parse(fs.readFileSync(path.join(home, 'bot-auth', 'signers', `${cdpPort}.json`), 'utf-8'));
+      assert(state.pid && state.ready, 'signer state names a ready pid');
+      assert(state.pid !== sleeper.pid && state.token !== 'stale' && state.keyid === keyid,
+        `launch trusted a stale state with a reused pid: ${JSON.stringify(state)}`);
+      const st = c('status');
+      assert(st.stdout.includes(`bot-auth: on (keyid ${keyid})`), `status: ${st.stdout}`);
+      assert(!/requests go out unsigned/.test(st.stderr), `no stale warning while signing: ${st.stderr}`);
+    } catch (err) {
+      stop();
+      throw err;
+    }
+    const readLog = () => fs.readFileSync(logFile, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+      .filter((e) => e.path !== '/ping');
+    e2e = { c, port, keyid, stop, readLog, home, cdpPort, sleeper };
+  });
+  const need = () => { assert(e2e, 'bot-auth e2e setup failed'); return e2e; };
+  const waitFor = (fn, ms) => {
+    const end = Date.now() + ms;
+    for (;;) {
+      const v = fn();
+      if (v || Date.now() > end) return v;
+      spawnSync(PYB, ['-c', 'import time; time.sleep(0.2)']);
+    }
+  };
+  // The legacy wire format, verified by the fixture in its default (legacy) mode.
+  const signedBy = (e, keyid) => e.verified === true
+    && e.signature_agent === '"https://agent.test"'
+    && e.signature_input.startsWith('sig1=("@authority" "signature-agent");')
+    && e.signature_input.includes(`keyid="${keyid}"`) && e.signature_input.includes('tag="web-bot-auth"');
+  try {
+    let goDone = 0;
+    test('bot-auth e2e (a): go — the document, a subresource and both redirect hops are signed', () => {
+      const { c, port, keyid, readLog } = need();
+      const r = c('go', `http://127.0.0.1:${port}/start?late=4000&popup=5000&worker=1`);
+      goDone = Date.now() / 1000;
+      assert.strictEqual(r.status, 0, `go: ${r.stdout}${r.stderr}`);
+      const log = waitFor(() => { const l = readLog(); return ['/sub.json', '/after-redirect']
+        .every((p) => l.some((e) => e.path === p)) && l; }, 10000);
+      assert(log, `origin missed /sub.json or /after-redirect: ${JSON.stringify(readLog().map((e) => e.path))}`);
+      for (const p of ['/start?late=4000&popup=5000&worker=1', '/sub.json', '/redirect', '/after-redirect']) {
+        const e = log.find((x) => x.path === p);
+        assert(e && signedBy(e, keyid), `${p}: ${JSON.stringify(e)}`);
+      }
+    });
+    test('bot-auth e2e (b): a fetch() the page makes after the cdpilot command exited is signed', () => {
+      const { keyid, readLog } = need();
+      const log = waitFor(() => { const l = readLog(); return l.some((e) => e.path === '/late?x=1') && l; }, 15000);
+      assert(log, 'origin saw no /late request');
+      const e = log.find((x) => x.path === '/late?x=1');
+      assert(goDone && e.t > goDone, `the late fetch (t=${e.t}) must come after go exited (t=${goDone})`);
+      assert(signedBy(e, keyid), JSON.stringify(e));
+    });
+    test('bot-auth e2e (c): a new tab opened by the page is signed (document and image)', () => {
+      const { keyid, readLog } = need();
+      const log = waitFor(() => { const l = readLog(); return l.some((e) => e.path === '/popup.png') && l; }, 15000);
+      assert(log, 'origin saw no popup requests');
+      for (const p of ['/popup', '/popup.png']) {
+        const e = log.find((x) => x.path === p);
+        assert(e && signedBy(e, keyid), `${p}: ${JSON.stringify(e)}`);
+      }
+    });
+    test('bot-auth e2e (d): a dedicated Worker the page starts is signed (script and its fetch)', () => {
+      const { keyid, readLog } = need();
+      const log = waitFor(() => { const l = readLog(); return l.some((e) => e.path === '/from-worker') && l; }, 10000);
+      assert(log, 'origin saw no request from the worker');
+      for (const p of ['/worker.js', '/from-worker']) {
+        const e = log.find((x) => x.path === p);
+        assert(e && signedBy(e, keyid), `${p}: ${JSON.stringify(e)}`);
+      }
+    });
+    test('bot-auth e2e: every request the origin received verifies with the directory key', () => {
+      const { keyid, readLog } = need();
+      const log = readLog();
+      assert(log.length >= 5, `requests seen: ${log.length}`);
+      const bad = log.filter((e) => !signedBy(e, keyid));
+      assert.deepStrictEqual(bad, [], 'unsigned or unverified requests');
+    });
+    test('bot-auth e2e: stop ends the signer process and status says off', () => {
+      const { c, home, cdpPort, sleeper } = need();
+      const state = JSON.parse(fs.readFileSync(path.join(home, 'bot-auth', 'signers', `${cdpPort}.json`), 'utf-8'));
+      const r = c('stop');
+      assert.strictEqual(r.status, 0, r.stderr);
+      const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; } };
+      assert(waitFor(() => !alive(state.pid), 5000), `signer pid ${state.pid} still alive after stop`);
+      assert(!fs.existsSync(path.join(home, 'bot-auth', 'signers', `${cdpPort}.json`)), 'signer state cleared');
+      assert(/bot-auth: off/.test(c('bot-auth', 'status').stdout), 'bot-auth status: off');
+      assert(alive(sleeper.pid), 'the process that reused the stale pid must survive launch and stop');
+    });
+  } finally {
+    if (e2e) e2e.stop();
   }
 })();
 
