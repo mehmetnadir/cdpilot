@@ -84,6 +84,56 @@ test('setup detects python websockets', () => {
   assert(out.includes('websockets:'), 'Should show Python\'s websockets detection');
 });
 
+// ── CDPILOT_HOME honored everywhere (bin/cdpilot.js) ──
+// bin/cdpilot.js used to build the registry/profile paths straight from
+// os.homedir(), ignoring CDPILOT_HOME even when it was set — a test run
+// that isolated CDPILOT_HOME still wrote real project dirs into the
+// developer's actual ~/.cdpilot (src/cdpilot.py already honored it; the
+// Node entry point didn't). Every path must go through the cdpilotHome()
+// helper, which mirrors src/cdpilot.py's
+// `os.environ.get("CDPILOT_HOME") or os.path.expanduser("~/.cdpilot")`.
+(function() {
+  const os = require('os');
+  const tmpCdpilotHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-home-test-'));
+  const fakeUserHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-fakehome-test-'));
+
+  test('CDPILOT_HOME: setup writes only under CDPILOT_HOME, never under HOME/.cdpilot', () => {
+    execSync(`node ${CLI} setup`, {
+      timeout: 15000,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        CDP_PORT: '19222',
+        CDPILOT_LOG: '0',
+        CDPILOT_HOME: tmpCdpilotHome,
+        HOME: fakeUserHome,
+        // os.homedir() reads USERPROFILE first on Windows — override both
+        // so this test isolates HOME on every CI platform.
+        USERPROFILE: fakeUserHome,
+      },
+    });
+
+    const fakeHomeCdpilotDir = path.join(fakeUserHome, '.cdpilot');
+    assert(!fs.existsSync(fakeHomeCdpilotDir),
+      `Nothing should be created under HOME/.cdpilot, found: ${fakeHomeCdpilotDir}`);
+
+    // `setup` creates the project's profile dir under
+    // CDPILOT_HOME/projects/<project-id>/profile — that's the file this
+    // regression checks lands in the right place.
+    const projectsDir = path.join(tmpCdpilotHome, 'projects');
+    assert(fs.existsSync(projectsDir),
+      `Expected CDPILOT_HOME/projects to exist, found none under ${tmpCdpilotHome}`);
+    const projectDirs = fs.readdirSync(projectsDir);
+    assert(projectDirs.length > 0, 'Expected at least one project dir under CDPILOT_HOME/projects');
+    const profileDir = path.join(projectsDir, projectDirs[0], 'profile');
+    assert(fs.existsSync(profileDir),
+      `Expected the profile dir under CDPILOT_HOME, found none: ${profileDir}`);
+  });
+
+  fs.rmSync(tmpCdpilotHome, { recursive: true, force: true });
+  fs.rmSync(fakeUserHome, { recursive: true, force: true });
+})();
+
 // ── File structure ──
 
 test('cdpilot.py exists', () => {
@@ -5130,10 +5180,14 @@ print("RESULT=" + json.dumps(out))
     fs.mkdirSync(path.dirname(activityFile), { recursive: true });
     fs.writeFileSync(activityFile, `${now - 90}\n`);
     const js = fs.readFileSync(CLI, 'utf-8');
+    const homeSrc = (js.match(/function cdpilotHome\(\) \{[\s\S]*?\n\}\n/) || [])[0];
+    assert(homeSrc, 'bin/cdpilot.js must define cdpilotHome');
     const src = (js.match(/function idleCloseLabel\(port\) \{[\s\S]*?\n\}\n/) || [])[0];
     assert(src, 'bin/cdpilot.js must define idleCloseLabel');
+    assert(/idleCloseLabel\(port\) \{\s*\n\s*const home = cdpilotHome\(\);/.test(js),
+      'idleCloseLabel must resolve home via the shared cdpilotHome() helper');
     assert(/console\.log\(`\s*\$\{idleCloseLabel\(port\)\}/.test(js), 'runStatus must print the label');
-    const label = new Function('fs', 'path', 'os', 'process', `${src}\nreturn idleCloseLabel;`)(
+    const label = new Function('fs', 'path', 'os', 'process', `${homeSrc}\n${src}\nreturn idleCloseLabel;`)(
       fs, path, os, { env: { CDPILOT_HOME: home }, kill: process.kill.bind(process) });
     assert.strictEqual(label(port), 'idle close in 14m');
     assert.strictEqual(label(port + 1), 'idle close off', 'no watcher record -> off');
