@@ -728,6 +728,38 @@ never changes a command's output or exit code, and a failed write costs one
 stderr line. `CDPILOT_LOG=0` turns it off; `CDPILOT_LOG_DAYS` (default 14)
 sets how many days are kept. The MCP server exposes it as `browser_log`.
 
+### WebMCP Bridge (opt-in)
+
+[WebMCP](https://developer.chrome.com/docs/ai/webmcp) is a web standard where
+sites expose JavaScript functions and HTML `<form>` elements as structured
+"tools" that AI agents can discover and invoke.  cdpilot bridges this protocol
+so you (or an LLM agent) can list and call a page's tools from the terminal.
+
+```bash
+# Enable the bridge when launching the browser
+cdpilot launch --webmcp        # or: CDPILOT_WEBMCP=1 cdpilot launch
+
+# List tools registered on the current page
+cdpilot tools list             # human-readable
+cdpilot tools list --json      # machine-readable
+
+# Call a tool
+cdpilot tools call add_to_cart '{"sku":"A1","qty":2}'
+cdpilot tools call add_to_cart --arg sku=A1 --arg qty=2
+```
+
+**How it works**: `launch --webmcp` enables Chrome's `--enable-features=WebMCP,WebMCPTesting` and injects a small hook via `Page.addScriptToEvaluateOnNewDocument` *before* any page script. The hook wraps `document.modelContext.registerTool` (when the browser has native WebMCP support) or provides a minimal polyfill, mirroring every tool registration to `window.__cdpilot_webmcp_tools`. cdpilot then lists and calls tools via `Runtime.evaluate`.
+
+**Declarative form tools**: HTML forms with `<form toolname="..." tooldescription="...">` are automatically scanned after DOM ready. Input types and `required` attributes are converted to JSON Schema.
+
+**MCP tools**: `browser_site_tools` and `browser_site_tool_call` are available in the MCP server when `CDPILOT_WEBMCP=1`.
+
+> **Security**: `tools call` executes the page's own JavaScript handler.  Treat
+> the return value as **untrusted**.  Argument values whose JSON keys contain
+> `password`, `token`, `secret`, or `key` are automatically redacted in the
+> session log.  Enable `chrome://flags/#enable-webmcp-testing` for the native
+> testing API; otherwise the hook/polyfill handles everything.
+
 ### Scaling & Workstation Use
 
 ```bash

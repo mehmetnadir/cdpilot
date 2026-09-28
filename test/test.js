@@ -5154,12 +5154,248 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert(readme.includes(s), `README must mention ${s}`);
     }
     const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    const unreleased = changelog.split(/^## \[/m)[1] || ''; // newest: [Unreleased] or the release
-    assert(unreleased && unreleased.includes('cdpilot log'), 'CHANGELOG [Unreleased] must describe `cdpilot log`');
+    const sections = changelog.split(/^## \[/m).slice(1, 3).join(''); // newest two sections
+    assert(sections && sections.includes('cdpilot log'), 'CHANGELOG newest sections must describe `cdpilot log`');
     const help = run('--help');
     assert(help.includes('log --md') && help.includes('CDPILOT_LOG'), 'bin help must document log');
     assert(PY_CONTENT.slice(0, 2000).includes('CDPILOT_LOG=0'), 'python __doc__ must document CDPILOT_LOG');
   });
+})();
+
+// ── WebMCP bridge tests ──
+(function() {
+  const { execFileSync, spawn, spawnSync } = require('child_process');
+  const os = require('os');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const PY_PATH = path.join(__dirname, '..', 'src', 'cdpilot.py');
+  const PY_CONTENT = fs.readFileSync(PY_PATH, 'utf8');
+
+  // ── Browserless tests via fake CDP harness ──
+
+  let fakeResults = null;
+  function fake(name) {
+    if (!fakeResults) {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-webmcp-fake-'));
+      const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+        CDP_PORT: '19225', CDPILOT_LOG: '0', CDPILOT_WEBMCP: '1' };
+      const out = execFileSync(PYB, [path.join(__dirname, 'webmcp_fake_cdp.py'), PY_PATH], {
+        encoding: 'utf-8', timeout: 60000, env,
+      });
+      fakeResults = JSON.parse(out.trim().split('\n').pop());
+    }
+    const r = fakeResults[name];
+    assert(r, `fake-CDP scenario ${name} missing`);
+    assert(r.ok, `fake-CDP scenario ${name} failed:\n${r.error || JSON.stringify(r)}`);
+    return r.result;
+  }
+
+  test('webmcp: argument validation (required, type, not-dict, empty schema)', () => {
+    const results = fake('validate_args');
+    // Valid case
+    assert.strictEqual(results[0].ok, true, 'valid args should pass');
+    assert.strictEqual(results[0].err, null);
+    // Missing required
+    assert.strictEqual(results[1].ok, false, 'missing required should fail');
+    assert(results[1].err.includes('missing required'), `err: ${results[1].err}`);
+    // Wrong type
+    assert.strictEqual(results[2].ok, false, 'wrong type should fail');
+    assert(results[2].err.includes('expected integer'), `err: ${results[2].err}`);
+    // Not a dict
+    assert.strictEqual(results[3].ok, false, 'non-dict should fail');
+    // Empty schema (anything goes)
+    assert.strictEqual(results[4].ok, true, 'empty schema should pass');
+    // Number allows int
+    assert.strictEqual(results[5].ok, true, 'number type should accept int');
+  });
+
+  test('webmcp: CDPILOT_WEBMCP env var config', () => {
+    const results = fake('webmcp_config');
+    assert.strictEqual(results[0].active, true, 'CDPILOT_WEBMCP=1 should be active');
+    assert.strictEqual(results[1].active, false, 'CDPILOT_WEBMCP=0 should be inactive');
+    assert.strictEqual(results[2].active, true, 'CDPILOT_WEBMCP=true should be active');
+    assert.strictEqual(results[3].active, false, 'CDPILOT_WEBMCP= should be inactive');
+  });
+
+  test('webmcp: hook JS contains required patterns', () => {
+    const checks = fake('hook_js_content');
+    for (const [key, val] of Object.entries(checks)) {
+      assert(val, `hook JS missing: ${key}`);
+    }
+  });
+
+  test('webmcp: session log redacts secret-named tool call fields', () => {
+    const results = fake('redact_tools_call');
+    // Normal args — no secrets
+    assert.strictEqual(results[0].secrets.length, 0, 'normal: no secrets');
+    assert(results[0].has_sku, 'normal: sku should be visible');
+    // Secret field (password)
+    assert(results[1].password_redacted, 'password should be redacted');
+    assert(results[1].username_kept, 'username should be kept');
+    assert(results[1].secrets_has_hunter, 'hunter2 should be in secrets list');
+    // Secret field (api_key)
+    assert(results[2].key_redacted, 'api_key should be redacted');
+    assert(results[2].mode_kept, 'mode should be kept');
+  });
+
+  test('webmcp: documentation present (README, CHANGELOG, help)', () => {
+    const root = path.join(__dirname, '..');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    assert(readme.includes('WebMCP'), 'README must mention WebMCP');
+    assert(readme.includes('tools list'), 'README must document tools list');
+    assert(readme.includes('tools call'), 'README must document tools call');
+    assert(readme.includes('CDPILOT_WEBMCP'), 'README must document CDPILOT_WEBMCP');
+    assert(readme.includes('browser_site_tools'), 'README must mention MCP tools');
+
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+    assert(changelog.includes('[Unreleased]'), 'CHANGELOG must have [Unreleased]');
+    assert(changelog.includes('WebMCP bridge'), 'CHANGELOG [Unreleased] must describe WebMCP');
+
+    const help = run('--help');
+    assert(help.includes('WEBMCP'), 'bin help must have WEBMCP section');
+    assert(help.includes('tools list'), 'bin help must document tools list');
+    assert(help.includes('tools call'), 'bin help must document tools call');
+    assert(help.includes('--webmcp'), 'bin help must document --webmcp flag');
+
+    assert(PY_CONTENT.slice(0, 3000).includes('CDPILOT_WEBMCP'),
+      'python __doc__ must document CDPILOT_WEBMCP');
+  });
+
+  test('webmcp: MCP tool definitions registered (browser_site_tools, browser_site_tool_call)', () => {
+    assert(PY_CONTENT.includes('"browser_site_tools"'), 'MCP must have browser_site_tools');
+    assert(PY_CONTENT.includes('"browser_site_tool_call"'), 'MCP must have browser_site_tool_call');
+    // Verify tool_map entries
+    assert(PY_CONTENT.includes('"browser_site_tools": lambda'), 'tool_map must have browser_site_tools');
+    assert(PY_CONTENT.includes('"browser_site_tool_call": lambda'), 'tool_map must have browser_site_tool_call');
+  });
+
+  test('webmcp: test fixture exists (test/fixtures/webmcp/shop.html)', () => {
+    const fixture = path.join(__dirname, 'fixtures', 'webmcp', 'shop.html');
+    assert(fs.existsSync(fixture), 'test/fixtures/webmcp/shop.html must exist');
+    const html = fs.readFileSync(fixture, 'utf8');
+    assert(html.includes('add_to_cart'), 'fixture must have add_to_cart tool');
+    assert(html.includes('toolname'), 'fixture must have declarative form');
+    assert(html.includes('subscribe_newsletter'), 'fixture must have subscribe_newsletter');
+    assert(html.includes('modelContext'), 'fixture must use modelContext API');
+  });
+
+  // ── E2E tests (opt-in: CDPILOT_E2E=1) ──
+
+  if (process.env.CDPILOT_E2E !== '1') {
+    console.log('  - skipped: webmcp e2e (set CDPILOT_E2E=1 to run it against a headless browser)');
+    return;
+  }
+
+  const fixtures = path.join(__dirname, 'fixtures', 'webmcp');
+  let e2e = null;
+
+  test('webmcp e2e: headless browser and fixture server start', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-webmcp-e2e-'));
+    const [cdpPort, httpPort] = JSON.parse(execFileSync(PYB, ['-c', [
+      'import json, socket', 'ss = [socket.socket() for _ in range(2)]',
+      '[s.bind(("127.0.0.1", 0)) for s in ss]',
+      'print(json.dumps([s.getsockname()[1] for s in ss]))', '[s.close() for s in ss]',
+    ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
+
+    const server = spawn(PYB, ['-m', 'http.server', String(httpPort), '--bind', '127.0.0.1'],
+      { cwd: fixtures, stdio: 'ignore' });
+
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1', CDPILOT_WEBMCP: '1', CDPILOT_LOG: '0' };
+    delete env.CDPILOT_TARGET;
+
+    const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf-8', timeout: 60000, env });
+    const stop = () => {
+      c('stop');
+      try { server.kill(); } catch (err) { /* already gone */ }
+    };
+
+    try {
+      // Wait for HTTP server to be ready
+      execFileSync(PYB, ['-c', [
+        'import time, urllib.request',
+        `url = "http://127.0.0.1:${httpPort}/shop.html"`,
+        'for _ in range(50):',
+        '    try: urllib.request.urlopen(url, timeout=1); break',
+        '    except Exception: time.sleep(0.1)',
+      ].join('\n')], { timeout: 20000 });
+      const r = c('launch', '--webmcp');
+      assert(/CDP ready/.test(r.stdout + r.stderr), `launch: ${r.stdout}${r.stderr}`);
+    } catch (err) {
+      stop();
+      throw err;
+    }
+    e2e = { c, httpPort, stop };
+  });
+
+  const ok = (r, re, what) => assert(re.test(r.stdout + r.stderr),
+    `${what}: exit ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+  const needE2E = () => { assert(e2e, 'browser setup failed'); return e2e; };
+
+  try {
+    test('webmcp e2e: tools list shows both imperative and declarative tools', () => {
+      const { c, httpPort } = needE2E();
+      c('go', `http://127.0.0.1:${httpPort}/shop.html`);
+      // Wait for page to fully load and tools to register
+      const r = c('tools', 'list', '--json');
+      assert.strictEqual(r.status, 0, `tools list exit ${r.status}: ${r.stderr}`);
+      const out = JSON.parse(r.stdout.trim());
+      assert(Array.isArray(out.tools), 'tools should be an array');
+      assert(out.tools.length >= 2, `expected at least 2 tools, got ${out.tools.length}`);
+      const names = out.tools.map(t => t.name);
+      assert(names.includes('add_to_cart'), 'should find add_to_cart');
+      assert(names.includes('subscribe_newsletter'), 'should find subscribe_newsletter');
+      // Check sources
+      const cart = out.tools.find(t => t.name === 'add_to_cart');
+      assert.strictEqual(cart.source, 'imperative', 'add_to_cart should be imperative');
+      const sub = out.tools.find(t => t.name === 'subscribe_newsletter');
+      assert.strictEqual(sub.source, 'declarative', 'subscribe_newsletter should be declarative');
+    });
+
+    test('webmcp e2e: tools call add_to_cart returns result and updates page state', () => {
+      const { c, httpPort } = needE2E();
+      const r = c('tools', 'call', 'add_to_cart', '{"sku":"A1","qty":2}');
+      assert.strictEqual(r.status, 0, `tools call exit ${r.status}: ${r.stderr}`);
+      const result = JSON.parse(r.stdout.trim());
+      assert.strictEqual(result.ok, true, 'result.ok should be true');
+      assert.strictEqual(result.sku, 'A1', 'sku should be A1');
+      assert.strictEqual(result.qty, 2, 'qty should be 2');
+      assert.strictEqual(result.cart_size, 1, 'cart_size should be 1');
+      // Verify page state via eval
+      const evalR = c('eval', 'JSON.stringify(window.__cart)');
+      assert.strictEqual(evalR.status, 0);
+      const cart = JSON.parse(evalR.stdout.trim());
+      assert.strictEqual(cart.length, 1, 'cart should have 1 item');
+      assert.strictEqual(cart[0].sku, 'A1');
+    });
+
+    test('webmcp e2e: tools call with bad args exits 1 with clear message', () => {
+      const { c } = needE2E();
+      // Missing required argument
+      const r = c('tools', 'call', 'add_to_cart', '{"sku":"B1"}');
+      assert.strictEqual(r.status, 1, 'missing required should exit 1');
+      assert(/missing required/.test(r.stdout + r.stderr), 'should mention missing required');
+    });
+
+    test('webmcp e2e: tools call nonexistent tool exits 1', () => {
+      const { c } = needE2E();
+      const r = c('tools', 'call', 'no_such_tool', '{}');
+      assert.strictEqual(r.status, 1, 'nonexistent tool should exit 1');
+      assert(/not found/.test(r.stdout + r.stderr), 'should mention not found');
+    });
+
+    test('webmcp e2e: tools list on about:blank shows hint', () => {
+      const { c } = needE2E();
+      c('go', 'about:blank');
+      const r = c('tools', 'list');
+      assert.strictEqual(r.status, 0, 'no tools should still exit 0');
+      assert(/No WebMCP tools|hint/.test(r.stdout + r.stderr), 'should show hint');
+    });
+
+  } finally {
+    if (e2e) {
+      try { e2e.stop(); } catch (err) { /* best effort */ }
+    }
+  }
 })();
 
 // ── Summary ──
