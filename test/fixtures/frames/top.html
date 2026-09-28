@@ -49,6 +49,13 @@
         });
       });
     }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style'] });
+    // hover / dblclick / rightclick, kept apart from data-log: data-mouse.
+    ['mouseover', 'dblclick', 'contextmenu'].forEach(function (type) {
+      document.getElementById('top-btn').addEventListener(type, function (e) {
+        document.body.dataset.mouse = (document.body.dataset.mouse || '') + 'top-' + type + ':'
+          + (e.isTrusted ? 'trusted' : 'script') + ';';
+      });
+    });
     var q = new URLSearchParams(location.search);
     document.getElementById('card').src = q.get('child') || 'inner.html';
   </script>
