@@ -3923,8 +3923,9 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
 
   test('frames (fake CDP): click is one click; real mouse input with --entropy=on and in frames', () => {
     // clicks: el.click() calls cdpilot caused; pressed: Input mousePressed
-    // events; hits: hit-tests before the press, [object, x, y] per document
-    // (the <iframe> on the way, then the target). Main used el.click() and
+    // events; hits: hit-tests, [object, x, y] per document (the <iframe> on
+    // the way, then the target), before the press and again with the
+    // release. Main used el.click() and
     // then the mouse with entropy (two clicks), el.click() in frames
     // (isTrusted false), and put window.__cdpilot_waitFor on every page.
     const r = fake('click_input');
@@ -3939,12 +3940,13 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       assert(near(k.pressed[0], ...at), `${key}: pressed at ${k.pressed[0]}, want ${at} (page coordinates)`);
       assert.strictEqual(k.stderr, '', `${key}: no note`);
     }
-    assert.deepStrictEqual(r.frame.hits, [['owner:card', 140, 1050], ['el:card:#btn', 40, 50]]);
-    assert.deepStrictEqual(r.oopif.hits, [['owner:pay', 45, 57], ['el:pay:#btn', 40, 50]]);
+    const twice = (a) => a.concat(a);  // before the press, and with the release
+    assert.deepStrictEqual(r.frame.hits, twice([['owner:card', 140, 1050], ['el:card:#btn', 40, 50]]));
+    assert.deepStrictEqual(r.oopif.hits, twice([['owner:pay', 45, 57], ['el:pay:#btn', 40, 50]]));
     // #card: transform: scale(.5) at (100, 1000); #nested inside: zoom: 2 at (10, 20).
-    assert.deepStrictEqual(r.scaled.hits, [['owner:card', 145, 1060], ['owner:nested', 90, 120],
-      ['el:nested:#btn', 40, 50]], 'each hop checked at its own point');
-    assert.strictEqual(r.frame_entropy.hits.length, 3, 'nested: top, the outer frame, the target');
+    assert.deepStrictEqual(r.scaled.hits, twice([['owner:card', 145, 1060], ['owner:nested', 90, 120],
+      ['el:nested:#btn', 40, 50]]), 'each hop checked at its own point');
+    assert.strictEqual(r.frame_entropy.hits.length, 6, 'nested: top, the outer frame, the target; twice');
     assert.deepStrictEqual(r.page_plain.clicks, [['top', 'script']], 'plain page click: unchanged (el.click())');
     assert.strictEqual(r.page_plain.pressed.length + r.page_plain.hits.length, 0, 'plain page click: no mouse');
     assert.deepStrictEqual(r.frame_nobox.clicks, [['card', 'script']], 'no box: el.click() is the fallback');
@@ -3972,6 +3974,73 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       assert.strictEqual(k.stdout, 'Clicked: BUTTON #btn\n', key);
     }
     assert.strictEqual(r.covered_frame.hits.length, 2, 'the target frame is checked too, in one batch');
+  });
+
+  test('frames (fake CDP): the hit-test is repeated with the release; a target that moved gets a script click + note', () => {
+    // The target moves once the page handled mousedown: the press is
+    // completed (one press, one release), the mouse click is not claimed,
+    // and el.click() clicks the target.
+    const r = fake('click_input');
+    for (const [key, frame, label, was] of [['moved', 'card', 'iframe#card >>> #btn', 'div#wrap'],
+      ['moved_entropy', 'top', '#btn', 'body']]) {
+      const k = r[key];
+      assert.deepStrictEqual(k.res, ['ok', null], key);
+      assert.strictEqual(k.pressed.length, 1, `${key}: one press`);
+      assert.strictEqual(k.released.length, 1, `${key}: the release completed`);
+      assert.deepStrictEqual(k.clicks, [[frame, 'script']], `${key}: the target, by script`);
+      assert.strictEqual(k.stderr, `note: ${label} was no longer under the mouse when the button was released`
+        + ` (${was} was); used a script click\n`, key);
+      assert.strictEqual(k.hits.length % 2, 0, `${key}: the same checks, twice`);
+    }
+  });
+
+  test('frames (fake CDP): pointer-events: none on the target or its iframe is named so in the note', () => {
+    const r = fake('click_input');
+    assert.strictEqual(r.pe_target.stderr,
+      'note: iframe#card >>> #btn has pointer-events: none; used a script click\n');
+    assert.strictEqual(r.pe_frame.stderr,
+      'note: iframe#card >>> #btn is inside iframe#card, which has pointer-events: none; used a script click\n');
+    for (const key of ['pe_target', 'pe_frame']) {
+      assert.deepStrictEqual(r[key].clicks, [['card', 'script']], key);
+      assert.deepStrictEqual(r[key].pressed, [], `${key}: no press`);
+    }
+  });
+
+  test("frames (fake CDP): hover/dblclick/rightclick go through cdpilot's input blocker, restored after an error", () => {
+    const r = fake('mouse_cmds');
+    for (const key of ['dblclick_page', 'rightclick_page', 'hover_page', 'dblclick_frame', 'rightclick_oopif',
+      'hover_frame']) {
+      assert.deepStrictEqual(r[key].res, ['ok', null], `${key}: ${r[key].stderr}`);
+      assert.deepStrictEqual(r[key].blocker, ['none', ''], `${key}: opened around the input, restored`);
+      assert(r[key].mouse.length > 0, `${key}: mouse input sent`);
+    }
+    assert.deepStrictEqual(r.dblclick_frame.mouse[0], ['mousePressed', 140, 1050], 'frame: page coordinates');
+    assert.deepStrictEqual(r.dblclick_error.res, ['raise', 'RuntimeError']);
+    assert.deepStrictEqual(r.dblclick_error.blocker, ['none', ''], 'restored in finally');
+    for (const key of ['dblclick_visual_off', 'hover_visual_off']) {
+      assert.strictEqual(r[key].blocker_calls, 0, `${key}: visual feedback off: no blocker call`);
+      assert(r[key].mouse.length > 0, key);
+    }
+  });
+
+  test('frames (fake CDP): --timeout while the blocker is open: the watchdog restores it before exiting', () => {
+    // os._exit skips `finally`; the watchdog thread restores the blocker first.
+    const r = fake('timeout_restore');
+    assert.deepStrictEqual(r.exits, [124]);
+    assert.strictEqual(r.fd2, 'cdpilot: timed out after 0.05s (click)\n');
+    assert.deepStrictEqual(r.open_before, ['ws://fake/devtools/page/1']);
+    assert.deepStrictEqual(r.blocker, ['none', ''], 'made opaque again by the watchdog');
+    assert.deepStrictEqual(r.open_after, []);
+  });
+
+  test('input blocker: a blocker left transparent is made opaque again by the next command', () => {
+    // INPUT_BLOCKER_ON runs at the start of every command (visual feedback on).
+    const js = fake('timeout_restore').blocker_on_js;
+    const stale = { id: 'cdpilot-input-blocker', style: { pointerEvents: 'none' } };
+    const document = { getElementById: (id) => (id === stale.id ? stale : null) };
+    const out = require('vm').runInNewContext(js, { document });
+    assert.strictEqual(out, 'blocker already active');
+    assert.strictEqual(stale.style.pointerEvents, '', 'opaque again');
   });
 
   test("frames (fake CDP): cdpilot's input blocker is transparent only around the click, restored after an error", () => {
@@ -4345,6 +4414,61 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
         assert.strictEqual(count(deep, /deep-click:script/g), 0, deep);
         assert.strictEqual(blocker(), 'added;pe:none;pe:auto;removed;'.repeat(4), 'every click restored it');
       }
+    });
+
+    test('frames e2e: a target that moves on mousedown or has pointer-events: none: script click + note', () => {
+      const { c, p1 } = needE2E();
+      const cases = [
+        [`http://127.0.0.1:${p1}/moving.html`, '', ['--entropy=on'], (js) => c('eval', js).stdout],
+        [`http://127.0.0.1:${p1}/top.html?child=moving.html`, '#card >>> ', [],
+          (js) => c('frame', 'eval', '--frame', '#card', js).stdout.replace(/^Result: /, '')],
+      ];
+      for (const [url, prefix, flags, read] of cases) {
+        c('go', url);
+        const label = prefix ? 'iframe#card >>> ' : '';
+        const j = c('click', `${prefix}#jump`, ...flags);
+        ok(j, /Clicked: BUTTON/, `jump ${url}`);
+        assert(j.stderr.includes(`note: ${label}#jump was no longer under the mouse when the button was released`),
+          j.stderr);
+        const g = c('click', `${prefix}#ghost`, ...flags);
+        ok(g, /Clicked: BUTTON Ghost/, `ghost ${url}`);
+        assert(g.stderr.includes(`note: ${label}#ghost has pointer-events: none; used a script click`), g.stderr);
+        // One click each, by the script: no trusted click was claimed, none landed elsewhere.
+        assert.strictEqual(read('document.body.dataset.log').trim(), 'jump-down;jump-click:script;ghost-click:script;');
+      }
+    });
+
+    test('frames e2e: CDPILOT_SHOW=1: hover/dblclick/rightclick reach the page and frames through the blocker', () => {
+      const { c, cShow, p1, p2 } = needE2E();
+      for (const url of bothOrigins(p1, p2, 'top.html')) {
+        c('go', url);
+        for (const target of ['#top-btn', '#card >>> #pay-btn']) {
+          for (const cmd of ['hover', 'dblclick', 'rightclick']) {
+            const r = cShow(cmd, target);
+            assert.strictEqual(r.status, 0, `${cmd} ${target}: ${r.stderr}`);
+          }
+        }
+        const page = c('eval', 'document.body.dataset.mouse').stdout;
+        const pay = inFrame(c, '#card', 'document.body.dataset.mouse');
+        for (const [log, who] of [[page, 'top'], [pay, 'pay']]) {
+          for (const ev of ['mouseover', 'dblclick', 'contextmenu']) {
+            assert(log.includes(`${who}-${ev}:trusted`), `${who} ${ev} under the blocker: ${log}`);
+          }
+        }
+        assert.strictEqual(c('eval', 'document.body.dataset.blocker').stdout.trim(),
+          'added;pe:none;pe:auto;removed;'.repeat(6), 'opened and restored for each command');
+      }
+    });
+
+    test('frames e2e: a blocker left transparent (a --timeout mid-click) is opaque again in the next command', () => {
+      const { c, cShow, p1 } = needE2E();
+      c('go', `http://127.0.0.1:${p1}/top.html`);
+      c('eval', "(function () { var b = document.createElement('div'); b.id = 'cdpilot-input-blocker';"
+        + " b.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;pointer-events:none';"
+        + ' document.body.appendChild(b); return 1; })()');
+      const r = cShow('eval', "getComputedStyle(document.getElementById('cdpilot-input-blocker')).pointerEvents");
+      assert.strictEqual(r.stdout.trim(), 'auto', `during the next command: ${r.stdout}${r.stderr}`);
+      assert.strictEqual(c('eval', 'document.body.dataset.blocker').stdout.trim(), 'added;pe:auto;removed;');
     });
 
     test('frames e2e: no command above sent Runtime.enable (CDPILOT_CDP_TRACE)', () => {

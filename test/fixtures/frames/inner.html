@@ -51,6 +51,13 @@
     document.getElementById('country').addEventListener('change', function (e) {
       log('country=' + e.target.value);
     });
+    // hover / dblclick / rightclick, kept apart from data-log: data-mouse.
+    ['mouseover', 'dblclick', 'contextmenu'].forEach(function (type) {
+      document.getElementById('pay-btn').addEventListener(type, function (e) {
+        document.body.dataset.mouse = (document.body.dataset.mouse || '') + 'pay-' + type + ':'
+          + (e.isTrusted ? 'trusted' : 'script') + ';';
+      });
+    });
     var q = new URLSearchParams(location.search);
     document.getElementById('nested').src = q.get('nested') || 'nested.html';
   </script>
