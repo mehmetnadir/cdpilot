@@ -43,6 +43,8 @@
 | ⏳ | Glama sahiplenme | Claim edildi; Dockerfile formu + Make Release bekliyor (Nadir erteledi) → sonra punkpeye/awesome-mcp-servers'a 3. PR |
 | ✅ | v0.9.2 npm + registry | 27.09: auto-launch, --timeout (#2), `open`; `stop` artık takılmıyor ve Windows'ta kullanıcı tarayıcısını öldürmüyor; headless stealth/undetected sannysoft 31/31 |
 | ✅ | v0.9.3 | 28.09: iframe (#1, `>>>` / `--frame`, cross-origin dahil; 3 tur review), boşta kendiliğinden kapanma (`CDPILOT_IDLE_CLOSE`), oturum günlüğü (`cdpilot log`, maskeli), Windows boruda UTF-8; CI'da gerçek tarayıcı e2e işi |
+| ✅ | v0.9.4 | 29.09: connect (kendi tarayıcın, sahiplik kanıtı), WebMCP köprüsü, Web Bot Auth (Cloudflare canlı doğruladı), insan gibi basılı tutma + exit 3, OOPIF fare yönlendirme düzeltmesi, Chrome for Testing, Claude Code eklenti mağazası + .mcpb, `examples/` (gerçek çıktılı) |
+| ⏳ | Eklenti API + cdpilot-jev | plan: `.claude/docs/plan-eklenti-api-ve-jev.md` (ölçüm kapısı önce) |
 | ⏳ | Sonraki | CSS seçicide shadow DOM (#3); UA override `go` bağlantısıyla sınırlı; `--entropy=on` click ayrıca `el.click()` → çift tıklama; frame act bulamazsa sayfaya dönüş |
 | ⏳ | Sentinel takip | C6: daily_analytics gece yazmıyor (debug) · C8: 2 failed auto-like sebebi |
 | ⏳ | v0.9 tls-proxy | Optional local TLS-MITM (curl-impersonate semantics) |
@@ -51,7 +53,7 @@
 → 2026-09-28: v0.9.3 (iframe + idle close + session log + Windows UTF-8); günlük çıkış kodu Python 3.10/3.11 düzeltmesi.
 → İlk iş: pain_hunter'ın ilk canlı kayıtlarını oku (`/opt/cdpilot-twitter-bot/pains/2026-09.jsonl`); srv21 Claude token'ı (Nadir yazacak).
 
-Son Güncelleme: 2026-09-28
+Son Güncelleme: 2026-09-29
 
 <!-- gitnexus:start -->
 ## GitNexus — Code Intelligence

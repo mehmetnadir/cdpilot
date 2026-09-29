@@ -37,3 +37,7 @@ src/lib/
 .claude/docs/viral-icerik-plani-*.md
 .claude/docs/vaat-denetimi-*.md
 .claude/docs/mcp-dizin-denetimi-*.md
+
+# Local editor / agent-tool state
+.vscode/
+.antigravitycli/
