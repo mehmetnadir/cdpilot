@@ -1,71 +1,43 @@
 $ npm run build:mcpb
 
-> cdpilot@0.9.3 build:mcpb
+> cdpilot@0.9.4 build:mcpb
 > bash scripts/build-mcpb.sh
 
 Validating manifest.json...
 Manifest schema validation passes!
-Packing ~/01dev/cdpilot/.claude/worktrees/w-examples -> ~/01dev/cdpilot/.claude/worktrees/w-examples/cdpilot.mcpb
+Packing <repo> -> <repo>/cdpilot.mcpb
 Validating manifest...
 Manifest schema validation passes!
 
-📦  cdpilot@0.9.3
+📦  cdpilot@0.9.4
 Archive Contents
-  32.6kB bin/cdpilot.js
-    355B examples/iframe/cross.html
-    411B examples/iframe/index.html
-    755B examples/iframe/README.md
-   1.8kB examples/iframe/run.sh
-    343B examples/iframe/same.html
-   1011B examples/missed-click-exit-codes/index.html
-    785B examples/missed-click-exit-codes/README.md
-   1.5kB examples/missed-click-exit-codes/run.sh
-    686B examples/plugin-install/index.html
-   1.0kB examples/plugin-install/README.md
-   1.2kB examples/plugin-install/run.sh
-    904B examples/press-hold/index.html
-    628B examples/press-hold/README.md
-   1.3kB examples/press-hold/run.sh
-   1.0kB examples/README.md
-    382B examples/run-all.sh
-    936B examples/web-bot-auth/README.md
-   1.8kB examples/web-bot-auth/run.sh
-   1.2kB examples/webmcp/frame.html
-   1.5kB examples/webmcp/README.md
-   1.4kB examples/webmcp/run.sh
-   2.9kB examples/webmcp/shop.html
+  34.6kB bin/cdpilot.js
    1.1kB LICENSE
    1.7kB manifest.json
    1.8kB package.json
-  61.2kB README.md
- 787.1kB src/cdpilot.py
-  17.5kB examples/iframe/output/ [and 2 more files]
-  15.7kB examples/missed-click-exit-codes/output/ [and 2 more files]
-  27.4kB examples/plugin-install/output/ [and 2 more files]
-  14.6kB examples/press-hold/output/ [and 2 more files]
-  58.0kB examples/web-bot-auth/output/ [and 2 more files]
-  16.2kB examples/webmcp/output/ [and 2 more files]
+  69.8kB README.md
+ 859.1kB src/cdpilot.py
 
 Archive Details
 name: cdpilot
-version: 0.9.3
-filename: cdpilot-0.9.3.mcpb
-package size: 407.0kB
-unpacked size: 1.0MB
-shasum: 965d0e32d2426cee16af3143c7dce961ea7123d1
-total files: 40
-ignored (.mcpbignore) files: 69
+version: 0.9.4
+filename: cdpilot-0.9.4.mcpb
+package size: 289.1kB
+unpacked size: 967.9kB
+shasum: 0b766905063affc5a7005e8fcc24b1874f6892e8
+total files: 6
+ignored (.mcpbignore) files: 1
 
-Output: ~/01dev/cdpilot/.claude/worktrees/w-examples/cdpilot.mcpb
+Output: <repo>/cdpilot.mcpb
 Verifying bundle info...
 File: cdpilot.mcpb
-Size: 407.04 KB
+Size: 289.15 KB
 
 WARNING: Not signed
-Built ~/01dev/cdpilot/.claude/worktrees/w-examples/cdpilot.mcpb
+Built <repo>/cdpilot.mcpb
 $ cdpilot launch
 
-  cdpilot v0.9.3 — Pre-flight Check
+  cdpilot v0.9.4 — Pre-flight Check
   ───────────────────────────────────
 
   ✓ Python 3.14.7
@@ -74,12 +46,11 @@ $ cdpilot launch
 
   Ready!
 
-Launching browser (isolated session, port 59856) [plugin-install-cfa427]...
+Launching browser (isolated session, port 59856) [plugin-install-d8e2f8]...
   Mode: headless
   Idle close: off (launch --idle-close <min> or CDPILOT_IDLE_CLOSE=<min> turns it on)
-CDP ready! (port 59856) [plugin-install-cfa427]
+CDP ready! (port 59856) [plugin-install-d8e2f8]
 $ cdpilot go http://127.0.0.1:59866/index.html
-⚠️  navigation drift: expected 127.0.0.1, got 127.0.0.1:59866
 cdpilot Plugin Installation
 Add Marketplace: /plugin marketplace add mehmetnadir/cdpilot
 Install Plugin: /plugin install cdpilot@cdpilot

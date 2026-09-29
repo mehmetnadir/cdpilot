@@ -77,7 +77,7 @@ Exit codes: 0 ok, 1 error (batch / run: a step failed), 124 --timeout;
   "Pressed (the page replaced or left it ...)" and exits 0.
 """
 
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 
 import asyncio
 import atexit
@@ -10560,10 +10560,10 @@ async def _dispose_context(ctx_id):
 
 
 async def _adaptive_current_host(ws_url):
-    """Return location.host from the active tab, or '' on any failure."""
+    """Return location.hostname (no port, like urlparse().hostname) from the active tab, or ''."""
     try:
         r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {
-            "expression": "location.host",
+            "expression": "location.hostname",
             "returnByValue": True,
         })])
         return r.get(1, {}).get("result", {}).get("value", "") or ""

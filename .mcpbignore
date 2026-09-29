@@ -13,7 +13,14 @@ test/
 tests/
 xbot/
 scripts/
+examples/
 *.mcpb
+
+# Local editor / agent state, never part of a build
+.vscode/
+.antigravitycli/
+.gitnexus/
+.pytest_cache/
 
 CHANGELOG.md
 CONTRIBUTING.md

@@ -6,10 +6,10 @@ cd "$SCRIPT_DIR"
 
 CDPILOT="${CDPILOT:-node $(cd ../.. && pwd)/bin/cdpilot.js}"
 export CDPILOT_PYTHON="${CDPILOT_PYTHON:-/usr/local/bin/python3}"
-export CDP_PORT="${CDP_PORT:-59856}"
+export CDP_PORT="${CDP_PORT:-59925}"
 export CHROME_HEADLESS=1
 
-HTTP_PORT=59866
+HTTP_PORT=59924
 
 TMP_DIR="$(mktemp -d)"
 export CDPILOT_HOME="${TMP_DIR}/home"
@@ -27,14 +27,23 @@ sleep 1
 RAW_LOG="${TMP_DIR}/raw_output.txt"
 
 {
-  echo "$ npm run build:mcpb"
-  (cd ../.. && npm run build:mcpb) 2>&1
+  echo "$ cdpilot browser install chrome-for-testing"
+  $CDPILOT browser install chrome-for-testing 2>&1 | sed -e '/^  [0-9]\{1,3\}%/d'
 
-  echo "$ cdpilot launch"
-  $CDPILOT launch 2>&1
+  echo "$ cdpilot ext-install ../../test/fixtures/extension/unpacked"
+  $CDPILOT ext-install "../../test/fixtures/extension/unpacked" 2>&1
+
+  echo "$ cdpilot browser chrome-for-testing"
+  $CDPILOT browser chrome-for-testing 2>&1
 
   echo "$ cdpilot go http://127.0.0.1:${HTTP_PORT}/index.html"
   $CDPILOT go "http://127.0.0.1:${HTTP_PORT}/index.html" 2>&1
+
+  echo '$ cdpilot eval "document.documentElement.dataset.cdpilotExt"'
+  $CDPILOT eval "document.documentElement.dataset.cdpilotExt" 2>&1
+
+  echo "$ cdpilot browser status"
+  $CDPILOT browser status 2>&1
 
   echo "$ cdpilot shot output/screenshot.png"
   $CDPILOT shot output/screenshot.png 2>&1
