@@ -13,4 +13,5 @@ for dir in "$SCRIPT_DIR"/*; do
   fi
 done
 
+"${CDPILOT_PYTHON:-python3}" "$SCRIPT_DIR/sync-readmes.py"
 echo "All examples completed successfully!"

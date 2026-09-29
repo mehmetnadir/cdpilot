@@ -4,12 +4,12 @@ Bot Auth: configured
   keyid     : poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U
   format    : Signature-Agent legacy
   directory : https://http-message-signatures-example.research.cloudflare.com/.well-known/http-message-signatures-directory
-  bot-auth: off (port 59872)
+  bot-auth: off (port 59855)
 $ cdpilot bot-auth directory --headers --authority example.com
 cdpilot: serve the body above at https://example.com/.well-known/http-message-signatures-directory with these headers; the signature expires in 86400 s (--ttl), then run this again
 Content-Type: application/http-message-signatures-directory+json
-Signature-Input: sig1=("@authority";req);created=1790635549;keyid="poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U";alg="ed25519";expires=1790721949;nonce="5hrzpkzfbHwbSJp9X4anReE/PixK/WBCAoofrvINtB+dOxRrKm9ANyCBj7dJXCU9ZMX7nDWrbZ1uUEpSZxpBUw==";tag="http-message-signatures-directory"
-Signature: sig1=:512LQv/1xKvjo7oboUCTr1x2skbC1Ny1UKnGv/2JGNxP+O3xc/85iFfu5nGGJFw8R93ybKRYJhEIUjADz5TFBQ==:
+Signature-Input: sig1=("@authority";req);created=1790638559;keyid="poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U";alg="ed25519";expires=1790724959;nonce="4eq0VhUpQSmjoRPuQBNCqPoPDrM8rUTxlPywUwODd7eSl+R0oxYma8rH6N9JnoKTpECOzyx7cAEIZZfPnmsx1Q==";tag="http-message-signatures-directory"
+Signature: sig1=:wZrjALEe816wa+Pk7l/s4KuFMjGytgwylhQDu+HmFbDbsePZfzePnMv/TMyCIvkmlHfGVXCy8cBWw7Wx+RWcAQ==:
 
 {
   "keys": [
@@ -24,7 +24,7 @@ Signature: sig1=:512LQv/1xKvjo7oboUCTr1x2skbC1Ny1UKnGv/2JGNxP+O3xc/85iFfu5nGGJFw
 }
 $ cdpilot launch --bot-auth
 
-  cdpilot v0.9.3 — Pre-flight Check
+  cdpilot v0.9.4 — Pre-flight Check
   ───────────────────────────────────
 
   ✓ Python 3.14.7
@@ -33,10 +33,10 @@ $ cdpilot launch --bot-auth
 
   Ready!
 
-Launching browser (isolated session, port 59872) [web-bot-auth-2300a5]...
+Launching browser (isolated session, port 59855) [web-bot-auth-f45e65]...
   Mode: headless
   Idle close: off (launch --idle-close <min> or CDPILOT_IDLE_CLOSE=<min> turns it on)
-CDP ready! (port 59872) [web-bot-auth-2300a5]
+CDP ready! (port 59855) [web-bot-auth-f45e65]
   Bot Auth: signing every request as https://http-message-signatures-example.research.cloudflare.com (keyid poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U, Signature-Agent legacy)
 $ cdpilot go https://http-message-signatures-example.research.cloudflare.com/
 Identify Bots with HTTP Message Signatures
@@ -144,4 +144,4 @@ $ cdpilot shot output/screenshot.png
 output/screenshot.png (50.9KB)
 $ cdpilot stop
   Closed via CDP Browser.close.
-Browser stopped (port 59872).
+Browser stopped (port 59855).
