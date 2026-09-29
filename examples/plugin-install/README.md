@@ -15,29 +15,64 @@ npm run build:mcpb
 ```text
 $ npm run build:mcpb
 
-> cdpilot@0.9.3 build:mcpb
+> cdpilot@0.9.4 build:mcpb
 > bash scripts/build-mcpb.sh
 
 Validating manifest.json...
 Manifest schema validation passes!
-Packing ~/01dev/cdpilot/.claude/worktrees/w-examples -> ~/01dev/cdpilot/.claude/worktrees/w-examples/cdpilot.mcpb
+Packing <repo> -> <repo>/cdpilot.mcpb
 Validating manifest...
 Manifest schema validation passes!
 
-📦  cdpilot@0.9.3
+📦  cdpilot@0.9.4
+Archive Contents
+  34.6kB bin/cdpilot.js
+   1.1kB LICENSE
+   1.7kB manifest.json
+   1.8kB package.json
+  69.8kB README.md
+ 859.1kB src/cdpilot.py
+
 Archive Details
 name: cdpilot
-version: 0.9.3
-filename: cdpilot-0.9.3.mcpb
-package size: 381.9kB
-unpacked size: 1.0MB
-shasum: 8468f6fa99fd427c41b90ed8be12061e28227f5f
+version: 0.9.4
+filename: cdpilot-0.9.4.mcpb
+package size: 289.1kB
+unpacked size: 967.9kB
+shasum: 0b766905063affc5a7005e8fcc24b1874f6892e8
+total files: 6
+ignored (.mcpbignore) files: 1
 
-Output: ~/01dev/cdpilot/.claude/worktrees/w-examples/cdpilot.mcpb
+Output: <repo>/cdpilot.mcpb
 Verifying bundle info...
 File: cdpilot.mcpb
-Size: 381.94 KB
+Size: 289.15 KB
 
 WARNING: Not signed
-Built ~/01dev/cdpilot/.claude/worktrees/w-examples/cdpilot.mcpb
+Built <repo>/cdpilot.mcpb
+$ cdpilot launch
+
+  cdpilot v0.9.4 — Pre-flight Check
+  ───────────────────────────────────
+
+  ✓ Python 3.14.7
+  ✓ websockets
+  ✓ Brave Browser (/Applications/Brave Browser.app/Contents/MacOS/Brave Browser)
+
+  Ready!
+
+Launching browser (isolated session, port 59856) [plugin-install-d8e2f8]...
+  Mode: headless
+  Idle close: off (launch --idle-close <min> or CDPILOT_IDLE_CLOSE=<min> turns it on)
+CDP ready! (port 59856) [plugin-install-d8e2f8]
+$ cdpilot go http://127.0.0.1:59866/index.html
+cdpilot Plugin Installation
+Add Marketplace: /plugin marketplace add mehmetnadir/cdpilot
+Install Plugin: /plugin install cdpilot@cdpilot
+Build Bundle: npm run build:mcpb
+$ cdpilot shot output/screenshot.png
+output/screenshot.png (24.5KB)
+$ cdpilot stop
+  Closed via CDP Browser.close.
+Browser stopped (port 59856).
 ```

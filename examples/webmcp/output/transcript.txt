@@ -1,6 +1,6 @@
 $ cdpilot launch --webmcp
 
-  cdpilot v0.9.3 — Pre-flight Check
+  cdpilot v0.9.4 — Pre-flight Check
   ───────────────────────────────────
 
   ✓ Python 3.14.7
@@ -9,13 +9,12 @@ $ cdpilot launch --webmcp
 
   Ready!
 
-Launching browser (isolated session, port 59854) [webmcp-6adf53]...
+Launching browser (isolated session, port 59854) [webmcp-585cc3]...
   Mode: headless
   WebMCP: on (--enable-features=WebMCP)
   Idle close: off (launch --idle-close <min> or CDPILOT_IDLE_CLOSE=<min> turns it on)
-CDP ready! (port 59854) [webmcp-6adf53]
+CDP ready! (port 59854) [webmcp-585cc3]
 $ cdpilot go http://127.0.0.1:59865/shop.html
-⚠️  navigation drift: expected 127.0.0.1, got 127.0.0.1:59865
 WebMCP fixture shop
 
 Cart: 0 items
