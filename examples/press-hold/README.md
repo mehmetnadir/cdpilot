@@ -17,10 +17,34 @@ cdpilot stop
 ## Captured Output
 
 ```text
+$ cdpilot launch
+
+  cdpilot v0.9.4 — Pre-flight Check
+  ───────────────────────────────────
+
+  ✓ Python 3.14.7
+  ✓ websockets
+  ✓ Brave Browser (/Applications/Brave Browser.app/Contents/MacOS/Brave Browser)
+
+  Ready!
+
+Launching browser (isolated session, port 59852) [press-hold-979980]...
+  Mode: headless
+  Idle close: off (launch --idle-close <min> or CDPILOT_IDLE_CLOSE=<min> turns it on)
+CDP ready! (port 59852) [press-hold-979980]
+$ cdpilot go http://127.0.0.1:59863/index.html
+Press Hold Gap Measurement
+Click Me
+Waiting for click...
 $ cdpilot click "#target" --entropy=on
 Clicked: BUTTON Click Me
 $ cdpilot content
 Press Hold Gap Measurement
 Click Me
-Mousedown -> Mouseup Gap: 58 ms
+Mousedown -> Mouseup Gap: 56 ms
+$ cdpilot shot output/screenshot.png
+output/screenshot.png (13.6KB)
+$ cdpilot stop
+  Closed via CDP Browser.close.
+Browser stopped (port 59852).
 ```

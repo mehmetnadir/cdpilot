@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "cdpilot",
   "display_name": "cdpilot",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "description": "Zero-dependency browser automation CLI. Raw CDP, 70+ commands, friction ladder, 3-tier stealth, CAPTCHA + press-and-hold solvers, proxy pools, MCP server. No Puppeteer/Playwright/Selenium.",
   "long_description": "cdpilot drives a real Brave/Chrome/Chromium browser directly over the Chrome DevTools Protocol — no Puppeteer, Playwright, or Selenium. This bundle installs cdpilot's MCP server so its 70+ commands (navigation, interaction, iframes, screenshots/PDF, network control, device emulation, stealth and CAPTCHA handling) are available as MCP tools.\n\nRequires Node.js 18+, Python 3.10+ (the `websockets` module is auto-installed on first launch), and one of Brave Browser, Google Chrome, or Chromium already installed on the machine running the server.",
   "author": {

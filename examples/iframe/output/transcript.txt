@@ -1,6 +1,6 @@
 $ cdpilot launch
 
-  cdpilot v0.9.3 — Pre-flight Check
+  cdpilot v0.9.4 — Pre-flight Check
   ───────────────────────────────────
 
   ✓ Python 3.14.7
@@ -9,12 +9,11 @@ $ cdpilot launch
 
   Ready!
 
-Launching browser (isolated session, port 59851) [iframe-c190af]...
+Launching browser (isolated session, port 59851) [iframe-bff5f7]...
   Mode: headless
   Idle close: off (launch --idle-close <min> or CDPILOT_IDLE_CLOSE=<min> turns it on)
-CDP ready! (port 59851) [iframe-c190af]
+CDP ready! (port 59851) [iframe-bff5f7]
 $ cdpilot go http://127.0.0.1:59861/index.html
-⚠️  navigation drift: expected 127.0.0.1, got 127.0.0.1:59861
 IFrame Feature Demo
  
 $ cdpilot fill "iframe#same-frame >>> input#same-input" "Same Origin Text"

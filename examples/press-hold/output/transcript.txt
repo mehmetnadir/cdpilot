@@ -1,6 +1,6 @@
 $ cdpilot launch
 
-  cdpilot v0.9.3 — Pre-flight Check
+  cdpilot v0.9.4 — Pre-flight Check
   ───────────────────────────────────
 
   ✓ Python 3.14.7
@@ -9,12 +9,11 @@ $ cdpilot launch
 
   Ready!
 
-Launching browser (isolated session, port 59852) [press-hold-6d580e]...
+Launching browser (isolated session, port 59852) [press-hold-979980]...
   Mode: headless
   Idle close: off (launch --idle-close <min> or CDPILOT_IDLE_CLOSE=<min> turns it on)
-CDP ready! (port 59852) [press-hold-6d580e]
+CDP ready! (port 59852) [press-hold-979980]
 $ cdpilot go http://127.0.0.1:59863/index.html
-⚠️  navigation drift: expected 127.0.0.1, got 127.0.0.1:59863
 Press Hold Gap Measurement
 Click Me
 Waiting for click...
@@ -23,7 +22,7 @@ Clicked: BUTTON Click Me
 $ cdpilot content
 Press Hold Gap Measurement
 Click Me
-Mousedown -> Mouseup Gap: 97 ms
+Mousedown -> Mouseup Gap: 56 ms
 $ cdpilot shot output/screenshot.png
 output/screenshot.png (13.6KB)
 $ cdpilot stop

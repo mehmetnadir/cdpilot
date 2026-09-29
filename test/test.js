@@ -189,6 +189,14 @@ test('python script has shebang', () => {
 const PY_PATH = path.join(__dirname, '..', 'src', 'cdpilot.py');
 const PY_CONTENT = fs.existsSync(PY_PATH) ? fs.readFileSync(PY_PATH, 'utf-8') : '';
 
+// The CHANGELOG text for a feature that shipped in `version`: its [Unreleased] entry while it is
+// unreleased, its release section afterwards. Pin each docs test to its release so a version bump
+// never silently drops the check.
+function changelogFor(version) {
+  const secs = fs.readFileSync(path.join(__dirname, '..', 'CHANGELOG.md'), 'utf8').split(/^## \[/m);
+  return secs.filter(sec => sec.startsWith('Unreleased]') || sec.startsWith(`${version}]`)).join('');
+}
+
 function extractRawTripleString(src, varName) {
   // Extract the content between  VARNAME = r"""  ...  """
   const re = new RegExp(varName + '\\s*=\\s*r"""([\\s\\S]*?)"""', 'm');
@@ -2340,6 +2348,12 @@ test('_assert_host raises NavigationDrift when CDPILOT_ADAPTIVE_STRICT=1', () =>
     '_assert_host must raise NavigationDrift on mismatch when STRICT=1');
 });
 
+test('_assert_host compares hostnames, so a URL with a port is not drift', () => {
+  // expected_host is urlparse(url).hostname; location.host would add ':59864' and warn on every go.
+  const m = PY_CONTENT.match(/async def _adaptive_current_host[\s\S]{0,400}?"expression": "([^"]+)"/);
+  assert(m && m[1] === 'location.hostname', `current host must be location.hostname, got ${m && m[1]}`);
+});
+
 test('_assert_host no-ops when expected_host is empty', () => {
   // Guard: if expected_host is falsy the function must return immediately.
   const m = PY_CONTENT.match(/async def _assert_host[\s\S]{0,600}?if not expected_host:\s*\n\s*return/);
@@ -4380,8 +4394,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     const root = path.join(__dirname, '..');
     const bin = fs.readFileSync(path.join(root, 'bin', 'cdpilot.js'), 'utf8');
     const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
-    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    const unreleased = changelog.slice(changelog.indexOf('## [Unreleased]'), changelog.indexOf('## [0.9.3]'));
+    const unreleased = changelogFor('0.9.4');
     for (const [name, text] of [['src help', PY_CONTENT.slice(0, PY_CONTENT.indexOf('__version__ = '))], ['bin help', bin], ['README', readme],
       ['CHANGELOG [Unreleased]', unreleased]]) {
       assert(/exit 3/i.test(text) && /release missed the target, not clicked/.test(text), `${name} documents exit 3`);
@@ -4606,10 +4619,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       "page's own origin", 'frame search stopped after 2s', 'is not an iframe; using the iframe inside it']) {
       assert(section.includes(s), `README iframe section must mention ${s}`);
     }
-    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    // The newest release, plus the [Unreleased] section above it if there is one.
-    const secs = changelog.split(/^## \[/m);
-    const unreleased = (secs[1] || '').startsWith('Unreleased]') ? secs[1] + (secs[2] || '') : (secs[1] || '');
+    const unreleased = changelogFor('0.9.3');
     for (const s of ['--frame', 'matched no iframe', "page's own origin", 'frame search stopped after 2s',
       'is not an iframe; using the iframe inside it']) {
       assert(unreleased.includes(s), `CHANGELOG [Unreleased] must describe ${s}`);
@@ -5755,10 +5765,7 @@ print("RESULT=" + json.dumps([mod._idle_status(${port}), mod._idle_status(${port
     const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
     assert(/\| `CDPILOT_IDLE_CLOSE` \| `15` \|/.test(readme), 'README env table needs CDPILOT_IDLE_CLOSE');
     assert(/Idle auto-close/.test(readme), 'README Reliability section needs the idle auto-close note');
-    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    // The newest release, plus the [Unreleased] section above it if there is one.
-    const secs = changelog.split(/^## \[/m);
-    const unreleased = (secs[1] || '').startsWith('Unreleased]') ? secs[1] + (secs[2] || '') : (secs[1] || '');
+    const unreleased = changelogFor('0.9.3');
     assert(unreleased.includes('CDPILOT_IDLE_CLOSE'), 'CHANGELOG [Unreleased] must describe CDPILOT_IDLE_CLOSE');
   });
 
@@ -6192,10 +6199,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     for (const s of ['cdpilot log --md', '`CDPILOT_LOG`', '`CDPILOT_LOG_DAYS`']) {
       assert(readme.includes(s), `README must mention ${s}`);
     }
-    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    // The newest release, plus the [Unreleased] section above it if there is one.
-    const secs = changelog.split(/^## \[/m);
-    const unreleased = (secs[1] || '').startsWith('Unreleased]') ? secs[1] + (secs[2] || '') : (secs[1] || '');
+    const unreleased = changelogFor('0.9.3');
     assert(unreleased && unreleased.includes('cdpilot log'), 'CHANGELOG [Unreleased] must describe `cdpilot log`');
     const help = run('--help');
     assert(help.includes('log --md') && help.includes('CDPILOT_LOG'), 'bin help must document log');
@@ -8677,12 +8681,10 @@ print("ok")
     assert(help.includes('launch --bot-auth') && help.includes('bot-auth directory --headers')
       && help.includes('bot-auth format'), 'bin help documents bot-auth');
     assert(PY_CONTENT.slice(0, 3000).includes('launch --bot-auth'), 'python __doc__ documents bot-auth');
-    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    const secs = changelog.split(/^## \[/m);
-    assert((secs[1] || '').startsWith('Unreleased]') && secs[1].includes('launch --bot-auth'),
-      'CHANGELOG [Unreleased] describes Web Bot Auth');
+    const notes = changelogFor('0.9.4');
+    assert(notes.includes('launch --bot-auth'), 'CHANGELOG 0.9.4 describes Web Bot Auth');
     for (const s of ['`bot-auth:` line', '`bot_auth` key', 'directory --headers', 'legacy']) {
-      assert(secs[1].includes(s), `CHANGELOG [Unreleased] must mention ${s}`);
+      assert(notes.includes(s), `CHANGELOG 0.9.4 must mention ${s}`);
     }
   });
 
@@ -9015,8 +9017,7 @@ print("ok")
       'cdpilot browser chrome-for-testing']) {
       assert(readme.includes(s), `README must mention ${s}`);
     }
-    const secs = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8').split(/^## \[/m);
-    const unreleased = (secs[1] || '').startsWith('Unreleased]') ? secs[1] : '';
+    const unreleased = changelogFor('0.9.4');
     assert(/Chrome for Testing/.test(unreleased) && unreleased.includes('browser install chrome-for-testing'),
       'CHANGELOG [Unreleased] describes Chrome for Testing');
   });
@@ -9138,6 +9139,11 @@ test('examples: every examples/*/run.sh exists and passes sh -n, and README comm
     }
   }
 
+  // Commands main() handles before the tables (serve, mcp, ext-install, ...).
+  for (const m of pyCode.matchAll(/^\s*if cmd == ["']([a-zA-Z0-9_-]+)["']/gm)) {
+    dispatchCmds.add(m[1]);
+  }
+
   assert(dispatchCmds.size > 0, 'Could not parse dispatch table from src/cdpilot.py');
 
   const folders = fs.readdirSync(examplesDir).filter((f) => {
@@ -9160,19 +9166,43 @@ test('examples: every examples/*/run.sh exists and passes sh -n, and README comm
 
     const lines = readmeContent.split('\n');
     let inCodeBlock = false;
+    let isOutput = false;
     for (const line of lines) {
       if (line.trim().startsWith('```')) {
         inCodeBlock = !inCodeBlock;
+        isOutput = inCodeBlock && line.trim() === '```text';
         continue;
       }
       if (inCodeBlock) {
-        const m = line.match(/^\s*(?:\$\s+)?cdpilot\s+([a-zA-Z0-9_-]+)/);
+        // In captured output only `$ cdpilot ...` lines are commands; the rest is page text.
+        const m = line.match(isOutput ? /^\$\s+cdpilot\s+([a-zA-Z0-9_-]+)/
+          : /^\s*(?:\$\s+)?cdpilot\s+([a-zA-Z0-9_-]+)/);
         if (m) {
           const cmdName = m[1];
           assert(dispatchCmds.has(cmdName), `Command '${cmdName}' in examples/${folder}/README.md not in cdpilot dispatch table`);
         }
       }
     }
+  }
+});
+
+test('examples: README output is the real transcript, with no machine paths or bogus warnings', () => {
+  const examplesDir = path.join(__dirname, '..', 'examples');
+  const folders = fs.readdirSync(examplesDir)
+    .filter((f) => fs.statSync(path.join(examplesDir, f)).isDirectory());
+  for (const folder of folders) {
+    const dir = path.join(examplesDir, folder);
+    const transcript = fs.readFileSync(path.join(dir, 'output', 'transcript.txt'), 'utf-8');
+    assert(fs.existsSync(path.join(dir, 'output', 'screenshot.png')), `examples/${folder}: missing screenshot`);
+    const readme = fs.readFileSync(path.join(dir, 'README.md'), 'utf-8');
+    const m = readme.match(/## Captured Output\n\n```text\n([\s\S]*?)```/);
+    assert(m, `examples/${folder}/README.md: no Captured Output block`);
+    assert(m[1] === (transcript.endsWith('\n') ? transcript : transcript + '\n'),
+      `examples/${folder}/README.md drifted from output/transcript.txt (run examples/sync-readmes.py)`);
+    for (const bad of ['/Users/', '/var/folders/', '/private/tmp/', 'navigation drift']) {
+      assert(!transcript.includes(bad), `examples/${folder} transcript contains "${bad}"`);
+    }
+    assert(!/(^|[\s:])\/home\//m.test(transcript), `examples/${folder} transcript contains a /home/ path`);
   }
 });
 

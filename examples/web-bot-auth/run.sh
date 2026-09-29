@@ -64,5 +64,5 @@ RAW_LOG="${TMP_DIR}/raw_output.txt"
   $CDPILOT stop 2>&1
 } > "$RAW_LOG"
 
-sed -e "s|${HOME}|~|g" -e "s|/private/tmp/[^/]*|<tmp>|g" -e "s|/tmp/[^/]*|<tmp>|g" "$RAW_LOG" > output/transcript.txt
+sed -e "s|${TMP_DIR}|<tmp>|g" -e "s|$(cd "$SCRIPT_DIR/../.." && pwd)|<repo>|g" -e "s|${HOME}|~|g" -e "s|/private/tmp/[^/]*|<tmp>|g" -e "s|/tmp/[^/]*|<tmp>|g" "$RAW_LOG" > output/transcript.txt
 cat output/transcript.txt
