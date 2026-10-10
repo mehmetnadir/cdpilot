@@ -1,0 +1,72 @@
+<!doctype html>
+<!--
+  iframe fixture — top document.
+  ?child=<url>  src of iframe#card (default: inner.html, same origin).
+  For a cross-origin (out-of-process) child serve this directory on two
+  ports and point child at the other host, e.g.
+    top.html?child=http://localhost:8762/inner.html
+  (127.0.0.1 vs localhost = different site, so Chrome isolates the frame).
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>cdpilot frames: top</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 16px; }
+    .spacer { height: 900px; background: linear-gradient(#eee, #ccc); }
+    iframe { width: 520px; height: 420px; border: 6px solid #444; padding: 10px; }
+  </style>
+</head>
+<body data-log="">
+  <h1>Checkout</h1>
+  <button id="top-btn" onclick="document.getElementById('top-status').textContent='top clicked'">
+    Top button
+  </button>
+  <p id="top-status">idle</p>
+  <!-- Pushes the iframe below the fold: offsets must survive scrolling. -->
+  <div class="spacer"></div>
+  <iframe id="card" name="card-frame" title="Secure card payment"></iframe>
+  <script>
+    window.FRAME_NAME = 'top';
+    // One entry per click event: counts clicks, and tells real input from el.click().
+    document.getElementById('top-btn').addEventListener('click', function (e) {
+      document.body.dataset.log += 'top-click:' + (e.isTrusted ? 'trusted' : 'script') + ';';
+    });
+    // CDPILOT_SHOW=1 puts cdpilot's input blocker over the page for each
+    // command. Its pointer-events changes and its removal go into
+    // data-blocker: cdpilot's own click may open it, and must close it again.
+    new MutationObserver(function (records) {
+      records.forEach(function (r) {
+        var b = document.body.dataset;
+        if (r.type === 'attributes' && r.target.id === 'cdpilot-input-blocker') {
+          b.blocker = (b.blocker || '') + 'pe:' + (r.target.style.pointerEvents || 'auto') + ';';
+        }
+        Array.prototype.forEach.call(r.addedNodes, function (n) {
+          if (n.id === 'cdpilot-input-blocker') b.blocker = (b.blocker || '') + 'added;';
+        });
+        Array.prototype.forEach.call(r.removedNodes, function (n) {
+          if (n.id === 'cdpilot-input-blocker') b.blocker = (b.blocker || '') + 'removed;';
+        });
+      });
+    }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style'] });
+    // hover / dblclick / rightclick, kept apart from data-log: data-mouse.
+    ['mouseover', 'dblclick', 'contextmenu'].forEach(function (type) {
+      document.getElementById('top-btn').addEventListener(type, function (e) {
+        document.body.dataset.mouse = (document.body.dataset.mouse || '') + 'top-' + type + ':'
+          + (e.isTrusted ? 'trusted' : 'script') + ';';
+      });
+    });
+    var q = new URLSearchParams(location.search);
+    document.getElementById('card').src = q.get('child') || 'inner.html';
+  </script>
+<script>
+['mousemove','mousedown','mouseup','click'].forEach(function (t) {
+  window.addEventListener(t, function (e) {
+    var d = e.target && e.target.tagName ? e.target.tagName + (e.target.id ? '#' + e.target.id : '') : '?';
+    document.documentElement.dataset.diag = (document.documentElement.dataset.diag || '') + t + ':' + d + ':'
+      + (e.isTrusted ? 'T' : 'S') + '@' + Math.round(e.clientX) + ',' + Math.round(e.clientY) + ' sy' + Math.round(scrollY) + ';';
+  }, true);
+});
+</script>
+</body>
+</html>

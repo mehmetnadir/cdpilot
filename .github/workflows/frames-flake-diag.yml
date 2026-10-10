@@ -1,0 +1,27 @@
+name: frames flake diag (do not merge)
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        load: ['0', '4']
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: python -m pip install websockets cryptography
+      - name: loop
+        run: |
+          for i in $(seq 1 ${{ matrix.load }}); do (yes > /dev/null &); done
+          WT=$PWD OUT=$RUNNER_TEMP/out FX=$PWD/diag/fx MODE=both N=60 PYB=python CDPILOT_PYTHON=python \
+            node diag/tight.js | tee loop.log
+          pkill yes || true
+          grep -E 'FAIL|SUMMARY' loop.log || true

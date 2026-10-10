@@ -1,0 +1,39 @@
+<!doctype html>
+<!--
+  iframe fixture — scaled frames: the page's coordinates are not the frame's.
+  iframe#scaled has transform: scale(.5) (origin: centre), iframe#zoomed has
+  zoom: 2. Both load ?child=<url> (default: inner.html, same origin), whose
+  #pay-btn logs 'pay-click:trusted|script'. A click on the page itself is
+  logged here as 'page-click:<id or tag>' so a click that missed the frame
+  shows where it went.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>cdpilot frames: scaled</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 16px; }
+    .spacer { height: 500px; background: linear-gradient(#eee, #ccc); }
+    iframe { border: 6px solid #444; padding: 10px; display: block; margin: 12px 0; }
+    #scaled { width: 520px; height: 420px; transform: scale(.5); }
+    #zoomed { width: 300px; height: 200px; zoom: 2; }
+  </style>
+</head>
+<body data-log="">
+  <h1>Scaled frames</h1>
+  <div class="spacer"></div>
+  <iframe id="scaled" title="Scaled"></iframe>
+  <div class="spacer"></div>
+  <iframe id="zoomed" title="Zoomed"></iframe>
+  <div class="spacer"></div>
+  <script>
+    var q = new URLSearchParams(location.search);
+    var src = q.get('child') || 'inner.html';
+    document.getElementById('scaled').src = src;
+    document.getElementById('zoomed').src = src;
+    document.addEventListener('click', function (e) {
+      document.body.dataset.log += 'page-click:' + (e.target.id || e.target.tagName) + ';';
+    });
+  </script>
+</body>
+</html>
