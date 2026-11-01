@@ -1,0 +1,41 @@
+<!doctype html>
+<!--
+  iframe fixture — targets a real mouse click cannot finish on.
+  #jump (16 px) jumps 200 px to the right on mousedown: the press lands on it,
+  the release does not (a moving target, made deterministic). #ghost has
+  pointer-events: none inside div#wrap: the mouse falls through to #wrap.
+  Every event goes into <body data-log>: 'jump-down', 'jump-click:trusted|script',
+  'ghost-click:trusted|script', 'wrap-click'. Load it directly or as the
+  child of top.html (?child=moving.html).
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>cdpilot frames: moving</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 8px; position: relative; height: 300px; }
+    #jump { position: absolute; left: 20px; top: 40px; width: 16px; height: 16px; padding: 0; }
+    #wrap { position: absolute; left: 20px; top: 120px; padding: 12px; background: #eee; }
+    #ghost { pointer-events: none; }
+  </style>
+</head>
+<body data-log="">
+  <button id="jump" type="button" title="Jump"></button>
+  <div id="wrap" class="card"><button id="ghost" type="button">Ghost</button></div>
+  <script>
+    function log(s) { document.body.dataset.log += s + ';'; }
+    var jump = document.getElementById('jump');
+    jump.addEventListener('mousedown', function () {
+      log('jump-down');
+      jump.style.left = '220px';
+    });
+    jump.addEventListener('click', function (e) { log('jump-click:' + (e.isTrusted ? 'trusted' : 'script')); });
+    document.getElementById('ghost').addEventListener('click', function (e) {
+      log('ghost-click:' + (e.isTrusted ? 'trusted' : 'script'));
+    });
+    document.getElementById('wrap').addEventListener('click', function (e) {
+      if (e.target.id === 'wrap') log('wrap-click');
+    });
+  </script>
+</body>
+</html>

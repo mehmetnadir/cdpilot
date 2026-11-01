@@ -1,0 +1,34 @@
+<!doctype html>
+<!--
+  iframe fixture — a fixed cookie banner over the middle of the viewport,
+  where a scrolled-into-view frame element ends up. A click on the banner
+  logs 'cookie:trusted|script' in <body data-log>; ?child=<url> is the src of
+  iframe#card (default: inner.html, same origin).
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>cdpilot frames: covered</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 16px; }
+    .spacer { height: 900px; background: linear-gradient(#eee, #ccc); }
+    iframe { width: 520px; height: 420px; border: 6px solid #444; padding: 10px; }
+    #cookie { position: fixed; left: 0; right: 0; top: 20%; height: 60%; z-index: 10;
+              background: rgba(255, 255, 255, .9); padding: 24px; }
+  </style>
+</head>
+<body data-log="">
+  <h1>Covered</h1>
+  <div class="spacer"></div>
+  <iframe id="card" title="Card"></iframe>
+  <div class="spacer"></div>
+  <div id="cookie" class="banner consent">We use cookies. <button id="accept" type="button">Accept</button></div>
+  <script>
+    var q = new URLSearchParams(location.search);
+    document.getElementById('card').src = q.get('child') || 'inner.html';
+    document.getElementById('cookie').addEventListener('click', function (e) {
+      document.body.dataset.log += 'cookie:' + (e.isTrusted ? 'trusted' : 'script') + ';';
+    });
+  </script>
+</body>
+</html>

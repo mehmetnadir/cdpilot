@@ -1,0 +1,29 @@
+<!doctype html>
+<!--
+  iframe fixture — a page whose requestAnimationFrame and setTimeout never
+  call back (some pages wrap or stub them). cdpilot's wait before mouse input
+  into a frame must not depend on them. ?child=<url> is the src of iframe#card
+  (default: inner.html, same origin).
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>cdpilot frames: raf</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 16px; }
+    .spacer { height: 900px; background: linear-gradient(#eee, #ccc); }
+    iframe { width: 520px; height: 420px; border: 6px solid #444; padding: 10px; }
+  </style>
+</head>
+<body data-log="">
+  <h1>Stubbed timers</h1>
+  <div class="spacer"></div>
+  <iframe id="card" title="Card"></iframe>
+  <script>
+    var q = new URLSearchParams(location.search);
+    document.getElementById('card').src = q.get('child') || 'inner.html';
+    window.requestAnimationFrame = function () { return 1; };
+    window.setTimeout = function () { return 1; };
+  </script>
+</body>
+</html>
