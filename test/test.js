@@ -7263,8 +7263,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     const skip = PY_CONTENT.match(/AUTOLAUNCH_SKIP_CMDS = frozenset\(\{([\s\S]*?)\}\)/)[1];
     assert(/'connect'/.test(skip), "'connect' must never launch the browser");
     assert(/'disconnect'/.test(skip), "'disconnect' must never launch the browser");
-    const changelog = fs.readFileSync(path.join(__dirname, '..', 'CHANGELOG.md'), 'utf8');
-    const unreleased = changelog.split(/^## \[/m)[1] || '';
+    const unreleased = changelogFor('0.9.4');
     assert(unreleased && unreleased.includes('cdpilot connect'),
       'CHANGELOG [Unreleased] must describe `cdpilot connect`');
     const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
@@ -9204,6 +9203,86 @@ test('examples: README output is the real transcript, with no machine paths or b
     }
     assert(!/(^|[\s:])\/home\//m.test(transcript), `examples/${folder} transcript contains a /home/ path`);
   }
+});
+
+// ── MCP tool profiles (stdio JSON-RPC) ──
+
+function mcpSession(toolsArgs, env, calls) {
+  const { spawnSync } = require('child_process');
+  const lines = [
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+    { jsonrpc: '2.0', method: 'notifications/initialized' },
+    { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+    ...calls,
+    { jsonrpc: '2.0', id: 99, method: 'tools/list' },
+  ].map((m) => JSON.stringify(m)).join('\n') + '\n';
+  const r = spawnSync(process.execPath, [CLI, 'mcp', ...toolsArgs], {
+    input: lines, encoding: 'utf-8', timeout: 20000,
+    env: { ...process.env, CDPILOT_LOG: '0', CDPILOT_WEBMCP: '0', CDPILOT_MCP_TOOLS: '',
+           CDPILOT_HOME: RUN_HOME, CDPILOT_PROFILE: path.join(RUN_HOME, 'profile'), ...env },
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  return r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+}
+
+const byId = (msgs, id) => msgs.find((m) => m.id === id);
+const names = (msg) => msg.result.tools.map((t) => t.name);
+const CORE_NAMES = ['browser_navigate', 'browser_click', 'browser_fill', 'browser_content',
+  'browser_screenshot', 'browser_eval', 'browser_wait_for', 'browser_assert', 'browser_tabs',
+  'browser_connect'];
+
+test('mcp profile: CDPILOT_MCP_TOOLS=core lists the 10 core tools plus browser_tools', () => {
+  const msgs = mcpSession([], { CDPILOT_MCP_TOOLS: 'core' }, []);
+  assert.deepStrictEqual(names(byId(msgs, 2)).sort(), [...CORE_NAMES, 'browser_tools'].sort());
+  assert.strictEqual(byId(msgs, 1).result.capabilities.tools.listChanged, true);
+});
+
+test('mcp profile: --tools flag beats the env var', () => {
+  const msgs = mcpSession(['--tools', 'all'], { CDPILOT_MCP_TOOLS: 'core' }, []);
+  assert.strictEqual(names(byId(msgs, 2)).length, 45);
+});
+
+test('mcp profile: default stays all 45 tools, no browser_tools, no listChanged', () => {
+  const msgs = mcpSession([], {}, []);
+  const list = names(byId(msgs, 2));
+  assert.strictEqual(list.length, 45);
+  assert(!list.includes('browser_tools'));
+  assert.deepStrictEqual(byId(msgs, 1).result.capabilities, { tools: {} });
+});
+
+test('mcp profile: a comma list picks exactly those tools', () => {
+  const msgs = mcpSession(['--tools=browser_html,browser_log'], {}, []);
+  assert.deepStrictEqual(names(byId(msgs, 2)).sort(),
+    ['browser_html', 'browser_log', 'browser_tools']);
+});
+
+test('mcp profile: browser_tools enable adds a tool and sends list_changed', () => {
+  const call = (id, args) => ({ jsonrpc: '2.0', id, method: 'tools/call',
+    params: { name: 'browser_tools', arguments: args } });
+  const msgs = mcpSession(['--tools', 'core'], {}, [
+    call(3, { action: 'list' }),
+    call(4, { action: 'enable', names: ['browser_a11y', 'no_such_tool'] }),
+  ]);
+  const listed = byId(msgs, 3).result.content[0].text;
+  assert(listed.includes('browser_a11y: ') && !listed.includes('browser_navigate'));
+  assert(!listed.includes('inputSchema'));
+  const enabled = byId(msgs, 4).result.content[0].text;
+  assert(enabled.includes('browser_a11y') && enabled.includes('unknown tools: no_such_tool'));
+  const i4 = msgs.indexOf(byId(msgs, 4));
+  assert.deepStrictEqual(msgs[i4 + 1],
+    { jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+  assert.strictEqual(names(byId(msgs, 99)).length, 12);
+  assert(names(byId(msgs, 99)).includes('browser_a11y'));
+});
+
+test('mcp profile: calling a tool outside the profile returns the enable hint', () => {
+  const msgs = mcpSession(['--tools', 'core'], {}, [
+    { jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'browser_html', arguments: {} } },
+  ]);
+  const r = byId(msgs, 3).result;
+  assert.strictEqual(r.isError, true);
+  assert.strictEqual(r.content[0].text, 'tool not enabled; call browser_tools enable');
 });
 
 // ── Summary ──
