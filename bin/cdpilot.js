@@ -598,6 +598,7 @@ function showHelp() {
 
   AI AGENT
     mcp                Start MCP server (stdin/stdout JSON-RPC)
+                       --tools core|all|a,b (env CDPILOT_MCP_TOOLS): smaller tool list
 
   SESSION LOG (always on, local, redacted)
     log                Today's commands for this project: time, exit, command,
