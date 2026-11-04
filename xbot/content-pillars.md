@@ -272,3 +272,9 @@ parent tweet'e reply olarak atar.
 ---
 
 Son güncelleme: 2026-05-21 (URL-in-reply taktiği + 15-day experiment)
+
+## Kapsam genişlemesi (04.11.2026, Nadir)
+
+Konu artık yalnız cdpilot değil: kod, yazılım, yapay zekâ ajanları, açık kaynak, teknoloji şirketleri (Silikon
+Vadisi gündemi). Yasak: siyaset, sağlık, kamu politikası, din, kimlik tartışması. Her paylaşım ölçülmüş ya da
+kaynaklı bir sayı taşır; "SKIP" geçerli karardır. Günlük tür ritmi ve viral yollar: `EDITOR.md` §2.

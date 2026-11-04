@@ -147,3 +147,7 @@ Reply policy timing kuralları ile uyumludur. İçerik politikası BU dosyadadı
 ---
 
 Son Güncelleme: 2026-05-21
+
+> **03.11.2026, Nadir:** "bizim github repomuzun linkini yeri geldiğinde vermende hiç sakınca yok." Elle
+> yazılan (manuel) yanıtta `github.com/mehmetnadir/cdpilot` bağlantısı serbest; §2'deki "asla" satırları
+> otomatik `pain_hunter` yanıtları için geçerli kalır. URL 0,5× cezası bilinerek kabul edildi.
