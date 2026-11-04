@@ -207,13 +207,28 @@ def test_crisis_quiet_day_is_not_a_collapse(tmp_path, monkeypatch):
 
 
 def test_crisis_real_collapse_with_tracked_posts_still_triggers(tmp_path, monkeypatch):
-    """The rule must still fire when we DID post and engagement fell off."""
-    hist = [{"followers": 3, "tweet_metrics": [{"likes": 5, "views": "300"}]}
+    """The rule must still fire when we DID post and engagement fell off —
+    on an account past the follower noise floor."""
+    hist = [{"followers": 40, "tweet_metrics": [{"likes": 5, "views": "300"}]}
             for _ in range(5)]
-    hist[-1] = {"followers": 3, "tweet_metrics": [{"likes": 0, "views": "1"}]}
+    hist[-1] = {"followers": 40, "tweet_metrics": [{"likes": 0, "views": "1"}]}
     crisis_check, res = _crisis_with_history(tmp_path, monkeypatch, hist)
     assert res["triggered"] is True
     assert crisis_check.FREEZE_FLAG.exists()
+
+
+def test_crisis_tiny_account_engagement_drop_does_not_freeze(tmp_path, monkeypatch):
+    """2026-11-03 22:00: 3 followers, three fresh replies with no likes yet →
+    "engagement drop: today=0 vs median=6" froze every queued post for 15 hours.
+    Below MIN_FOLLOWERS_FOR_DROP a percentage drop is noise, so all drop rules
+    stay disarmed, not only the follower rule."""
+    hist = [{"followers": 3, "tweet_metrics": [{"likes": 6, "views": "300"}]}
+            for _ in range(5)]
+    hist[-1] = {"followers": 3, "tweet_metrics": [{"likes": 0, "views": "1"}]}
+    crisis_check, res = _crisis_with_history(tmp_path, monkeypatch, hist)
+    assert res["triggered"] is False, res["reasons"]
+    assert any("followers" in s and "disarmed" in s for s in res["skipped"])
+    assert not crisis_check.FREEZE_FLAG.exists()
 
 
 def test_crisis_single_unfollow_on_small_account_does_not_freeze(tmp_path, monkeypatch):
@@ -1447,10 +1462,12 @@ if __name__ == "__main__":
 # ── crisis_check: noise floor + freeze expiry (2026-09-27) ──
 def test_crisis_tiny_median_is_noise_not_a_drop(tmp_path, monkeypatch):
     """2026-09-16 regression: "engagement drop: today=0 vs median=1" froze
-    posting for 11 days. A 60% fall from one like is one missing like."""
-    hist = [{"followers": 3, "tweet_metrics": [{"likes": 1, "views": "40"}]}
+    posting for 11 days. A 60% fall from one like is one missing like.
+    Followers sit above MIN_FOLLOWERS_FOR_DROP so the median floor itself is
+    what disarms the rules here (the tiny-account gate has its own test)."""
+    hist = [{"followers": 40, "tweet_metrics": [{"likes": 1, "views": "40"}]}
             for _ in range(5)]
-    hist[-1] = {"followers": 3, "tweet_metrics": [{"likes": 0, "views": "10"}]}
+    hist[-1] = {"followers": 40, "tweet_metrics": [{"likes": 0, "views": "10"}]}
     crisis_check, res = _crisis_with_history(tmp_path, monkeypatch, hist)
     assert res["triggered"] is False, res["reasons"]
     assert any("engagement rule disarmed" in s for s in res["skipped"])

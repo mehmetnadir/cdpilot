@@ -171,6 +171,19 @@ def check() -> dict:
             "baseline days with tracked tweets"
         )
 
+    # The follower gate below (MIN_FOLLOWERS_FOR_DROP) only guarded the follower
+    # rule. 2026-11-03 22:00: with 3 followers the engagement rule froze posting
+    # on "today=0 vs median=6" — three replies with no likes yet — and the freeze
+    # silently skipped every queued post for 15 hours. On an account this small
+    # a percentage drop is noise; the same gate now disarms all drop rules.
+    followers_now = today["followers"]
+    if signal_ok and isinstance(followers_now, int) and followers_now < MIN_FOLLOWERS_FOR_DROP:
+        signal_ok = False
+        skipped.append(
+            f"drop rules disarmed: {followers_now} followers < {MIN_FOLLOWERS_FOR_DROP} — "
+            "percentage drops are noise on a tiny account"
+        )
+
     # Engagement drop
     base_eng = [d["total_engagement"] for d in baseline_with_data if d["total_engagement"] > 0]
     if signal_ok and base_eng:
