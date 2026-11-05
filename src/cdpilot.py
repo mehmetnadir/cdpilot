@@ -6811,6 +6811,7 @@ def cmd_launch(auto=False, idle_close=None):
             'IPFSCompanion', 'Translate', 'OptimizationGuideModelDownloading',
             'InterestFeedContentSuggestions', 'CalculateNativeWinOcclusion',
             'PasswordManagerOnboarding', 'AutofillServerCommunication',
+            'MacAppCodeSignClone',
         ]),
         # Anti-bot leak fix (2026-05-31): Chrome's blink runtime exposes an
         # "automation controlled" flag when --remote-debugging-port is set;
