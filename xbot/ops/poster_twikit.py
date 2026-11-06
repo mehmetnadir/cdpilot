@@ -35,6 +35,7 @@ from twikit import Client  # type: ignore
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import bot_home  # noqa: E402
 import _notify  # noqa: E402
+from x_text import check as _check_text  # noqa: E402
 
 DATA = bot_home()
 QUEUE_DIR = DATA / "queue"
@@ -582,6 +583,36 @@ async def main_async() -> None:
                      f"{item['id']} deferred")
                 continue
             preview = (item.get("text") or (item.get("texts") or ["?"])[0])[:80]
+            # Precheck weighted length following twitter-text v3
+            texts_to_check: list[str] = []
+            if kind in ("tweet", "reply", "quote"):
+                texts_to_check.append(item.get("text", "") or "")
+            elif kind == "thread":
+                texts_to_check.extend(item.get("texts") or [])
+            if item.get("followup_text"):
+                texts_to_check.append(item["followup_text"])
+
+            failed_chk: dict | None = None
+            for t in texts_to_check:
+                chk = _check_text(t)
+                if not chk["ok"]:
+                    failed_chk = chk
+                    break
+
+            if failed_chk:
+                urls_str = ", ".join(failed_chk["urls"]) if failed_chk["urls"] else "none"
+                item["status"] = "failed"
+                item["failed_at"] = int(time.time())
+                item["error"] = (
+                    f"precheck: weighted length {failed_chk['weighted']} > 280 "
+                    f"(urls count 23: {urls_str})"
+                )
+                (FAILED_DIR / p.name).write_text(
+                    json.dumps(item, ensure_ascii=False, indent=2)
+                )
+                p.unlink()
+                _log(f"⛔ precheck failed {item['id']} — {item['error']}")
+                continue
             if kind in ("tweet", "reply", "quote"):
                 dup = _duplicate_of(item.get("text", ""))
                 if dup:

@@ -45,7 +45,7 @@ bir noktamız (reply-policy §3). Yoksa SKIP.
 Dosya: `queue/<id>.json`. Özgün: `{"id","kind":"tweet","text","followup_text","image_path"?,"status":"pending",
 "scheduled_time":<epoch>,"created_at","approved_at","source":"x-editor","context"}`. Yanıt: `kind:"reply"`,
 `"to":"https://x.com/<user>/status/<id>"`, `target_created_ts`. Uzunluk: metin ≤ 280 (bağlantı 23 sayılır);
-hesapla, geçerse kısalt. Saat: 13:00–23:00 İstanbul, tam saat değil (…:07, :23, :37, :51), paylaşımlar arası ≥ 20 dk.
+hesapla, geçerse kısalt. Kuyruk öğesi yazmadan önce `/usr/bin/python3 xbot/ops/x_text.py "<text>"` ile ağırlıklı uzunluğu hesapla (alan adı 23 sayılır). Saat: 13:00–23:00 İstanbul, tam saat değil (…:07, :23, :37, :51), paylaşımlar arası ≥ 20 dk.
 Görsel gerekiyorsa `xbot/gorsel/<tarih>-<ad>.html` yaz, ortak tarayıcıda 1600×900 PNG al (yeni tarayıcı açma),
 `scp` ile `images/`e koy. Yazdığın her öğeyi `ls queue` ile doğrula.
 
