@@ -141,6 +141,15 @@ that teaches Claude Code when and how to reach for cdpilot's commands. See
 [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json) and
 [`plugins/cdpilot/`](plugins/cdpilot/).
 
+### Smaller MCP tool list
+
+`cdpilot mcp --tools core` (or `CDPILOT_MCP_TOOLS=core`; the flag wins) lists 10 core
+tools (navigate, click, fill, content, screenshot, eval, wait_for, assert, tabs, connect)
+plus `browser_tools`. The agent calls `browser_tools` with `list` to see the other
+tools, or `enable` to add some (the server sends `tools/list_changed`). `--tools a,b,c`
+picks tools by name; `all` (default) is unchanged. Schema size of `tools/list`
+(tiktoken `o200k_base`): 45 tools = 5,769 tokens, `core` = 11 tools = 1,342 tokens.
+
 ### MCP Bundle (.mcpb)
 
 For MCP clients that support one-click local server installation (Claude
