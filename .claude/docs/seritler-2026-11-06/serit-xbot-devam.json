@@ -1,0 +1,24 @@
+{
+ "varsayilan": {
+  "cwd": "/Users/nadir/01dev/_worktrees/cdpilot-xbot",
+  "rol": "kod",
+  "zaman": "45m"
+ },
+ "isler": [
+  {
+   "id": "xbot-uzunluk",
+   "rol": "kod",
+   "prompt": "CONTINUE MODE: an earlier run of this same task was interrupted by a machine restart. The worktree may already contain partial changes (run `git status` and `git diff` first, also look for new files under test/ and xbot/). Read them, keep what is correct, fix what is not, and finish the task below. Do not start from scratch and do not revert existing partial work without a reason you write in the report.\n\nTASK: the X poster (xbot/ops/poster_twikit.py, runs on srv21 as a systemd timer) posted a 280-character tweet containing `clay.com` on 05.11.2026 and X rejected it (error 186 \"Tweet needs to be a bit shorter\"): X counts every URL and bare domain as 23 characters and some code points as 2. Add a weighted-length precheck so such an item never reaches the API, plus a CLI the daily editor can call before writing a queue item.\n\nFILES YOU OWN (nothing else): xbot/ops/x_text.py (new), xbot/ops/poster_twikit.py (edit), xbot/tests/test_x_text.py (new), xbot/EDITOR.md (one sentence in section 3 pointing to the CLI).\n\nx_text.py (stdlib only; Python 3.11+ as on srv21; type hints):\n- `weighted_length(text: str) -> int` following twitter-text v3: (1) NFC-normalize; (2) each URL counts 23: detect with a regex close to twitter-text's: optional `https?://`, optional `www.`, a domain of labels with a valid TLD (a built-in list of ~60 common gTLDs plus any 2-letter ccTLD, case-insensitive), then an optional path/query up to whitespace or a closing `)`/quote; `clay.com`, `github.com/BraaMohammed/bricks`, `x.com/a/status/1`, `https://example.org/a?b=c` ARE urls; `localhost`, `v1.2`, `node_modules`, `e.g.`, `1.5x`, `cdpilot.py` are NOT (`.py` is not a TLD in your list; say so in a comment); (3) every other code point weighs 1 if it is in U+0000-U+10FF, U+2000-U+200D, U+2010-U+201F, U+2032-U+2037, else 2 (CJK, emoji, most symbols); (4) leading/trailing whitespace counts.\n- `check(text: str, limit: int = 280) -> dict` -> {\"weighted\": n, \"limit\": limit, \"ok\": bool, \"urls\": [matched strings]}.\n- `__main__`: `python3 x_text.py \"<text>\"` or text on stdin -> prints `weighted=NNN limit=280 ok=True urls=[...]`; exit 0 when ok, 1 when not.\n\nposter_twikit.py: in the queue loop (main_async ~502-700), before `_process_one` for kinds tweet/reply/quote (also each text of a thread item, and `followup_text` when present), run check(); if any text is not ok: item status \"failed\", \"failed_at\", \"error\": \"precheck: weighted length N > 280 (urls count 23: <urls>)\" and move it to failed/ exactly like the duplicate branch (~585-596); `_log` one line; NO API call and NO phone push for this case (the daily editor reads failed/ and rewrites). Every other path stays byte-for-byte unchanged.\n\nTESTS (pytest in xbot/tests/test_x_text.py; run with: `cd xbot && uv run --no-project --python 3.13 --with pytest --with twikit --with httpx --with requests python -m pytest tests -q -p no:cacheprovider` — the one pre-existing failure `test_image_gen_signature_prompt_has_slots` is known): the real 05.11 text, verbatim: `bricks is an open-source, local alternative to clay.com: drop in a csv, define columns like \"find linkedin url\", and headless browsers + llm calls fill them on your machine. local-first keeps pii off third-party infra. the price: you own the browser fleet. who runs this at scale?` -> len 280 but weighted 295, ok False, urls [\"clay.com\"]; plain 280 ascii -> ok; 281 -> not ok; `github.com/BraaMohammed/bricks` alone -> 23; `https://x.com/cdpilot_dev/status/1` -> 23; one emoji -> 2; one CJK char -> 2; `é` -> 1; the non-URL list above -> each counts its plain length; two URLs in one text -> 46 + rest; poster integration: a queue item with the 05.11 text ends in failed/ with the precheck error and the client's create_tweet is never called (mock the client the way tests/test_xbot.py mocks it); a 268-weight item still reaches create_tweet.\nDOCS: EDITOR.md section 3: one sentence: compute with `python3 xbot/ops/x_text.py \"<text>\"` before writing a queue item.\nFINAL REPORT: files + line ranges, the pytest summary line, the exact weighted value the 05.11 text gets. Commit nothing. Do not touch anything outside the files you own.\n",
+   "dosyalar": [
+    "xbot/ops/x_text.py",
+    "xbot/ops/poster_twikit.py",
+    "xbot/tests/test_x_text.py",
+    "xbot/EDITOR.md"
+   ],
+   "beklenen": [
+    "xbot/ops/x_text.py",
+    "xbot/tests/test_x_text.py"
+   ]
+  }
+ ]
+}

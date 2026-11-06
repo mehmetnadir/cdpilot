@@ -1,0 +1,16 @@
+{
+ "varsayilan": {
+  "cwd": "/Users/nadir/01dev/cdpilot",
+  "rol": "review",
+  "zaman": "40m"
+ },
+ "isler": [
+  {
+   "id": "iddia-denetimi",
+   "rol": "review",
+   "kip": "oku",
+   "ek_dizin": "/Users/nadir/01dev/cdpilot-site",
+   "prompt": "READ-ONLY TASK: audit every promise cdpilot makes against its code and tests. Write nothing to disk; your final message IS the report.\nSOURCES: /Users/nadir/01dev/cdpilot/README.md, CHANGELOG.md (0.9.3, 0.9.4, [Unreleased]), src/cdpilot.py `__doc__` and help text (search \"Usage\"), bin/cdpilot.js help; the site copy in /Users/nadir/01dev/cdpilot-site/content and /Users/nadir/01dev/cdpilot-site/src (page text, feature lists, comparison tables, pricing/claims); the claim gates: /Users/nadir/01dev/cdpilot/test/test.js (search \"claim\", \"README\", \"CHANGELOG\") and /Users/nadir/01dev/cdpilot-site/test/claims.test.mjs; the measurement docs /Users/nadir/01dev/cdpilot/.claude/docs/token-olcumu-2026-09-27.md and token-taban-2026-10-24.md.\nREPORT (markdown, Turkish headings, claims verbatim in English):\n1. A table of every quantitative or absolute claim (\"zero\", \"never\", \"always\", \"all\", \"100%\", \"N tools\", \"Nx faster\", \"N tokens\", \"N/N captcha\", \"works on X\", \"supports Y\", \"no Puppeteer/Playwright\"): # | claim (verbatim, <=120 chars) | where (file:line) | evidence (code or test file:line, or \"none\") | verdict KANITLI / KISMİ / KANITSIZ / YANLIŞ / BAYAT (was true, code moved on) | fix (one line: reword / add test / remove / measure).\n2. Promises the README or site already imply but the code does not have yet (compare with open issues #3 shadow DOM, #4 HAR export, #5 record/replay, and CHANGELOG [Unreleased]).\n3. The 5 most misleading items for a new user, ordered, each with the exact replacement sentence.\nRules: verify each verdict by reading the code or test it points to; \"KANITLI\" needs a file:line; do not propose new features; do not edit files; keep each cell short.\n"
+  }
+ ]
+}
