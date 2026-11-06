@@ -17053,12 +17053,59 @@ class MCPServer:
          "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "description": "Tool name, as returned by browser_site_tools"}, "arguments": {"type": "object", "description": "Tool input: a JSON object matching the tool's inputSchema"}, "frame": {"type": "string", "description": "Only when several frames register the same name: part of the frame URL"}}, "required": ["name"]}},
     ]
 
-    def __init__(self):
+    # Tool profiles (`mcp --tools core|all|a,b,c`, env CDPILOT_MCP_TOOLS): a smaller
+    # tools/list cuts the schema tokens an MCP client sends with every request.
+    CORE_TOOLS = (
+        "browser_navigate", "browser_click", "browser_fill", "browser_content",
+        "browser_screenshot", "browser_eval", "browser_wait_for", "browser_assert",
+        "browser_tabs", "browser_connect",
+    )
+    DISCOVERY_TOOL = {
+        "name": "browser_tools",
+        "description": "Tools outside this server's profile. action=list: name and "
+                       "description of each tool that is not enabled. action=enable "
+                       "with names: add those tools to tools/list "
+                       "(notifications/tools/list_changed follows).",
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "enable"]},
+            "names": {"type": "array", "items": {"type": "string"},
+                      "description": "Tool names to enable (action=enable)"}},
+            "required": ["action"]},
+    }
+    NOT_ENABLED = "tool not enabled; call browser_tools enable"
+
+    def __init__(self, tools_spec=None):
         self.tools = self._register_tools()
+        spec = (tools_spec or os.environ.get("CDPILOT_MCP_TOOLS") or "all").strip()
+        self.profiled = spec != "all"
+        self.enabled = set(self.CORE_TOOLS if spec == "core" else spec.split(","))
+        self.pending_notifications = []
 
     def listed_tools(self):
-        """tools/list: the base tools, plus the WebMCP ones while the mode is on."""
-        return self.tools + (self.WEBMCP_TOOLS if get_webmcp_config() else [])
+        """tools/list: the profile's tools (all by default), plus the WebMCP ones
+        while the mode is on."""
+        webmcp = self.WEBMCP_TOOLS if get_webmcp_config() else []
+        if not self.profiled:
+            return self.tools + webmcp
+        base = [t for t in self.tools if t["name"] in self.enabled]
+        return base + [self.DISCOVERY_TOOL] + webmcp
+
+    def _browser_tools(self, req_id, args):
+        """browser_tools: list the tools the profile left out, or enable some."""
+        off = [t for t in self.tools if t["name"] not in self.enabled]
+        if args.get("action") == "enable":
+            names = args.get("names") or []
+            known = {t["name"] for t in off}
+            self.enabled.update(n for n in names if n in known)
+            unknown = [n for n in names if n not in known and n not in self.enabled]
+            text = "enabled: " + ", ".join(n for n in names if n in self.enabled)
+            if unknown:
+                text += "\nunknown tools: " + ", ".join(unknown)
+            self.pending_notifications.append("notifications/tools/list_changed")
+        else:
+            text = "\n".join(f"{t['name']}: {t['description']}" for t in off) or "none"
+        return {"jsonrpc": "2.0", "id": req_id, "result": {
+            "content": [{"type": "text", "text": text}], "isError": False}}
 
     def _register_tools(self):
         return [
@@ -17177,7 +17224,7 @@ class MCPServer:
         if method == "initialize":
             return {"jsonrpc": "2.0", "id": req_id, "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {"listChanged": True} if self.profiled else {}},
                 "serverInfo": {"name": "cdpilot", "version": __version__}
             }}
         elif method == "notifications/initialized":
@@ -17185,7 +17232,14 @@ class MCPServer:
         elif method == "tools/list":
             return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": self.listed_tools()}}
         elif method == "tools/call":
-            return self._execute_tool(req_id, params.get("name", ""), params.get("arguments", {}))
+            name, args = params.get("name", ""), params.get("arguments") or {}
+            if self.profiled and name == "browser_tools":
+                return self._browser_tools(req_id, args)
+            if self.profiled and name not in self.enabled and any(
+                    t["name"] == name for t in self.tools):
+                return {"jsonrpc": "2.0", "id": req_id, "result": {
+                    "content": [{"type": "text", "text": self.NOT_ENABLED}], "isError": True}}
+            return self._execute_tool(req_id, name, args)
         elif method == "ping":
             return {"jsonrpc": "2.0", "id": req_id, "result": {}}
         else:
@@ -17322,7 +17376,11 @@ class MCPServer:
                 response = self._handle_request(request)
                 if response is not None:
                     sys.stdout.write(json_mod.dumps(response) + "\n")
-                    sys.stdout.flush()
+                for method in self.pending_notifications:
+                    sys.stdout.write(json_mod.dumps(
+                        {"jsonrpc": "2.0", "method": method}) + "\n")
+                self.pending_notifications = []
+                sys.stdout.flush()
             except json_mod.JSONDecodeError as e:
                 sys.stdout.write(json_mod.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"Parse error: {str(e)}"}}) + "\n")
                 sys.stdout.flush()
@@ -20042,7 +20100,13 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if cmd == "mcp":
-        server = MCPServer()
+        _spec = None
+        for _i, _a in enumerate(args):
+            if _a == '--tools' and _i + 1 < len(args):
+                _spec = args[_i + 1]
+            elif _a.startswith('--tools='):
+                _spec = _a.split('=', 1)[1]
+        server = MCPServer(_spec)
         server.run()
         sys.exit(0)
 

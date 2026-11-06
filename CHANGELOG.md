@@ -2,6 +2,11 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **MCP tool profiles: `cdpilot mcp --tools core|all|a,b,c` (env `CDPILOT_MCP_TOOLS`, the flag wins).** `core` lists 10 tools plus `browser_tools`, which lists the other tools (name and description) or enables some and sends `notifications/tools/list_changed`. A call to a tool outside the profile returns "tool not enabled; call browser_tools enable". `tools/list` schema: 5,769 tokens (45 tools) down to 1,342 (11 tools). Default `all` is unchanged; WebMCP tools are unaffected.
+
 ## [0.9.4] - 2026-09-29
 
 ### Added
