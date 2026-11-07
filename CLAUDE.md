@@ -9,7 +9,7 @@
 ## Kimlik
 - **Stack:** Node.js (entry) + Python 3 (core) | Pure CDP over HTTP/WebSocket
 - **Port:** CDP 9222 (varsayılan, `CDP_PORT` ile değiştirilebilir)
-- **Paket Yöneticisi:** npm | **Bağımlılık:** Sıfır (npm + Python stdlib)
+- **Paket Yöneticisi:** npm | **Bağımlılık:** 0 npm; Python `websockets` (sihirbaz kurar), isteğe bağlı `cryptography` (Web Bot Auth)
 
 ## Hızlı Başlangıç
 - `npx cdpilot launch` — Tarayıcı başlat (CDP modunda)
@@ -27,7 +27,7 @@
 
 ## Dikkat Edilecekler
 - **Tek dosya mimari:** Tüm Python kodu `src/cdpilot.py` (büyüyor — güncel satır sayısı için `wc -l src/cdpilot.py`, 2026-09-27'de 13.129 satır)
-- **Sıfır bağımlılık:** Harici Python/npm paketi eklenmez — stdlib only
+- **Bağımlılık eklenmez:** npm 0; Python yalnız `websockets` (+ isteğe bağlı `cryptography`). README "zero dependency" demez, "zero npm dependencies" der (06.11 vaat denetimi)
 - **Port 9222:** Varsayılan CDP, `CDP_PORT` env ile değişir
 - **Tarayıcı seçimi `auto` (varsayılan):** eklenti yoksa Chrome; `ext-install` ile eklenti kayıtlıysa Brave/Vivaldi (Chrome 137+ paketlenmemiş eklentiyi yüklemiyor); macOS 26'da Brave geri sırada — sebebi `cdpilot browser status` söyler
 - **İzole profil:** `~/.cdpilot/profile` — kullanıcı tarayıcısına dokunulmaz
