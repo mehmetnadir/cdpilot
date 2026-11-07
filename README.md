@@ -718,7 +718,7 @@ is dropped, never signalled.
 
 **Idle close** still works while the signer runs: the signer is attached to every page, so instead
 of "a page is attached" cdpilot counts the CDP clients other than the signer (by socket owner:
-`netstat` on macOS and Windows, `ss` on Linux), and a `watch` daemon or a Playwright session keeps
+`netstat` with an `lsof` fallback on macOS, `netstat` on Windows, `ss` on Linux), and a `watch` daemon or a Playwright session keeps
 the browser open. On Linux, `ss -tnp` shows only your own processes' sockets, so a client running
 as another user is not counted and idle close may close the browser under it.
 
