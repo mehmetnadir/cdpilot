@@ -1,0 +1,8 @@
+## Güvenlik smoke T0 — cdpilot (08.11 02:34)
+| Denetim | Sonuç | Not |
+|---|---|---|
+| git-sir-dosya | OK |  |
+| sir-deseni | İHLAL | test/test.js:5868:  "api_token": ("x", ["sk-ant-api03-abcdefghijklmnopqrstuvwxyz"]),; |
+| bagimlilik | OK |  |
+| sessiz-catch | OK |  |
+Sonuç: İHLAL (ihlal 1, uyarı 0)

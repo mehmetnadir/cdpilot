@@ -1,0 +1,587 @@
+
+  cdpilot tests
+
+  ✓ --version prints version
+  ✓ -v prints version
+  ✓ help shows usage
+  ✓ --help shows usage
+  ✓ no args shows help
+  ✓ setup detects browser
+  ✓ setup detects python
+  ✓ setup detects python websockets
+  ✓ CDPILOT_HOME: setup writes only under CDPILOT_HOME, never under HOME/.cdpilot
+  ✓ cdpilot.py exists
+  ✓ package.json has bin field
+  ✓ package.json has correct name
+  ✓ python script has version
+  ✓ python script has shebang
+  ✓ STEALTH_JS constant is defined
+  ✓ STEALTH_JS is syntactically valid JavaScript
+  ✓ STEALTH_JS is idempotent (guards with __cdpilot_stealth flag)
+  ✓ STEALTH_JS patches the documented fingerprint surfaces
+  ✓ STEALTH_JS only patches webdriver when value is actually true (smart no-op)
+  ✓ STEALTH_JS plugins inherit from PluginArray.prototype (instanceof check)
+  ✓ STEALTH_JS patches Worker constructor for worker-context webdriver
+  ✓ STEALTH_JS does NOT weaken web security primitives
+  ✓ CAPTCHA_DETECT_JS constant is defined
+  ✓ CAPTCHA_DETECT_JS is syntactically valid JavaScript
+  ✓ CAPTCHA_DETECT_JS covers major providers
+  ✓ CAPTCHA_DETECT_JS is read-only (no DOM mutation or network)
+  ✓ get_stealth_config default is OFF (opt-in)
+  ✓ cmd_stealth is registered in sync dispatch
+  ✓ captcha-check and captcha-wait are registered in async dispatch
+  ✓ captcha commands are in NO_CONTROL_CMDS (no glow interference)
+  ✓ captcha-solve: cmd_captcha_solve defined + dispatched
+  ✓ captcha-solve: amazon detection via #captchacharacters
+  ✓ captcha-solve: graceful when amazoncaptcha not installed
+  ✓ captcha-solve: capsolver BYOK reads CAPSOLVER_API_KEY env
+  ✓ press-hold: _solve_press_and_hold defined + cmd_press_hold dispatched
+  ✓ press-hold: uses Input.dispatchMouseEvent mousePressed->mouseMoved(jitter)->mouseReleased sequence
+  ✓ press-hold: hold duration is gaussian-randomized (not fixed)
+  ✓ press-hold: micro-jitter during hold (1-2px mouseMoved with button held)
+  ✓ press-hold: reuses existing humanizer (no reimplemented mouse path) + jitter cadence
+  ✓ press-hold: cmd_captcha_solve routes perimeterx -> press_and_hold
+  ✓ press-hold: target finder (px hooks + TR/EN text) + retry + result schema
+  ✓ MCP: browser_press_hold tool + handler registered
+  ✓ profile warm: cmd_profile_warm defined
+  ✓ profile warm: visits safe site list + aging delays
+  ✓ MCP: browser_captcha_solve tool registered
+  ✓ friction: FRICTION_DETECT_JS constant defined + valid JS
+  ✓ friction: FRICTION_DETECT_JS is read-only (no mutation/network/storage)
+  ✓ friction: _detect_friction defined + cmd_friction dispatched
+  ✓ friction: 6-level ladder ordered low->high
+  ✓ friction: rate_limited keyword detection (TR + EN)
+  ✓ friction: login_wall detection (login form + gate keyword)
+  ✓ friction: otp_sms detection (verification code input/keyword)
+  ✓ friction: hard_block detection (403/access denied)
+  ✓ friction: _friction_action returns backoff for rate_limited
+  ✓ friction: login/otp/hard map to human handoff (NO autonomous bypass)
+  ✓ friction: cmd_go integrates friction probe with bounded backoff
+  ✓ friction: env knobs honored (CDPILOT_FRICTION_BACKOFF / MAX_RETRY)
+  ✓ friction: in NO_CONTROL_CMDS (no glow interference)
+  ✓ MCP: browser_friction tool registered + mapped
+  ✓ navigate_collect gates stealth injection behind the active tier
+  ✓ navigate_collect registers stealth BEFORE Page.navigate
+  ✓ cmd_go runs CAPTCHA detection after navigate (non-blocking)
+  ✓ help output includes STEALTH & CAPTCHA section
+  ✓ wait-for-text command is defined as async function
+  ✓ wait-for-text uses MutationObserver with characterData=true
+  ✓ wait-for-text is registered in async dispatch
+  ✓ browser_wait_for_text MCP tool exposed in tools/list and tool_map
+  ✓ cdp_get has TTL cache for /json and /json/version
+  ✓ cdp_cache_invalidate is called after tab-mutating ops
+  ✓ eval-batch command is defined and runs all expressions in one Promise.all
+  ✓ eval-batch is registered in dispatch
+  ✓ browser_eval_batch MCP tool exposed in tools/list and tool_map
+  ✓ block-resources: config + presets + cmd_block defined
+  ✓ navigate_collect applies Network.setBlockedURLs when block is enabled
+  ✓ block command is registered in dispatch
+  ✓ help output advertises eval-batch and block
+  ✓ cdp_send signature is unchanged (callers depend on it)
+  ✓ WS pool: structures and atexit cleanup are declared
+  ✓ WS pool: helpers exist with correct contracts
+  ✓ WS pool: non-pooled path stays identical when CDPILOT_WS_POOL=0
+  ✓ WS pool: stale-conn retry only fires on reused conn with zero results
+  ✓ WS pool: per-URL lock prevents command interleaving
+  ✓ scrollIntoView uses instant (not smooth) everywhere
+  ✓ navigate_collect post-load sleep cut from 1.5s to 0.3s
+  ✓ visual feedback config: default OFF
+  ✓ _control_start and _control_end gate on visual config
+  ✓ fast mode config: get_auto_wait_ms honors env override and clamps
+  ✓ cmd_click and cmd_fill use get_auto_wait_ms (no hardcoded 5000)
+  ✓ show and fast registered in dispatch
+  ✓ help output advertises show and fast
+  ✓ dismiss pattern lib: positives cover LLM chat escape hatches
+  ✓ dismiss pattern lib: negatives prevent destructive misfires
+  ✓ cmd_dismiss: one negative hit disqualifies regardless of positives
+  ✓ cmd_dismiss: visibility gate + min score threshold
+  ✓ dismiss registered in dispatch + MCP
+  ✓ help advertises dismiss command
+  ✓ adaptive config + hostname memory defined
+  ✓ cmd_go: adaptive auto-enables tier for known host before navigate
+  ✓ cmd_go: CAPTCHA detection → remember host + retry once with stealth
+  ✓ adaptive never auto-demotes — once added, hostname stays until manual forget
+  ✓ adaptive registered in dispatch with forget subcommand routing
+  ✓ help advertises adaptive command
+  ✓ cmd_cookies accepts variadic args for save/load
+  ✓ cmd_cookies save: writes JSON array via Network.getCookies
+  ✓ cmd_cookies load: round-trips via Network.setCookies and verifies count
+  ✓ cookies dispatch passes variadic args
+  ✓ help advertises cookies save/load
+  ✓ cmd_context_create uses CDP Target.createBrowserContext + createTarget
+  ✓ cmd_context_create rolls back on createTarget failure
+  ✓ CDPILOT_TARGET env pin bypasses session lookup
+  ✓ CDPILOT_TARGET pin fails loud when tab is gone
+  ✓ cmd_context_close refuses to destroy the default context
+  ✓ context registered in dispatch as variadic dispatcher
+  ✓ help advertises context commands
+  ✓ _resolve_selector_ladder exists with correct default strategy order
+  ✓ text-exact strategy queries visible elements by innerText
+  ✓ css fast-path returns inp directly without token injection
+  ✓ _log_heal writes JSONL with required fields
+  ✓ _log_heal writes to project-specific heal.jsonl path
+  ✓ _log_heal respects no_heal flag (skips write)
+  ✓ cmd_click skips heal log on immediate CSS hit
+  ✓ cmd_click delegates @N refs to cmd_click_ref unchanged
+  ✓ cmd_heal_log and cmd_heal_stats are registered in sync_cmds under heal
+  ✓ stable-attr strategy tries data-testid, data-cy, name, id
+  ✓ --no-heal flag plumbed through click dispatch
+  ✓ --ladder flag plumbed through click dispatch
+  ✓ ENTROPY_CONFIG_FILE is declared alongside other config files
+  ✓ _ENTROPY_SEED is read from CDPILOT_ENTROPY_SEED env at module scope
+  ✓ get_entropy_config default is OFF
+  ✓ get_entropy_config honors CDPILOT_ENTROPY env override
+  ✓ _gauss clamp logic is present
+  ✓ _quartic_easeout is defined with correct formula
+  ✓ _bezier_path returns correct point count
+  ✓ _gauss stays within [lo, hi] bounds (1000 samples)
+  ✓ cmd_entropy is defined as sync function
+  ✓ cmd_entropy registered in sync dispatch
+  ✓ cmd_entropy writes to ENTROPY_CONFIG_FILE via _atomic_write_json
+  ✓ --entropy flag plumbed through click dispatch
+  ✓ --entropy flag plumbed through fill dispatch
+  ✓ --entropy flag plumbed through hover dispatch
+  ✓ cmd_click accepts entropy param
+  ✓ cmd_fill accepts entropy param
+  ✓ cmd_hover accepts entropy param
+  ✓ adaptive escalation auto-enables entropy on CAPTCHA detect (v0.5.2: per-host)
+  ✓ _humanize_mouse_move dispatches mouseMoved events via CDP
+  ✓ _humanize_type dispatches keyDown/keyUp with dwell delay
+  ✓ _humanize_scroll uses quartic easeout chunking
+  ✓ AGENT_INTERACTIVE_ROLES defined with core interactive roles
+  ✓ _agent_state_path returns project-scoped path
+  ✓ _load_agent_state returns fresh state dict on missing file
+  ✓ _save_agent_state drops oldest entries when actions_map exceeds 1000
+  ✓ _estimate_tokens uses chars//4 heuristic
+  ✓ _diff_snapshots computes added/removed/value_changed
+  ✓ _diff_snapshots uses set operations for efficiency (no O(n) .remove)
+  ✓ _snapshot_to_actions assigns monotonically increasing ref IDs
+  ✓ _snapshot_to_actions reuses existing ref for same backend_node_id
+  ✓ cmd_agent_observe is async and outputs JSON with required fields
+  ✓ cmd_agent_act is async and handles click/type/hover/submit/url
+  ✓ cmd_agent_act type/fill uses Input.insertText CDP (not cmd_fill selector)
+  ✓ cmd_agent_act outputs diff JSON with saved_vs_full
+  ✓ cmd_agent_reset deletes state file and outputs JSON
+  ✓ cmd_agent_stats outputs token savings JSON
+  ✓ _dispatch_agent_cmd is synchronous and returns coroutine
+  ✓ _dispatch_agent_cmd parses --ref, --action, --text, --url flags
+  ✓ 'agent' command registered in main() async_map dispatch
+  ✓ _agent_full_snapshot syncs _A11Y_REF_MAP for click-ref compatibility
+
+  Browserbase-compatible API (serve command)
+
+  ✓ cmd_serve function defined
+  ✓ BrowserbaseHandler class defined
+  ✓ DEFAULT_MAX_SESSIONS defined
+  ✓ _api_create_session defined
+  ✓ _api_get_session defined
+  ✓ _api_release_session defined
+  ✓ serve command registered in main() dispatch
+  ✓ TEST_MODE env var supported in _api_create_session
+  ✓ ThreadingHTTPServer used in cmd_serve
+  ✓ CDPILOT_MAX_SESSIONS env configures session limit
+  ✓ atexit shutdown registered in cmd_serve
+  ✓ /healthz route handled in do_GET
+  ✓ /v1/sessions POST route handled in do_POST
+  ✓ /v1/sessions/{id}/debug route handled
+  ✓ do_DELETE handles /v1/sessions/{id}
+  ✓ 404 returned for unknown routes
+  ✓ Browserbase session dict shape contains required fields
+  ✓ live: GET /healthz returns 200 with status ok
+  ✓ live: POST /v1/sessions returns 201 with id and connectUrl
+  ✓ live: GET /v1/sessions returns array
+  ✓ live: GET /v1/sessions/{id} returns session
+  ✓ live: GET /v1/sessions/{id}/debug returns debuggerUrl
+  ✓ live: DELETE /v1/sessions/{id} returns 200
+  ✓ live: GET /v1/sessions/{id} after delete returns 404
+  ✓ live: unknown route returns 404
+  ✓ registry: pid liveness never signals the process (Windows os.kill(pid, 0) terminates it)
+  ✓ registry: port probe cannot bind over a live listener on Windows
+  ✓ registry: _is_port_free reports a listening port as taken
+  ✓ registry: _pid_alive tells a live pid from a dead one
+  ✓ registry: CDPILOT_HOME is overridable via env var (test isolation)
+  ✓ registry: 100 dead entries filling the whole port range no longer exhaust _allocate_port (regression)
+  ✓ registry: dead entries are actually removed from disk, not just marked stopped
+  ✓ registry: a genuinely live (listening) port is never pruned
+  ✓ registry: pruning never touches the real ~/.cdpilot/registry.json
+  ✓ stop: no taskkill call targets an image name (/IM kills the user's own browser)
+  ✓ stop: every lsof/pkill/pgrep/taskkill/powershell subprocess.run passes timeout=
+  ✓ stop: nothing listening -> returns fast and reports no browser found
+  ✓ stop: kills the process with --remote-debugging-port=<p>, never the one with <p>0
+  ✓ test runner: fixture file exists
+  ✓ test runner: cmd_test defined in cdpilot.py
+  ✓ test runner: cmd_trace_list defined in cdpilot.py
+  ✓ test runner: cmd_trace_open defined in cdpilot.py
+  ✓ test runner: cmd_trace_clean defined in cdpilot.py
+  ✓ test runner: TRACES_DIR constant defined
+  ✓ test runner: TRACE_VIEWER_HTML constant defined
+  ✓ test runner: test and trace registered in sync_cmds
+  ✓ test runner: --internal-test-runner flag handled in bin/cdpilot.js
+  ✓ test runner: --grep flag parsed in cmd_test_dispatch
+  ✓ test runner: reporters handled (json, junit, tap)
+  ✓ test runner: parallel execution via ThreadPoolExecutor
+  ✓ test runner: watch mode uses getmtime polling
+  ✓ test runner: trace bundle format — meta.json + steps.jsonl referenced
+  ✓ test runner: trace clean handles d/h/m suffixes
+  ✓ test runner: fixture runs via --internal-test-runner (no browser)
+  ✓ test runner: --grep filters tests
+  ✓ twitter: TWITTER_BASE constant defined
+  ✓ twitter: _TW_SEL dict contains required testid selectors
+  ✓ twitter: _TW_HUMANIZE checks CDPILOT_TWITTER_HUMANIZE env
+  ✓ twitter: cmd_twitter_status checks logged_in, handle, rate_limited, suspended
+  ✓ twitter: cmd_twitter_post navigates to compose/tweet
+  ✓ twitter: cmd_twitter_post prints tweet_id in output
+  ✓ twitter: cmd_twitter_thread uses humanized pacing via _tw_pause
+  ✓ twitter: cmd_twitter_reply navigates to /i/status/TWEET_ID
+  ✓ twitter: cmd_twitter_replies slices articles from DOM
+  ✓ twitter: cmd_twitter_like navigates and clicks like_btn
+  ✓ twitter: cmd_twitter_follow navigates to profile and clicks follow_btn
+  ✓ twitter: _dispatch_agent_twitter_cmd dispatches all subcommands
+  ✓ twitter: _dispatch_agent_cmd routes twitter to _dispatch_agent_twitter_cmd
+  ✓ blog: _dispatch_blog_cmd handles publish/list/regenerate subcommands
+  ✓ blog: cmd_blog_publish writes to BLOG_DIR with valid slug
+  ✓ blog: slug validation enforces kebab-case pattern
+  ✓ blog: FAQ section minimum 3 items enforced
+  ✓ blog: word count gate warns below 800 words
+  ✓ blog: sync_cmds dispatcher includes blog entry routing to _dispatch_blog_cmd
+  ✓ _resolve_project_config returns non-None project_id even in manual-override mode
+  ✓ _log_heal guards against None PROJECT_ID before os.path.join
+  ✓ NavigationDrift exception class is defined
+  ✓ _assert_host raises NavigationDrift when CDPILOT_ADAPTIVE_STRICT=1
+  ✓ _assert_host compares hostnames, so a URL with a port is not drift
+  ✓ _assert_host no-ops when expected_host is empty
+  ✓ idempotent adaptive: cmd_go checks current host before re-nav
+  ✓ _new_isolated_context calls Target.createBrowserContext and Target.createTarget
+  ✓ cmd_go uses isolated context when adaptive on and host is known-hostile
+  ✓ Fix 1 context spawn gated by CDPILOT_ADAPTIVE_FRESH_CONTEXT env var (default OFF)
+  ✓ _new_isolated_context and _dispose_context helpers exist for env-gated use
+  ✓ CAPTCHA_ENTROPY_REQUIRED defined with correct CF=False, behavior-sensitive=True mapping
+  ✓ _adaptive_remember_host_entropy defined and writes entropy_hosts to adaptive.json
+  ✓ _entropy_enabled accepts host param and checks adaptive entropy_hosts
+  ✓ adaptive detect: calls _adaptive_remember_host_entropy with detected captcha_types
+  ✓ adaptive detect: no longer global-writes entropy.json (per-host instead)
+  ✓ cmd_click: ws obtained before entropy check (host-aware ordering)
+  ✓ cmd_fill: ws obtained before entropy check (host-aware ordering)
+  ✓ cmd_hover and cmd_drag use host-aware _entropy_enabled
+  ✓ cmd_scroll_to uses host-aware _entropy_enabled
+  ✓ captcha: CAPTCHA_PROVIDERS_FILE points to CDPILOT_HOME
+  ✓ captcha: CAPTCHA_AUTO_FILE in PROFILE_DIR (per-project)
+  ✓ captcha: CaptchaSolverError defined
+  ✓ captcha: _captcha_load_config returns default dict on missing file
+  ✓ captcha: _captcha_save_config uses atomic write and chmod 600
+  ✓ captcha: _solve_2captcha polls res.php every 5s
+  ✓ captcha: _solve_anticaptcha uses JSON API with createTask/getTaskResult
+  ✓ captcha: _solve_capmonster uses capmonster.cloud base URL
+  ✓ captcha: provider preferred fallback (first enabled if preferred unavailable)
+  ✓ captcha: _extract_site_key probes recaptcha, hcaptcha, turnstile selectors
+  ✓ captcha: _inject_captcha_token handles recaptcha, hcaptcha, turnstile
+  ✓ captcha: adaptive auto-solve hook fires in cmd_go after captcha detect
+  ✓ captcha: cmd_captcha_dispatch subcommand routing
+  ✓ captcha: captcha command in async_map dispatch table
+  ✓ COOKIES_DIR constant defined under CDPILOT_HOME
+  ✓ CF_CLEARANCE_COOKIES frozenset contains cf_clearance and __cf_bm
+  ✓ _cookies_safe_host replaces : and / with _
+  ✓ _cookies_host_dir returns path under COOKIES_DIR
+  ✓ _save_host_cookies: atomic write + chmod 600 + returns path
+  ✓ _save_host_cookies: metadata contains cf_clearance_present and expires_soonest_unix
+  ✓ _load_host_cookies: returns None on expiry
+  ✓ _load_host_cookies: returns None on OSError/ValueError
+  ✓ _cookies_auto_config reads COOKIES_AUTO_CONFIG_FILE (v0.6.1)
+  ✓ v0.6.1: _cookies_auto_should_apply gates by safe-host list
+  ✓ v0.6.1: cookies auto add/remove/list CLI subcommands
+  ✓ cmd_cookies: save --host mode writes per-host via _save_host_cookies
+  ✓ cmd_cookies: load --host mode calls _load_host_cookies
+  ✓ cmd_cookies: list subcommand lists COOKIES_DIR
+  ✓ cmd_cookies: clear --all removes entire COOKIES_DIR
+  ✓ cmd_cookies: auto on|off toggles _set_cookies_auto
+  ✓ cmd_cookies: cf-replay injects cookies via Network.setCookies
+  ✓ cmd_go: auto pre-navigate hook injects cached cookies (v0.6.1 safe-host gated)
+  ✓ cmd_go: auto post-navigate hook saves cookies after navigation (v0.6.1 safe-host gated)
+  ✓ cmd_cookies: clear --older-than guards against missing COOKIES_DIR
+  ✓ v0.8.0: BROWSER_BINARIES does NOT include camoufox/undetected-chrome (CDP incompatible)
+  ✓ v0.8.0: cmd_tls_check defined and probes via navigate_collect
+  ✓ v0.8.0: KNOWN_CHROME_TLS comparison set defined
+  ✓ v0.8.0: tls-check registered in async dispatch table
+  ✓ v0.7.0: _proxy_config_raw + named pool helpers exist
+  ✓ v0.7.0: get_proxy_config returns active pool URL over legacy
+  ✓ v0.7.0: _proxy_redact masks credentials in URL
+  ✓ v0.7.0: cmd_proxy supports add/remove/use/list/show subcommands
+  ✓ v0.7.0: proxy command dispatched with *args
+  ✓ v0.6.2: cmd_wipe defined with --all/--keep/--cookies/--storage/--tabs flags
+  ✓ v0.6.2: cmd_wipe preserves cookies-auto safe-list by default
+  ✓ v0.6.2: cmd_wipe uses Network.deleteCookies + Storage.clearDataForOrigin
+  ✓ v0.6.2: wipe command registered in async dispatch table
+  ✓ smart_click: skips disabled buttons
+  ✓ smart_click: errors when all matches disabled
+  ✓ smart_click: deepQuerySelectorAll traverses shadow root
+  ✓ smart_fill: deepQuerySelectorAll for shadow inputs
+  ✓ smart_click: Turkish İ matches lowercase i (locale-aware lowercase)
+  ✓ smart_click: German ß matches (locale-aware lowercase used everywhere)
+  ✓ smart_fill: aria-labelledby lookup
+  ✓ smart_fill: nested aria-label closest()
+  ✓ smart_select: also gets disabled + shadow + locale hardening
+  ✓ v0.9 watch: cmd_watch_start defined and registered in sync dispatch
+  ✓ v0.9 watch: daemon entry sends Page.startScreencast with correct params
+  ✓ v0.9 watch: frames written to per-project ring buffer dir as <ts_ms>.jpg
+  ✓ v0.9 watch: cmd_watch_query filters by --at/--window and --last/--since-last
+  ✓ v0.9 watch: ring buffer evicts frames older than retention OR over disk cap
+  ✓ v0.9 watch: cmd_watch_status returns frame count + disk usage as JSON
+  ✓ v0.9 watch: cmd_watch_query emits JSON with frame paths + timestamps + count
+  ✓ v0.9 watch: daemon is forked via subprocess.Popen with hidden flag (no blocking)
+  ✓ v0.9 watch: MCP server exposes browser_watch_* tools
+  ✓ v0.9 watch: CLI smoke — `watch status` works with no active session
+  ✓ v0.9 watch: CLI smoke — `watch query` without a session returns empty + error key
+  ✓ mode: cmd_mode defined + dispatched
+  ✓ mode: regular tier injects no fingerprint patch
+  ✓ mode: stealth tier uses STEALTH_JS_LIGHT (no plugin array)
+  ✓ mode: undetected tier uses STEALTH_JS_FULL
+  ✓ mode: STEALTH_JS_LIGHT excludes plugin spoofing
+  ✓ mode: backwards-compat — stealth on maps to undetected
+  ✓ stealth UA: stealth/undetected navigate path calls the headless UA override
+  ✓ stealth UA: regular tier never reaches the UA override
+  ✓ stealth UA: override is headless-gated, reads Browser.getVersion, sends metadata
+  ✓ stealth UA: headless_ua_rewrite / brand rewrite / GREASE list (pure)
+  ✓ stealth UA: FULL plugin item() coerces like WebIDL unsigned long (overflowTest)
+  ✓ stealth UA: FULL Worker wrapper resolves relative URLs and only patches webdriver===true
+  ✓ MCP: browser_mode tool registered
+  ✓ mode: STEALTH_JS_LIGHT is a self-contained IIFE (no FULL-only refs)
+  ✓ mode: stealth tier injection doesn't reference undefined symbols
+  ✓ mode: LIGHT is a strict subset of FULL (regression guard for the split)
+  ✓ close: cmd_close defined and dispatched with --force/--keep flags
+  ✓ close: tracks owned tab on go / new-tab / session-window / smart-click
+  ✓ close: closes ONLY owned tabs, leaves user tabs
+  ✓ close: when no user tabs remain -> Browser.close (graceful, never kill -9)
+  ✓ close: --keep never quits the browser; legacy cmd_stop preserved
+  ✓ close: MCP browser_close exposes force/keep_browser + maps to flags
+  ✓ close: owned-tab tracking persists to a per-profile JSON file
+  ✓ close: CLI smoke — `close` with no browser is a graceful no-op
+  ✓ close: CLI smoke — `stop --smart` with no browser is a graceful no-op
+  ✓ metadata: version is identical in package.json, cdpilot.py, server.json, marketplace.json, plugin.json and manifest.json
+  ✓ plugin marketplace: marketplace.json parses and has required fields
+  ✓ plugin marketplace: plugin.json name matches its marketplace entry name
+  ✓ plugin marketplace: cdpilot MCP server is declared via .mcp.json at the plugin root
+  ✓ plugin marketplace: skill exists and only documents commands the README already has
+  ✓ mcpb: manifest.json parses and has the required MCPB fields
+  ✓ mcpb: .mcpbignore exists so a build does not ship dev/demo files
+  ✓ mcpb: build script exists and npm run build:mcpb is wired to it
+  ✓ claims: README panel numbers are tied to a measurement file that backs them
+  ✓ launcher: a python killed by a signal is not reported as success
+  ✓ metadata: publish workflow can be re-run after npm succeeded
+  ✓ metadata: MCP Registry name matches between package.json and server.json
+  ✓ metadata: no file advertises a Python older than the 3.10 the code needs
+  ✓ metadata: launch drafts do not repeat the corrected 0.9.1 numbers
+  ✓ frames: >>> chain parser (nesting, quotes, brackets, escapes, empty segments = no chain)
+  ✓ frames: literal-fallback decision — a >>> whose first hop is no iframe stays the old selector
+  ✓ frames: --frame flag extraction and hop kinds (index / url= / auto for --frame, sel for >>>)
+  ✓ frames: rewrite sends Runtime/DOM into the frame and maps mouse x/y by the frame scale and offset
+  ✓ frames: a frame point maps through every hop with its scale (transform: scale, zoom), nested
+  ✓ frames (fake CDP): element and smart-* commands are frame-aware; search limits 20 frames / 2 s
+  ✓ frames (fake CDP): >>> and --frame reach same-process, nested and out-of-process frames
+  ✓ frames (fake CDP): "Next >>>", "Home >>> Products" run as written; failure adds the note line
+  ✓ frames (fake CDP): smart-click "Main >>> Settings" stays literal text (no frame lookup)
+  ✓ frames (fake CDP): a hop that wraps an iframe works, with one stderr note
+  ✓ frames (fake CDP): CDPILOT_WS_POOL=0 is restored after an exception, SystemExit and cancellation
+  ✓ frames (fake CDP): smart-* order — page real match, disabled-only, frames, then page weak match
+  ✓ frames (fake CDP): the chosen frame no longer matching at act time gives its not-found result
+  ✓ frames (fake CDP): smart-fill/select auto search enters same-origin frames only
+  ✓ frames (fake CDP): a slow frame call gets the remaining budget as its timeout
+  ✓ frames (fake CDP): a probe cut off by the budget acts nowhere; the page fallback is the one action
+  ✓ frames (fake CDP): a frame-call timeout keeps the pooled socket; a plain cdp_send timeout drops it
+  ✓ frames (fake CDP): plain cdp_send still reads a reply that lands just after its timeout
+  ✓ frames (fake CDP): no frame command sends Runtime.enable (main world via DOM.resolveNode)
+  ✓ frames (fake CDP): no usable main-world id: isolated world, one note line for every frame command
+  ✓ frames (fake CDP): click is one click; real mouse input with --entropy=on and in frames
+  ✓ frames (fake CDP): hit-test fails (banner over the iframe or the target): script click + one note, no mouse
+  ✓ frames (fake CDP): out-of-process frame: no press until a mouse move reached the target
+  ✓ frames (fake CDP): the hit-test is repeated with the release; a target that moved: note, no script click
+  ✓ frames (fake CDP): pointer-events: none on the target or its iframe is named so in the note
+  ✓ frames (fake CDP): hover/dblclick/rightclick go through cdpilot's input blocker, restored after an error
+  ✓ frames (fake CDP): --timeout while the blocker is open: the watchdog restores it before exiting
+  ✓ press hold (fake CDP): real clicks hold the button 40-120 ms (frames, OOPIF, --entropy=on, rightclick, bot clicks)
+  ✓ press hold (fake CDP): a release that misses (moved, replaced, page navigated): note, no script click, not "Clicked"
+  ✓ click outcome (fake CDP): release missed -> exit 3 ("moved"); target replaced / page left -> exit 0 ("gone")
+  ✓ click outcome (fake CDP): no reply to the release check is "unknown" (exit 3), not "gone"
+  ✓ click outcome (fake CDP): a target detached before the press is an error (exit 1), no press, no script click
+  ✓ click outcome (fake CDP): batch runs every step; exit 1 if one failed, else 3 if one was not clicked, else 0
+  ✓ click outcome (fake CDP): run goes on after every line; exit 1 if one failed, else 3 if one was not clicked, else 0
+  ✓ click outcome (fake CDP): MCP: exit 3 and "gone" are not errors; a JSON first line says clicked: false
+  ✓ click outcome: exit 3 is documented (help in src and bin, README, CHANGELOG)
+  ✓ x bot (fake CDP): _tw_click_sel clicks the box it found (the reply's result.value), held
+  ✓ press hold (fake CDP): dblclick is two held clicks, clickCount 1 then 2, 60-140 ms apart
+  ✓ press hold (fake CDP): cdpilot's input blocker is transparent around the whole held press, and only then
+  ✓ press hold (fake CDP): CDPILOT_PRESS_MS=0-0 restores the instant click (dblclick pause too)
+  ✓ press hold: CDPILOT_PRESS_MS min-max is validated; a bad value warns once and falls back to 40-120
+  ✓ press hold (fake CDP): --timeout fires mid-hold: the watchdog releases the button, then restores the blocker
+  ✓ press hold (fake CDP): a command cancelled mid-hold releases the button in finally (page coordinates)
+  ✓ input blocker: a blocker left transparent is made opaque again by the next command
+  ✓ frames (fake CDP): cdpilot's input blocker is transparent only around the click, restored after an error
+  ✓ frames (fake CDP): the settle wait runs in isolated worlds and is cut off after 0.3 s
+  ✓ frames (fake CDP): smart-click in a frame: the finder picks, the mouse clicks (hit-tested); page act unchanged
+  ✓ frames (fake CDP): CDPILOT_CDP_TRACE lists each CDP method sent, names only
+  ✓ frames (fake CDP): plain cdp_send sends the same wire messages and skips interleaved events
+  ✓ frames (fake CDP): frame list keeps its old output; --frame lists and evals inside the frame
+  ✓ frames: CLI rejects --frame without a value (exit 2, before any browser work)
+  ✓ frames: docs — README section, CHANGELOG [Unreleased], help text in src and bin
+  - skipped: frames e2e (set CDPILOT_E2E=1 to run it against a headless browser)
+  ✓ autolaunch: CDPILOT_NO_AUTOLAUNCH=1 keeps the exact old error and exit code
+  ✓ autolaunch: a failed launch prints the old error plus the reason, exits non-zero
+  ✓ launch: a browser binary that cannot start is named, with no traceback
+  ✓ autolaunch: never-launch commands are real dispatch names and cover lifecycle/status/servers
+  ✓ autolaunch: a never-launch command does not attempt a launch
+  ✓ autolaunch: go/debug/context no longer call cmd_launch directly (one gated path)
+  ✓ --timeout: parsed before/after the command, env fallback, flag wins, lookalikes kept
+  ✓ --timeout: the launcher skips a leading --timeout to find its own commands
+  ✓ --timeout: a malformed value exits 2 with a message
+  ✓ --timeout: a hung command exits 124 with the message (flag before the command)
+  ✓ --timeout: CDPILOT_TIMEOUT applies, and a flag after the command beats it
+  ✓ --timeout: expiry kills child processes, but not a released one (the launched browser)
+  ✓ open: routes to go (alias in __main__, not a separate command)
+  ✓ docs: README and CHANGELOG cover --timeout, CDPILOT_TIMEOUT, CDPILOT_NO_AUTOLAUNCH
+  ✓ idle close: CDPILOT_IDLE_CLOSE parsing (auto default 15, explicit default off, 0/off, fractions, bad value warns)
+  ✓ idle close: auto-launch gets a watcher; explicit launch only with env or --idle-close
+  ✓ idle close: page fingerprint (ids + urls, no titles) and change detection are pure
+  ✓ idle close: a normal command touches the activity stamp, read-only checks do not
+  ✓ idle close: decision function (now, last activity, minutes) -> close?
+  ✓ idle close: the watcher only ever closes the browser cdpilot launched
+  ✓ idle close: watcher is spawned detached on POSIX and Windows, std streams not inherited
+  ✓ idle close: wired into launch, dispatcher, mcp and serve
+  ✓ idle close: status (node) and health (python) show "idle close in Xm" / "idle close off"
+  ✓ idle close: README and CHANGELOG document CDPILOT_IDLE_CLOSE
+  ✓ log redaction: fill/type/smart-fill/smart-select/assert-value/dialog values
+  ✓ log redaction: password/token/key flags, header values, cookie values
+  ✓ log redaction: eval source kept, long string literals cut, secret literals replaced
+  ✓ log redaction: URL query/fragment/userinfo masking; plain commands untouched
+  ✓ log redaction: output text — echoed values (even cut off), run echo lines, bearer/JWT, key=value
+  ✓ log: one command writes exactly one JSON line with the expected fields; output unchanged
+  ✓ log: the logged exit code is the process exit code on every local Python
+  ✓ output: UTF-8 on Windows pipes; MCP child and server agree on UTF-8
+  ✓ log: exit codes and output are identical with logging on and off
+  ✓ log: CDPILOT_LOG=0 writes nothing
+  ✓ log: an unwritable log dir never changes the exit code (one stderr warning)
+  ✓ log: `log --json` round-trips the file; table/--md/--path; reading adds nothing
+  ✓ log: retention deletes day files older than CDPILOT_LOG_DAYS on the first write of a day
+  ✓ log: a command killed by --timeout still writes its line (exit 124)
+  ✓ log: MCP lists browser_log; a tool call is logged once (via mcp:<tool>), browser_log reads it
+  ✓ log: wired into dispatch, never auto-launches, documented (README, CHANGELOG, help)
+  ✓ connect: _parse_devtools_active_port parses valid 2-line content
+  ✓ connect: _parse_devtools_active_port rejects single-line content
+  ✓ connect: _parse_devtools_active_port rejects port out of range
+  ✓ connect: remote address exits 2
+  ✓ connect: [::1] is rejected with exit 2 (the old allow-list entry could never match)
+  ✓ connect: stop on external registry leaves the browser running and keeps the entry
+  ✓ connect: disconnect is the only command that forgets the external entry
+  ✓ connect: autolaunch refuses when external browser is registered but gone
+  ✓ external guard: gone connected browser → `content` exits 1, never launches
+  ✓ external guard: gone connected browser → `go https://example.com/` exits 1, never launches
+  ✓ external guard: gone connected browser → `tabs` exits 1, never launches
+  ✓ external guard: gone connected browser → `new-tab` exits 1, never launches
+  ✓ external guard: gone connected browser → `launch` exits 1, never launches
+  ✓ external guard: `projects` and a port allocation keep a gone external entry
+  ✓ external guard: `close` leaves a connected browser alive, sends no close
+  ✓ external guard: `close --force` leaves a connected browser alive, sends no close
+  ✓ external guard: `stop` leaves a connected browser alive, sends no close
+  ✓ external guard: `stop --smart` leaves a connected browser alive, sends no close
+  ✓ external guard: `stop --smart --force` leaves a connected browser alive, sends no close
+  ✓ external guard: `project-stop ext-proj` leaves a connected browser alive, sends no close
+  ✓ external guard: `stop-all` leaves a connected browser alive, sends no close
+  ✓ external guard: `session-close` leaves a connected browser alive, sends no close
+  ✓ external guard: `tabs --reap --all` leaves a connected browser alive, sends no close
+  ✓ external guard: `close-tab` leaves a connected browser alive, sends no close
+  ✓ external guard: `wipe` is refused on a connected browser (cookies, storage, tabs)
+  ✓ external guard: `cookies load` is refused on a connected browser unless --allow-external
+  ✓ external guard: `cookies cf-replay` is refused on a connected browser unless --allow-external
+  ✓ external guard: MCP browser_close {force:true} leaves a connected browser alive
+  ✓ external guard: idle watcher, serve teardown and the stop helpers never close a connected browser
+  ✓ external guard: harness control — a cdpilot-owned entry DOES get Browser.close
+  ✓ external guard: no stealth/glow/input blocker into a connected browser (mode.json stealth, MCP)
+  ✓ external guard: connect refuses over a live cdpilot-launched browser (no orphan)
+  ✓ external guard: page commands open a tab of their own, never touch the user's tab
+  ✓ ownership: stale entry (dead pid, no GUID (older entry)) + a foreign browser on the port → stop/close send nothing, connect replaces it
+  ✓ ownership: stale entry (dead pid, GUID of an old browser) + a foreign browser on the port → stop/close send nothing, connect replaces it
+  ✓ ownership: stale entry (live pid that does not hold the port) + a foreign browser on the port → stop/close send nothing, connect replaces it
+  ✓ ownership: a browser cdpilot launched (GUID recorded) still stops: Browser.close, then its pid
+  ✓ ownership: a GUID mismatch is not proof even with the recorded pid alive (no signal)
+  ✓ ownership: launch records the browser GUID in the registry
+  ✓ ownership + bot-auth: no signal to a signer next to a browser without proof; proven or gone → signer ended
+    (cryptography missing for the CLI interpreter: launch part not exercised)
+  ✓ ownership + bot-auth: launch --bot-auth attaches no signer to a browser without proof
+  ✓ connect: clicks and presses in a connected browser touch no input blocker (nothing but the click)
+  ✓ connect: a session made before connect (CDP_PORT at that browser) is not reused after it
+  ✓ connect: close / session-close / idle cleanup close only the tabs cdpilot opened (inactive window), never a user tab
+  ✓ new-tab: PUT /json/new (Chrome refuses GET) on a cdpilot browser
+  ✓ disconnect: stops this project's watch daemon
+  ✓ registry: concurrent registrations lose nothing (file lock), external flag kept
+  ✓ connect: --auto finds DevToolsActivePort via CDPILOT_BROWSER_SEARCH_ROOT
+  ✓ connect --auto: skips stale files (dead port, other GUID) and connects to the live one
+  ✓ connect --auto: chrome://inspect ws-only endpoint → unsupported message, exit 2
+  ✓ connect --auto: no WebSocket probe at all once a live browser is found
+  ✓ connect --auto: finds the README setup, --user-data-dir="$HOME/cdpilot-chrome"
+  ✓ external guard: tripwire — Browser.close / kill / tab-close call sites are all known
+  ✓ connect: wired into dispatch, documented (CHANGELOG, help, python __doc__)
+  ✓ connect: README and CHANGELOG say what the code does
+  - skipped: connect e2e (set CDPILOT_E2E=1)
+  ✓ webmcp: tools list calls getTools() in an isolated world and reports title/annotations/frame/form
+  ✓ webmcp: tools call runs executeTool(tool, input, {signal}) in an isolated world
+  ✓ webmcp: tools call aborts the execution signal when its time budget ends (exit 124)
+  ✓ webmcp: with --timeout the tool is aborted at the deadline and the watchdog lets that be reported
+  ✓ webmcp: a page that wraps getTools/executeTool cannot add tools, change results or see the calls
+  ✓ webmcp: without a usable isolated world it falls back to the main world with one note
+  ✓ webmcp: one tool name in two frames: ambiguous without --frame, --frame picks one
+  ✓ webmcp: bad args and unknown tools never reach executeTool (exit 1)
+  ✓ webmcp: tools list with no usable tools exits 0 and says why
+  ✓ webmcp: argument validator (required, type with bool != integer, enum, const, unions, nested)
+  ✓ webmcp: diagnosis names the cause (flag off, insecure, old browser, legacy API, policy)
+  ✓ webmcp: mode persists in webmcp.json, CDPILOT_WEBMCP overrides, launch merges --enable-features
+  ✓ webmcp: session log redacts secret-named fields in tools call args and in results
+  ✓ webmcp: MCP tools/list is 45 tools with WebMCP off (43 + browser_connect/browser_disconnect), 47 with it on
+  ✓ webmcp: launch --webmcp saves the mode for later processes; status shows it only while on
+  ✓ webmcp: `tools` is in Available commands; help documents tools list/call and --webmcp
+  - skipped: webmcp e2e (set CDPILOT_E2E=1 to run it against a headless browser)
+  ✓ bot auth signature base generation matches RFC 9421 test vector
+  ✓ bot-auth: signature bases of draft-05 A.2 (legacy A.2.3 too), Cloudflare v2 and directory vectors
+  - skipped: bot-auth vector signatures (cryptography not installed)
+  ✓ bot-auth: RFC 7638 JWK thumbprint (RFC 8037 A.3, vector key) and RFC 9421 @authority
+  ✓ bot-auth helper: flat auto-attach; Fetch (Request stage) before the paused target runs
+  ✓ bot-auth helper: requestPaused -> continueRequest carries Signature, Signature-Input, Signature-Agent
+  ✓ bot-auth helper: data:/blob:/chrome-extension: and a signing error continue unsigned; one log line
+  - skipped: bot-auth real-signature helper test (cryptography not installed)
+  ✓ bot-auth: navigate sends no stealth script or UA override while the signer runs
+  ✓ bot-auth: stealth conflict is one warning line; the session log masks signatures
+  ✓ bot-auth: signer state is trusted only for this port's signer and browser; stale = dropped + warning
+  ✓ bot-auth: stop never signals a reused pid (live sleep survives), ends a real signer, clears state
+  ✓ bot-auth: spawn lock — holder SIGKILLed, three concurrent launches -> exactly one signer
+  ✓ bot-auth: health has no bot_auth key while bot-auth is unused (same keys as before), one once set up
+  ✗ bot-auth: idle close counts CDP clients other than the signer (socket owners per OS)
+    a connected client is seen
+
+false !== true
+
+  ✓ bot-auth: status prints a bot-auth line only when bot-auth is set up (default output unchanged)
+  ✓ bot-auth without cryptography: init/status/directory/launch --bot-auth -> install hint, exit 2
+  ✓ bot-auth without cryptography: other commands are unaffected
+  - skipped: bot-auth init/directory/status CLI test (cryptography not installed)
+  ✓ bot-auth docs: README section, bin help, __doc__, CHANGELOG [Unreleased]
+  - skipped: bot-auth e2e (set CDPILOT_E2E=1 to run it against a headless browser)
+  ✓ cft: install downloads the platform zip, verifies size + md5, extracts, records (mac/linux/win)
+  ✓ cft: a second install of the same version downloads nothing
+  ✓ cft: browser status shows it; `browser chrome-for-testing` selects it
+  ✓ cft: --channel beta, --version <full>, --version <milestone> resolve from the right endpoint
+  ✓ cft: bad arguments and unknown versions fail cleanly, install nothing
+  ✓ cft: refuses md5 mismatch, truncated body, no Content-Length, non-zip, zip-slip and escaping symlinks
+  ✓ cft: dev extensions + branded Chrome + CfT installed -> CfT, one stderr line; otherwise unchanged
+  ✓ cft: bin/cdpilot.js's CHROME_BIN guess is re-resolved; a user's CHROME_BIN is not
+  ✓ cft: ext-install suggests the install (Vivaldi/Brave as fallback) and never downloads by itself
+  ✓ cft: path classification (ours, .app, Puppeteer layout, branded Chrome, Chromium)
+  ✓ cft: help, README and CHANGELOG describe it (extension development, not stealth)
+  - skipped: chrome-for-testing e2e (set CDPILOT_E2E=1 to download CfT and load a real extension)
+  ✓ examples: every examples/*/run.sh exists and passes sh -n, and README commands exist in dispatch table
+  ✓ examples: README output is the real transcript, with no machine paths or bogus warnings
+  ✓ mcp profile: CDPILOT_MCP_TOOLS=core lists the 10 core tools plus browser_tools
+  ✓ mcp profile: --tools flag beats the env var
+  ✓ mcp profile: default stays all 45 tools, no browser_tools, no listChanged
+  ✓ mcp profile: a comma list picks exactly those tools
+  ✓ mcp profile: browser_tools enable adds a tool and sends list_changed
+  ✓ mcp profile: calling a tool outside the profile returns the enable hint
+
+  564 passed, 1 failed
+
