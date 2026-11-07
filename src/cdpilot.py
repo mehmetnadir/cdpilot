@@ -2553,17 +2553,23 @@ def _bot_auth_warn_if_stale(port=None, version=_BOT_AUTH_UNSET):
     return False
 
 
-def _cdp_client_pids(port):
+def _cdp_client_pids(port, _run=None):
     """Pids holding a TCP connection TO the CDP port (clients: a cdpilot
     command, `watch`, Playwright, the signer), or None when it cannot be
-    told. Per OS the tool that answers fast: `netstat -anv` on macOS (lsof
-    there scans every process and took >30 s), `ss -tnp` on Linux (lsof as a
-    fallback), `netstat -ano` on Windows."""
+    told. Per OS the tool that answers fast: `netstat -anv` on macOS with a
+    fallback to port-scoped `lsof` (on macOS 26 `netstat -anv` can exit 0
+    with empty stdout under unprivileged parent interpreters; unscoped lsof
+    scanned every process and took >30 s, but port-scoped lsof answers in
+    ~0.1-0.3 s), `ss -tnp` on Linux (lsof as a fallback), `netstat -ano` on
+    Windows."""
     port = int(port)
 
-    def run(argv):
+    def _default_run(argv):
         r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
-        return r.stdout if r.returncode == 0 else None
+        ok = (0, 1) if (argv and argv[0] == "lsof") else (0,)
+        return r.stdout if r.returncode in ok else None
+
+    run = _run or _default_run
 
     try:
         if os.name == "nt":
@@ -2571,36 +2577,43 @@ def _cdp_client_pids(port):
             return None if out is None else _cdp_client_pids_netstat(out, port)
         if sys.platform == "darwin":
             out = run(["netstat", "-anv", "-p", "tcp"])
-            return None if out is None else _cdp_client_pids_bsd_netstat(out, port)
+            res = None if out is None else _cdp_client_pids_bsd_netstat(out, port)
+            if res is not None:
+                return res
+            out = run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:ESTABLISHED", "-F", "pn"])
+            return None if out is None else _cdp_client_pids_lsof(out, port)
         try:
             out = run(["ss", "-tnp"])
             if out is not None:
                 return _cdp_client_pids_ss(out, port)
         except OSError:
             pass
-        r = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:ESTABLISHED", "-F", "pn"],
-                           capture_output=True, text=True, timeout=5)
-        if r.returncode not in (0, 1):  # lsof exits 1 when nothing matches
-            return None
-        return _cdp_client_pids_lsof(r.stdout, port)
+        out = run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:ESTABLISHED", "-F", "pn"])
+        return None if out is None else _cdp_client_pids_lsof(out, port)
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
 
 def _cdp_client_pids_bsd_netstat(text, port):
     """Client pids from macOS `netstat -anv -p tcp`: foreign address
-    `<ip>.<port>`, the owner in the `process:pid` column."""
+    `<ip>.<port>`, the owner in the `process:pid` column. An empty or
+    header-only table returns None (unknown), not an empty set."""
     pids = set()
+    has_rows = False
     for line in (text or "").splitlines():
         parts = line.split()
-        if len(parts) < 6 or not parts[0].startswith("tcp") or parts[5] != "ESTABLISHED":
+        if not parts:
+            continue
+        if parts[0].lower().startswith("tcp"):
+            has_rows = True
+        if len(parts) < 6 or not parts[0].lower().startswith("tcp") or parts[5] != "ESTABLISHED":
             continue
         if parts[4].rsplit(".", 1)[-1] != str(port):
             continue
         m = _re.search(r"\S:(\d+)(?=\s|$)", " ".join(parts[6:]))
         if m and int(m.group(1)) > 0:
             pids.add(int(m.group(1)))
-    return pids
+    return pids if has_rows else None
 
 
 def _cdp_client_pids_ss(text, port):

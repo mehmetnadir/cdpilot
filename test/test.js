@@ -8471,6 +8471,78 @@ print("ok")
     }
   });
 
+  test('bot-auth: socket owner parsing and darwin lsof fallback (_cdp_client_pids)', () => {
+    const script = `
+import sys
+sys.path.insert(0, "./src")
+from cdpilot import _cdp_client_pids_bsd_netstat, _cdp_client_pids
+
+# (a) _cdp_client_pids_bsd_netstat("", 58600) is None and a header-only table is None
+assert _cdp_client_pids_bsd_netstat("", 58600) is None, "empty string must be None"
+header_only = "Proto Recv-Q Send-Q  Local Address  Foreign Address  (state)  rxbytes txbytes rhiwat shiwat process:pid state options\\n"
+assert _cdp_client_pids_bsd_netstat(header_only, 58600) is None, "header-only table must be None"
+
+# (b) a table with rows on other ports only -> empty set
+other_ports = (
+    "Proto Recv-Q Send-Q  Local Address  Foreign Address  (state)  rxbytes txbytes rhiwat shiwat process:pid state options\\n"
+    "tcp4 0 0 127.0.0.1.52000 127.0.0.1.80 ESTABLISHED 0 0 1 1 Chrome:202 00002 0\\n"
+)
+assert _cdp_client_pids_bsd_netstat(other_ports, 58600) == set(), "other ports only must return empty set"
+
+# (c) darwin path with injected runner
+if sys.platform != "darwin":
+    print("skipped")
+    sys.exit(0)
+
+calls = []
+lsof_out = "p4242\\nf5\\nn127.0.0.1:52000->127.0.0.1:58600\\n"
+
+def runner_fallback(argv):
+    calls.append(argv[0])
+    if argv[0] == "netstat":
+        return ""
+    if argv[0] == "lsof":
+        return lsof_out
+    return None
+
+res = _cdp_client_pids(58600, _run=runner_fallback)
+assert res == {4242}, f"expected {{4242}}, got {res}"
+assert calls == ["netstat", "lsof"], f"expected ['netstat', 'lsof'], got {calls}"
+
+calls.clear()
+def runner_other(argv):
+    calls.append(argv[0])
+    if argv[0] == "netstat":
+        return other_ports
+    if argv[0] == "lsof":
+        return lsof_out
+    return None
+
+res2 = _cdp_client_pids(58600, _run=runner_other)
+assert res2 == set(), f"expected set(), got {res2}"
+assert calls == ["netstat"], f"expected ['netstat'], got {calls}"
+
+calls.clear()
+def runner_both_none(argv):
+    calls.append(argv[0])
+    return None
+
+res3 = _cdp_client_pids(58600, _run=runner_both_none)
+assert res3 is None, f"expected None, got {res3}"
+assert calls == ["netstat", "lsof"], f"expected ['netstat', 'lsof'], got {calls}"
+
+print("ok")
+`;
+    const r = spawnSync(PYB, ['-c', script], { encoding: 'utf-8', timeout: 20000,
+      cwd: path.join(__dirname, '..'), env: { ...process.env, CDPILOT_LOG: '0' } });
+    assert.strictEqual(r.status, 0, (r.stdout || '') + (r.stderr || ''));
+    if (r.stdout.trim() === 'skipped') {
+      console.log('  - note: darwin socket-owner fallback test skipped on non-darwin');
+    } else {
+      assert.strictEqual(r.stdout.trim(), 'ok');
+    }
+  });
+
   test('bot-auth: status prints a bot-auth line only when bot-auth is set up (default output unchanged)', () => {
     // A stand-in CDP endpoint (a node child serving /json/version) on a free
     // port in 58680-58699: the child tries them in turn and prints the one it got.
