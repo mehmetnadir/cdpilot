@@ -61,3 +61,9 @@ Hepsi `src/cdpilot.py`'ye dokunur; çatışma olursa küçük olur (ayrı fonksi
 2. srv21 `state/claude-oauth-token` (0 bayt, 28.09'dan beri): drafter'ın Claude kolu ve 3 bot işi `exit=1`.
 3. Show HN / Reddit çapraz paylaşım: Nadir'in hesabı gerekli.
 4. T2 tam güvenlik denetimi (16 ajan, ~45 dk) ne zaman: ilk 1.0 öncesi mi, şimdi mi?
+
+## 5. Delta 08.11 02:35 (oturum kapanması sonrası)
+- Restart olmadı; 06.11 oturumu kapanınca shadow/flow/har 12. dk kesildi (agy "interrupted"). 08.11 02:26 CONTINUE kipinde yeniden başladı (agy-filo 20261108-0226*).
+- Şerit 6 kök neden ölçüldü: macOS 26 + Homebrew Python 3.15 altında `netstat -anv -p tcp` rc 0, 0 satır; `/usr/bin/python3` altında 256 satır; `lsof -nP -iTCP:<port>` her ikisinde çalışır. Spec `serit-botauth.json`, koşu 20261108-023008.
+- Vaat düzeltmeleri commit: README 755d60f (7 madde), site a25cee1 (3 madde, deploy onay bekler). Test: 564 geçti, 1 bilinen arıza.
+- X: 07.11 bricks paylaşımı ConnectTimeout ile düştü → 08.11 14:07 kuyruğa alındı. Kredi org 1: 135 $/190 $ (07.11).
