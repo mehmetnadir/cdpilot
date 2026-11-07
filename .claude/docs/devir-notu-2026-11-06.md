@@ -67,3 +67,7 @@ Hepsi `src/cdpilot.py`'ye dokunur; çatışma olursa küçük olur (ayrı fonksi
 - Şerit 6 kök neden ölçüldü: macOS 26 + Homebrew Python 3.15 altında `netstat -anv -p tcp` rc 0, 0 satır; `/usr/bin/python3` altında 256 satır; `lsof -nP -iTCP:<port>` her ikisinde çalışır. Spec `serit-botauth.json`, koşu 20261108-023008.
 - Vaat düzeltmeleri commit: README 755d60f (7 madde), site a25cee1 (3 madde, deploy onay bekler). Test: 564 geçti, 1 bilinen arıza.
 - X: 07.11 bricks paylaşımı ConnectTimeout ile düştü → 08.11 14:07 kuyruğa alındı. Kredi org 1: 135 $/190 $ (07.11).
+- 02:40 bot-auth şeridi main'e girdi (35e1e3c); 566/0.
+- 02:41 HAR 1. tur incelendi, 5 bulgu düzeltme turu (`har-duzelt.prompt.txt`, koşu 20261108-024115, 589 sn) → 2. tur incelendi, temiz; şef ek: URL gizli parametre + userinfo maskesi `_slog_mask_url` ile (`request.url`, `queryString`, `redirectURL`), 1 saf test. Paket koşuyor (`cdpilot-har/.lane-test.out`).
+- 02:51 flow (#5) 1. tur incelendi: 9 bulgu (`flow-duzelt.prompt.txt`, koşu 20261108-025110, 60 dk). Başlıca: sırlar `active.json`'a düz metin yazılıyordu (maske yalnız `record stop`'ta) → maske kanca anına taşınır; regex kopyaları; `--save` sırası; replay hata çıktısında sır; e2e asenkron.
+- shadow (#3) CONTINUE koşusu sürüyor (657 satır + 2 fixture, `.lane-test.out` 02:53).
