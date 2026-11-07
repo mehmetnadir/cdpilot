@@ -41,3 +41,7 @@ src/lib/
 # Local editor / agent-tool state
 .vscode/
 .antigravitycli/
+
+# local agent worktrees (Claude Agent tool, isolation: worktree) and lane test outputs
+.claude/worktrees/
+.lane-test*.out
