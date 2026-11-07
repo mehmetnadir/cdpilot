@@ -28,14 +28,14 @@ No config files. No boilerplate. Just `npx` and go.
 AI agents and developers need browser control that **just works**:
 
 - **Zero config** — `npx cdpilot launch` starts an isolated browser session
-- **Zero dependency** — No Puppeteer, no Playwright, no Selenium. Pure CDP over HTTP
+- **Zero npm dependencies** — No Puppeteer, no Playwright, no Selenium. Pure CDP over HTTP/WebSocket; the Python side needs one package, `websockets` (the setup wizard installs it)
 - **70+ commands** — Navigate, click, type, screenshot, network, console, accessibility, video understanding, progressive anti-bot resilience, and more
 - **AI-agent friendly** — Designed for Claude, GPT, Gemini, and any LLM tool-use workflow
 - **Isolated sessions** — Your personal browser stays untouched. cdpilot runs in its own profile
 - **Visual feedback** — Green glow overlay, cursor visualization, click ripples, and keystroke display keep you informed during automation
 - **Multi-project isolation** — Each project gets its own browser instance and port automatically, no conflicts
 - **AI control warning** — Red toast notification appears when you hover during active automation
-- **Privacy-first** — Everything runs locally. No data leaves your machine
+- **Privacy-first** — Everything runs locally; nothing leaves your machine unless you opt in (CAPTCHA solver keys, `tls-check`, proxies)
 
 ### Browser Selection (Workload-Aware Auto-Pick)
 
@@ -1239,9 +1239,9 @@ print(result.stdout)
 | v0.6.0 | + captcha solver + cookies-auto (regression) | 15 / 80 | 18.75% |
 | **v0.8.0** | **Full — cookies safe-host scoped + per-task wipe (no proxy, no TLS fork)** | **29 / 80** | **36.25%** |
 | v0.7.0 (slot) | + named proxy pools | _depends on user proxy_ | — |
-| v0.8.0 (slot) | + TLS-aware launcher (camoufox/undetected-chrome) | _depends on browser choice_ | — |
+| v0.8.0 (slot) | TLS-aware launcher — withdrawn: camoufox / undetected-chrome do not speak CDP (CHANGELOG 0.8.0) | — | — |
 
-**What cdpilot does not do:** `cdpilot` is an avoidance engine, not a CAPTCHA solver. We prioritize structural stealth (JS fingerprinting, behavioral entropy) to prevent challenges from appearing. When a CAPTCHA blocks progress and cannot be bypassed, the task fails — that is the honest definition of our success rate. PerimeterX (2/18), GeeTest (0/4) and Akamai (1/6) are known weaknesses; v0.7+ (residential proxy) and v0.8+ (TLS fingerprint correction via camoufox) target these directly.
+**What cdpilot does not do:** `cdpilot` is an avoidance engine first; the solver plugins above (`cdpilot captcha`, bring your own key, off by default) are a fallback, not the strategy. We prioritize structural stealth (JS fingerprinting, behavioral entropy) to prevent challenges from appearing. When a CAPTCHA blocks progress and cannot be avoided, the task fails — that is the honest definition of our success rate. PerimeterX (2/18), GeeTest (0/4) and Akamai (1/6) are known weaknesses; named proxy pools (v0.7) help where the block is IP-based, while TLS-level fingerprinting cannot be fixed from inside a CDP-driven browser and remains open.
 
 ## Recommended Configuration
 
@@ -1280,7 +1280,7 @@ Future paid offerings:
 - **No arbitrary file access** — MCP screenshot filenames are sanitized and restricted to the screenshots directory. Path traversal is blocked.
 - **Safe CSS selectors** — All selectors passed to `querySelector` are JSON-escaped to prevent injection.
 - **No network exposure** — CDP listens on `127.0.0.1` only. Remote connections are not possible by default.
-- **No dependencies** — Zero npm/Python runtime dependencies means zero supply-chain attack surface.
+- **One dependency** — zero npm packages; the Python side needs only `websockets`. A one-package supply chain is small enough to audit.
 
 Found a vulnerability? Please email the maintainer directly instead of opening a public issue.
 
@@ -1318,13 +1318,13 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] **10 built-in test assertions** — assert, assert-url, assert-title, assert-count, assert-value, assert-attr, assert-visible/hidden, wait-for, check (batch), screenshot-diff
 - [x] **`test` runner + `trace` viewer** — `cdpilot test [--watch]` runs `*.cdpt.js` files; `cdpilot trace open <run>` opens a time-travel trace viewer for a run
 - [x] **Accessibility tree snapshot** (`a11y-snapshot`) — structured text with @ref handles the agent can act on directly, no vision model needed; 1.4–42× smaller than the page's raw HTML on the four pages we measured (2026-09-27). Not always cheaper than a screenshot: link-heavy pages produce more text than a small screenshot costs
-- [x] **Token-efficient screenshots** — element-level crop (13x smaller), JPEG quality control, format selection
+- [x] **Token-efficient screenshots** — element-level crop, JPEG quality control, format selection
 - [x] **Vision fallback** (`describe`) — a11y + screenshot + text in one call
 - [x] **Annotated screenshots** — @N badge overlays on interactive elements
 - [x] **Auto-wait** — MutationObserver-based, 5s automatic element waiting
 - [x] **`wait-for-text`** — adaptive text-based waiting (subtree + characterData) for streaming AI responses, async toasts, and selector-less synchronization
 - [x] **`eval-batch`** — run N JS expressions in 1 CDP roundtrip (5-30x speedup vs sequential `eval`)
-- [x] **`block`** — request blocking via `Network.setBlockedURLs` with built-in presets (images/fonts/ads/media), 3-10x faster page loads on opt-in
+- [x] **`block`** — request blocking via `Network.setBlockedURLs` with built-in presets (images/fonts/ads/media); fewer bytes and faster loads on opt-in (measure on your own pages)
 - [x] **`dismiss`** — heuristic auto-click for LLM chat sign-up walls (EN+TR pattern library, destructive-action guards)
 - [x] **`adaptive`** — auto-escalate to stealth on CAPTCHA-protected hosts, persistent per-host memory ("run fast, climb walls")
 - [x] **`cookies save/load`** — export/import cookies as JSON (replay CF/DataDome clearance across runs)
