@@ -7,6 +7,9 @@ All notable changes to cdpilot will be documented in this file.
 ### Added
 - **MCP tool profiles: `cdpilot mcp --tools core|all|a,b,c` (env `CDPILOT_MCP_TOOLS`, the flag wins).** `core` lists 10 tools plus `browser_tools`, which lists the other tools (name and description) or enables some and sends `notifications/tools/list_changed`. A call to a tool outside the profile returns "tool not enabled; call browser_tools enable". `tools/list` schema: 5,769 tokens (45 tools) down to 1,342 (11 tools). Default `all` is unchanged; WebMCP tools are unaffected.
 
+### Fixed
+- **Web Bot Auth idle close counts CDP clients reliably on macOS 26.** `netstat -anv -p tcp` under unprivileged parent interpreters on macOS 26 exits 0 with empty stdout; an empty or header-only netstat table is now treated as unknown rather than "no clients", falling back to port-scoped `lsof -nP -iTCP:<port> -sTCP:ESTABLISHED -F pn` (~0.1-0.3 s). Idle close no longer closes a shared browser under concurrent clients when verbose netstat is withheld.
+
 ## [0.9.4] - 2026-09-29
 
 ### Added
