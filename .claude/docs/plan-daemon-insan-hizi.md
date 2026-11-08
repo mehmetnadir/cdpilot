@@ -201,10 +201,25 @@ araç çağrısı yalnız CDP işidir. Kalan kazanç Python tarafında (`go` iç
 | # | İş | Beklenen | Kapı |
 |---|---|---|---|
 | 0 | ✅ Sabit 300 ms uyku → 100 ms olay sessizliği (tavan 300) | −200 ms statik sayfada | ölçüldü §5.1 |
-| 1 | `navigate_collect` daemon'da `_WS_POOL` oturumunu kullansın (`_ws_lock` altında olay döngüsü); taze süreçte bugünkü yol | −(WS açılışı + 4 enable) ≈ 50–150 ms | aynı çıktı; e2e CI yeşil |
+| 1 | ⏸ ERTELENDİ (08.11 18:00, ölçümle; gerekçe §6.1) — `navigate_collect` daemon'da `_WS_POOL` oturumunu kullansın (`_ws_lock` altında olay döngüsü); taze süreçte bugünkü yol | −(WS açılışı + 4 enable) ≈ 50–150 ms | aynı çıktı; e2e CI yeşil |
 | 2 | Stealth/UA/blokaj kaydı havuzlu oturumda kalıcı → "stealth go oturumuna bağlı" sınırı kalkar | davranış iyileşmesi | sannysoft e2e |
 | 3 | Olay hijyeni: navigasyon bitince `Network.disable`, `Log.disable`; `Page`/`Runtime` açık kalır | §3.1 riski kapanır | boşta 10 dk → sonraki `go` yeniden bağlanmıyor |
 | 4 | ✅ Yük sonrası 4 evaluate (host, friction, friction içindeki captcha, captcha) tek `Runtime.evaluate` (`POST_NAV_PROBE_JS`, `_post_nav_probe`) | −3 tur; ölçüm (yük 11–17): sıcak `go` 229–236 ms, önce 230–242 → yerelde fark gürültü içinde (havuzlu WS'te tur 1–3 ms); kazanç uzak/yavaş CDP'de ve ağır sayfada (3 ayrı detector çalışması yerine 1) | sahte CDP testi: yükten sonra yalnız sayfa okuma + 1 sonda; süreç içi test: parçalar eksikse tekil sondaya düşüş |
 | 5 | Düşük yükte yeniden ölçüm (yük <10), tabloyu güncelle | — | `go` ≤150 ya da sınırın adı konur (node 110 + navigasyon) |
 
 node açılışının 110 ms'si ayrı iş: kabuk/C ince istemci (`cdpilot` ikilisi) ya da `node --snapshot-blob`; ölçülmeden söz verilmez.
+
+### 6.1 D2 #1 kararı: havuzlu `go` oturumu ertelendi (08.11 18:00)
+
+Oturum-bağlı durum envanteri (`navigate_collect`, kendi WS'inde): `Page/Network/Runtime/Log.enable` · stealth betiği
+(`Page.addScriptToEvaluateOnNewDocument`, kademeye bağlı; dış tarayıcı ve bot-auth'ta yok) · başsız UA düzeltmesi
+(`apply_headless_ua_override`, aynı oturum) · `Network.setBlockedURLs` (desenler). `cdp_send` havuzlu sokette istenmeyen
+olayları zaten yok sayar (yalnız bekleyen id'leri eşler); yani havuzlu oturum teknik olarak kurulabilir: betik kimliği +
+(kademe, desen) imzası tutulur, kademe değişince eski betik kaldırılır, navigasyon sonrası `Network/Log.disable`.
+
+Ama kazanç yok denecek kadar az: sıcak `go` ≈ 230 ms = node ~125 (bu makinede) + sessizlik penceresi 100 + Python/CDP ≤ 15.
+WS açılışı + 4 enable + betik kaydı yerelde ≤ 15 ms. Kalan kaldıraç **sessizlik penceresi**dir (100 ms): yüklemeden sonra
+bekleyen istek yoksa (`Network.requestWillBeSent` − `loadingFinished/Failed` = 0) pencere 30 ms'ye inebilir (−70 ms);
+SPA'da yük sonrası DOM değişimini kaçırma riski ölçülmeden karar verilmez (bekleyen iş: SPA settle ölçümü — 3 SPA
+sayfasında `innerText` uzunluğunun yük sonrası zaman eğrisi). Nadir kararı: pencere sabit kalsın mı, "bekleyen istek yok"
+kısayolu mu?
