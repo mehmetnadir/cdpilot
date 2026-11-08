@@ -561,3 +561,81 @@ def test_crisis_keeps_telegram_as_last_resort(monkeypatch):
                         "run", lambda args, **k: calls.append(args))
     cc._telegram_send("kriz")
     assert calls and "telegram_bridge.py" in str(calls[0][1])
+
+
+# ── 5. poster: a connect failure keeps a tweet queued; a read timeout does not ──
+
+class _ConnectTimeout(Exception):
+    """Named like httpx's: the poster classifies by class name."""
+
+
+_ConnectTimeout.__name__ = "ConnectTimeout"
+
+
+class _ReadTimeout(Exception):
+    pass
+
+
+_ReadTimeout.__name__ = "ReadTimeout"
+
+
+def _instant_sleep(monkeypatch, pt):
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(pt.asyncio, "sleep", lambda *_a, **_k: real_sleep(0))
+
+
+def test_connect_failure_retries_once_then_keeps_tweet_queued(monkeypatch, tmp_path, no_telegram,
+                                                              _no_real_push):
+    """07.11 + 08.11 14:09: the bricks tweet died twice on a 5 s ConnectTimeout while
+    the egress was fine minutes later. Nothing was sent, so the item is retried once
+    in-cycle and then kept in the queue for a later cycle, not moved to failed/."""
+    pt, client = _poster(monkeypatch, tmp_path)
+    _instant_sleep(monkeypatch, pt)
+    calls = []
+
+    async def _dead(*a, **k):
+        calls.append(1)
+        raise _ConnectTimeout("")
+    client.create_tweet = _dead
+    before = int(time.time())
+    _q(pt, id="t-conn", kind="tweet", text="unique bricks text", approved_at=before)
+    asyncio.run(pt.main_async())
+    assert len(calls) == 2, "one in-cycle retry"
+    assert not (pt.FAILED_DIR / "t-conn.json").exists()
+    kept = json.loads((pt.QUEUE_DIR / "t-conn.json").read_text())
+    assert kept["status"] == "pending" and kept["connect_failures"] == 1
+    assert kept["scheduled_time"] >= before + pt.CONNECT_RETRY_DELAY - 1
+    assert kept["error"] == "ConnectTimeout('')"
+    p = _no_real_push.payloads[-1]
+    assert "kuyrukta tutuldu" in p["title"] and p["topic"] == "cdpilot-x"
+
+
+def test_connect_failures_exhaust_into_failed(monkeypatch, tmp_path, no_telegram, _no_real_push):
+    pt, client = _poster(monkeypatch, tmp_path)
+    _instant_sleep(monkeypatch, pt)
+
+    async def _dead(*a, **k):
+        raise _ConnectTimeout("")
+    client.create_tweet = _dead
+    _q(pt, id="t-gone", kind="tweet", text="still unique text", approved_at=int(time.time()),
+       connect_failures=pt.CONNECT_RETRY_MAX)
+    asyncio.run(pt.main_async())
+    assert (pt.FAILED_DIR / "t-gone.json").exists()
+    assert not (pt.QUEUE_DIR / "t-gone.json").exists()
+    assert _no_real_push.payloads[-1]["topic"] == "bekci"
+
+
+def test_read_timeout_on_tweet_is_not_retried(monkeypatch, tmp_path, no_telegram, _no_real_push):
+    """The request may have reached X: no second create_tweet, failed/ as before."""
+    pt, client = _poster(monkeypatch, tmp_path)
+    _instant_sleep(monkeypatch, pt)
+    calls = []
+
+    async def _slow(*a, **k):
+        calls.append(1)
+        raise _ReadTimeout("")
+    client.create_tweet = _slow
+    _q(pt, id="t-read", kind="tweet", text="another unique text", approved_at=int(time.time()))
+    asyncio.run(pt.main_async())
+    assert len(calls) == 1
+    assert (pt.FAILED_DIR / "t-read.json").exists()

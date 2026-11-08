@@ -451,6 +451,17 @@ def _duplicate_of(text: str) -> str | None:
 
 # X/httpx timeout classes stringify to '' — str(e) alone loses the cause.
 IDEMPOTENT_KINDS = {"like", "retweet", "rt", "bookmark", "follow"}
+# A connect failure (httpx/httpcore ConnectTimeout, ConnectError) means the TCP/TLS
+# connection never came up: the request was not sent, nothing can have landed on
+# X, so it is safe to try again for every kind. 07.11 and 08.11, 14:09: the same
+# tweet died twice on a 5 s ConnectTimeout while the egress was fine minutes
+# later. Such an item is kept in the queue for a later cycle, this many times.
+CONNECT_RETRY_MAX = 3
+CONNECT_RETRY_DELAY = 600  # seconds before the poster looks at it again
+
+
+def _is_connect_failure(e: BaseException) -> bool:
+    return type(e).__name__ in ("ConnectTimeout", "ConnectError")
 
 
 def _err_str(e: BaseException) -> str:
@@ -464,14 +475,18 @@ def _is_transient(e: BaseException) -> bool:
     return "Timeout" in name or "Connect" in name
 
 
-async def _with_transient_retry(kind: str, item: dict, call):
+async def _with_transient_retry(kind: str, item: dict, call, *, connect_only: bool = False):
     """srv21's egress to X drops connections at random; a ConnectTimeout is not
-    a rejection. Only idempotent actions retry — re-sending a tweet/reply after
-    a timeout could duplicate a post that actually landed server-side."""
+    a rejection. Idempotent actions retry any transient error. With
+    `connect_only` (tweet/reply/quote) only a connect failure is retried: the
+    connection never came up, so nothing was sent. A ReadTimeout there may mean
+    'posted, response lost', and re-sending could duplicate the post."""
     try:
         return await call()
     except Exception as first:
         if not _is_transient(first):
+            raise
+        if connect_only and not _is_connect_failure(first):
             raise
         _log(f"  ↻ transient {type(first).__name__} on {kind} {item.get('id')} — retrying in 15s")
         await asyncio.sleep(15)
@@ -639,7 +654,11 @@ async def main_async() -> None:
                     kind, item, lambda: _process_one(client, item)
                 )
             else:
-                result = await _process_one(client, item)
+                # tweet/reply/quote: a connect failure (nothing sent) is retried
+                # once in-cycle; a ReadTimeout is not (see _with_transient_retry).
+                result = await _with_transient_retry(
+                    kind, item, lambda: _process_one(client, item), connect_only=True
+                )
             if result.get("ok"):
                 item["status"] = "posted"
                 item["posted_at"] = int(time.time())
@@ -722,6 +741,23 @@ async def main_async() -> None:
                     f"{item['id']}: {_err_str(e)[:200]}",
                     _notify.status_url(item["posted_ids"][0], _notify.HANDLE),
                     priority="yuksek", tags=["warning"], alarm=True,
+                )
+                continue
+            tries = int(item.get("connect_failures") or 0)
+            if _is_connect_failure(e) and tries < CONNECT_RETRY_MAX:
+                # Nothing reached X: keep the item queued for a later cycle
+                # instead of letting it die in failed/ (bricks, 07.11 + 08.11).
+                item["connect_failures"] = tries + 1
+                item["error"] = _err_str(e)
+                item["scheduled_time"] = int(time.time()) + CONNECT_RETRY_DELAY
+                p.write_text(json.dumps(item, ensure_ascii=False, indent=2))
+                _log(f"↻ connect failure on {item['id']} ({tries + 1}/{CONNECT_RETRY_MAX}): "
+                     f"kept in queue, next try in {CONNECT_RETRY_DELAY // 60} min")
+                _phone_notify(
+                    "Bağlantı hatası, kuyrukta tutuldu",
+                    f"{item['id']} ({kind}): {_err_str(e)[:120]} — deneme "
+                    f"{tries + 1}/{CONNECT_RETRY_MAX}, {CONNECT_RETRY_DELAY // 60} dk sonra yeniden",
+                    _target_url(item), tags=["x"],
                 )
                 continue
             item["status"] = "failed"

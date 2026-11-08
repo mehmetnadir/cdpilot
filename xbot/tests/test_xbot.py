@@ -735,6 +735,46 @@ def test_poster_does_not_retry_non_idempotent_kinds(tmp_path, monkeypatch):
     assert "quote" not in pt.IDEMPOTENT_KINDS
 
 
+def test_poster_connect_only_retry_distinguishes_connect_from_read(tmp_path, monkeypatch):
+    """tweet/reply/quote: a ConnectTimeout (nothing sent) is retried once; a
+    ReadTimeout (the request may have landed) is not."""
+    import asyncio
+    pt = _import_poster(tmp_path, monkeypatch)
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(pt.asyncio, "sleep", lambda *_a, **_k: real_sleep(0))
+
+    class ConnectTimeout(Exception):
+        pass
+
+    class ReadTimeout(Exception):
+        pass
+
+    assert pt._is_connect_failure(ConnectTimeout(""))
+    assert not pt._is_connect_failure(ReadTimeout(""))
+    assert pt._is_transient(ReadTimeout(""))
+
+    calls = []
+
+    async def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectTimeout("")
+        return {"ok": True}
+
+    res = asyncio.run(pt._with_transient_retry("tweet", {"id": "x"}, flaky, connect_only=True))
+    assert res["ok"] is True and len(calls) == 2
+
+    reads = []
+
+    async def slow():
+        reads.append(1)
+        raise ReadTimeout("")
+
+    with pytest.raises(ReadTimeout):
+        asyncio.run(pt._with_transient_retry("tweet", {"id": "x"}, slow, connect_only=True))
+    assert len(reads) == 1
+
+
 def test_poster_blocks_duplicate_text(tmp_path, monkeypatch):
     """2026-08-28: a dead claude CLI put the identical fallback sentence under
     14 different tweets over 5 days — four of them the same account."""
