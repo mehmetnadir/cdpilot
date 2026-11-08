@@ -3735,12 +3735,15 @@ print(json.dumps([_frame_selector_hops(t) for t in json.load(sys.stdin)]))
   });
 
   test('frames: literal-fallback decision — a >>> whose first hop is no iframe stays the old selector', () => {
-    const src = 'import re as _re\n' + pyFuncs(['_split_frame_chain', '_frame_selector_hops', '_parse_frame_hop',
-      '_frame_hop_is_selector', '_frame_chain_candidate', '_frame_selector_plan']) + `
+    const src = 'import re as _re\nclass _FrameError(Exception): pass\n' + pyFuncs([
+      '_frame_fallback_note', '_shadow_closed_error', '_split_frame_chain',
+      '_frame_selector_hops', '_parse_frame_hop', '_frame_hop_is_selector',
+      '_frame_chain_candidate', '_frame_selector_plan'
+    ]) + `
 import json, sys
 print(json.dumps([_frame_selector_plan(*c) for c in json.load(sys.stdin)]))
 `;
-    const note = (hop) => `note: '${hop}' matched no iframe; used the selector as written`;
+    const note = (hop) => `note: '${hop}' matched no iframe or shadow host; used the selector as written`;
     const cases = [
       [['Next >>>', false], [[], 'Next >>>', null]],
       [['Next >>>', true], [[], 'Next >>>', null]],
@@ -3766,6 +3769,74 @@ print(json.dumps([_frame_selector_plan(*c) for c in json.load(sys.stdin)]))
     ];
     const got = pyCases(src, cases);
     cases.forEach((c, i) => assert.deepStrictEqual(got[i], c[1], `plan ${JSON.stringify(c[0])}`));
+  });
+
+  test('shadow: pure hop classification (_classify_hop)', () => {
+    const src = pyFuncs(['_classify_hop']) + `
+import json, sys
+print(json.dumps([_classify_hop(c) for c in json.load(sys.stdin)]))
+`;
+    const cases = [
+      [null, 'none'],
+      [{}, 'none'],
+      [{ found: false }, 'none'],
+      [{ found: true, tag: 'div', id: 'foo' }, 'none'],
+      [{ frameId: 'F1' }, 'frame'],
+      [{ shadowRoots: [{ shadowRootType: 'open' }] }, 'shadow_open'],
+      [{ shadowRoots: [{ shadowRootType: 'closed' }] }, 'shadow_closed'],
+      [{ shadowRoots: [{ shadowRootType: 'user-agent' }] }, 'none'],
+      // If both frame and shadow are present, frame takes precedence
+      [{ frameId: 'F1', shadowRoots: [{ shadowRootType: 'open' }] }, 'frame'],
+      // Closed root takes precedence over open in multiple roots
+      [{ shadowRoots: [{ shadowRootType: 'open' }, { shadowRootType: 'closed' }] }, 'shadow_closed'],
+    ];
+    const got = pyCases(src, cases.map((c) => [c[0]]));
+    cases.forEach((c, i) => assert.strictEqual(got[i], c[1], `classify ${JSON.stringify(c[0])}`));
+  });
+
+  test('shadow: >>> chain plan with open and closed shadow roots (_frame_selector_plan)', () => {
+    const src = 'import re as _re\nclass _FrameError(Exception): pass\n' + pyFuncs([
+      '_frame_fallback_note', '_shadow_closed_error', '_split_frame_chain',
+      '_frame_selector_hops', '_parse_frame_hop', '_frame_hop_is_selector',
+      '_frame_chain_candidate', '_frame_selector_plan'
+    ]) + `
+import json, sys
+res = []
+for c in json.load(sys.stdin):
+    try:
+        res.append(['ok', _frame_selector_plan(*c)])
+    except _FrameError as e:
+        res.append(['error', str(e)])
+print(json.dumps(res))
+`;
+    const cases = [
+      [['my-card >>> button', 'shadow_open'], ['ok', [[], 'my-card >>> button', null]]],
+      [['my-app >>> my-panel >>> input', 'shadow_open'], ['ok', [[], 'my-app >>> my-panel >>> input', null]]],
+      [['my-card >>> button', 'shadow_closed'], ['error', "'my-card' has a closed shadow root; cdpilot cannot reach inside it"]],
+      [['closed-host >>> .btn', 'closed'], ['error', "'closed-host' has a closed shadow root; cdpilot cannot reach inside it"]],
+      [['my-card >>> button', 'none'], ['ok', [[], 'my-card >>> button', "note: 'my-card' matched no iframe or shadow host; used the selector as written"]]],
+    ];
+    const got = pyCases(src, cases.map((c) => [c[0]]));
+    cases.forEach((c, i) => assert.deepStrictEqual(got[i], c[1], `plan shadow ${JSON.stringify(c[0])}`));
+  });
+
+  test('shadow: note wording pure functions', () => {
+    const src = pyFuncs(['_frame_fallback_note', '_shadow_closed_error', '_shadow_deep_fallback_note']) + `
+import json, sys
+args = json.load(sys.stdin)
+print(json.dumps([
+  _frame_fallback_note(args[0]),
+  _shadow_closed_error(args[1]),
+  _shadow_deep_fallback_note(args[2][0], args[2][1]),
+]))
+`;
+    const got = JSON.parse(execFileSync(PYB, ['-c', src], {
+      input: JSON.stringify(['foo', 'bar', ['#btn', 'my-card#c1']]),
+      encoding: 'utf-8'
+    }).trim());
+    assert.strictEqual(got[0], "note: 'foo' matched no iframe or shadow host; used the selector as written");
+    assert.strictEqual(got[1], "'bar' has a closed shadow root; cdpilot cannot reach inside it");
+    assert.strictEqual(got[2], "note: '#btn' found inside the shadow root of my-card#c1");
   });
 
   test('frames: --frame flag extraction and hop kinds (index / url= / auto for --frame, sel for >>>)', () => {
@@ -3921,7 +3992,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.strictEqual(r.home.stderr + r.page_of.stderr, '', 'no note when the literal selector works');
     assert.deepStrictEqual(r.fail_nope.res, ['exit', 1], 'exit code of the command itself');
     assert.strictEqual(r.fail_nope.stderr, "Error: selector '#nope >>> #x' not resolved.\n"
-      + "note: '#nope' matched no iframe; used the selector as written\n");
+      + "note: '#nope' matched no iframe or shadow host; used the selector as written\n");
     assert.deepStrictEqual(r.fail_plain.res, ['exit', 1]);
     assert(!/note:/.test(r.fail_plain.stderr), 'no note when no frame was looked for');
     assert(r.seen.every((s) => !s.routed), 'literal strings never run inside a frame');
@@ -4615,7 +4686,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
     const section = (readme.split('### Element targeting inside iframes')[1] || '').split('\n### ')[0];
     assert(section, 'README needs the element-targeting section');
-    for (const s of ['iframe#card >>> input[name=cardnumber]', '--frame', 'matched no iframe; used the selector as written',
+    for (const s of ['iframe#card >>> input[name=cardnumber]', '--frame', 'matched no iframe or shadow host; used the selector as written',
       "page's own origin", 'frame search stopped after 2s', 'is not an iframe; using the iframe inside it']) {
       assert(section.includes(s), `README iframe section must mention ${s}`);
     }
@@ -4728,7 +4799,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       ok(c('eval', 'document.body.dataset.log'), /next;/, 'the page button was clicked');
       const r = c('click', '#nope >>> #x');
       assert.strictEqual(r.status, 1, `exit ${r.status}`);
-      assert(r.stderr.includes("note: '#nope' matched no iframe; used the selector as written"), r.stderr);
+      assert(r.stderr.includes("note: '#nope' matched no iframe or shadow host; used the selector as written"), r.stderr);
     });
 
     test('frames e2e: smart-click "Main >>> Settings" is page text; a wrapper hop works with a note', () => {
@@ -5070,6 +5141,55 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       const r = cShow('eval', "getComputedStyle(document.getElementById('cdpilot-input-blocker')).pointerEvents");
       assert.strictEqual(r.stdout.trim(), 'auto', `during the next command: ${r.stdout}${r.stderr}`);
       assert.strictEqual(c('eval', 'document.body.dataset.blocker').stdout.trim(), 'added;pe:auto;removed;');
+    });
+
+    test('frames e2e: shadow DOM (open, nested, in iframe, closed root, deep fallback)', () => {
+      const { c, p1 } = needE2E();
+      c('go', `http://127.0.0.1:${p1}/shadow.html`);
+
+      // 1. click "my-card >>> button" clicks the inner button
+      const r1 = c('click', 'my-card >>> button');
+      assert.strictEqual(r1.status, 0, `click "my-card >>> button": ${r1.stdout}${r1.stderr}`);
+      const log1 = c('eval', 'document.body.dataset.log').stdout.trim();
+      assert(log1.includes('card-btn-clicked'), `expected card-btn-clicked in ${log1}`);
+
+      // Reset log
+      c('eval', 'document.body.dataset.log = ""');
+
+      // 2. plain click ".inner" finds it and prints the note
+      const r2 = c('click', '.inner');
+      assert.strictEqual(r2.status, 0, `plain click ".inner": ${r2.stdout}${r2.stderr}`);
+      assert(r2.stderr.includes("note: '.inner' found inside the shadow root of my-card#card1"),
+        `stderr should contain fallback note, got: ${r2.stderr}`);
+      const log2 = c('eval', 'document.body.dataset.log').stdout.trim();
+      assert(log2.includes('card-btn-clicked'), `expected card-btn-clicked via deep fallback in ${log2}`);
+
+      // 3. nested shadow root: my-app >>> my-panel >>> button
+      c('eval', 'document.body.dataset.log = ""');
+      const r3 = c('click', 'my-app >>> my-panel >>> button');
+      assert.strictEqual(r3.status, 0, `nested click: ${r3.stdout}${r3.stderr}`);
+      const log3 = c('eval', 'document.body.dataset.log').stdout.trim();
+      assert(log3.includes('nested-btn-clicked'), `expected nested-btn-clicked in ${log3}`);
+
+      // 4. host inside an iframe: iframe#frame1 >>> my-card >>> button.inner
+      const r4 = c('click', 'iframe#frame1 >>> my-card >>> button.inner');
+      assert.strictEqual(r4.status, 0, `iframe shadow click: ${r4.stdout}${r4.stderr}`);
+
+      // 5. existing iframe chain still works: iframe#frame1 >>> button#iframe-plain-btn
+      const r5 = c('click', 'iframe#frame1 >>> button#iframe-plain-btn');
+      assert.strictEqual(r5.status, 0, `iframe plain click: ${r5.stdout}${r5.stderr}`);
+
+      // 6. closed root gives the closed error
+      const r6 = c('click', 'my-closed >>> button');
+      assert.strictEqual(r6.status, 1, `exit code should be 1 for closed root, got ${r6.status}`);
+      assert(r6.stderr.includes("'my-closed' has a closed shadow root; cdpilot cannot reach inside it"),
+        `stderr should contain closed error, got: ${r6.stderr}`);
+
+      // 7. wait-for finds late-appearing element in shadow root
+      const r7 = c('wait-for', '#late-btn', '3000');
+      assert.strictEqual(r7.status, 0, `wait-for late-btn: ${r7.stdout}${r7.stderr}`);
+      assert(r7.stderr.includes("note: '#late-btn' found inside the shadow root of my-card#card1"),
+        `stderr should contain fallback note, got: ${r7.stderr}`);
     });
 
     test('frames e2e: no command above sent Runtime.enable (CDPILOT_CDP_TRACE)', () => {
