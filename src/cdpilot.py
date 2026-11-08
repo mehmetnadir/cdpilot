@@ -94,7 +94,7 @@ Exit codes: 0 ok, 1 error (batch / run: a step failed), 124 --timeout;
   "Pressed (the page replaced or left it ...)" and exits 0.
 """
 
-__version__ = "0.9.4"
+__version__ = "0.9.5"
 
 import asyncio
 import atexit
