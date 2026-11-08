@@ -10091,6 +10091,528 @@ print(json.dumps({"har1": har1, "har2": har2, "har3": har3}))
   });
 })();
 
+// ─── Record & Replay (issue #5) ───
+
+(function() {
+  const { execFileSync, spawnSync } = require('child_process');
+  const os = require('os');
+  const http = require('http');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+
+  function makeIsolatedEnv(home) {
+    return {
+      ...process.env,
+      CDPILOT_HOME: home,
+      CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDPILOT_LOG: '0',
+      CDPILOT_NO_AUTOLAUNCH: '1',
+      CDP_PORT: '19230',
+    };
+  }
+
+  function runCli(args, env) {
+    const r = spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf-8', timeout: 15000 });
+    return {
+      status: r.status,
+      stdout: r.stdout || '',
+      stderr: r.stderr || '',
+    };
+  }
+
+  test('record: start/status/stop/cancel lifecycle', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-life-'));
+    const env = makeIsolatedEnv(home);
+
+    // Status with no recording
+    let r = runCli(['record', 'status'], env);
+    assert.strictEqual(r.status, 0);
+    assert(r.stdout.includes('No recording active'));
+
+    // Start
+    r = runCli(['record', 'start', '--name', 'flow-alpha'], env);
+    assert.strictEqual(r.status, 0);
+    assert(r.stdout.includes('Recording started: flow-alpha'));
+
+    // Status with active recording
+    r = runCli(['record', 'status'], env);
+    assert.strictEqual(r.status, 0);
+    assert(r.stdout.includes('Recording active: flow-alpha'));
+
+    // Cancel
+    r = runCli(['record', 'cancel'], env);
+    assert.strictEqual(r.status, 0);
+    assert(r.stdout.includes('Recording cancelled: flow-alpha'));
+
+    // Status after cancel
+    r = runCli(['record', 'status'], env);
+    assert.strictEqual(r.status, 0);
+    assert(r.stdout.includes('No recording active'));
+
+    // Start again and stop without --save (prints JSON to stdout)
+    r = runCli(['record', 'start', '--name', 'flow-beta'], env);
+    assert.strictEqual(r.status, 0);
+
+    // Record a browser-free step
+    r = runCli(['block', 'on'], env);
+    assert.strictEqual(r.status, 0);
+
+    r = runCli(['record', 'stop'], env);
+    assert.strictEqual(r.status, 0);
+    const flow = JSON.parse(r.stdout);
+    assert.strictEqual(flow.cdpilot_flow, 1);
+    assert.strictEqual(flow.name, 'flow-beta');
+    assert.strictEqual(flow.steps.length, 1);
+    assert.strictEqual(flow.steps[0].cmd, 'block');
+    assert.deepStrictEqual(flow.steps[0].args, ['on']);
+
+    // Status after stop
+    r = runCli(['record', 'status'], env);
+    assert.strictEqual(r.status, 0);
+    assert(r.stdout.includes('No recording active'));
+  });
+
+  test('record: second start is refused with exit 1 naming active recording', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-start2-'));
+    const env = makeIsolatedEnv(home);
+
+    let r = runCli(['record', 'start', '--name', 'my-active-rec'], env);
+    assert.strictEqual(r.status, 0);
+
+    r = runCli(['record', 'start', '--name', 'second-rec'], env);
+    assert.strictEqual(r.status, 1);
+    assert(r.stderr.includes('my-active-rec'), `stderr should name active recording: ${r.stderr}`);
+  });
+
+  test('record: failed steps are dropped at record stop and reported', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-fail-'));
+    const env = makeIsolatedEnv(home);
+
+    let r = runCli(['record', 'start', '--name', 'drop-test'], env);
+    assert.strictEqual(r.status, 0);
+
+    // Successful step
+    r = runCli(['entropy', 'on'], env);
+    assert.strictEqual(r.status, 0);
+
+    // Failed step (invalid argument exits 1)
+    r = runCli(['entropy', 'invalid-argument-xyz'], env);
+    assert.strictEqual(r.status, 1);
+
+    // Stop recording
+    r = runCli(['record', 'stop'], env);
+    assert.strictEqual(r.status, 0);
+    assert(/dropped 1 failed steps?/.test(r.stderr), `stderr must report dropped failed step: ${r.stderr}`);
+
+    const flow = JSON.parse(r.stdout);
+    assert.strictEqual(flow.steps.length, 1);
+    assert.strictEqual(flow.steps[0].cmd, 'entropy');
+    assert.deepStrictEqual(flow.steps[0].args, ['on']);
+  });
+
+  test('record: --save writes the flow file shape', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-save-'));
+    const env = makeIsolatedEnv(home);
+    const savePath = path.join(home, 'saved-flow.json');
+
+    runCli(['record', 'start', '--name', 'saved-flow'], env);
+    runCli(['block', 'on'], env);
+    runCli(['entropy', 'on'], env);
+
+    // Bad save path: a parent component is an existing regular file, write must fail
+    const badFile = path.join(home, 'a-file.txt');
+    fs.writeFileSync(badFile, 'cannot be a directory');
+    const badSavePath = path.join(badFile, 'x.json');
+    let r = runCli(['record', 'stop', '--save', badSavePath], env);
+    assert.strictEqual(r.status, 1);
+    assert(r.stderr.includes(`cdpilot: could not write ${badSavePath}`));
+
+    // Assert recording is still active after failed write
+    let st = runCli(['record', 'status'], env);
+    assert.strictEqual(st.status, 0);
+    assert(st.stdout.includes('Recording active: saved-flow'));
+
+    r = runCli(['record', 'stop', '--save', savePath], env);
+    assert.strictEqual(r.status, 0);
+    assert(fs.existsSync(savePath), 'flow file must exist');
+
+    const flow = JSON.parse(fs.readFileSync(savePath, 'utf-8'));
+    assert.strictEqual(flow.cdpilot_flow, 1);
+    assert.strictEqual(flow.name, 'saved-flow');
+    assert(typeof flow.recorded_at === 'string');
+    assert.strictEqual(flow.cdpilot_version, require('../package.json').version);
+    assert(Array.isArray(flow.steps));
+    assert.strictEqual(flow.steps.length, 2);
+    assert.strictEqual(flow.steps[0].cmd, 'block');
+    assert.deepStrictEqual(flow.steps[0].args, ['on']);
+    assert.strictEqual(typeof flow.steps[0].t_ms, 'number');
+    assert.strictEqual(flow.steps[1].cmd, 'entropy');
+    assert.deepStrictEqual(flow.steps[1].args, ['on']);
+    assert.strictEqual(typeof flow.steps[1].t_ms, 'number');
+    assert(typeof flow.vars === 'object');
+  });
+
+  test('record: secrets never reach disk in active.json', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-nodisk-'));
+    const script = `
+import json, os, sys, io, contextlib, importlib.util
+
+os.environ["CDPILOT_HOME"] = ${JSON.stringify(tmpHome)}
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+with contextlib.redirect_stdout(io.StringIO()):
+    m.cmd_record_start()
+m._record_hook_step("fill", ["#password", "hunter2"], 0)
+m._record_hook_step("fill", ["#email", "a@b.c"], 0)
+
+active_path = m._record_active_path()
+with open(active_path, "r", encoding="utf-8") as f:
+    raw_text = f.read()
+state = json.loads(raw_text)
+
+print(json.dumps({
+    "raw_text": raw_text,
+    "state": state,
+}))
+`;
+    const res = JSON.parse(execFileSync(PYB, ['-c', script], {
+      encoding: 'utf-8', timeout: 10000,
+    }).trim());
+
+    assert(!res.raw_text.includes('hunter2'), 'raw active.json must never contain secret hunter2');
+    assert.deepStrictEqual(res.state.steps[0].args, ['#password', '{{password}}']);
+    assert.deepStrictEqual(res.state.vars.password, { step: 1, hint: 'fill #password' });
+    assert.deepStrictEqual(res.state.steps[1].args, ['#email', 'a@b.c']);
+  });
+
+  test('record & replay: placeholders — fill "#password" hunter2 -> {{password}} + vars entry, fill "#email" a@b.c kept verbatim', () => {
+    const script = `
+import json, sys, importlib.util
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+cases = json.load(sys.stdin)
+res = []
+vars_dict = {}
+for idx, (cmd, args) in enumerate(cases, 1):
+    new_args, vars_dict = m._record_detect_placeholders(cmd, args, step_num=idx, vars_dict=vars_dict)
+    res.append({"args": new_args, "vars": dict(vars_dict)})
+print(json.dumps(res))
+`;
+    const inputCases = [
+      ['fill', ['#password', 'hunter2']],
+      ['fill', ['#email', 'a@b.c']],
+    ];
+    const out = JSON.parse(execFileSync(PYB, ['-c', script], {
+      input: JSON.stringify(inputCases), encoding: 'utf-8', timeout: 10000,
+    }).trim());
+    // Case 1: #password -> {{password}} and vars entry
+    assert.deepStrictEqual(out[0].args, ['#password', '{{password}}']);
+    assert.deepStrictEqual(out[0].vars.password, { step: 1, hint: 'fill #password' });
+    // Case 2: #email -> kept verbatim and no new vars entry
+    assert.deepStrictEqual(out[1].args, ['#email', 'a@b.c']);
+    assert.strictEqual(out[1].vars.email, undefined);
+  });
+
+  test('replay: --dry-run prints substitutions and never prints secret value', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-dry-'));
+    const env = makeIsolatedEnv(home);
+    const flowPath = path.join(home, 'secret-flow.json');
+
+    const secretFlow = {
+      cdpilot_flow: 1,
+      name: 'secret-test',
+      recorded_at: new Date().toISOString(),
+      cdpilot_version: '0.9.4',
+      steps: [
+        { cmd: 'block', args: ['on'], t_ms: 10 },
+        { cmd: 'block', args: ['{{password}}'], t_ms: 50 },
+      ],
+      vars: {
+        password: { step: 2, hint: 'fill #password' },
+      },
+    };
+    fs.writeFileSync(flowPath, JSON.stringify(secretFlow, null, 2));
+
+    const r = runCli(['replay', flowPath, '--var', 'password=hunter2_super_secret_value', '--dry-run'], env);
+    assert.strictEqual(r.status, 0);
+    assert(!r.stdout.includes('hunter2_super_secret_value'), 'dry-run stdout must never contain secret value');
+    assert(!r.stderr.includes('hunter2_super_secret_value'), 'dry-run stderr must never contain secret value');
+    assert(r.stdout.includes('{{password}}'), 'dry-run must print placeholder {{password}}');
+    assert(r.stdout.includes('[1/2] block on'));
+    assert(r.stdout.includes('[2/2] block {{password}}'));
+  });
+
+  test('replay: missing var exits 2 before any step', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-missing-'));
+    const env = makeIsolatedEnv(home);
+    const flowPath = path.join(home, 'var-req-flow.json');
+
+    const varFlow = {
+      cdpilot_flow: 1,
+      name: 'missing-var-test',
+      recorded_at: new Date().toISOString(),
+      cdpilot_version: '0.9.4',
+      steps: [
+        { cmd: 'block', args: ['{{auth_token}}'], t_ms: 10 },
+      ],
+      vars: {
+        auth_token: { step: 1, hint: 'smart-fill auth_token' },
+      },
+    };
+    fs.writeFileSync(flowPath, JSON.stringify(varFlow, null, 2));
+
+    const r = runCli(['replay', flowPath], env);
+    assert.strictEqual(r.status, 2);
+    assert(r.stderr.includes('missing required variable(s): auth_token'));
+  });
+
+  test('replay: runs browser-free steps and reports per-step status', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-run-'));
+    const env = makeIsolatedEnv(home);
+    const flowPath = path.join(home, 'run-flow.json');
+
+    const runFlow = {
+      cdpilot_flow: 1,
+      name: 'run-test',
+      recorded_at: new Date().toISOString(),
+      cdpilot_version: '0.9.4',
+      steps: [
+        { cmd: 'block', args: ['on'], t_ms: 10 },
+        { cmd: 'entropy', args: ['on'], t_ms: 20 },
+      ],
+      vars: {},
+    };
+    fs.writeFileSync(flowPath, JSON.stringify(runFlow, null, 2));
+
+    const r = runCli(['replay', flowPath, '--delay', 'none'], env);
+    assert.strictEqual(r.status, 0);
+    assert(/\[1\/2\] block on \.\.\. ok \d+\.\d+s/.test(r.stdout), `stdout must report step 1 status: ${r.stdout}`);
+    assert(/\[2\/2\] entropy on \.\.\. ok \d+\.\d+s/.test(r.stdout), `stdout must report step 2 status: ${r.stdout}`);
+  });
+
+  test('replay: --delay none runs without sleeping', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-delay-'));
+    const env = makeIsolatedEnv(home);
+    const flowPath = path.join(home, 'delay-flow.json');
+
+    // Recorded with a 6-second gap
+    const delayFlow = {
+      cdpilot_flow: 1,
+      name: 'delay-test',
+      recorded_at: new Date().toISOString(),
+      cdpilot_version: '0.9.4',
+      steps: [
+        { cmd: 'block', args: ['on'], t_ms: 0 },
+        { cmd: 'entropy', args: ['on'], t_ms: 6000 },
+      ],
+      vars: {},
+    };
+    fs.writeFileSync(flowPath, JSON.stringify(delayFlow, null, 2));
+
+    const t0 = Date.now();
+    const r = runCli(['replay', flowPath, '--delay', 'none'], env);
+    const elapsed = Date.now() - t0;
+
+    assert.strictEqual(r.status, 0);
+    assert(elapsed < 3000, `--delay none should run without sleeping (took ${elapsed}ms, expected < 3000ms)`);
+  });
+
+  test('record: unknown option exits 2, no subcommand exits 2', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-opt-'));
+    const env = makeIsolatedEnv(home);
+
+    // No subcommand
+    let r = runCli(['record'], env);
+    assert.strictEqual(r.status, 2);
+    assert(r.stderr.includes('Usage: cdpilot record <subcommand>'));
+
+    // Unknown option in record start
+    r = runCli(['record', 'start', '--invalid-opt'], env);
+    assert.strictEqual(r.status, 2);
+    assert(r.stderr.includes('cdpilot: unknown record option: --invalid-opt'));
+
+    // Unknown option in record stop
+    r = runCli(['record', 'stop', '--invalid-opt'], env);
+    assert.strictEqual(r.status, 2);
+    assert(r.stderr.includes('cdpilot: unknown record option: --invalid-opt'));
+  });
+
+  test('replay: invalid flow file shape or bad version exits 2', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-inv-'));
+    const env = makeIsolatedEnv(home);
+
+    // Non-existent file
+    let r = runCli(['replay', path.join(home, 'nonexistent.json')], env);
+    assert.strictEqual(r.status, 2);
+    assert(r.stderr.includes('file not found'));
+
+    // Bad JSON
+    const badJsonPath = path.join(home, 'bad.json');
+    fs.writeFileSync(badJsonPath, 'not json at all');
+    r = runCli(['replay', badJsonPath], env);
+    assert.strictEqual(r.status, 2);
+    assert(r.stderr.includes('invalid JSON'));
+
+    // Bad version
+    const badVerPath = path.join(home, 'bad-ver.json');
+    fs.writeFileSync(badVerPath, JSON.stringify({ cdpilot_flow: 999, steps: [] }));
+    r = runCli(['replay', badVerPath], env);
+    assert.strictEqual(r.status, 2);
+    assert(r.stderr.includes('unknown or missing flow version'));
+
+    // Bad --var format
+    const validFlowPath = path.join(home, 'valid.json');
+    fs.writeFileSync(validFlowPath, JSON.stringify({ cdpilot_flow: 1, steps: [] }));
+    r = runCli(['replay', validFlowPath, '--var', 'invalid_no_equal'], env);
+    assert.strictEqual(r.status, 2);
+    assert(r.stderr.includes('invalid --var format'));
+
+    // Malformed step (cmd empty or not a string, args not list of str)
+    const malformedPath = path.join(home, 'malformed-step.json');
+    fs.writeFileSync(malformedPath, JSON.stringify({
+      cdpilot_flow: 1,
+      steps: [{ cmd: '', args: [] }],
+    }));
+    r = runCli(['replay', malformedPath], env);
+    assert.strictEqual(r.status, 2);
+    assert(r.stderr.includes('cdpilot: invalid flow file: step 1 malformed'));
+
+    fs.writeFileSync(malformedPath, JSON.stringify({
+      cdpilot_flow: 1,
+      steps: [{ cmd: 'block', args: [123] }],
+    }));
+    r = runCli(['replay', malformedPath], env);
+    assert.strictEqual(r.status, 2);
+    assert(r.stderr.includes('cdpilot: invalid flow file: step 1 malformed'));
+  });
+
+  test('replay: failed step replaces substituted secrets in error output', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-sececho-'));
+    const env = makeIsolatedEnv(home);
+    const flowPath = path.join(home, 'secret-echo-flow.json');
+
+    const secretFlow = {
+      cdpilot_flow: 1,
+      name: 'secret-echo-test',
+      recorded_at: new Date().toISOString(),
+      cdpilot_version: '0.9.4',
+      steps: [
+        { cmd: 'record', args: ['{{secret}}'], t_ms: 0 },
+      ],
+      vars: {
+        secret: { step: 1, hint: 'x' },
+      },
+    };
+    fs.writeFileSync(flowPath, JSON.stringify(secretFlow, null, 2));
+
+    const r = runCli(['replay', flowPath, '--var', 'secret=zzz-super-secret', '--delay', 'none'], env);
+    assert.strictEqual(r.status, 1);
+    assert(r.stdout.includes('[1/1] record {{secret}} ... failed (1)'));
+    assert(!r.stdout.includes('zzz-super-secret'), 'stdout must never contain zzz-super-secret');
+    assert(!r.stderr.includes('zzz-super-secret'), 'stderr must never contain zzz-super-secret');
+    assert(r.stderr.includes('{{secret}}'), 'stderr must contain placeholder {{secret}}');
+  });
+
+  test('replay: failing step stops execution unless --continue', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-fail-'));
+    const env = makeIsolatedEnv(home);
+    const flowPath = path.join(home, 'fail-flow.json');
+
+    const failFlow = {
+      cdpilot_flow: 1,
+      name: 'fail-test',
+      recorded_at: new Date().toISOString(),
+      cdpilot_version: '0.9.4',
+      steps: [
+        { cmd: 'entropy', args: ['invalid-xyz'], t_ms: 0 },
+        { cmd: 'block', args: ['on'], t_ms: 10 },
+      ],
+      vars: {},
+    };
+    fs.writeFileSync(flowPath, JSON.stringify(failFlow, null, 2));
+
+    // Without --continue: stops on first failure (step 2 never runs)
+    let r = runCli(['replay', flowPath, '--delay', 'none'], env);
+    assert.strictEqual(r.status, 1);
+    assert(r.stdout.includes('[1/2] entropy invalid-xyz ... failed'));
+    assert(!r.stdout.includes('[2/2]'), 'step 2 must not run when step 1 fails without --continue');
+    assert(r.stderr.length > 0, 'failing step stderr must be printed');
+
+    // With --continue: executes step 2 as well, but exits 1 at the end
+    r = runCli(['replay', flowPath, '--delay', 'none', '--continue'], env);
+    assert.strictEqual(r.status, 1);
+    assert(r.stdout.includes('[1/2] entropy invalid-xyz ... failed'));
+    assert(r.stdout.includes('[2/2] block on ... ok'), 'step 2 must run with --continue');
+  });
+
+  test('record & replay e2e: go -> fill -> record stop -> replay (gated by CDPILOT_E2E=1)', () => {
+    if (process.env.CDPILOT_E2E !== '1') {
+      console.log('  - skipped: record/replay e2e (set CDPILOT_E2E=1 to run it against a headless browser)');
+      return;
+    }
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-e2e-'));
+    const cdpPort = '19235';
+    const env = {
+      ...process.env,
+      CDPILOT_HOME: home,
+      CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: cdpPort,
+      CHROME_HEADLESS: '1',
+      CDPILOT_LOG: '0',
+    };
+    delete env.CDPILOT_TARGET;
+
+    const dataUrl = 'data:text/html,<!DOCTYPE html><html><body><form id="login">' +
+      '<input type="text" id="email" name="email" value="" />' +
+      '<input type="password" id="password" name="password" value="" />' +
+      '<button type="submit" id="submit-btn">Login</button>' +
+      '</form></body></html>';
+    const flowPath = path.join(home, 'e2e-flow.json');
+
+    try {
+      let r = runCli(['record', 'start', '--name', 'e2e-login-flow'], env);
+      assert.strictEqual(r.status, 0);
+
+      r = runCli(['go', dataUrl], env);
+      assert.strictEqual(r.status, 0);
+
+      r = runCli(['fill', '#email', 'user@example.com'], env);
+      assert.strictEqual(r.status, 0);
+
+      r = runCli(['fill', '#password', 'my_secret_pass'], env);
+      assert.strictEqual(r.status, 0);
+
+      r = runCli(['record', 'stop', '--save', flowPath], env);
+      assert.strictEqual(r.status, 0);
+
+      const flow = JSON.parse(fs.readFileSync(flowPath, 'utf-8'));
+      assert.strictEqual(flow.name, 'e2e-login-flow');
+      assert(flow.vars.password, 'vars must contain password');
+      assert.strictEqual(flow.vars.password.hint, 'fill #password');
+
+      const emailStep = flow.steps.find((s) => s.cmd === 'fill' && s.args[0] === '#email');
+      assert(emailStep, 'email step must be recorded');
+      assert.strictEqual(emailStep.args[1], 'user@example.com', 'email must be kept verbatim');
+
+      const passStep = flow.steps.find((s) => s.cmd === 'fill' && s.args[0] === '#password');
+      assert(passStep, 'password step must be recorded');
+      assert.strictEqual(passStep.args[1], '{{password}}', 'password value must be placeholder {{password}}');
+
+      r = runCli(['replay', flowPath, '--var', 'password=my_secret_pass', '--delay', 'none'], env);
+      assert.strictEqual(r.status, 0);
+      assert(r.stdout.includes('fill #email ... ok'));
+      assert(r.stdout.includes('fill #password ... ok'));
+    } finally {
+      runCli(['stop'], env);
+    }
+  });
+})();
+
+
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
