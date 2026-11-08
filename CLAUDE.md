@@ -46,7 +46,7 @@
 | ✅ | v0.9.4 | 29.09: connect (kendi tarayıcın, sahiplik kanıtı), WebMCP köprüsü, Web Bot Auth (Cloudflare canlı doğruladı), insan gibi basılı tutma + exit 3, OOPIF fare yönlendirme düzeltmesi, Chrome for Testing, Claude Code eklenti mağazası + .mcpb, `examples/` (gerçek çıktılı) |
 | ⏳ | Eklenti API + cdpilot-jev | plan: `.claude/docs/plan-eklenti-api-ve-jev.md` (ölçüm kapısı önce) |
 | ⏳ | v0.9.5 (main'de 259620c; push → CI e2e → GitHub release → npm onayı bekler) | 08.11: shadow DOM (#3, `>>>` + derin geri düşüş), record/replay (#5, sırlar diske yazılmaz; kayıt maskesi = oturum günlüğü kuralları), HAR 1.2 (#4, maskeli), MCP `--tools core` (45→11 araç), bot-auth lsof düzeltmesi (macOS 26), `network -- <url>` enjeksiyon kapısı, vaat denetimi; 7 sürüm alanı 0.9.5, CHANGELOG `[0.9.5] - 2026-11-08`; tutanak TT-20261108-034616-4b0057 594/594 (GEÇTİ); e2e yalnız CI |
-| ⏳ | Sonraki | UA override `go` bağlantısıyla sınırlı; `--entropy=on` click ayrıca `el.click()` → çift tıklama; frame act bulamazsa sayfaya dönüş; perf tabanı (`.claude/docs/perf-taban-<tarih>.md`); oynak press-hold zamanlama testi |
+| ⏳ | Sonraki | Stealth + UA override `go` oturumuna bağlı (WS kapanınca düşer; kalıcı tutucu süreç tasarımı gerekir); frame act bulamazsa sayfaya dönüş; perf tabanı (`.claude/docs/perf-taban-<tarih>.md`, makine boşken — 08.11 yük 46); oynak press-hold testi sertleştirildi (08.11, damga kanıtı + yük toleranslı tel eşikleri) |
 | ⏳ | Sentinel takip | C6: daily_analytics gece yazmıyor (debug) · C8: 2 failed auto-like sebebi |
 | ⏳ | v0.9 tls-proxy | Optional local TLS-MITM (curl-impersonate semantics) |
 

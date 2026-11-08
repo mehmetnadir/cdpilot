@@ -4522,13 +4522,21 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       gaps.push(...k.press.gaps);
     }
     gaps.sort((a, b) => a - b);
-    assert(gaps[Math.floor(gaps.length / 2)] < 15, `median gap under 15 ms: ${gaps}`);
-    assert(gaps[0] < 15, `min gap under 15 ms: ${gaps}`);
-    for (const key of ['frame', 'dblclick', 'rightclick']) {
-      for (const g of r[`instant_${key}`].press.stamps) assert(g === 0, `${key}: timestamps equal: ${g}`);
+    // The proof that nothing is held is deterministic: the events' own timestamps are equal.
+    // The wire gaps only have to stay under the deliberate minimums (40 ms hold, 60 ms dblclick
+    // pause): a busy machine wakes the release late (seen: 240 ms under load), so a tight 15 ms
+    // median or pause bound made this test flaky without catching anything the stamps do not.
+    for (const key of ['frame', 'oopif', 'page_entropy', 'frame_entropy', 'moved', 'rightclick', 'dblclick',
+      'dblclick_page', 'humanize_click', 'click_held']) {
+      const st = r[`instant_${key}`].press.stamps || [];
+      assert(st.length > 0, `${key}: every event carries a timestamp`);
+      for (const g of st) assert(g === 0, `${key}: timestamps equal: ${g}`);
     }
+    assert(gaps[0] < 15, `min gap under 15 ms: ${gaps}`);
+    assert(gaps[Math.floor(gaps.length / 2)] < 40, `median gap under the 40 ms hold minimum: ${gaps}`);
     assert.deepStrictEqual(r.instant_dblclick.press.counts, [1, 2]);
-    assert(r.instant_dblclick.press.between[0] < 15, `no dblclick pause: ${r.instant_dblclick.press.between}`);
+    assert(r.instant_dblclick.press.between[0] < 60,
+      `no dblclick pause (60-140 ms when held): ${r.instant_dblclick.press.between}`);
     assert.deepStrictEqual(r.instant_frame.blocker, ['none', '']);
   });
 
