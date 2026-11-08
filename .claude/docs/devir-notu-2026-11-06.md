@@ -105,3 +105,10 @@ Hepsi `src/cdpilot.py`'ye dokunur; çatışma olursa küçük olur (ayrı fonksi
 3. srv21 `state/claude-oauth-token` yenileme (sır; trend/flood kanadı o yüzden ölü).
 4. Worktree temizliği: 6 şerit worktree + 24 `.claude/worktrees/agent-*` → `~/Silinecekler`.
 5. Show HN / Reddit zamanı, kredi org 1 (146,96 $/190 $), T2 tam denetim tarihi, fiyat katmanları (§4).
+
+## 9. Delta 08.11 15:10–15:40 (Nadir: 1 evet, 2 evet, 3 bekle, 4 tamam, 5 tamam)
+- 1 ✅ srv21 poster dağıtıldı: md5 d3d981ae…, py3.10 derleme + import OK, `systemctl start` 15:23 temiz (vadesi gelen öğe yok). Kuyruk: bricks-r2 17:30, tools-core 09.11 (metin "cdpilot 0.9.5 adds").
+- 2 ⏳ cdpilot-site: 0.9.5 kopyası commit'lendi (hero/layout sürümü, commands.ts record/replay/--har, compare zayıflığı → ölçülmüş süreç başlatma maliyeti, pricing recorder Free'ye, features kart 08); site testleri 9/9 (node 26; PATH'teki Intel node 20 test 9'u .ts yüzünden düşürür); deploy arka planda (`deploy/deploy.sh`, VPN açık).
+- 3 ⏸ srv21 `claude-oauth-token`: Nadir "bekle, şimdilik bu bilgisayardan" → trend/flood kanadı srv21'de ölü kalır; Claude işleri bu Mac'te.
+- 4 ✅ 30 worktree `~/Silinecekler/cdpilot-worktrees-2026-11-08/` (6 şerit + 24 .claude/worktrees; 316 MB; LISTE.md satırı); `git worktree prune`; dallar duruyor. Kirli olanlar da taşındı (w-examples 11, w-webmcp-flake 13 dosya — eski oturum artıkları, geri alınabilir).
+- Perf tabanı alındı: `.claude/docs/perf-taban-2026-11-08.md` — tarayıcı 20 ms'de boyuyor, cdpilot `go` ~1 s (node 0,1 + derleme 0,15 + başlatma 0,13 + CDP oturum ~0,5). Hız hedefi A→D (bytecode, tembel import, daemon, sıcak oturum): `go` ≤150 ms.

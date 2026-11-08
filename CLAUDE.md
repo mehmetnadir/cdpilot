@@ -46,13 +46,13 @@
 | ✅ | v0.9.4 | 29.09: connect (kendi tarayıcın, sahiplik kanıtı), WebMCP köprüsü, Web Bot Auth (Cloudflare canlı doğruladı), insan gibi basılı tutma + exit 3, OOPIF fare yönlendirme düzeltmesi, Chrome for Testing, Claude Code eklenti mağazası + .mcpb, `examples/` (gerçek çıktılı) |
 | ⏳ | Eklenti API + cdpilot-jev | plan: `.claude/docs/plan-eklenti-api-ve-jev.md` (ölçüm kapısı önce) |
 | ✅ | v0.9.5 | 08.11 14:52 yayında (Nadir onayı: push + release): npm 0.9.5, GitHub release `v0.9.5` + `cdpilot.mcpb`, MCP Registry publish.yml ile. İçerik: shadow DOM (#3), record/replay (#5, kayıt maskesi = oturum günlüğü kuralları), HAR 1.2 (#4), MCP `--tools core` (45→11 araç), bot-auth lsof (macOS 26), `network -- <url>` enjeksiyon kapısı, WebMCP çerçeve araçları Chrome 156 düzeltmesi, vaat denetimi. CI 12 birim + e2e yeşil (Chrome 156); tutanak TT-20261108-144423-57d206 595/595 |
-| ⏳ | Sonraki | Stealth + UA override `go` oturumuna bağlı (WS kapanınca düşer; kalıcı tutucu süreç tasarımı gerekir); frame act bulamazsa sayfaya dönüş; perf tabanı (`.claude/docs/perf-taban-<tarih>.md`, makine boşken — 08.11 yük 46); xbot poster bağlantı hatası politikası (286aec0) srv21'e dağıtılacak (onay) |
+| ⏳ | Sonraki | HIZ hedefi (`.claude/docs/perf-taban-2026-11-08.md`): `go` ~1 s → ≤150 ms (bytecode önbelleği, tembel import, daemon + sıcak oturum; tarayıcı 20 ms'de boyuyor); stealth + UA override `go` oturumuna bağlı; frame act bulamazsa sayfaya dönüş; canlı tuval fikri (LLM kodu → sekmede anında uygulama) karar bekliyor |
 | ⏳ | Sentinel takip | C6: daily_analytics gece yazmıyor (debug) · C8: 2 failed auto-like sebebi |
 | ⏳ | v0.9 tls-proxy | Optional local TLS-MITM (curl-impersonate semantics) |
 
 ## Son Oturum
 → 2026-11-08 (CEO kipi, gece + gündüz): 5 şerit birleşti, T1 güvenlik (2 düşük bulgu kapandı), 0.9.5 yayınlandı. CI'da Chrome 156 WebMCP iframe arızası çıktı, aynı gün düzeltildi (ae4a857, e2e yeşil). X: bricks paylaşımı 14:09'da ikinci kez ConnectTimeout → 17:30'a yeniden kuyruklandı; poster artık bağlantı hatasında öğeyi kuyrukta tutar (286aec0). Devir notu: `.claude/docs/devir-notu-2026-11-06.md` §5–§7.
-→ İlk iş: Nadir kararları — srv21 poster dağıtımı, cdpilot-site deploy a25cee1, srv21 `state/claude-oauth-token` (0 bayt → trend/flood exit 1), worktree temizliği.
+→ İlk iş: hız hedefi A→D (perf tabanına karşı ölç); Nadir kararı: canlı tuval hedefi; srv21 claude-oauth-token şimdilik bu Mac'ten (Nadir 08.11).
 
 Son Güncelleme: 2026-11-08
 
