@@ -5,6 +5,7 @@ All notable changes to cdpilot will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Session recording and replay (`cdpilot record` / `cdpilot replay`).** Record sequences of CLI commands into portable flow JSON files with secrets replaced by `{{name}}` placeholders before they are written and replay them with variable substitution. Commands run during an active recording session (`record start [--name <n>]`) are tracked; failed steps are dropped on `record stop [--save file.json]`. Secret selectors (passwords, tokens, keys) and secret values (tokens, bearer prefixes, sensitive URL parameters) are replaced with `{{name}}` placeholders listed under `vars`. Replay validates variables before running, supports `--delay real|none|<ms>`, `--dry-run`, and `--continue`.
 - **MCP tool profiles: `cdpilot mcp --tools core|all|a,b,c` (env `CDPILOT_MCP_TOOLS`, the flag wins).** `core` lists 10 tools plus `browser_tools`, which lists the other tools (name and description) or enables some and sends `notifications/tools/list_changed`. A call to a tool outside the profile returns "tool not enabled; call browser_tools enable". `tools/list` schema: 5,769 tokens (45 tools) down to 1,342 (11 tools). Default `all` is unchanged; WebMCP tools are unaffected.
 
 ## [0.9.4] - 2026-09-29

@@ -960,6 +960,23 @@ never changes a command's output or exit code, and a failed write costs one
 stderr line. `CDPILOT_LOG=0` turns it off; `CDPILOT_LOG_DAYS` (default 14)
 sets how many days are kept. The MCP server exposes it as `browser_log`.
 
+### Record & replay
+
+Record sequences of CLI commands into a portable flow JSON file and replay them with variable substitution:
+
+```bash
+cdpilot record start [--name <n>]
+cdpilot record status
+cdpilot record cancel
+cdpilot go https://example.com
+cdpilot click "#login"
+cdpilot fill "#email" test@test.com
+cdpilot record stop [--save login-flow.json]
+cdpilot replay login-flow.json [--var k=v ...] [--delay real|none|<ms>] [--dry-run] [--continue]
+```
+
+Commands that run while recording is active are appended to `$CDPILOT_HOME/record/active.json`; secrets are replaced by `{{name}}` placeholders before a step is written to active.json. `CDPILOT_LOG=0` does not turn recording off, and steps run by `replay` are not recorded. Failed steps (`exit != 0`) are dropped at `record stop`. A value becomes a placeholder `{{name}}` cataloged under `vars` if the selector/label is secret-shaped (`#password`, `input[type=password]`, API key), or the value matches a token/bearer pattern or secret URL parameter. Other typed values (emails, search terms) are preserved verbatim. In `replay`, `--delay real` reproduces recorded inter-step timing (capped at 10 s per gap), while `--delay none` or a fixed millisecond delay skips waiting. Variables are supplied via `--var k=v` or `CDPILOT_VAR_<NAME>`; missing variables halt replay before any step runs.
+
 ### Use your own browser (human-in-the-loop)
 
 An agent hits a CAPTCHA or a login wall it cannot get past. A person solves it,
