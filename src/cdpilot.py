@@ -19791,6 +19791,105 @@ def _slog_redact_tool_kv(kv, secrets):
     return _slog_clip_mark(_slog_scrub_text(kv, secrets, echo=False), SLOG_ARG_CHARS)
 
 
+def _slog_secret_hits(cmd, args):
+    """Find positions and kinds of secrets that session logging would redact.
+
+    Returns a list of (index, kind, key) tuples where kind is in:
+      {"flag_value", "word_value", "kv_value", "tokenish", "input_value"}
+    and key is the flag / word / kv key name (or None).
+    """
+    args = ["" if a is None else str(a) for a in (args or [])]
+    hits = []
+    done = set()
+
+    if cmd in SLOG_JS_CMDS or (cmd == "frame" and args[:1] == ["eval"]) or cmd == "eval-batch":
+        return []
+
+    if cmd in SLOG_VALUE_CMDS:
+        val_idxs = [i for i, a in enumerate(args) if not a.startswith("--")][1:]
+        for idx in val_idxs:
+            hits.append((idx, "input_value", None))
+            done.add(idx)
+        for i, a in enumerate(args):
+            if a.startswith("--") and "=" not in a and a not in SLOG_VALUE_CMD_FLAGS:
+                hits.append((i, "input_value", None))
+                done.add(i)
+    elif cmd in SLOG_LABEL_VALUE_CMDS or cmd == "assert-value":
+        for idx in range(1, len(args)):
+            hits.append((idx, "input_value", None))
+            done.add(idx)
+    elif cmd == "dialog" and args[:1] == ["prompt"]:
+        for idx in range(1, len(args)):
+            hits.append((idx, "input_value", None))
+            done.add(idx)
+    elif cmd == "assert-attr" and len(args) >= 3 and args[1].lower() == "value":
+        for idx in range(2, len(args)):
+            hits.append((idx, "input_value", None))
+            done.add(idx)
+    elif cmd == "tools" and args[:1] == ["call"] and len(args) >= 2:
+        done.update({0, 1})
+        i = 2
+        while i < len(args):
+            a = args[i]
+            if a in ("--arg", "--frame") and i + 1 < len(args):
+                done.add(i)
+                if a == "--arg":
+                    done.add(i + 1)
+                    k, eq, v = args[i + 1].partition("=")
+                    if eq and v and _SLOG_SECRET_NAME_RE.search(k):
+                        hits.append((i + 1, "kv_value", k))
+                i += 2
+                continue
+            if a.startswith("--arg="):
+                done.add(i)
+                k, eq, v = a.split("=", 1)[1].partition("=")
+                if eq and v and _SLOG_SECRET_NAME_RE.search(k):
+                    hits.append((i, "kv_value", k))
+            elif a[:1] in ("{", "["):
+                done.add(i)
+            i += 1
+
+    for i, arg in enumerate(args):
+        if i in done:
+            continue
+        value_follows = False
+        follow_key = None
+        follow_kind = None
+        if arg.startswith("-"):
+            name, eq, val = arg.lstrip("-").partition("=")
+            if _SLOG_SECRET_NAME_RE.search(name):
+                done.add(i)
+                if eq and val:
+                    key = arg[:len(arg) - len(val)]
+                    hits.append((i, "flag_value", key))
+                elif not eq:
+                    value_follows = True
+                    follow_key = arg
+                    follow_kind = "flag_value"
+        elif _SLOG_SECRET_WORD_RE.fullmatch(arg):
+            done.add(i)
+            value_follows = True
+            follow_key = arg
+            follow_kind = "word_value"
+        if value_follows:
+            if i + 1 < len(args) and i + 1 not in done and not args[i + 1].startswith("--"):
+                hits.append((i + 1, follow_kind, follow_key))
+                done.add(i + 1)
+            continue
+        if i not in done:
+            if _re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", arg) and (
+                    "://" in arg or arg[:11].lower().startswith(("data:", "javascript:"))):
+                continue
+            m = _SLOG_KV_ARG_RE.fullmatch(arg)
+            if m and m.group(3) and (cmd == "cookies" or _SLOG_SECRET_NAME_RE.search(m.group(1))):
+                hits.append((i, "kv_value", m.group(1)))
+                done.add(i)
+            elif _slog_tokenish(arg):
+                hits.append((i, "tokenish", None))
+                done.add(i)
+    return hits
+
+
 def _slog_redact_args(cmd, args):
     """Redact one command line for the session log. Pure: no I/O, no state.
 
@@ -20393,7 +20492,22 @@ def cmd_log(*args):
 
 # ─── Record & Replay (issue #5) ───
 
-RECORD_INPUT_CMDS = frozenset({'fill', 'type', 'smart-fill', 'smart-select', 'select'})
+RECORD_INPUT_CMDS = frozenset({'fill', 'type', 'smart-fill', 'smart-select', 'select', 'assert-value'})
+# Recorder-only widening of the session log's secret-name test, applied to the
+# selector / label of input commands: short words get boundaries so that
+# "#shipping-address" (pin), "#discard" (card) and "#lesson" (ssn) stay verbatim.
+_RECORD_SECRET_SEL_RE = _re.compile(
+    _SLOG_SECRET_NAME_RE.pattern + r"|\bpw\b|\bpin\b|pincode|cvv|cvc|\bcard|iban|\bssn\b|tc(?:kn|kimlik)",
+    _re.I,
+)
+
+
+def _record_slug(s):
+    """Derive a clean snake_case slug from a flag, key, or selector name."""
+    if not s:
+        return None
+    slug = _re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_").lower()
+    return slug or None
 
 
 def _record_dir():
@@ -20507,6 +20621,26 @@ def _record_slug_from_selector(sel):
     return None
 
 
+def _record_redact_js(src, step_num, vars_dict, next_v_name_fn, cmd="eval"):
+    """Find secret string literals in JS and replace their content with {{vN}}."""
+    out, last = [], 0
+    for m in _SLOG_JS_STR_RE.finditer(src):
+        quote, body = m.group(0)[0], m.group(0)[1:-1]
+        before = src[max(0, m.start() - 80):m.start()]
+        if body and (_SLOG_JS_SECRET_CTX_RE.search(before) or _slog_tokenish(body)):
+            v_name = next_v_name_fn()
+            if v_name not in vars_dict:
+                vars_dict[v_name] = {"step": step_num, "hint": f"{cmd} {v_name}"}
+            new_body = f"{{{{{v_name}}}}}"
+        else:
+            new_body = body
+        out.append(src[last:m.start()])
+        out.append(quote + new_body + quote)
+        last = m.end()
+    out.append(src[last:])
+    return "".join(out)
+
+
 def _record_detect_placeholders(cmd, args, step_num=1, vars_dict=None):
     """Detect secrets in a step's args and replace with {{name}} placeholders.
 
@@ -20524,7 +20658,86 @@ def _record_detect_placeholders(cmd, args, step_num=1, vars_dict=None):
             n += 1
         return f"v{n}"
 
-    # (a) Input commands with secret-shaped selector / label
+    # (c) JS commands: eval, eval-batch, frame eval, multi-eval
+    if cmd in SLOG_JS_CMDS and args:
+        if len(args) == 1:
+            new_js = _record_redact_js(args[0], step_num, vars_dict, next_v_name, cmd=cmd)
+            return [new_js], vars_dict
+        new_js = _record_redact_js(" ".join(args), step_num, vars_dict, next_v_name, cmd=cmd)
+        return [new_js], vars_dict
+    if cmd == "frame" and args[:1] == ["eval"] and len(args) > 1:
+        new_js = _record_redact_js(" ".join(args[1:]), step_num, vars_dict, next_v_name, cmd="frame eval")
+        return ["eval", new_js], vars_dict
+    if cmd == "eval-batch" and args:
+        try:
+            exprs = json.loads(args[0])
+        except ValueError:
+            exprs = None
+        if isinstance(exprs, list):
+            red_exprs = [
+                _record_redact_js(e, step_num, vars_dict, next_v_name, cmd=cmd) if isinstance(e, str) else e
+                for e in exprs
+            ]
+            new_arg0 = json.dumps(red_exprs, ensure_ascii=False)
+        else:
+            new_arg0 = _record_redact_js(args[0], step_num, vars_dict, next_v_name, cmd=cmd)
+        return [new_arg0] + args[1:], vars_dict
+
+    # (d) tools call <name> <json>
+    if cmd == "tools" and args[:1] == ["call"] and len(args) >= 2:
+        new_args = list(args)
+        i = 2
+        while i < len(new_args):
+            a = new_args[i]
+            if a in ("--arg", "--frame") and i + 1 < len(new_args):
+                if a == "--arg":
+                    kv = new_args[i + 1]
+                    k, eq, v = kv.partition("=")
+                    if eq and v and _SLOG_SECRET_NAME_RE.search(k):
+                        slug = _record_slug(k) or next_v_name()
+                        if slug not in vars_dict:
+                            vars_dict[slug] = {"step": step_num, "hint": f"{cmd} {k}"}
+                        new_args[i + 1] = f"{k}={{{{{slug}}}}}"
+                i += 2
+                continue
+            if a.startswith("--arg="):
+                kv = a.split("=", 1)[1]
+                k, eq, v = kv.partition("=")
+                if eq and v and _SLOG_SECRET_NAME_RE.search(k):
+                    slug = _record_slug(k) or next_v_name()
+                    if slug not in vars_dict:
+                        vars_dict[slug] = {"step": step_num, "hint": f"{cmd} {k}"}
+                    new_args[i] = f"--arg={k}={{{{{slug}}}}}"
+                i += 1
+                continue
+            if a[:1] in ("{", "["):
+                try:
+                    obj = json.loads(a)
+                except ValueError:
+                    obj = None
+                if obj is not None:
+                    def _redact_json_rec(val):
+                        if isinstance(val, dict):
+                            out_dict = {}
+                            for k, v in val.items():
+                                if _SLOG_SECRET_NAME_RE.search(str(k)) and v is not None:
+                                    slug = _record_slug(str(k)) or next_v_name()
+                                    if slug not in vars_dict:
+                                        vars_dict[slug] = {"step": step_num, "hint": f"{cmd} {k}"}
+                                    out_dict[k] = f"{{{{{slug}}}}}"
+                                else:
+                                    out_dict[k] = _redact_json_rec(v)
+                            return out_dict
+                        elif isinstance(val, list):
+                            return [_redact_json_rec(x) for x in val]
+                        return val
+                    red_obj = _redact_json_rec(obj)
+                    new_args[i] = json.dumps(red_obj, separators=(',', ':'), ensure_ascii=False)
+            i += 1
+        return new_args, vars_dict
+
+    # (b) Input commands
+    new_args = list(args)
     if cmd in RECORD_INPUT_CMDS:
         if cmd in ('fill', 'type'):
             non_flags = [i for i, a in enumerate(args) if not a.startswith("--")]
@@ -20532,13 +20745,16 @@ def _record_detect_placeholders(cmd, args, step_num=1, vars_dict=None):
                 sel_idx = non_flags[0]
                 sel = args[sel_idx]
                 val_idxs = non_flags[1:]
-                if _SLOG_SECRET_NAME_RE.search(sel) and val_idxs:
-                    slug = _record_slug_from_selector(sel) or next_v_name()
+                val_str = " ".join(args[i] for i in val_idxs) if val_idxs else ""
+                is_secret_sel = bool(_RECORD_SECRET_SEL_RE.search(sel))
+                is_tok = bool(val_idxs and _slog_tokenish(val_str))
+                if (is_secret_sel or is_tok) and val_idxs:
+                    slug = (_record_slug_from_selector(sel) if is_secret_sel else None) or next_v_name()
                     var_name = slug
                     if var_name not in vars_dict:
                         vars_dict[var_name] = {"step": step_num, "hint": f"{cmd} {sel}"}
-                    new_args = []
                     val_placed = False
+                    new_args = []
                     for i, a in enumerate(args):
                         if i in val_idxs:
                             if not val_placed:
@@ -20547,20 +20763,62 @@ def _record_detect_placeholders(cmd, args, step_num=1, vars_dict=None):
                         else:
                             new_args.append(a)
                     return new_args, vars_dict
-        elif cmd in ('smart-fill', 'smart-select', 'select'):
+        elif cmd in ('smart-fill', 'smart-select', 'select', 'assert-value'):
             if len(args) >= 2:
                 sel = args[0]
-                if _SLOG_SECRET_NAME_RE.search(sel):
-                    slug = _record_slug_from_selector(sel) or next_v_name()
+                val_str = " ".join(args[1:])
+                is_secret_sel = bool(_RECORD_SECRET_SEL_RE.search(sel))
+                is_tok = bool(_slog_tokenish(val_str))
+                if is_secret_sel or is_tok:
+                    slug = (_record_slug_from_selector(sel) if is_secret_sel else None) or next_v_name()
                     var_name = slug
                     if var_name not in vars_dict:
                         vars_dict[var_name] = {"step": step_num, "hint": f"{cmd} {sel}"}
                     return [sel, f"{{{{{var_name}}}}}"], vars_dict
 
-    # (b) Value itself matches secret patterns:
-    # _SLOG_TOKEN_PREFIX_RE, _SLOG_BEARER_RE, secret URL params via _slog_mask_url
-    new_args = list(args)
-    for i, arg in enumerate(args):
+    # (a) General hits from _slog_secret_hits
+    hits = _slog_secret_hits(cmd, new_args)
+    handled_indices = set()
+    for idx, kind, key in hits:
+        if kind == "input_value":
+            continue
+        if kind in ("flag_value", "word_value", "kv_value") and key:
+            slug = _record_slug(key) or next_v_name()
+            hint = f"{cmd} {key}"
+        else:
+            slug = next_v_name()
+            hint = f"{cmd} {key}" if key else f"{cmd} {slug}"
+
+        if slug not in vars_dict:
+            vars_dict[slug] = {"step": step_num, "hint": hint}
+
+        if kind == "kv_value":
+            arg = new_args[idx]
+            m = _SLOG_KV_ARG_RE.fullmatch(arg)
+            if m:
+                new_args[idx] = m.group(1) + m.group(2) + f"{{{{{slug}}}}}"
+            else:
+                new_args[idx] = f"{{{{{slug}}}}}"
+            handled_indices.add(idx)
+        elif kind == "flag_value":
+            arg = new_args[idx]
+            if "=" in arg and arg.startswith("-"):
+                prefix, _, _ = arg.partition("=")
+                new_args[idx] = f"{prefix}={{{{{slug}}}}}"
+            else:
+                new_args[idx] = f"{{{{{slug}}}}}"
+            handled_indices.add(idx)
+        elif kind == "word_value":
+            new_args[idx] = f"{{{{{slug}}}}}"
+            handled_indices.add(idx)
+        elif kind == "tokenish":
+            new_args[idx] = f"{{{{{slug}}}}}"
+            handled_indices.add(idx)
+
+    # (e) Existing URL, Bearer, Token-prefix rules for unhandled indices
+    for i, arg in enumerate(new_args):
+        if i in handled_indices:
+            continue
         # 1. Secret URL params or userinfo password
         if ("://" in arg or arg.startswith(("http:", "https:"))) and _slog_mask_url(arg) != arg:
             from urllib.parse import urlsplit, urlunsplit, unquote_plus
@@ -20580,7 +20838,7 @@ def _record_detect_placeholders(cmd, args, step_num=1, vars_dict=None):
                 for p in parts.query.split("&") if parts.query else []:
                     k, sep, v = p.partition("=")
                     if sep and v and _SLOG_SECRET_PARAM_RE.search(unquote_plus(k)):
-                        slug = _re.sub(r"[^A-Za-z0-9]+", "_", k).strip("_").lower() or next_v_name()
+                        slug = _record_slug(k) or next_v_name()
                         var_name = slug
                         if var_name in vars_dict and vars_dict[var_name].get("step") != step_num:
                             var_name = f"{slug}_{step_num}"
@@ -20592,7 +20850,7 @@ def _record_detect_placeholders(cmd, args, step_num=1, vars_dict=None):
                 for p in parts.fragment.split("&") if parts.fragment else []:
                     k, sep, v = p.partition("=")
                     if sep and v and _SLOG_SECRET_PARAM_RE.search(unquote_plus(k)):
-                        slug = _re.sub(r"[^A-Za-z0-9]+", "_", k).strip("_").lower() or next_v_name()
+                        slug = _record_slug(k) or next_v_name()
                         var_name = slug
                         if var_name in vars_dict and vars_dict[var_name].get("step") != step_num:
                             var_name = f"{slug}_{step_num}"
@@ -20801,7 +21059,8 @@ def cmd_record_stop(*args):
             save_dir = os.path.dirname(os.path.abspath(save_path))
             if save_dir:
                 os.makedirs(save_dir, exist_ok=True)
-            with open(save_path, "w", encoding="utf-8") as f:
+            fd = os.open(save_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with open(fd, "w", encoding="utf-8") as f:
                 json.dump(flow_data, f, indent=2, ensure_ascii=False)
                 f.write("\n")
         except Exception as e:
