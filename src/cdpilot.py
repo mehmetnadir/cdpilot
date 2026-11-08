@@ -21877,17 +21877,22 @@ def cmd_replay_dispatch(args):
 # ─── CLI ───
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Warm process ("daemon"). One Python process keeps the module, its asyncio
-# loop and the pooled CDP sockets alive between CLI calls; bin/cdpilot.js
-# starts it (CDPILOT_DAEMON=1), hands it each call over a Unix socket and runs
-# a fresh process whenever the daemon is missing, busy, or of another version.
-# Measured 2026-11-08 (M1 Max): a fresh process costs ~110 ms of node, ~140 ms
-# of Python start-up and ~500 ms of CDP session set-up before `go` even starts;
-# the warm process pays none of them. Design: .claude/docs/plan-daemon-insan-hizi.md
+# Warm process ("daemon"). One Python process keeps the module and its
+# asyncio loop alive between CLI calls; bin/cdpilot.js starts it
+# (CDPILOT_DAEMON=1), hands it each call over a Unix socket and runs a fresh
+# process whenever the daemon is missing, busy, or of another version.
+# Measured 2026-11-08 (M1 Max): a fresh process costs ~110 ms of node and
+# ~140 ms of Python start-up before the command runs; the warm process pays
+# neither. Each request runs as its own process would: the caller's argv, cwd,
+# environment and stdin; module state reset; exit-time hooks at request end;
+# the pooled CDP sockets closed at request end (their Page/Network/Emulation
+# state is session-bound and dies with a fresh process — see
+# _daemon_request_teardown). Design: .claude/docs/plan-daemon-insan-hizi.md
 #
 # Protocol (newline-delimited JSON, one request per connection):
 #   daemon → {"hello": 1, "version": ..., "pid": ...}
-#   client → {"argv": [...], "cwd": "...", "stdin": "..."} | {"op": "ping"|"shutdown"}
+#   client → {"argv": [...], "cwd": "...", "env": {...}, "stdin": "..."}
+#            | {"op": "ping"|"shutdown"}
 #   daemon → {"o": text} / {"e": text} frames in order, then {"exit": code};
 #            or {"fallback": reason} before anything ran (the client then
 #            spawns a process — nothing is ever executed twice).
@@ -21904,8 +21909,8 @@ DAEMON_SPAWN_CMDS = frozenset({
     'serve', 'mcp', 'watch', 'setup', 'status', 'daemon', 'replay', 'run',
     'agent', 'blog', 'bot-auth', 'browser', 'test', 'trace', 'heal', 'health',
     'session', 'sessions', 'session-close', 'projects', 'proxy', 'extensions',
-    'tls-proxy', 'help', '--help', '-h'})
-_DAEMON = {"loop": None, "asyncio_run": None, "served": 0, "started": None}
+    'tls-proxy', 'captcha-wait', 'help', '--help', '-h'})
+_DAEMON = {"loop": None, "asyncio_run": None, "served": 0, "started": None, "task": None}
 
 
 class _DaemonStream(io.TextIOBase):
@@ -21978,25 +21983,53 @@ def _daemon_recv_line(conn, limit=8 * 1024 * 1024):
 
 
 def _daemon_asyncio_run(coro, **kwargs):
-    """asyncio.run() of the warm process: always the one long-lived loop, so
-    the pooled CDP sockets (bound to the loop that opened them, see _ws_lock)
-    survive from one request to the next. Unlike asyncio.run it leaves
-    background tasks alone: the pool's websockets run their transfer and
-    keepalive tasks on this loop."""
+    """asyncio.run() of the warm process: the one long-lived loop, the
+    coroutine wrapped in a task the request's disconnect watcher can cancel."""
     loop = _DAEMON["loop"]
     if loop is None or loop.is_running():
         return _DAEMON["asyncio_run"](coro, **kwargs)
-    return loop.run_until_complete(coro)
+    if _DAEMON.get("gone"):  # the client left: no further async step of this request
+        coro.close()
+        raise asyncio.CancelledError()
+    task = loop.create_task(coro)
+    _DAEMON["task"] = task
+    try:
+        return loop.run_until_complete(task)
+    finally:
+        _DAEMON["task"] = None
+
+
+async def _daemon_request_teardown():
+    """What a process exit did for free. The pooled CDP sockets go: their
+    Page.enable / Network.enable / Emulation.* / addScriptToEvaluateOnNewDocument
+    state is session-bound and a fresh process never carried it into the next
+    command (nor its event backlog). Then every task the command left behind
+    ends, as asyncio.run() would have ended it."""
+    for ws in list(_WS_POOL.values()):
+        try:
+            await asyncio.wait_for(ws.close(), 1)
+        except BaseException:
+            pass
+    _WS_POOL.clear()
+    _WS_LOCKS.clear()
+    me = asyncio.current_task()
+    pending = [t for t in asyncio.all_tasks() if t is not me and not t.done()]
+    for t in pending:
+        t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _daemon_reset_state():
     """Per-process state becomes per-request state: what a fresh process would
     start with, a request starts with."""
-    global _FRAME_FLAG, DIALOG_MODE, INTERCEPT_RULES, _A11Y_REF_MAP
+    global _FRAME_FLAG, DIALOG_MODE, INTERCEPT_RULES, _A11Y_REF_MAP, _glow_script_id
     _FRAME_FLAG = None
     DIALOG_MODE = None
     INTERCEPT_RULES = []
     _A11Y_REF_MAP = {}
+    _glow_script_id = None
+    _CDP_GET_CACHE.clear()  # the 0.5 s /json cache: a request sees the page as it is now
     _SLOG.clear()
     _SLOG.update(active=False, warned=False)
     _AUTOLAUNCH.update(cmd=None, attempted=False, failure=None)
@@ -22014,25 +22047,44 @@ def _daemon_exit_code(exc, err):
     return 1
 
 
+def _daemon_watch_client(conn, done):
+    """Thread: notices the client going away while its command runs (Ctrl+C,
+    a killed shell) and cancels the command, as killing a fresh process would —
+    instead of leaving it running next to the client's next, fresh call."""
+    while not done.is_set():
+        try:
+            data = conn.recv(1)  # the client sends nothing after its request line
+        except (socket.timeout, TimeoutError):
+            continue
+        except OSError:
+            break
+        if not data:
+            break
+    if done.is_set():
+        return
+    # Cancel the async step that is running (or refuse the next one, see
+    # _daemon_asyncio_run); a purely synchronous command runs to its quick end.
+    # Never interrupt_main(): a KeyboardInterrupt landing in the request's
+    # clean-up would leave the process half restored.
+    _DAEMON["gone"] = True
+    task, loop = _DAEMON.get("task"), _DAEMON["loop"]
+    if task is not None and loop is not None:
+        loop.call_soon_threadsafe(task.cancel)
+
+
 def _daemon_run_request(conn, req):
-    """Run one CLI call in this process as if it were its own process."""
+    """Run one CLI call in this process as if it were its own process.
+    Returns True (ran), False (refused before anything ran) or "stale" (refused:
+    this process was imported for another port/profile/project than a fresh
+    process would resolve now — it exits and the client starts a new one)."""
     argv = req.get("argv")
     if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
         _daemon_send(conn, {"fallback": "request"})
         return False
-    try:
-        timeout_s, plain = _extract_timeout(argv)
-    except ValueError:
-        timeout_s, plain = None, argv
-    cmd = plain[0] if plain else None
-    if timeout_s or cmd in DAEMON_SPAWN_CMDS or (cmd or "").startswith("--_"):
-        # --timeout ends a process with os._exit (see _arm_timeout_watchdog);
-        # lifecycle commands fork, serve or wait — a fresh process for them.
-        _daemon_send(conn, {"fallback": "command"})
-        return False
     out, err = _DaemonStream(conn, "o"), _DaemonStream(conn, "e")
     out._peer, err._peer = err, out
     saved = (sys.stdout, sys.stderr, sys.stdin, sys.exit, sys.excepthook, sys.argv)
+    env_before, cwd_before = dict(os.environ), os.getcwd()
     real_register = atexit.register
     at_end = []  # what the command registered for process exit runs at request end
 
@@ -22040,47 +22092,93 @@ def _daemon_run_request(conn, req):
         at_end.append((fn, a, k))
         return fn
 
-    atexit.register = _register
-    _daemon_reset_state()
-    code = 0
+    done = threading.Event()
+    watcher = None
+    code = None  # set once the command ran
+    outcome = False
     try:
+        env = req.get("env")  # the caller's environment, as a fresh process would see it
+        if isinstance(env, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+            os.environ.clear()
+            os.environ.update(env)
         cwd = req.get("cwd")
         if isinstance(cwd, str) and cwd:
             try:
                 os.chdir(cwd)
-            except OSError as e:
-                err.write(f"cdpilot: cannot enter {cwd}: {e.strerror or e}\n")
-                raise SystemExit(1)
+            except OSError:
+                _daemon_send(conn, {"fallback": "cwd"})
+                return False
+        try:
+            timeout_s, plain = _extract_timeout(argv)
+        except ValueError:
+            timeout_s, plain = None, argv
+        cmd = plain[0] if plain else None
+        if timeout_s or cmd in DAEMON_SPAWN_CMDS or (cmd or "").startswith("--_"):
+            # --timeout ends a process with os._exit (see _arm_timeout_watchdog);
+            # lifecycle commands fork, serve or wait — a fresh process for them.
+            _daemon_send(conn, {"fallback": "command"})
+            return False
+        try:  # port, profile and project id are resolved at import: still what a fresh process gets?
+            current = _resolve_project_config()
+        except Exception:
+            current = None
+        if tuple(current or ()) != (CDP_PORT, PROFILE_DIR, PROJECT_ID):
+            _daemon_send(conn, {"fallback": "stale"})
+            return "stale"
+        atexit.register = _register
+        _daemon_reset_state()
         sys.argv = ["cdpilot"] + list(argv)
         stdin_text = req.get("stdin")
         sys.stdin = io.StringIO(stdin_text if isinstance(stdin_text, str) else "")
         sys.stdout, sys.stderr = out, err
-        _cli_main()
-    except SystemExit as e:
-        code = _daemon_exit_code(e, err)
-    except KeyboardInterrupt:
-        code = 130
-    except BaseException as e:  # what the interpreter would print, then exit 1
+        _DAEMON["gone"] = False
+        code = 0
         try:
-            sys.excepthook(type(e), e, e.__traceback__)
-        except Exception:
-            pass
-        code = 1
-    finally:
-        for fn, a, k in reversed(at_end):  # session log line, record step, idle stamp
+            watcher = threading.Thread(target=_daemon_watch_client, args=(conn, done), daemon=True)
+            watcher.start()
+            _cli_main()
+        except SystemExit as e:
+            code = _daemon_exit_code(e, err)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            code = 130
+        except BaseException as e:  # what the interpreter would print, then exit 1
             try:
-                fn(*a, **k)
-            except Exception:
+                sys.excepthook(type(e), e, e.__traceback__)
+            except BaseException:
                 pass
+            code = 1
+        outcome = True
+    finally:
+        done.set()
+        if code is not None:
+            for fn, a, k in reversed(at_end):  # session log line, record step, idle stamp
+                try:
+                    fn(*a, **k)
+                except BaseException:
+                    pass
         atexit.register = real_register
         try:
             out.flush()
             err.flush()
-        except Exception:
+        except BaseException:
             pass
         sys.stdout, sys.stderr, sys.stdin, sys.exit, sys.excepthook, sys.argv = saved
-    _daemon_send(conn, {"exit": code})
-    return True
+        os.environ.clear()
+        os.environ.update(env_before)
+        try:
+            os.chdir(cwd_before)
+        except OSError:
+            pass
+        if code is not None and _DAEMON["loop"] is not None:
+            try:
+                _DAEMON["loop"].run_until_complete(asyncio.wait_for(_daemon_request_teardown(), 5))
+            except BaseException:
+                pass
+        if watcher is not None:
+            watcher.join(0.2)
+    if code is not None:
+        _daemon_send(conn, {"exit": code})
+    return outcome
 
 
 def _daemon_ping(sock_path, timeout=0.5):
@@ -22118,7 +22216,7 @@ def _daemon_serve_entry(args):
         idle_s = float(os.environ.get(DAEMON_IDLE_ENV) or DAEMON_IDLE_DEFAULT)
     except ValueError:
         idle_s = DAEMON_IDLE_DEFAULT
-    os.umask(0o077)  # the socket and its info file: this user only
+    umask_before = os.umask(0o077)  # the socket and its info file: this user only
     sock_dir = os.path.dirname(sock_path) or "."
     os.makedirs(sock_dir, mode=0o700, exist_ok=True)
     st = os.stat(sock_dir)  # a pre-made directory (shared /tmp) of someone else: refuse
@@ -22147,8 +22245,9 @@ def _daemon_serve_entry(args):
     asyncio.run = _daemon_asyncio_run
     stop = []
 
-    def _on_signal(*_):
+    def _on_signal(*_):  # SIGTERM / SIGHUP: end the running command (exit 130), then leave
         stop.append(True)
+        raise KeyboardInterrupt
 
     for sig in (signal.SIGTERM, signal.SIGHUP):
         try:
@@ -22163,6 +22262,7 @@ def _daemon_serve_entry(args):
             os.unlink(sock_path + ".starting")
         except OSError:
             pass
+        os.umask(umask_before)  # files the commands write get the caller's usual modes
         last = time.monotonic()
         while not stop:
             if time.monotonic() - last > idle_s:  # checked every turn: pings keep accept() busy
@@ -22171,6 +22271,8 @@ def _daemon_serve_entry(args):
                 conn, _ = srv.accept()
             except socket.timeout:
                 continue
+            except KeyboardInterrupt:
+                break
             except OSError:
                 if stop:
                     break
@@ -22180,18 +22282,26 @@ def _daemon_serve_entry(args):
                     conn.settimeout(5.0)  # the request line follows the hello at once
                     _daemon_send(conn, {"hello": 1, "version": __version__, "pid": os.getpid()})
                     req = _daemon_recv_line(conn)
-                    if isinstance(req, dict):
-                        conn.settimeout(None)
-                        op = req.get("op")
-                        if op == "shutdown":
-                            _daemon_send(conn, {"exit": 0})
-                            stop.append(True)
-                        elif op == "ping":
-                            _daemon_send(conn, {"pong": 1, "pid": os.getpid(), "served": _DAEMON["served"],
-                                                "started": _DAEMON["started"], "idle": idle_s})
-                        elif _daemon_run_request(conn, req):
+                    if not isinstance(req, dict):
+                        _daemon_send(conn, {"fallback": "request"})  # malformed / too long: a fresh process
+                        continue
+                    conn.settimeout(10.0)  # a stopped client never blocks a send forever
+                    op = req.get("op")
+                    if op == "shutdown":
+                        _daemon_send(conn, {"exit": 0})
+                        stop.append(True)
+                    elif op == "ping":
+                        _daemon_send(conn, {"pong": 1, "pid": os.getpid(), "served": _DAEMON["served"],
+                                            "started": _DAEMON["started"], "idle": idle_s})
+                    else:
+                        ran = _daemon_run_request(conn, req)
+                        if ran == "stale":
+                            stop.append(True)  # imported for another port/profile/project
+                        elif ran:
                             _DAEMON["served"] += 1
                             last = time.monotonic()  # pings and refusals do not count as use
+                except KeyboardInterrupt:
+                    stop.append(True)
                 except OSError:
                     pass
     finally:

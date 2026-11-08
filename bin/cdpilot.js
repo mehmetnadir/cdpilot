@@ -82,7 +82,7 @@ const DAEMON_SPAWN_CMDS = new Set([
   'serve', 'mcp', 'watch', 'setup', 'status', 'daemon', 'replay', 'run',
   'agent', 'blog', 'bot-auth', 'browser', 'test', 'trace', 'heal', 'health',
   'session', 'sessions', 'session-close', 'projects', 'proxy', 'extensions',
-  'tls-proxy', 'help', '--help', '-h']);
+  'tls-proxy', 'captcha-wait', 'help', '--help', '-h']);
 
 function daemonEnabled() {
   return process.env.CDPILOT_DAEMON === '1' && process.platform !== 'win32';
@@ -115,16 +115,40 @@ function daemonKey(env, python) {
 }
 
 // sun_path holds 104 bytes on macOS: a long CDPILOT_HOME moves the socket to
-// a private directory under the temp dir (the key still includes the home).
+// a private per-user directory — $XDG_RUNTIME_DIR when set (Linux desktops),
+// else one under the temp dir (the key still includes the home).
 function daemonDirs() {
-  const uid = typeof os.userInfo === 'function' ? os.userInfo().uid : 0;
-  return [path.join(cdpilotHome(), 'daemon'), path.join(os.tmpdir(), `cdpilot-${uid}-daemon`)];
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  const runtime = process.env.XDG_RUNTIME_DIR
+    ? path.join(process.env.XDG_RUNTIME_DIR, 'cdpilot-daemon')
+    : path.join(os.tmpdir(), `cdpilot-${uid}-daemon`);
+  return [path.join(cdpilotHome(), 'daemon'), runtime];
 }
 
 function daemonSockPath(key) {
-  const [home, tmp] = daemonDirs();
+  const [home, runtime] = daemonDirs();
   const p = path.join(home, `${key}.sock`);
-  return Buffer.byteLength(p) <= 100 ? p : path.join(tmp, `${key}.sock`);
+  return Buffer.byteLength(p) <= 100 ? p : path.join(runtime, `${key}.sock`);
+}
+
+// A socket is only used when its directory and the socket itself belong to
+// this user and nobody else may write there: in a shared temp dir another
+// user could otherwise plant a fake daemon and receive argv, cwd and stdin.
+function daemonPathSafe(sockPath) {
+  if (typeof process.getuid !== 'function') return true;
+  const uid = process.getuid();
+  try {
+    const dir = fs.lstatSync(path.dirname(sockPath));
+    if (!dir.isDirectory() || dir.uid !== uid || (dir.mode & 0o077) !== 0) return false;
+  } catch (e) {
+    return e.code === 'ENOENT';  // no directory yet: startDaemon creates it 0700
+  }
+  try {
+    const st = fs.lstatSync(sockPath);
+    return st.isSocket() && st.uid === uid;
+  } catch (e) {
+    return e.code === 'ENOENT';  // no socket yet: the daemon may be started here
+  }
 }
 
 // One request on one connection. Resolves {handled: true, code} when the
@@ -132,8 +156,9 @@ function daemonSockPath(key) {
 // {handled: false, reason} when nothing ran and the caller must spawn.
 function daemonRequest(sockPath, payload, onFrame) {
   return new Promise((resolve) => {
-    let settled = false, hello = false, buf = '', exitCode = null;
+    let settled = false, hello = false, buf = '', scanFrom = 0, exitCode = null;
     const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    if (!daemonPathSafe(sockPath)) { done({ handled: false, reason: 'unsafe' }); return; }
     const sock = net.createConnection(sockPath);
     sock.setEncoding('utf8');
     const timer = setTimeout(() => {
@@ -147,9 +172,10 @@ function daemonRequest(sockPath, payload, onFrame) {
     sock.on('data', (chunk) => {
       buf += chunk;
       let nl;
-      while ((nl = buf.indexOf('\n')) >= 0) {
+      while ((nl = buf.indexOf('\n', scanFrom)) >= 0) {
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
+        scanFrom = 0;
         let msg;
         try { msg = JSON.parse(line); } catch { continue; }
         if (!hello) {
@@ -172,6 +198,7 @@ function daemonRequest(sockPath, payload, onFrame) {
         if (msg.exit !== undefined) { exitCode = msg.exit; continue; }
         onFrame(msg);
       }
+      scanFrom = buf.length;  // a frame longer than one chunk: do not rescan it
     });
     sock.on('close', () => {
       clearTimeout(timer);
@@ -182,13 +209,24 @@ function daemonRequest(sockPath, payload, onFrame) {
   });
 }
 
-// Fork the warm process for this key, detached; at most once per 5 s.
+// Fork the warm process for this key, detached; at most once per 5 s. The
+// stamp is created exclusively (no symlink following, no second starter).
 function startDaemon(sockPath, python, env) {
+  if (!daemonPathSafe(sockPath)) return false;
   const stamp = `${sockPath}.starting`;
-  try { if (Date.now() - fs.statSync(stamp).mtimeMs < 5000) return false; } catch {}
   try {
     fs.mkdirSync(path.dirname(sockPath), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(stamp, String(process.pid));
+    let fd;
+    try {
+      fd = fs.openSync(stamp, 'wx', 0o600);
+    } catch (e) {
+      if (e.code !== 'EEXIST') return false;
+      try { if (Date.now() - fs.lstatSync(stamp).mtimeMs < 5000) return false; } catch { return false; }
+      fs.unlinkSync(stamp);  // a starter that never got to bind: try once more
+      fd = fs.openSync(stamp, 'wx', 0o600);
+    }
+    fs.writeSync(fd, String(process.pid));
+    fs.closeSync(fd);
     const child = spawn(python, pyArgs(DAEMON_SERVE_FLAG, sockPath),
       { detached: true, stdio: 'ignore', env });
     child.on('error', () => {});
@@ -247,7 +285,9 @@ async function daemonCommand(sub, python, env) {
     for (const sock of listDaemonSockets()) {
       const r = await daemonRequest(sock, { op: 'shutdown' }, () => {});
       if (r.handled) n++;
-      else { try { fs.unlinkSync(sock); } catch {} }
+      else if (r.reason === 'ECONNREFUSED' || r.reason === 'ENOENT') {
+        try { fs.unlinkSync(sock); } catch {}  // nobody listens: a leftover of a crash
+      }  // busy (no hello in time): leave it, it is serving a command
     }
     console.log(n ? `stopped ${n} daemon${n === 1 ? '' : 's'}` : 'no daemon running');
     return 0;
@@ -1161,7 +1201,9 @@ if (cmd === 'status') {
     daemonCommand(args.slice(1), python, env).then((code) => { process.exitCode = code; });
   } else if (daemonEligible(cmd, args)) {
     const sockPath = daemonSockPath(daemonKey(env, python));
-    const payload = { argv: args, cwd: process.cwd() };
+    // env: the daemon applies the caller's environment to the request (proxy
+    // and solver keys, PATH, TZ … are read when a command runs, not at import).
+    const payload = { argv: args, cwd: process.cwd(), env };
     const stdin = daemonStdin(cmd, args);
     if (stdin !== undefined) payload.stdin = stdin;
     daemonRequest(sockPath, payload, (m) => {
@@ -1174,7 +1216,7 @@ if (cmd === 'status') {
         return;
       }
       // No daemon (yet): start one for the next call; this call runs fresh.
-      if (['ENOENT', 'ECONNREFUSED', 'version', 'closed'].includes(r.reason)) {
+      if (['ENOENT', 'ECONNREFUSED', 'version', 'closed', 'stale'].includes(r.reason)) {
         startDaemon(sockPath, python, env);
       }
       spawnPython(python, args, env);

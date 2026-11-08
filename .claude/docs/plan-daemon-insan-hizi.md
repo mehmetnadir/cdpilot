@@ -42,15 +42,28 @@ Kararlar ve gerekçeleri:
   `bin/cdpilot.js` `CDPILOT_PROJECT_ID`'yi cwd'den türetip ortama koyduğu için proje kimliği cwd'den bağımsız kalır.
 - **Sıralı yürütücü.** Tek iş parçacığı, tek istek. Meşgulken ikinci istemci hello alamaz, 150 ms'de taze sürece düşer;
   paralel kullanıcı bugünkü hızı görür, bir komut asla iki kez koşmaz (düşüş yalnız istek gönderilmeden önce).
-- **`asyncio.run` kalkanı.** Dağıtıcı `asyncio.run(_wrapped())` çağırır; daemon bunu kalıcı döngüde `run_until_complete`
-  yapar. `_ws_lock` havuzu "döngü aynı mı" damgasıyla tutar (3691–3717); döngü aynı kaldığı için `_WS_POOL`
-  istekler arası yaşar. Bekleyen görevler iptal edilmez: websockets'in aktarım/keepalive görevleri o döngüdedir.
+- **`asyncio.run` kalkanı.** Dağıtıcı `asyncio.run(_wrapped())` çağırır; daemon bunu kalıcı döngüde bir görev olarak
+  `run_until_complete` yapar (görev kopan istemcinin iptal edebilmesi için). **İnceleme sonrası (08.11 17:00):** havuz
+  istekler arası YAŞAMAZ — `_daemon_request_teardown` istek sonunda havuzdaki WS'leri kapatır ve kalan görevleri iptal
+  eder (asyncio.run gibi). Sebep: `Emulation.*`, `Network.enable`, `Page.enable`, `addScriptToEvaluateOnNewDocument`
+  (glow/stealth) oturuma bağlıdır; taze süreçte çıkışla silinir, sıcak havuzda sonraki komuta taşınırdı. "Sıcak oturum"
+  (D) ancak bu oturum-bağlı durumun envanteri ve yönetimiyle gelir; ölçüm: havuz kapatmanın bedeli ~10 ms/komut.
 - **İstek sonu = eski süreç sonu.** `_slog_begin` (günlük + kayıt adımı), `_idle_touch_activity` ve zaman aşımı
-  `atexit.register` kullanır; daemon kaydı istek listesine alır, sonunda LIFO koşar. Import anında kaydedilen
-  `_ws_pool_close_all` listeye girmez (havuz yaşar); gerçek süreç çıkışında koşar.
+  `atexit.register` kullanır; daemon kaydı istek listesine alır, sonunda LIFO koşar.
+- **İstek ortamı.** İstemci `process.env`'i isteğe koyar; daemon istek süresince `os.environ`'ı onunla değiştirir, sonra
+  geri yükler (`CDPILOT_MODE` yazımı, proxy/çözücü anahtarları, PATH, TZ istek anında okunur). Çalışma dizini de geri
+  yüklenir. `umask` yalnız soket/bilgi dosyası yazılırken 077; komutların yazdığı dosyalar çağıranın kipinde.
+- **Bayat yapılandırma.** `CDP_PORT/PROFILE_DIR/PROJECT_ID` import anında çözülür; her istekte `_resolve_project_config()`
+  yeniden çözülür, farklıysa `{"fallback":"stale"}` ve daemon çıkar (istemci taze koşar, yenisini başlatır). Elle
+  port+profil verilip proje kimliği cwd'den türeyen kurulumda cwd değişimi daemon'u yeniler — kabul edilen bedel.
+- **Kopan istemci.** İstek başına bir izleyici iş parçacığı istemci soketini okur; istemci kapanınca koşan asyncio görevi
+  iptal edilir ya da sonraki async adım reddedilir (çıkış 130). `interrupt_main` bilerek kullanılmaz (temizlik ortasında
+  KeyboardInterrupt). Gönderimler 10 sn zaman aşımlı: durdurulmuş istemci daemon'u asmaz.
 - **Sıfırlanan modül durumu** (`_daemon_reset_state`): `_FRAME_FLAG`, `DIALOG_MODE`, `INTERCEPT_RULES`, `_A11Y_REF_MAP`,
   `_SLOG`, `_AUTOLAUNCH`, `_CLICK_MISSES` (exit 3 sızmasın), `_PRESS_MS_WARNED`, `_SHADOW_NOTES_PRINTED`, `_IDLE_WARNED`.
   Kalanlar bilerek kalır: `_CDP_GET_CACHE` (0,5 s TTL), `_glow_script_id` (oturuma bağlı), `_WS_POOL/_WS_LOCKS`.
+  `os.environ` istek öncesi kopyalanır, sonra geri yüklenir (`cmd_go` uyarlanabilir kipte `CDPILOT_MODE` yazar). Yürütücü
+  testi (`daemon: the request executor…`) env/akış/sys kancası geri yükleme, çıkış kodları, stdin ve redleri süreç içinde denetler.
 - **Taze sürece kalanlar** (`DAEMON_SPAWN_CMDS`, iki tarafta aynı liste, test eşitliği denetler): `launch stop stop-all
   project-stop connect disconnect serve mcp watch setup status daemon replay run agent blog bot-auth browser test trace
   heal health session sessions session-close projects proxy extensions tls-proxy help`. `--timeout`/`CDPILOT_TIMEOUT`:
@@ -61,9 +74,12 @@ Kararlar ve gerekçeleri:
 - **Yaşam.** İstemci ilk çağrıda daemon'u ayrık (`detached`, 5 sn'de en çok 1 deneme) başlatır, o çağrı taze koşar.
   Boşta `CDPILOT_DAEMON_IDLE` sn (varsayılan 1800) sonra kendi kapanır; `cdpilot daemon start|stop|status`.
   Sürüm el sıkışması: eski kurulumun daemon'una `shutdown` gönderilir, çağrı taze koşar, yenisi başlar.
-- **Güvenlik.** Yalnız AF_UNIX (Windows şimdilik hep taze süreç); `umask 077`, soket 0600, dizin 0700; dizin başkasının
-  ya da grup/diğer izinliyse daemon çıkar (paylaşılan /tmp yarışı). İstek tek satır JSON, 8 MB üst sınır. T2 güvenlik
-  denetimi bu yüzey için sırada (§6).
+- **Güvenlik.** Yalnız AF_UNIX (Windows şimdilik hep taze süreç); soket 0600, dizin 0700; dizin ya da soket başkasının
+  ya da grup/diğer izinliyse İKİ taraf da reddeder (istemci `lstat` ile bağlanmadan önce; daemon bind'den önce). Uzun
+  `CDPILOT_HOME` için yedek dizin `$XDG_RUNTIME_DIR/cdpilot-daemon`, yoksa `$TMPDIR/cdpilot-<uid>-daemon`. Başlatma
+  damgası `O_EXCL` ile açılır (sembolik bağ izlenmez, ikinci başlatıcı yok). İstek tek satır JSON, 8 MB üst sınır;
+  bozuk istek `{"fallback":"request"}`. `daemon stop` yalnız kimsenin dinlemediği soketi siler (meşgul daemon'a
+  dokunmaz). T2 güvenlik denetimi bu yüzey için sırada (§6).
 
 ## 2. Ölçüm — tarayıcısız komut (08.11 16:00, M1 Max, yük ~10)
 
@@ -75,16 +91,22 @@ Kararlar ve gerekçeleri:
 
 Kalan ~140 ms'nin ~110'u node açılışı: ince istemci de node. Daha aşağısı node'suz bir kabuk/ikili istemci ister (ayrı iş).
 
-## 3. Riskler (uygulamada görülen / açık)
+## 3. Riskler ve inceleme (08.11 17:00, Claude reviewer: 9 bulgu → hepsi işlendi)
 
-1. **Sıcak WS'de olay birikimi.** Havuzdaki oturumda `Page.enable`/`Network.enable` açık kalırsa tarayıcı istekler arasında
-   olay basar; döngü boştayken okunmaz, çekirdek tamponu dolar, Chrome 1 MB'ta bağlantıyı kapatır → sonraki istek yeniden
-   bağlanır (mevcut `_ws_is_open` yolu). Ölçülecek; gerekirse istek sonunda alanları kapatma.
-2. **Bekleyen görevler.** Komutun bıraktığı görev bir sonraki istekte sürer (asyncio.run iptal ederdi). Havuz görevleri
-   için zorunlu bırakıldı; sızıntı şüphesinde `asyncio.all_tasks` ölçümü.
-3. **Süreç düzeyi işler.** `launch`'ın başlattığı tarayıcı daemon'un çocuğu olur (auto-launch sayfa komutundan gelirse);
-   ayrık başlatıldığı için daemon kapanınca yaşar — doğrulanacak.
-4. **İstemci kopması.** Komut sürerken istemci ölürse çıktı düşer, komut bitirilir; çift koşu yok ama "yarım iş" olabilir.
+| # | Bulgu | Karar |
+|---|---|---|
+| 1 | Import anında çözülen port/profil/proje bayatlar (`connect`/`launch` registry'yi değiştirir) | her istekte yeniden çözüm, farklıysa `stale` + çıkış |
+| 2 | Havuz WS'i oturum-bağlı durumu (Emulation, Network.enable, glow betiği) sonraki isteğe taşır | havuz istek sonunda kapanır; `_glow_script_id` sıfırlanır |
+| 3 | `os.environ` anlık görüntüsü yetmez; umask 077 komut dosyalarına bulaşır; `_CDP_GET_CACHE` bayat | istek ortamı istemciden; umask yalnız bind'de; önbellek temizlenir |
+| 4 | Kopan istemci: komut sürer, yeni çağrı taze süreçte aynı sayfaya dokunur; sendall sonsuz bloklanabilir; `daemon stop` meşgulü siler | izleyici iş parçacığı + görev iptali; gönderim 10 sn; stop yalnız ölü soketi siler |
+| 5 | Paylaşılan /tmp yedek dizini: istemci sahiplik denetlemez, damga sembolik bağı izler | istemci lstat (uid + kip + S_IFSOCK); XDG_RUNTIME_DIR; damga O_EXCL |
+| 6 | Bozuk/çok büyük istek "bağlantı kayboldu" exit 1 olur; O(n²) tampon taraması | `{"fallback":"request"}`; `scanFrom` |
+| 7 | Bekleyen görevler sonraki isteğe sarkar | istek sonunda `all_tasks` iptal + gather |
+| 8 | `captcha-wait` terminalde Enter bekler, daemon'da stdin StringIO | `captcha-wait` taze sürece |
+| 9 | Settle: yükleme sonrası 300 ms penceresindeki konsol olayları artık toplanıyor (önce düşüyordu); SPA'da 100 ms sonra çizilen içerik eksik kalabilir | CHANGELOG'a yazıldı; SPA kümesinde ölçüm D2 kapısı |
+
+Açık kalanlar: `launch`'ın başlattığı tarayıcı daemon'un çocuğu olur (ayrık; doğrulanacak); Windows yok; istemci Ctrl+C
+komutu iptal eder ama tarayıcıda yarım kalmış navigasyon kalabilir (taze süreçte de böyleydi).
 
 ## 4. Sürüm planı
 

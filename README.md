@@ -954,8 +954,8 @@ runs — a browser paints a page in 20 ms, `cdpilot go` took about a second
 (measurements: `.claude/docs/perf-taban-2026-11-08.md`). With
 `CDPILOT_DAEMON=1` the launcher keeps one warm Python process per project and
 environment and hands page commands to it over a Unix socket; the process keeps
-the module, its event loop and the pooled CDP connections between calls, so the
-second and later calls skip all of that.
+the module and its event loop between calls, so the second and later calls skip
+the start-up cost.
 
 ```bash
 export CDPILOT_DAEMON=1
@@ -966,15 +966,22 @@ cdpilot daemon stop                 # stop every running daemon (they also leave
 ```
 
 Output, exit codes, the session log and recordings are the same either way:
-each request runs as its own process would (own argv, cwd and stdin, state
-reset between requests, exit-time hooks run at request end). The launcher runs
-a fresh process instead whenever the daemon is missing, busy with another call,
-of another version (that one is asked to leave), or the command is not a page
-command: `launch`, `stop`, `connect`, `mcp`, `serve`, `watch`, `replay`, `run`
-and the other lifecycle commands, and anything with `--timeout`. Nothing is
-ever executed twice. POSIX only for now; `CDPILOT_DAEMON_IDLE=<seconds>` sets
-the idle exit (default 1800). Opt-in in this release; the default may change
-once two weeks of use show no difference in error rates.
+each request runs as its own process would (the caller's argv, cwd,
+environment and stdin; module state reset between requests; exit-time hooks
+run at request end; the CDP connections a command opened are closed at request
+end, as a process exit closed them, so no viewport, throttle or event state
+leaks into the next command). Closing the client (Ctrl+C) cancels the running
+command. The launcher runs a fresh process instead whenever the daemon is
+missing, busy with another call, of another version (that one is asked to
+leave), set up for a port or profile the registry no longer names, or the
+command is not a page command: `launch`, `stop`, `connect`, `mcp`, `serve`,
+`watch`, `replay`, `run`, `captcha-wait` and the other lifecycle commands, and
+anything with `--timeout`. Nothing is ever executed twice. POSIX only for now;
+the socket lives in `$CDPILOT_HOME/daemon/` (or `$XDG_RUNTIME_DIR` / a private
+temp directory when that path is too long for a Unix socket), 0600, and is used
+only when it and its directory belong to you. `CDPILOT_DAEMON_IDLE=<seconds>`
+sets the idle exit (default 1800). Opt-in in this release; the default may
+change once two weeks of use show no difference in error rates.
 
 ### Session log
 

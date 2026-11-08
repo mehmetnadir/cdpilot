@@ -105,6 +105,7 @@ Hepsi `src/cdpilot.py`'ye dokunur; çatışma olursa küçük olur (ayrı fonksi
 3. srv21 `state/claude-oauth-token` yenileme (sır; trend/flood kanadı o yüzden ölü).
 4. Worktree temizliği: 6 şerit worktree + 24 `.claude/worktrees/agent-*` → `~/Silinecekler`.
 5. Show HN / Reddit zamanı, kredi org 1 (146,96 $/190 $), T2 tam denetim tarihi, fiyat katmanları (§4).
+   → 08.11 16:45: Show HN + Reddit metinleri ve 4 karar sorusu `.claude/docs/duyuru-taslaklari-2026-11-08.md` (öneri: D2 sonrası ilk Salı, Nadir'in hesabından).
 
 ## 9. Delta 08.11 15:10–15:40 (Nadir: 1 evet, 2 evet, 3 bekle, 4 tamam, 5 tamam)
 - 1 ✅ srv21 poster dağıtıldı: md5 d3d981ae…, py3.10 derleme + import OK, `systemctl start` 15:23 temiz (vadesi gelen öğe yok). Kuyruk: bricks-r2 17:30, tools-core 09.11 (metin "cdpilot 0.9.5 adds").
@@ -120,3 +121,5 @@ Hepsi `src/cdpilot.py`'ye dokunur; çatışma olursa küçük olur (ayrı fonksi
 - Bilinen: node açılışı ~110 ms taban; Windows daemon yok (hep taze); istemci Ctrl+C komutu kesmez; `_worktrees/cdpilot-lazy` (B için açılmıştı) Silinecekler'e taşındı.
 - Daemon commit 189d7f7: tutanak TT-20261108-162420-0ebba4 GEÇERLİ 604/604 (ilk koşu 594/604 KALDI: 9 kaynak-okuyan test `if __name__` bloğunu arıyordu, 2 `__doc__` testi bayt sınırıyla kesiyordu → testler `_cli_main` + gerçek docstring okur; tripwire listesi); push 16:3x; CI izleniyor.
 - Settle (bu commit): `navigate_collect` sabit `sleep(0.3)` → 100 ms olay sessizliği, tavan 300 ms. Ölçüm (yük 17): taze `go` 502–826, sıcak `go` 227–298 ms (önce 426–515); `content` sıcak 105–126, `eval` 95–114. Kalan: node ~100 + sessizlik 100 + WS/enable/3 evaluate.
+- Settle commit d0b811b: tutanak TT-20261108-164123-f23896 GEÇERLİ 605/605 (ilk koşu 604/605: eski `sleep(0.3)`'ü zorunlu kılan kaynak testi yeni davranışa çevrildi); CI 42486… yeşil.
+- İnceleme turu (Claude reviewer, salt okunur, 9 bulgu; plan belgesi §3 tablosu): havuz istek sonunda kapanır (oturum-bağlı Emulation/Network/glow durumu sızmasın), istek ortamı istemciden gelir ve geri yüklenir, import anı yapılandırması her istekte doğrulanır (`stale` → çıkış), kopan istemci görevi iptal eder, gönderim 10 sn zaman aşımı, umask yalnız bind'de, istemci tarafı lstat sahiplik denetimi + XDG_RUNTIME_DIR + O_EXCL damga, `daemon stop` meşgulü silmez, bozuk istek fallback, `captcha-wait` taze süreç, `_CDP_GET_CACHE`/`_glow_script_id` sıfırlama. Süreç içi yürütücü testi 10 senaryo (env, çıkış kodları, stdin, red, havuz kapanışı, kopan istemci 130, stale). Daemon alt kümesi 12/12; tam tutanak bu commit'te.
