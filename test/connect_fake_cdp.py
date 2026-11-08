@@ -22,6 +22,7 @@ would signal this process. Standard library only.
 import base64
 import hashlib
 import json
+import time
 import socket
 import struct
 import sys
@@ -198,7 +199,9 @@ def handle_ws(conn, path, headers):
             msg = json.loads(text)
         except ValueError:
             continue
-        entry = {"ws": path, "method": msg.get("method")}
+        # "t": when the message arrived (ms, monotonic): tests measure the gaps
+        # between cdpilot's own calls (the settle after Page.loadEventFired).
+        entry = {"ws": path, "method": msg.get("method"), "t": round(time.monotonic() * 1000, 1)}
         # What an injection would carry, by the markers in cdpilot's scripts.
         params = msg.get("params") or {}
         text = str(params.get("expression") or "") + str(params.get("source") or "")

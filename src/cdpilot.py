@@ -5674,12 +5674,15 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True,
         # Navigate
         await ws.send(json.dumps({"id": 100, "method": "Page.navigate", "params": {"url": url}}))
 
-        # Collect events until page load
-        loaded = False
+        # Collect events until page load, then settle: keep reading until
+        # 100 ms pass without an event (a static page: ~100 ms), 300 ms at
+        # most. Was a blind 1.5 s, then a blind 0.3 s sleep (measured 08.11:
+        # that sleep was most of a warm `go`).
+        loaded_at = None
         start = time.time()
-        while time.time() - start < 20:
+        while time.time() - start < 20 and (loaded_at is None or time.time() - loaded_at < 0.3):
             try:
-                resp = await asyncio.wait_for(ws.recv(), timeout=1)
+                resp = await asyncio.wait_for(ws.recv(), timeout=1 if loaded_at is None else 0.1)
                 data = json.loads(resp)
                 method = data.get("method", "")
 
@@ -5711,15 +5714,9 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True,
                     })
 
                 if method == "Page.loadEventFired":
-                    loaded = True
-                    # Was 1.5s blind sleep. Most pages settle within 300ms
-                    # of the load event. Pages with late JS still get up to
-                    # the outer 20s deadline via the next iteration's recv —
-                    # we just don't pay 1.2s of dead waiting on every nav.
-                    await asyncio.sleep(0.3)
-                    break
+                    loaded_at = time.time()
             except asyncio.TimeoutError:
-                if loaded:
+                if loaded_at is not None:
                     break
 
         # Inject visual indicator (glow overlay + visual feedback).
