@@ -62,6 +62,32 @@ test('-v prints version', () => {
   assert(out.includes(require('../package.json').version), 'Should print version');
 });
 
+test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interpreter choice is cached in CDPILOT_HOME', () => {
+  // 2026-11-08 perf baseline: `record status` took ~500 ms end to end, 0.15 s of it the
+  // recompilation of the 22k-line script on every call and 50-150 ms the `--version`
+  // probes that pick the interpreter. Both are cached now; behaviour is unchanged.
+  const src = fs.readFileSync(CLI, 'utf8');
+  assert(/runpy\.run_module\('cdpilot', run_name='__main__', alter_sys=True\)/.test(src), 'runpy loader');
+  assert(!/\[SCRIPT, \.\.\.args\]/.test(src), 'no plain script spawn left');
+  const out = run('record status');
+  assert(/No recording active/.test(out), out);
+  const cache = JSON.parse(fs.readFileSync(path.join(RUN_HOME, 'python.json'), 'utf8'));
+  assert(cache.python && typeof cache.at === 'number', 'python.json written in CDPILOT_HOME');
+  assert.strictEqual(cache.key, process.env.CDPILOT_PYTHON || '', 'CDPILOT_PYTHON is part of the key');
+  const pyc = path.join(__dirname, '..', 'src', '__pycache__');
+  if (fs.existsSync(pyc)) {
+    assert(fs.readdirSync(pyc).some((f) => /^cdpilot\.cpython-\d+\.pyc$/.test(f)),
+      'bytecode cached next to the source');
+  }
+  // A stale entry pointing at an absolute path that no longer exists is ignored, not used.
+  fs.writeFileSync(path.join(RUN_HOME, 'python.json'),
+    JSON.stringify({ python: '/nonexistent/python3', key: process.env.CDPILOT_PYTHON || '', at: Date.now() }));
+  const again = run('record status');
+  assert(/No recording active/.test(again), again);
+  assert.notStrictEqual(JSON.parse(fs.readFileSync(path.join(RUN_HOME, 'python.json'), 'utf8')).python,
+    '/nonexistent/python3', 'the vanished interpreter was re-probed');
+});
+
 test('help shows usage', () => {
   const out = run('help');
   assert(out.includes('cdpilot'), 'Should show cdpilot name');
