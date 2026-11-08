@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Shadow Iframe</title></head>
+<body data-log="">
+  <button id="iframe-plain-btn" onclick="document.body.dataset.log = (document.body.dataset.log || '') + 'plain;'">Plain Button</button>
+  <my-card id="iframe-card"></my-card>
+  <script>
+    var c = document.getElementById('iframe-card');
+    var r = c.attachShadow({mode: 'open'});
+    var b = document.createElement('button');
+    b.className = 'inner';
+    b.id = 'iframe-card-btn';
+    b.textContent = 'Iframe Card Button';
+    b.onclick = function() { document.body.dataset.log = (document.body.dataset.log || '') + 'iframe-card-clicked;'; };
+    r.appendChild(b);
+  </script>
+</body>
+</html>

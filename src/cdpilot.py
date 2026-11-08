@@ -8,8 +8,8 @@ Chrome DevTools Protocol (CDP). No Puppeteer, no Playwright, no Selenium.
 Usage:
   cdpilot <command> [arguments]
 
-Elements inside iframes (same-origin or cross-origin; nest with >>>):
-  cdpilot click "iframe#card >>> input[name=cardnumber]"   # or --frame <sel|index|url>
+Elements inside iframes and shadow roots (open shadow DOM; nest with >>>):
+  cdpilot click "iframe#card >>> input[name=cardnumber]"   # or --frame <sel> / my-card >>> .inner
 
 WebMCP tools of the page (browser started with `launch --webmcp`):
   cdpilot tools list [--json] | tools call <name> [json | --arg k=v ...]
@@ -501,17 +501,157 @@ DEV_EXTENSIONS_FILE = os.path.join(PROFILE_DIR, 'dev-extensions.json')
 # A function declaration pasted INSIDE each command's IIFE, so it stays local:
 # nothing is left on `window` for page scripts (anti-bot checks, often in an
 # iframe) to find. It used to be window.__cdpilot_waitFor.
-WAIT_AND_QUERY_JS = """
+# ─── Shadow DOM & Selector JS Helper ─────────────────────────────────────────
+# Shared JS helper for resolving CSS selectors with Shadow DOM support.
+# 1. Traverses explicit `>>>` chains through open shadow roots.
+# 2. Automatically falls back to depth-first traversal of all open shadow roots
+#    when a plain CSS selector matches nothing at document level.
+_SHADOW_QUERY_JS = r"""
+function __cdpilot_splitHops(sel) {
+  var parts = [], buf = '', quote = null, depth = 0;
+  for (var i = 0; i < sel.length; i++) {
+    var ch = sel[i];
+    if (ch === '\\' && i + 1 < sel.length) {
+      buf += sel.substr(i, 2);
+      i++;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      buf += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch; buf += ch;
+    } else if (ch === '[' || ch === '(') {
+      depth++; buf += ch;
+    } else if (ch === ']' || ch === ')') {
+      depth = Math.max(0, depth - 1); buf += ch;
+    } else if (depth === 0 && sel.substr(i, 3) === '>>>') {
+      parts.push(buf.trim());
+      buf = '';
+      i += 2;
+    } else {
+      buf += ch;
+    }
+  }
+  parts.push(buf.trim());
+  return parts;
+}
+
+function __cdpilot_walkHops(root, hops) {
+  root = root || document;
+  if (!hops || !hops.length) return { el: null, failedHop: null };
+  var curr = root;
+  var failedHop = null;
+  for (var i = 0; i < hops.length; i++) {
+    var seg = hops[i];
+    var el = null;
+    try { el = curr.querySelector(seg); } catch (e) { return { el: null, failedHop: failedHop }; }
+    if (!el) return { el: null, failedHop: failedHop };
+    if (i === hops.length - 1) {
+      if (!el.shadowRoot && !failedHop) failedHop = seg;
+      return { el: el, failedHop: failedHop };
+    }
+    if (el.shadowRoot) {
+      curr = el.shadowRoot;
+    } else {
+      if (!failedHop) failedHop = seg;
+      return { el: null, failedHop: failedHop };
+    }
+  }
+  return { el: null, failedHop: failedHop };
+}
+
+function __cdpilot_deepQuery(root, selector) {
+  var all = [];
+  try { all = root.querySelectorAll('*'); } catch (e) {}
+  for (var i = 0; i < all.length; i++) {
+    var el = all[i];
+    if (el.shadowRoot) {
+      try {
+        var m = el.shadowRoot.querySelector(selector);
+        if (m) return { el: m, host: el };
+      } catch (e) {}
+      var deeper = __cdpilot_deepQuery(el.shadowRoot, selector);
+      if (deeper) return deeper;
+    }
+  }
+  return null;
+}
+
+function __cdpilot_hostDesc(host) {
+  if (!host) return '';
+  var tag = (host.tagName || '').toLowerCase();
+  return host.id ? tag + '#' + host.id : tag;
+}
+
+function __cdpilot_resolveSelector(root, selector, deepFallback) {
+  root = root || document;
+  if (!selector) return null;
+  if (selector.indexOf('>>>') !== -1) {
+    var parts = __cdpilot_splitHops(selector);
+    if (parts.length > 1 && parts.every(function (p) { return p.length > 0; })) {
+      var res = __cdpilot_walkHops(root, parts);
+      if (res && res.el) {
+        return { el: res.el, host: null };
+      }
+      return null;
+    }
+  }
+  var direct = null;
+  try { direct = root.querySelector(selector); } catch (e) {}
+  if (direct) {
+    return { el: direct, host: null };
+  }
+  if (deepFallback !== false && selector.indexOf('>>>') === -1) {
+    var hit = __cdpilot_deepQuery(root, selector);
+    if (hit) return hit;
+  }
+  return null;
+}
+"""
+
+_SHADOW_NOTES_PRINTED = set()
+
+
+def _maybe_print_shadow_note(sel, host_desc):
+    """Print the shadow fallback note at most once per selector in a command run."""
+    if not host_desc:
+        return
+    key = (sel, host_desc)
+    if key not in _SHADOW_NOTES_PRINTED:
+        _SHADOW_NOTES_PRINTED.add(key)
+        print(_shadow_deep_fallback_note(sel, host_desc), file=sys.stderr)
+
+
+WAIT_AND_QUERY_JS = _SHADOW_QUERY_JS + """
 function __cdpilot_waitFor(selector, timeout) {
   return new Promise(function(resolve) {
-    var el = document.querySelector(selector);
-    if (el) { resolve(el); return; }
-    var obs = new MutationObserver(function() {
-      var found = document.querySelector(selector);
-      if (found) { obs.disconnect(); resolve(found); }
-    });
+    var res = __cdpilot_resolveSelector(document, selector, true);
+    if (res && res.el) { resolve(res.el); return; }
+    var obs = null;
+    var timer = null;
+    var timerTimeout = null;
+    function cleanup() {
+      if (obs) { obs.disconnect(); obs = null; }
+      if (timer) { clearInterval(timer); timer = null; }
+      if (timerTimeout) { clearTimeout(timerTimeout); timerTimeout = null; }
+    }
+    function check() {
+      var found = __cdpilot_resolveSelector(document, selector, true);
+      if (found && found.el) {
+        cleanup();
+        resolve(found.el);
+        return true;
+      }
+      return false;
+    }
+    obs = new MutationObserver(check);
     obs.observe(document.documentElement, {childList: true, subtree: true});
-    setTimeout(function() { obs.disconnect(); resolve(null); }, timeout || 5000);
+    timer = setInterval(check, 200);
+    timerTimeout = setTimeout(function() {
+      cleanup();
+      resolve(null);
+    }, timeout || 5000);
   });
 }
 """
@@ -3936,6 +4076,44 @@ def _frame_selector_hops(target):
     return parts[:-1], parts[-1]
 
 
+def _frame_fallback_note(hop):
+    """Stderr note when a >>> first hop matches no iframe or shadow host."""
+    return f"note: '{hop}' matched no iframe or shadow host; used the selector as written"
+
+
+def _shadow_closed_error(hop):
+    """Error message when a >>> hop matches an element with a closed shadow root."""
+    return f"'{hop}' has a closed shadow root; cdpilot cannot reach inside it"
+
+
+def _shadow_deep_fallback_note(sel, host_desc):
+    """Stderr note when a selector is resolved via deep shadow-piercing fallback."""
+    return f"note: '{sel}' found inside the shadow root of {host_desc}"
+
+
+def _classify_hop(node_info):
+    """Classify a probed hop target into: 'frame', 'shadow_open', 'shadow_closed', or 'none'.
+
+    Pure.
+    """
+    if not node_info or not node_info.get("found", True):
+        return "none"
+    if node_info.get("frameId"):
+        return "frame"
+    shadow_roots = node_info.get("shadowRoots") or []
+    has_open = False
+    for sr in shadow_roots:
+        if isinstance(sr, dict):
+            st = sr.get("shadowRootType")
+            if st == "closed":
+                return "shadow_closed"
+            if st == "open":
+                has_open = True
+    if has_open:
+        return "shadow_open"
+    return "none"
+
+
 def _frame_selector_plan(target, first_hop_is_frame, kind="css"):
     """How an element command reads `target` once its first hop was probed.
 
@@ -3949,8 +4127,12 @@ def _frame_selector_plan(target, first_hop_is_frame, kind="css"):
     if cand is None:
         return [], target, None
     names, inner = cand
-    if not first_hop_is_frame:
-        return [], target, f"note: '{names[0]}' matched no iframe; used the selector as written"
+    if first_hop_is_frame in ("shadow_closed", "closed"):
+        raise _FrameError(_shadow_closed_error(names[0]))
+    if first_hop_is_frame in ("shadow_open", "shadow"):
+        return [], target, None
+    if not first_hop_is_frame or first_hop_is_frame == "none":
+        return [], target, _frame_fallback_note(names[0])
     return [_parse_frame_hop(n, implicit=True) for n in names], inner, None
 
 
@@ -4493,12 +4675,76 @@ async def _frame_route_rewrite(route, commands):
     return out
 
 
+async def _probe_route_hop(route, hop):
+    """Probe whether `hop` in `route` is an iframe, an open shadow host, closed, or neither.
+
+    Returns (kind, oid, node_info):
+      kind: 'frame', 'shadow_open', 'shadow_closed', or 'none'.
+    """
+    args = f"{json.dumps(hop['kind'])}, {json.dumps(hop['value'])}"
+    # 1. First see if _FRAME_OWNER_JS matches an iframe (same-process or out-of-process)
+    r1 = await _frame_cdp(route, [(1, "Runtime.evaluate",
+                                   route.eval_params(f"({_FRAME_OWNER_JS})({args}, false)", by_value=False),
+                                   route.session_id)])
+    oid1 = r1.get(1, {}).get("result", {}).get("objectId")
+    if oid1:
+        d = await _frame_cdp(route, [(2, "DOM.describeNode", {"objectId": oid1}, route.session_id)])
+        node = d.get(2, {}).get("node", {})
+        if node.get("frameId"):
+            return "frame", oid1, node
+
+    # 2. Not an iframe: query the element itself in the current context
+    r2 = await _frame_cdp(route, [(3, "Runtime.evaluate",
+                                   route.eval_params(f"""(function () {{
+                                     try {{ return document.querySelector({json.dumps(hop['value'])}); }} catch (e) {{ return null; }}
+                                   }})()""", by_value=False),
+                                   route.session_id)])
+    oid2 = r2.get(3, {}).get("result", {}).get("objectId")
+    if not oid2:
+        return "none", None, {"found": False}
+
+    d2 = await _frame_cdp(route, [
+        (4, "DOM.describeNode", {"objectId": oid2, "depth": 1, "pierce": True}, route.session_id)
+    ])
+    node2 = d2.get(4, {}).get("node", {})
+    classification = _classify_hop(node2)
+    return classification, oid2, node2
+
+
+async def _check_chain_closed_shadow(route, names):
+    """Check if any subsequent hop in names has a closed shadow root."""
+    if len(names) <= 1:
+        return
+    chk_closed_js = f"""(function () {{
+      {_SHADOW_QUERY_JS}
+      var res = __cdpilot_walkHops(document, {json.dumps(names)});
+      return res ? res.failedHop : null;
+    }})()"""
+    r_chk = await _frame_cdp(route, [(1, "Runtime.evaluate", route.eval_params(chk_closed_js, by_value=True), route.session_id)])
+    failed_hop = r_chk.get(1, {}).get("result", {}).get("value")
+    if failed_hop:
+        idx = names.index(failed_hop) if failed_hop in names else len(names) - 1
+        sub_hops = names[:idx + 1]
+        get_node_js = f"""(function() {{
+          {_SHADOW_QUERY_JS}
+          var res = __cdpilot_walkHops(document, {json.dumps(sub_hops)});
+          return res ? res.el : null;
+        }})()"""
+        r_nd = await _frame_cdp(route, [(2, "Runtime.evaluate", route.eval_params(get_node_js, by_value=False), route.session_id)])
+        failed_oid = r_nd.get(2, {}).get("result", {}).get("objectId")
+        if failed_oid:
+            d_nd = await _frame_cdp(route, [(3, "DOM.describeNode", {"objectId": failed_oid, "depth": 1, "pierce": True}, route.session_id)])
+            node_d = d_nd.get(3, {}).get("node", {})
+            if _classify_hop(node_d) == "shadow_closed":
+                raise _FrameError(_shadow_closed_error(failed_hop))
+
+
 async def _frame_resolve_target(ws_url, flag_hops, target, kind="css"):
     """Route for one element command: (route or None, selector, note).
 
     `--frame` hops are strict. A `>>>` chain in `target` is used only when its
-    first hop is an iframe (or wraps one) and, for smart-* text, reads as a
-    selector; otherwise `target` stays a plain selector / text with no
+    first hop is an iframe (or wraps one) or an open shadow host and, for smart-*
+    text, reads as a selector; otherwise `target` stays a plain selector / text with no
     routing (None) and `note` explains, if needed.
     """
     route = _FrameRoute(ws_url)
@@ -4507,13 +4753,47 @@ async def _frame_resolve_target(ws_url, flag_hops, target, kind="css"):
         for hop in flag_hops:
             await _frame_route_push(route, hop)
         cand = _frame_chain_candidate(target, kind)
-        found = False
-        if cand is not None:
-            first = _parse_frame_hop(cand[0][0], implicit=True)
-            found = await _frame_route_push(route, first, missing_ok=True)
-        hops, selector, note = _frame_selector_plan(target, found, kind)
-        for hop in hops[1:]:
-            await _frame_route_push(route, hop)
+        if cand is None:
+            if not route.chain:
+                await _frame_route_close(route)
+                return None, target, None
+            return route, target, None
+
+        names, inner = cand
+        first = _parse_frame_hop(names[0], implicit=True)
+        first_kind, first_oid, _ = await _probe_route_hop(route, first)
+        plan_hops, plan_target, note = _frame_selector_plan(target, first_kind, kind)
+        if not first_kind or first_kind == "none":
+            if not route.chain:
+                await _frame_route_close(route)
+                return None, plan_target, note
+            return route, plan_target, note
+        if first_kind in ("shadow_open", "shadow"):
+            await _check_chain_closed_shadow(route, names)
+            if not route.chain:
+                await _frame_route_close(route)
+                return None, plan_target, None
+            return route, plan_target, None
+
+        # First hop is an iframe: enter it
+        await _frame_route_push(route, plan_hops[0])
+        for i, hop_name in enumerate(names[1:], 1):
+            next_hop = plan_hops[i]
+            hop_kind, _, _ = await _probe_route_hop(route, next_hop)
+            if hop_kind == "shadow_closed":
+                raise _FrameError(_shadow_closed_error(hop_name))
+            if hop_kind == "frame":
+                await _frame_route_push(route, next_hop)
+            elif hop_kind == "shadow_open":
+                await _check_chain_closed_shadow(route, names[i:])
+                rem_selector = " >>> ".join(names[i:] + [inner])
+                return route, rem_selector, None
+            else:
+                frames = await _frame_list(route)
+                avail = "; ".join(f"[{f['index']}] {f['id'] or f['name'] or f['src'][:60]}" for f in frames)
+                raise _FrameError(f"no iframe matches '{hop_name}' in {route.describe()}"
+                                  + (f" (frames: {avail})" if avail else " (it has no iframes)"))
+        return route, inner, None
     except _FrameError as e:
         await _frame_route_close(route)
         print(f"Error: {e}", file=sys.stderr)
@@ -4521,10 +4801,6 @@ async def _frame_resolve_target(ws_url, flag_hops, target, kind="css"):
     except BaseException:
         await _frame_route_close(route)
         raise
-    if not route.chain:
-        await _frame_route_close(route)
-        return None, selector, note
-    return route, selector, note
 
 
 def _frame_aware(kind="css"):
@@ -7187,17 +7463,21 @@ async def cmd_shot(output=None, quality=None, element=None, fmt=None):
         safe_sel = json.dumps(element)
         js = f"""
         (function() {{
-          var el = document.querySelector({safe_sel});
-          if (!el) return null;
+          {_SHADOW_QUERY_JS}
+          var res = __cdpilot_resolveSelector(document, {safe_sel}, true);
+          if (!res || !res.el) return null;
+          var el = res.el;
           el.scrollIntoView({{block: 'center'}});
           var r = el.getBoundingClientRect();
-          return JSON.stringify({{x: r.x, y: r.y, width: r.width, height: r.height}});
+          return JSON.stringify({{x: r.x, y: r.y, width: r.width, height: r.height, shadowHost: res.host ? __cdpilot_hostDesc(res.host) : null}});
         }})()
         """
         cr = await cdp_send(ws, [(2, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
         rect_str = cr.get(2, {}).get("result", {}).get("value")
         if rect_str:
             rect = json.loads(rect_str)
+            if rect.get("shadowHost"):
+                _maybe_print_shadow_note(element, rect["shadowHost"])
             params["clip"] = {
                 "x": rect["x"], "y": rect["y"],
                 "width": rect["width"], "height": rect["height"],
@@ -7406,6 +7686,22 @@ async def _resolve_selector_ladder(ws_url, inp, strategies=None):
             r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {
                 "expression": f"!!document.querySelector({json.dumps(inp)})", "returnByValue": True})])
             if r.get(1, {}).get("result", {}).get("value"):
+                tried.append({"strategy": "css", "hit": True, "selector": inp})
+                return inp, tried
+            js_shadow = f"""(function(){{
+{_SHADOW_QUERY_JS}
+var res = __cdpilot_resolveSelector(document, {json.dumps(inp)}, true);
+if (res && res.el) {{
+  return {{ hit: true, shadowHost: res.host ? __cdpilot_hostDesc(res.host) : null }};
+}}
+return {{ hit: false }};
+}})()"""
+            r2 = await cdp_send(ws_url, [(1, "Runtime.evaluate", {
+                "expression": js_shadow, "returnByValue": True})])
+            val = r2.get(1, {}).get("result", {}).get("value") or {}
+            if val.get("hit"):
+                if val.get("shadowHost"):
+                    _maybe_print_shadow_note(inp, val["shadowHost"])
                 tried.append({"strategy": "css", "hit": True, "selector": inp})
                 return inp, tried
             tried.append({"strategy": "css", "hit": False})
@@ -8055,7 +8351,9 @@ async def cmd_submit(selector="form", ladder=None, no_heal=False):
         _log_heal("submit", selector, tried, dur, no_heal)
     safe_sel = json.dumps(res_sel)
     js = f"""(function() {{
-        const form = document.querySelector({safe_sel});
+        {_SHADOW_QUERY_JS}
+        const resolved = __cdpilot_resolveSelector(document, {safe_sel}, true);
+        const form = resolved ? resolved.el : null;
         if (!form) return 'Form not found: ' + {safe_sel};
         const btn = form.querySelector('button[type=submit], input[type=submit], button:last-of-type');
         var res;
@@ -8071,18 +8369,51 @@ async def cmd_submit(selector="form", ladder=None, no_heal=False):
 async def cmd_wait(selector, timeout=5):
     ws, _ = get_page_ws()
     safe_sel = json.dumps(selector)
-    js = f"""new Promise((resolve) => {{
-        const el = document.querySelector({safe_sel});
-        if (el) return resolve('Found: ' + el.tagName + ' ' + (el.textContent||'').substring(0,60).trim());
-        const obs = new MutationObserver(() => {{
-            const el = document.querySelector({safe_sel});
-            if (el) {{ obs.disconnect(); resolve('Found: ' + el.tagName + ' ' + (el.textContent||'').substring(0,60).trim()); }}
+    js = f"""(function() {{
+        {_SHADOW_QUERY_JS}
+        return new Promise((resolve) => {{
+            const res = __cdpilot_resolveSelector(document, {safe_sel}, true);
+            if (res && res.el) {{
+                const el = res.el;
+                const hostDesc = res.host ? __cdpilot_hostDesc(res.host) : null;
+                return resolve({{ out: 'Found: ' + el.tagName + ' ' + (el.textContent||'').substring(0,60).trim(), shadowHost: hostDesc }});
+            }}
+            let obs = null;
+            let timer = null;
+            let timerTimeout = null;
+            function cleanup() {{
+                if (obs) {{ obs.disconnect(); obs = null; }}
+                if (timer) {{ clearInterval(timer); timer = null; }}
+                if (timerTimeout) {{ clearTimeout(timerTimeout); timerTimeout = null; }}
+            }}
+            function check() {{
+                const found = __cdpilot_resolveSelector(document, {safe_sel}, true);
+                if (found && found.el) {{
+                    cleanup();
+                    const el = found.el;
+                    const hostDesc = found.host ? __cdpilot_hostDesc(found.host) : null;
+                    resolve({{ out: 'Found: ' + el.tagName + ' ' + (el.textContent||'').substring(0,60).trim(), shadowHost: hostDesc }});
+                    return true;
+                }}
+                return false;
+            }}
+            obs = new MutationObserver(check);
+            obs.observe(document.documentElement || document.body, {{childList:true, subtree:true}});
+            timer = setInterval(check, 200);
+            timerTimeout = setTimeout(() => {{
+                cleanup();
+                resolve({{ out: 'Timeout: ' + {safe_sel} + ' not found ({timeout}s)' }});
+            }}, {int(timeout)*1000});
         }});
-        obs.observe(document.body, {{childList:true, subtree:true}});
-        setTimeout(() => {{ obs.disconnect(); resolve('Timeout: ' + {safe_sel} + ' not found ({timeout}s)'); }}, {int(timeout)*1000});
-    }})"""
+    }})()"""
     r = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})])
-    print(r.get(1, {}).get("result", {}).get("value", "?"))
+    val = r.get(1, {}).get("result", {}).get("value")
+    if isinstance(val, dict):
+        if val.get("shadowHost"):
+            _maybe_print_shadow_note(selector, val["shadowHost"])
+        print(val.get("out", "?"))
+    else:
+        print(val or "?")
 
 
 async def cmd_batch():
@@ -13138,10 +13469,11 @@ async def _get_element_center(ws_url, selector):
     """Return the screen center (x, y) of the element matching selector."""
     js = f"""
     (function() {{
-        var el = document.querySelector({json.dumps(selector)});
-        if (!el) return null;
-        var r = el.getBoundingClientRect();
-        return {{x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2)}};
+        {_SHADOW_QUERY_JS}
+        var res = __cdpilot_resolveSelector(document, {json.dumps(selector)}, true);
+        if (!res || !res.el) return null;
+        var r = res.el.getBoundingClientRect();
+        return {{x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2), shadowHost: res.host ? __cdpilot_hostDesc(res.host) : null}};
     }})()
     """
     res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
@@ -13149,6 +13481,8 @@ async def _get_element_center(ws_url, selector):
     if not val:
         print(f"Error: element '{selector}' not found.", file=sys.stderr)
         sys.exit(1)
+    if val.get("shadowHost"):
+        _maybe_print_shadow_note(selector, val["shadowHost"])
     return val["x"], val["y"]
 
 
@@ -14449,19 +14783,30 @@ async def cmd_assert(selector, expected_text=None, check_visible=True):
     safe_sel = json.dumps(selector)
     js = f"""
     (function() {{
+      {_SHADOW_QUERY_JS}
       var sel = {safe_sel};
-      var el = document.querySelector(sel);
-      if (!el) return 'FAIL: Element not found: ' + sel;
+      var res = __cdpilot_resolveSelector(document, sel, true);
+      if (!res || !res.el) return {{ msg: 'FAIL: Element not found: ' + sel }};
+      var el = res.el;
       {visible_check}
       {text_check}
       var tag = el.tagName.toLowerCase();
       var txt = (el.textContent || '').substring(0, 60).trim();
-      return 'PASS: ' + tag + (txt ? ' "' + txt + '"' : '') + ' (' + sel + ')';
+      var hostDesc = res.host ? __cdpilot_hostDesc(res.host) : null;
+      return {{
+        msg: 'PASS: ' + tag + (txt ? ' "' + txt + '"' : '') + ' (' + sel + ')',
+        shadowHost: hostDesc
+      }};
     }})()
     """
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
-    print(result)
+    val = r.get(1, {}).get("result", {}).get("value")
+    if isinstance(val, dict):
+        if val.get("shadowHost"):
+            _maybe_print_shadow_note(selector, val["shadowHost"])
+        print(val.get("msg", "ERROR"))
+    else:
+        print(val or "ERROR")
 
 
 async def cmd_wait_for(selector, timeout_ms=5000):
@@ -14470,22 +14815,56 @@ async def cmd_wait_for(selector, timeout_ms=5000):
     safe_sel = json.dumps(selector)
     js = f"""
     (function() {{
+      {_SHADOW_QUERY_JS}
       return new Promise(function(resolve) {{
         var sel = {safe_sel};
-        var el = document.querySelector(sel);
-        if (el) return resolve('FOUND: ' + el.tagName + ' "' + (el.textContent || '').substring(0, 60).trim() + '"');
-        var obs = new MutationObserver(function() {{
-          var el = document.querySelector(sel);
-          if (el) {{ obs.disconnect(); resolve('FOUND: ' + el.tagName + ' "' + (el.textContent || '').substring(0, 60).trim() + '"'); }}
-        }});
-        obs.observe(document.body, {{childList: true, subtree: true}});
-        setTimeout(function() {{ obs.disconnect(); resolve('TIMEOUT: ' + sel + ' not found after {timeout_ms}ms'); }}, {timeout_ms});
+        var res = __cdpilot_resolveSelector(document, sel, true);
+        if (res && res.el) {{
+          var hostDesc = res.host ? __cdpilot_hostDesc(res.host) : null;
+          return resolve({{
+            out: 'FOUND: ' + res.el.tagName + ' "' + (res.el.textContent || '').substring(0, 60).trim() + '"',
+            shadowHost: hostDesc
+          }});
+        }}
+        var obs = null;
+        var timer = null;
+        var timerTimeout = null;
+        function cleanup() {{
+          if (obs) {{ obs.disconnect(); obs = null; }}
+          if (timer) {{ clearInterval(timer); timer = null; }}
+          if (timerTimeout) {{ clearTimeout(timerTimeout); timerTimeout = null; }}
+        }}
+        function check() {{
+          var found = __cdpilot_resolveSelector(document, sel, true);
+          if (found && found.el) {{
+            cleanup();
+            var hostDesc = found.host ? __cdpilot_hostDesc(found.host) : null;
+            resolve({{
+              out: 'FOUND: ' + found.el.tagName + ' "' + (found.el.textContent || '').substring(0, 60).trim() + '"',
+              shadowHost: hostDesc
+            }});
+            return true;
+          }}
+          return false;
+        }}
+        obs = new MutationObserver(check);
+        obs.observe(document.documentElement || document.body, {{childList: true, subtree: true}});
+        timer = setInterval(check, 200);
+        timerTimeout = setTimeout(function() {{
+          cleanup();
+          resolve({{ out: 'TIMEOUT: ' + sel + ' not found after {timeout_ms}ms' }});
+        }}, {timeout_ms});
       }});
     }})()
     """
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})], timeout=max(15, timeout_ms // 1000 + 5))
-    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
-    print(result)
+    val = r.get(1, {}).get("result", {}).get("value")
+    if isinstance(val, dict):
+        if val.get("shadowHost"):
+            _maybe_print_shadow_note(selector, val["shadowHost"])
+        print(val.get("out", "ERROR"))
+    else:
+        print(val or "ERROR")
 
 
 async def cmd_wait_for_text(text, timeout_ms=5000):
@@ -14562,14 +14941,26 @@ async def cmd_check(checks_json=None):
             }}"""
         js = f"""
         (function() {{
-          var el = document.querySelector({safe_sel});
-          if (!el) return 'FAIL: Not found: ' + {safe_sel};
+          {_SHADOW_QUERY_JS}
+          var res = __cdpilot_resolveSelector(document, {safe_sel}, true);
+          if (!res || !res.el) return {{ msg: 'FAIL: Not found: ' + {safe_sel} }};
+          var el = res.el;
           {text_check}
-          return 'PASS: ' + el.tagName + ' (' + {safe_sel} + ')';
+          var hostDesc = res.host ? __cdpilot_hostDesc(res.host) : null;
+          return {{
+            msg: 'PASS: ' + el.tagName + ' (' + {safe_sel} + ')',
+            shadowHost: hostDesc
+          }};
         }})()
         """
         r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-        result = r.get(1, {}).get("result", {}).get("value", "ERROR")
+        val = r.get(1, {}).get("result", {}).get("value")
+        if isinstance(val, dict):
+            if val.get("shadowHost"):
+                _maybe_print_shadow_note(sel, val["shadowHost"])
+            result = val.get("msg", "ERROR")
+        else:
+            result = val or "ERROR"
         if result.startswith("PASS"):
             passed += 1
         else:
@@ -14634,16 +15025,24 @@ async def cmd_assert_value(selector, expected_value):
     safe_sel = json.dumps(selector)
     safe_expected = json.dumps(expected_value)
     js = f"""(function() {{
-      var el = document.querySelector({safe_sel});
-      if (!el) return 'FAIL: Element not found: ' + {safe_sel};
+      {_SHADOW_QUERY_JS}
+      var res = __cdpilot_resolveSelector(document, {safe_sel}, true);
+      if (!res || !res.el) return 'FAIL: Element not found: ' + {safe_sel};
+      var el = res.el;
       var val = el.value;
       var expected = {safe_expected};
-      if (val === expected) return 'PASS: Value matches \"' + expected + '\"';
-      return 'FAIL: Expected value \"' + expected + '\" but got \"' + val + '\"';
+      var hostDesc = res.host ? __cdpilot_hostDesc(res.host) : null;
+      var msg = val === expected ? 'PASS: Value matches \"' + expected + '\"' : 'FAIL: Expected value \"' + expected + '\" but got \"' + val + '\"';
+      return {{ msg: msg, shadowHost: hostDesc }};
     }})()"""
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
-    print(result)
+    val = r.get(1, {}).get("result", {}).get("value")
+    if isinstance(val, dict):
+        if val.get("shadowHost"):
+            _maybe_print_shadow_note(selector, val["shadowHost"])
+        print(val.get("msg", "ERROR"))
+    else:
+        print(val or "ERROR")
 
 
 async def cmd_assert_attr(selector, attr, expected):
@@ -14653,16 +15052,24 @@ async def cmd_assert_attr(selector, attr, expected):
     safe_attr = json.dumps(attr)
     safe_expected = json.dumps(expected)
     js = f"""(function() {{
-      var el = document.querySelector({safe_sel});
-      if (!el) return 'FAIL: Element not found: ' + {safe_sel};
+      {_SHADOW_QUERY_JS}
+      var res = __cdpilot_resolveSelector(document, {safe_sel}, true);
+      if (!res || !res.el) return 'FAIL: Element not found: ' + {safe_sel};
+      var el = res.el;
       var val = el.getAttribute({safe_attr}) || '';
       var expected = {safe_expected};
-      if (val.indexOf(expected) !== -1) return 'PASS: ' + {safe_sel} + '[' + {safe_attr} + '] = \"' + val + '\"';
-      return 'FAIL: Expected ' + {safe_sel} + '[' + {safe_attr} + '] to contain \"' + expected + '\" but got \"' + val + '\"';
+      var hostDesc = res.host ? __cdpilot_hostDesc(res.host) : null;
+      var msg = val.indexOf(expected) !== -1 ? 'PASS: ' + {safe_sel} + '[' + {safe_attr} + '] = \"' + val + '\"' : 'FAIL: Expected ' + {safe_sel} + '[' + {safe_attr} + '] to contain \"' + expected + '\" but got \"' + val + '\"';
+      return {{ msg: msg, shadowHost: hostDesc }};
     }})()"""
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
-    print(result)
+    val = r.get(1, {}).get("result", {}).get("value")
+    if isinstance(val, dict):
+        if val.get("shadowHost"):
+            _maybe_print_shadow_note(selector, val["shadowHost"])
+        print(val.get("msg", "ERROR"))
+    else:
+        print(val or "ERROR")
 
 
 async def cmd_assert_visible(selector, should_be_visible=True):
@@ -14672,8 +15079,10 @@ async def cmd_assert_visible(selector, should_be_visible=True):
     expect_label = "visible" if should_be_visible else "hidden"
     opposite_label = "hidden" if should_be_visible else "visible"
     js = f"""(function() {{
-      var el = document.querySelector({safe_sel});
-      if (!el) return 'FAIL: Element not found: ' + {safe_sel};
+      {_SHADOW_QUERY_JS}
+      var res = __cdpilot_resolveSelector(document, {safe_sel}, true);
+      if (!res || !res.el) return 'FAIL: Element not found: ' + {safe_sel};
+      var el = res.el;
       var style = window.getComputedStyle(el);
       var rect = el.getBoundingClientRect();
       var isVisible = (
@@ -14683,12 +15092,18 @@ async def cmd_assert_visible(selector, should_be_visible=True):
         (rect.width > 0 || rect.height > 0)
       );
       var expectVisible = {str(should_be_visible).lower()};
-      if (isVisible === expectVisible) return 'PASS: ' + {safe_sel} + ' is {expect_label}';
-      return 'FAIL: ' + {safe_sel} + ' expected {expect_label} but is {opposite_label}';
+      var hostDesc = res.host ? __cdpilot_hostDesc(res.host) : null;
+      var msg = isVisible === expectVisible ? 'PASS: ' + {safe_sel} + ' is {expect_label}' : 'FAIL: ' + {safe_sel} + ' expected {expect_label} but is {opposite_label}';
+      return {{ msg: msg, shadowHost: hostDesc }};
     }})()"""
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-    result = r.get(1, {}).get("result", {}).get("value", "ERROR")
-    print(result)
+    val = r.get(1, {}).get("result", {}).get("value")
+    if isinstance(val, dict):
+        if val.get("shadowHost"):
+            _maybe_print_shadow_note(selector, val["shadowHost"])
+        print(val.get("msg", "ERROR"))
+    else:
+        print(val or "ERROR")
 
 
 async def cmd_screenshot_diff(path1, path2):
@@ -16168,25 +16583,36 @@ async def cmd_scroll_to(selector, entropy=None):
     if entropy:
         # Get element position then humanize scroll
         js_pos = f"""(function(){{
-            var el=document.querySelector({json.dumps(selector)});
-            if(!el) return null;
-            var r=el.getBoundingClientRect();
-            return {{top: r.top, height: r.height}};
+            {_SHADOW_QUERY_JS}
+            var res = __cdpilot_resolveSelector(document, {json.dumps(selector)}, true);
+            if(!res || !res.el) return null;
+            var r=res.el.getBoundingClientRect();
+            return {{top: r.top, height: r.height, shadowHost: res.host ? __cdpilot_hostDesc(res.host) : null}};
         }})()"""
         res_pos = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js_pos, "returnByValue": True})])
         val = res_pos.get(1, {}).get("result", {}).get("value")
         if not val:
             print(f"Error: element '{selector}' not found.", file=sys.stderr)
             sys.exit(1)
+        if val.get("shadowHost"):
+            _maybe_print_shadow_note(selector, val["shadowHost"])
         delta = int(val.get("top", 0))
         if delta != 0:
             await _humanize_scroll(ws_url, delta)
         print(f"Scrolled to (entropy): {selector}")
     else:
-        js = f"(function(){{ var el=document.querySelector({json.dumps(selector)}); if(!el) return false; el.scrollIntoView({{behavior:'instant',block:'center'}}); return true; }})()"
+        js = f"""(function(){{
+            {_SHADOW_QUERY_JS}
+            var res = __cdpilot_resolveSelector(document, {json.dumps(selector)}, true);
+            if(!res || !res.el) return null;
+            res.el.scrollIntoView({{behavior:'instant',block:'center'}});
+            return {{ ok: true, shadowHost: res.host ? __cdpilot_hostDesc(res.host) : null }};
+        }})()"""
         res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-        ok = res.get(1, {}).get("result", {}).get("value", False)
-        if ok:
+        val = res.get(1, {}).get("result", {}).get("value")
+        if val and val.get("ok"):
+            if val.get("shadowHost"):
+                _maybe_print_shadow_note(selector, val["shadowHost"])
             print(f"Scrolled to: {selector}")
         else:
             print(f"Error: element '{selector}' not found.", file=sys.stderr)
@@ -17114,9 +17540,9 @@ class MCPServer:
             {"name": "browser_screenshot", "description": "Capture a screenshot of the current browser viewport. Supports element-level cropping to save tokens (capture only a specific element instead of full page). Use JPEG format with quality parameter for smaller files (~5x smaller than PNG). Prefer element cropping + JPEG for token-efficient AI workflows.",
              "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Output file path (e.g. /tmp/screenshot.png). Extension determines format: .png, .jpg, .webp", "default": "screenshot.png"}, "element": {"type": "string", "description": "CSS selector to capture only that element (crops to bounding box). Saves ~3-7x tokens vs full page."}, "quality": {"type": "number", "description": "JPEG quality 1-100 (only for .jpg files). Lower = smaller file = fewer tokens. Default: 80"}}}},
             {"name": "browser_click", "description": "Click an element on the page identified by CSS selector. Auto-waits up to 5 seconds for the element to appear (MutationObserver). Scrolls the element into view before clicking. Returns the tag name and text of the clicked element. When a real mouse click (inside a frame, or with entropy) was pressed but the page changed under the press so the release missed the target, nothing is clicked again by script and the first line is JSON {\"clicked\": false, \"reason\": \"moved\"|\"gone\"|\"unknown\"} (isError stays false): the page may already have reacted to the press, so check it before retrying.",
-             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element to click (e.g. '#submit-btn', '.nav a', 'button[type=submit]'). Inside an iframe (cross-origin too): 'iframe#card >>> button#pay'"}}, "required": ["selector"]}},
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element to click (e.g. '#submit-btn', '.nav a', 'button[type=submit]'). Inside an iframe or shadow root: 'iframe#card >>> button#pay' or 'my-card >>> button.inner'"}}, "required": ["selector"]}},
             {"name": "browser_type", "description": "Type text into an input or textarea element. Uses React-compatible value setting (native setter + input/change events). Auto-waits up to 5 seconds for the element. Use browser_fill as an alias.",
-             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the input element. Inside an iframe (cross-origin too): 'iframe#card >>> input[name=cardnumber]'"}, "text": {"type": "string", "description": "Text value to type into the element"}}, "required": ["selector", "text"]}},
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the input element. Inside an iframe or shadow root: 'iframe#card >>> input[name=cardnumber]' or 'my-card >>> input.inner'"}, "text": {"type": "string", "description": "Text value to type into the element"}}, "required": ["selector", "text"]}},
             {"name": "browser_content", "description": "Get the visible text content of the current page (document.body.innerText). Returns up to 10000 characters. Use this to read page content without HTML markup. Prefer browser_a11y for structured navigation data.",
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_html", "description": "Get the full HTML source of the current page (document.documentElement.outerHTML). Returns up to 50000 characters. Use sparingly — prefer browser_content or browser_a11y for most tasks as they return smaller, more useful data.",
@@ -17134,7 +17560,7 @@ class MCPServer:
             {"name": "browser_a11y", "description": "Get the accessibility tree of the current page as structured data. Returns interactive elements with @N references that can be used with browser_click. This is the PREFERRED way to understand page structure — uses ~500 tokens vs ~250K for screenshots. Use 'summary' mode for a compact view.",
              "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["full", "summary"], "description": "Output detail level: 'full' for complete tree, 'summary' for interactive elements only", "default": "full"}}}},
             {"name": "browser_fill", "description": "Set an input element's value using React-compatible method (native descriptor setter + input/change events). Auto-waits up to 5 seconds for the element. Works with regular inputs, textareas, and React controlled components.",
-             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the input element. Inside an iframe (cross-origin too): 'iframe#card >>> input[name=cardnumber]'"}, "value": {"type": "string", "description": "Value to set in the input field"}}, "required": ["selector", "value"]}},
+             "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the input element. Inside an iframe or shadow root: 'iframe#card >>> input[name=cardnumber]' or 'my-card >>> input.inner'"}, "value": {"type": "string", "description": "Value to set in the input field"}}, "required": ["selector", "value"]}},
             {"name": "browser_launch", "description": "Launch an isolated browser instance with Chrome DevTools Protocol enabled. Uses existing Brave/Chrome/Chromium installation — no browser download needed. Creates an isolated profile directory so your personal browser data is never touched.",
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_close", "description": "Smart close: shut down every tab cdpilot opened during this automation, then close the whole browser application gracefully ONLY if no user-opened tabs remain. If the user has their own tabs open in the same browser, those are left untouched and the browser stays open. Use this to clean up after automation. Set force=true to close the browser even when user tabs remain; set keep_browser=true to only close cdpilot's tabs and never quit the browser.",
