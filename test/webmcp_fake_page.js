@@ -20,6 +20,8 @@
 //            tool is added, results are replaced, calls are recorded
 //   isoblind the isolated world has no document.modelContext; the main does
 //   twoframes two same-origin frames register the same tool name
+//   framesown Chrome 156: the top document's getTools() leaves out the frame's
+//            tool; the frame's own document.modelContext lists and runs it
 'use strict';
 const vm = require('vm');
 
@@ -103,6 +105,24 @@ if (scenario === 'legacy') {
     }
     return settle(tool, inputObject, options);
   };
+}
+
+if (scenario === 'framesown') {
+  const frameTool = tools.splice(tools.findIndex((t) => t.name === 'frame_echo'), 1)[0];
+  frameWin.document.modelContext = {
+    getTools() {
+      calls.push({ fn: 'getTools', world, argc: arguments.length, ctx: 'frame' });
+      return Promise.resolve([frameTool]);
+    },
+    executeTool(tool, inputObject = undefined, options = {}) {
+      record(tool, inputObject, options);
+      calls[calls.length - 1].argc = arguments.length;
+      calls[calls.length - 1].ctx = 'frame';
+      return settle(tool, inputObject, options);
+    },
+  };
+  frameWin.frames = [];
+  win.frames = [frameWin];
 }
 
 const secure = scenario !== 'insecure';

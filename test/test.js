@@ -7862,6 +7862,30 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert(/not found in a frame matching 'nowhere'/.test(r.nomatch.stderr), r.nomatch.stderr);
   });
 
+  test("webmcp: a frame tool the parent's getTools() leaves out (Chrome 156) is listed and run from its own document", () => {
+    const r = fake('frames_own');
+    for (const key of ['list', 'frame', 'filtered', 'top']) {
+      isolatedOnly(r[key], key);
+      assert.strictEqual(r[key].exit, 0, `${key}: ${r[key].stderr}`);
+      assert.strictEqual(r[key].stderr, '', `${key}: no note`);
+    }
+    const tools = JSON.parse(r.list.stdout).tools;
+    assert.deepStrictEqual(tools.map((t) => t.name), ['add_to_cart', 'frame_echo', 'subscribe_newsletter']);
+    assert.strictEqual(tools[1].frame, 'https://shop.test/frame.html');
+    assert.strictEqual(tools[0].frame, null);
+    // The top document was asked once, then the frame; nothing else.
+    assert.deepStrictEqual(r.list.calls[0].map((c) => [c.fn, c.ctx || 'top']),
+      [['getTools', 'top'], ['getTools', 'frame']]);
+    const exec = (run) => [].concat(...run.calls).filter((c) => c.fn === 'executeTool');
+    for (const key of ['frame', 'filtered']) {
+      assert.deepStrictEqual(exec(r[key]).map((c) => [c.name, c.frame, c.ctx]),
+        [['frame_echo', 'frame', 'frame']], `${key}: runs on the frame's own modelContext`);
+      assert.strictEqual(exec(r[key])[0].signal, true, key);
+    }
+    assert.deepStrictEqual(JSON.parse(r.frame.stdout), { ok: true, tool: 'frame_echo', got: { text: 'hi' } });
+    assert.deepStrictEqual(exec(r.top).map((c) => [c.name, c.ctx || 'top']), [['add_to_cart', 'top']]);
+  });
+
   test('webmcp: bad args and unknown tools never reach executeTool (exit 1)', () => {
     const r = fake('call_refusals');
     for (const [key, re] of [['missing', /missing required argument: qty/],

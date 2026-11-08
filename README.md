@@ -1124,7 +1124,9 @@ cdpilot launch --no-webmcp     # turn it off again (applies at the next start)
   Chrome reads feature flags only at startup: a browser that is already running
   keeps its flags until `cdpilot stop`.
 - `tools list` shows the tools of the page and of its same-origin iframes
-  (with the frame URL), marks form tools and whether the form submits itself
+  (with the frame URL; every readable frame is asked for its own tools, so a
+  frame tool missing from the top document's `getTools()` is still listed and
+  runs in its frame), marks form tools and whether the form submits itself
   (`toolautosubmit`), and shows `title` and the `readOnlyHint` /
   `consequentialHint` / `untrustedContentHint` annotations. Nothing is injected
   into the page: the list is the browser's registry at that moment, so it

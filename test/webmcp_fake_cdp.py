@@ -194,6 +194,20 @@ def scenario_two_frames(mod, node):
     }
 
 
+def scenario_frames_own(mod, node):
+    """Chrome 156: the parent's getTools() leaves out a same-origin frame's tool;
+    the frame's own document.modelContext lists it and runs it."""
+    return {
+        "list": run(mod, node, "framesown", lambda: mod.cmd_tools_list(as_json=True)),
+        "frame": run(mod, node, "framesown",
+                     lambda: mod.cmd_tools_call("frame_echo", {"text": "hi"})),
+        "filtered": run(mod, node, "framesown",
+                        lambda: mod.cmd_tools_call("frame_echo", {"text": "hi"}, "frame.html")),
+        "top": run(mod, node, "framesown",
+                   lambda: mod.cmd_tools_call("add_to_cart", {"sku": "A1", "qty": 2})),
+    }
+
+
 def scenario_call_timeout(mod, node):
     """The command's time budget aborts the execution through the signal."""
     saved = mod.WEBMCP_CALL_TIMEOUT
@@ -357,6 +371,7 @@ SCENARIOS = {
     "hostile_page": scenario_hostile_page,
     "world_fallback": scenario_world_fallback,
     "two_frames": scenario_two_frames,
+    "frames_own": scenario_frames_own,
     "call_refusals": scenario_call_refusals,
     "list_diagnosis": scenario_list_diagnosis,
     "validate": scenario_validate,
