@@ -78,3 +78,14 @@ Hepsi `src/cdpilot.py`'ye dokunur; çatışma olursa küçük olur (ayrı fonksi
 - 03:17 flow merge main'de (8e0f840); tutanak TT-20261108-031714-3cdb63 GEÇTİ 588/588.
 - 03:20 T1 güvenlik incelemesi (skill security-review, bulucu + 2 süzgeç): HIGH/MEDIUM yok. İki düşük güvenli bulgu: (1) MCP `browser_network` url'si `--har=<yol>` olarak yorumlanıp dosya eziyordu → düzeltildi efcf2e0 (`--` ile seçenek sonu, 2 test); (2) kayıt maskesi oturum günlüğünden dar (`#login-pw`, `cardnumber`, `X-Api-Key:…`, eval literal, tools call JSON) → şerit `lane/redact` (`redact.prompt.txt`, worktree cdpilot-redact) açıldı.
 - 03:27 shadow 2. tur incelendi (8/8), merge 7c1c161; main tutanağı TT-20261108-032740-36a312 GEÇTİ 593/593. Shadow e2e yerelde koşmadı (tarayıcı başlatma yok) → CI. Kalan: redact şeridi → merge → sürüm 0.9.5 hazırlığı → Nadir onayı (push + PR + npm).
+- 03:40 redact şeridi (T1 bulgu 2) incelendi: koşu 849 sn, 591/0; tasarım izlendi (`_slog_secret_hits` tek kaynak, JS literal `{{vN}}`, tools-call JSON, `assert-value`, `--save` 0600, 10 vakalı test). Şef ek: seçici regex'ine sözcük sınırı (`\bpin\b`, `\bcard`, `\bssn\b`; `#shipping-address`, `#discard`, `#lesson` düz kalır; `#keyword` oturum günlüğü gibi `key` ile maskelenir — bilinçli, güvenli yön), README cümlesi birleştirildi. Commit f79b1d4, merge 34370ac (CHANGELOG çatışması: şerit satırı + shadow satırı).
+- 03:45 sürüm hazırlığı 259620c: package/server×2/manifest/plugin/marketplace/`__version__` = 0.9.5; CHANGELOG `[Unreleased]` → `[0.9.5] - 2026-11-08` + 2 eksik satır (`network -- <url>` kapısı, README vaat denetimi); HAR belge testi `changelogFor('0.9.5')`. package-lock.json kök sürümü 0.5.0 (eskiden beri bayat; dokunulmadı).
+- 03:46 main tutanağı TT-20261108-034616-4b0057: 594/594 — GEÇTİ. Ağaç temiz, origin/main'in 30 commit önünde; push yok.
+- X: 08.11 editör turu (09:17) henüz koşmadı (`tur-2026-11-08.log` yok); srv21 kuyruğu 08.11 14:07 bricks + 09.11 17:17 tools-core, poster son başarılı 07.11 17:44.
+
+## 6. Yayın adımları 0.9.5 (Nadir onayı; sıra bozulmaz)
+1. `git push origin main` (30 commit; ya da önceki sürümler gibi PR → merge).
+2. CI yeşil mi: birim matrisi + `CDPILOT_E2E=1` işi (shadow DOM, HAR, record/replay e2e'leri yerelde hiç koşmadı — ilk gerçek tarayıcı burada). Kırmızı ise düzeltme commit'i, yayın bekler.
+3. GitHub release `v0.9.5` (notlar = CHANGELOG [0.9.5]) → `publish.yml` OIDC ile npm'e basar, `.mcpb`'yi release'e ekler.
+4. `npm view cdpilot version` = 0.9.5 doğrulaması; MCP Registry `server.json` yeniden yayını (0.9.4'te yapıldığı gibi).
+5. 09.11 17:17 X paylaşımı: yayın o saatten önce olmazsa `post-2026-11-09-tools-core.json` metni "the next release" → "0.9.5" ya da ertele.
