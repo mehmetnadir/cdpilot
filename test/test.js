@@ -10113,8 +10113,8 @@ print(json.dumps({"har1": har1, "har2": har2, "har3": har3}))
       'README must mention response bodies omitted');
     assert(/«masked»/.test(readme), 'README must mention «masked»');
 
-    assert(/## \[Unreleased\][\s\S]*?HAR export for network monitoring/i.test(changelog),
-      'CHANGELOG [Unreleased] must document HAR export');
+    assert(/HAR export for network monitoring/i.test(changelogFor('0.9.5')),
+      'CHANGELOG [Unreleased]/[0.9.5] must document HAR export');
 
     assert(/Network monitoring & HAR export:/.test(PY_CONTENT),
       'src/cdpilot.py __doc__ must document network --har');

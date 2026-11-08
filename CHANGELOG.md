@@ -2,7 +2,7 @@
 
 All notable changes to cdpilot will be documented in this file.
 
-## [Unreleased]
+## [0.9.5] - 2026-11-08
 
 ### Added
 - **HAR export for network monitoring: `cdpilot network <url> --har <file>` (or `--har -` for stdout).** Exports the HTTP requests of that navigation as valid HAR 1.2 JSON, written atomically (`tmp + os.replace`). Entries capture URLs (userinfo passwords and secret-named query parameters masked like the session log), methods, headers, status codes, query strings, and CDP timing breakdowns (DNS, connect, SSL, send, wait, receive). Response bodies are omitted to avoid transfer and memory overhead. Header values carrying secrets (`Cookie`, `Authorization`, `X-Api-Key`, tokens) are masked as `"«masked»"`. Prints `"har: N entries -> <file>"` to stderr.
@@ -12,6 +12,10 @@ All notable changes to cdpilot will be documented in this file.
 
 ### Fixed
 - **Web Bot Auth idle close counts CDP clients reliably on macOS 26.** `netstat -anv -p tcp` under unprivileged parent interpreters on macOS 26 exits 0 with empty stdout; an empty or header-only netstat table is now treated as unknown rather than "no clients", falling back to port-scoped `lsof -nP -iTCP:<port> -sTCP:ESTABLISHED -F pn` (~0.1-0.3 s). Idle close no longer closes a shared browser under concurrent clients when verbose netstat is withheld.
+- **`network` stops option parsing at `--`; the MCP `browser_network` tool passes its url after `--`.** A url shaped like `--har=<path>` handed to the MCP tool was parsed as the HAR output flag and could write a file at that path; it is now a plain (invalid) url. CLI: `cdpilot network -- <url>` (T1 security review).
+
+### Changed
+- **README claims audit (06.11).** "Zero dependency" is now "zero npm dependencies" (`websockets` is a real Python dependency the setup wizard installs); the CAPTCHA stance names the opt-in BYOK solver plugins instead of contradicting them; withdrawn camoufox / undetected-chrome mentions and the unmeasured "13x smaller" / "3-10x faster" multipliers are gone; the privacy line names the opt-in paths that leave the machine.
 
 ## [0.9.4] - 2026-09-29
 
