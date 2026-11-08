@@ -453,6 +453,25 @@ cdpilot a11y summary          # Quick summary
 cdpilot a11y find <role>      # Find elements by ARIA role
 ```
 
+### Agent mode: numbered refs and diffs (token budget)
+
+```bash
+cdpilot agent observe                 # {url, title, actions:[{ref:"@1", role, name, value?}], text, token_estimate}
+cdpilot agent act --ref @3 --action click
+cdpilot agent act --ref @4 --action fill --text "cdpilot"
+cdpilot agent act --url https://example.com/   # navigates silently, prints the diff
+cdpilot agent observe --diff          # only what changed since the last observe/act
+cdpilot agent stats | agent reset
+```
+
+`observe` turns the accessibility tree into a numbered list of things an agent can act on (buttons, links,
+fields with their current value, unique text anchors) plus a short text summary; no screenshot, no HTML.
+Every `act` and `observe --diff` returns only the change: `changed.added` (full descriptors, so the agent can act
+on a new element without another observe), `changed.removed` (refs), `changed.value_changed`, and `text` only
+when it changed (`text_changed`). Refs are stable while the element exists (keyed by the DOM node, not by
+position); a navigation starts a new set. `token_estimate` is `len(json)/4`; `saved_vs_full` compares the diff
+with a full observe of the same page. State lives in `~/.cdpilot/projects/<id>/agent-state.json`.
+
 ### Session Management
 
 ```bash
