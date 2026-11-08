@@ -69,6 +69,14 @@ pip install cryptography):
                        (tabs, popups, iframes, workers), until `stop`
   cdpilot bot-auth status      Agent URL, keyid, signer on/off
 
+Network monitoring & HAR export:
+  cdpilot network [url] [--har <file>]
+                       Monitor HTTP requests of navigation. With `--har <file>`,
+                       exports traffic as HAR 1.2 JSON (`--har -` for stdout).
+                       Sensitive header values (Cookie, Authorization, ...) and
+                       secret-named URL parameters are masked. Response bodies
+                       are omitted.
+
 Exit codes: 0 ok, 1 error (batch / run: a step failed), 124 --timeout;
   exit 3 from click / smart-click (batch / run: one, and no failed step):
   pressed, release missed the target, not clicked (a real mouse click whose
@@ -5237,10 +5245,91 @@ async def _smart_act_real(route, expr, label):
         await _frame_cdp(route, [(9, "Runtime.releaseObjectGroup", {"objectGroup": g}, sid)])
 
 
-async def navigate_collect(ws_url, url, network=False, console=False, glow=True):
+def _process_har_event(data, har_records, har_active, har_page_events):
+    method = data.get("method", "")
+    params = data.get("params", {})
+    req_id = params.get("requestId")
+
+    if method == "Network.requestWillBeSent":
+        if req_id and req_id in har_active:
+            prev = har_active[req_id]
+            if "redirectResponse" in params and not prev.get("responseReceived"):
+                prev["responseReceived"] = params["redirectResponse"]
+        req_data = params.get("request", {})
+        post_data = req_data.get("postData")
+        rec = {
+            "requestId": req_id,
+            "requestWillBeSent": {
+                "url": req_data.get("url", ""),
+                "method": req_data.get("method", "GET"),
+                "headers": req_data.get("headers", {}),
+                "hasPostData": req_data.get("hasPostData", bool(post_data)),
+                "postDataLength": len(post_data.encode("utf-8")) if isinstance(post_data, str) else (len(post_data) if post_data else 0),
+                "wallTime": params.get("wallTime"),
+                "timestamp": params.get("timestamp"),
+                "initiator": params.get("initiator", {}),
+                "type": params.get("type", ""),
+            },
+        }
+        har_records.append(rec)
+        if req_id:
+            har_active[req_id] = rec
+
+    elif method == "Network.responseReceived":
+        resp_data = params.get("response", {})
+        rec = har_active.get(req_id)
+        if not rec:
+            rec = {"requestId": req_id}
+            har_records.append(rec)
+            if req_id:
+                har_active[req_id] = rec
+        rec["responseReceived"] = {
+            "status": resp_data.get("status"),
+            "statusText": resp_data.get("statusText", ""),
+            "headers": resp_data.get("headers", {}),
+            "mimeType": resp_data.get("mimeType", ""),
+            "timing": resp_data.get("timing"),
+            "remoteIPAddress": resp_data.get("remoteIPAddress", ""),
+            "remotePort": resp_data.get("remotePort"),
+            "protocol": resp_data.get("protocol", ""),
+            "fromDiskCache": resp_data.get("fromDiskCache", False),
+            "fromServiceWorker": resp_data.get("fromServiceWorker", False),
+            "type": params.get("type", ""),
+        }
+
+    elif method == "Network.loadingFinished":
+        rec = har_active.get(req_id)
+        if rec:
+            rec["loadingFinished"] = {
+                "encodedDataLength": params.get("encodedDataLength", 0),
+                "timestamp": params.get("timestamp"),
+            }
+
+    elif method == "Network.loadingFailed":
+        rec = har_active.get(req_id)
+        if rec:
+            rec["loadingFailed"] = {
+                "errorText": params.get("errorText", ""),
+                "canceled": params.get("canceled", False),
+                "timestamp": params.get("timestamp"),
+            }
+
+    elif method == "Page.domContentEventFired":
+        har_page_events["domContentEventFired"] = params.get("timestamp")
+
+    elif method == "Page.loadEventFired":
+        har_page_events["loadEventFired"] = params.get("timestamp")
+
+
+async def navigate_collect(ws_url, url, network=False, console=False, glow=True, har=False):
     """Navigate to a page and optionally collect network/console events."""
     import websockets
     events = {"network": [], "console": []}
+    har_records = []
+    har_active = {}
+    har_page_events = {}
+    if har:
+        events["har"] = {"records": har_records, "page_events": har_page_events}
 
     async with websockets.connect(ws_url, max_size=100 * 1024 * 1024) as ws:
         # Enable CDP domains
@@ -5301,6 +5390,9 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
                 resp = await asyncio.wait_for(ws.recv(), timeout=1)
                 data = json.loads(resp)
                 method = data.get("method", "")
+
+                if har:
+                    _process_har_event(data, har_records, har_active, har_page_events)
 
                 if network and method == "Network.responseReceived":
                     r = data["params"]["response"]
@@ -5390,6 +5482,8 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True)
                 resp = await asyncio.wait_for(ws.recv(), timeout=5)
                 data = json.loads(resp)
                 m = data.get("method", "")
+                if har:
+                    _process_har_event(data, har_records, har_active, har_page_events)
                 if network and m == "Network.responseReceived":
                     r = data["params"]["response"]
                     events["network"].append({
@@ -8159,11 +8253,309 @@ async def cmd_batch():
         sys.exit(CLICK_MISSED_EXIT_CODE)
 
 
-async def cmd_network(url=None):
+def _har_usage_exit():
+    print("Usage: cdpilot network [url] [--har <file>]\ncdpilot: --har needs a value", file=sys.stderr)
+    sys.exit(2)
+
+
+def _atomic_write_har(path, har_dict):
+    """Write HAR dict to path atomically (tmp file in target directory + os.replace)."""
+    target_path = os.path.abspath(path)
+    target_dir = os.path.dirname(target_path) or "."
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".har-", suffix=".tmp", dir=target_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(har_dict, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, target_path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _har_from_events(events, page=None, creator_version=None):
+    """Pure builder: converts HAR records and page events into a HAR 1.2 dict."""
+    import urllib.parse
+    import datetime
+
+    records = []
+    page_events = {}
+
+    if isinstance(events, dict):
+        if "har" in events and isinstance(events["har"], dict):
+            h = events["har"]
+            records = h.get("records") or []
+            page_events = h.get("page_events") or {}
+        elif "records" in events:
+            records = events.get("records") or []
+            page_events = events.get("page_events") or {}
+
+    def _format_http_version(protocol):
+        if not protocol:
+            return "HTTP/1.1"
+        p = str(protocol).lower().strip()
+        if p.startswith("h2"):
+            return "HTTP/2"
+        if p.startswith("h3"):
+            return "HTTP/3"
+        if p == "http/1.1":
+            return "HTTP/1.1"
+        if p == "http/1.0":
+            return "HTTP/1.0"
+        return str(protocol).upper()
+
+    def _mask_headers(hdr_dict):
+        """Secret-named headers are masked whole; URL-bearing values of the
+        others (Location, Referer, Link, Refresh) get their secret query
+        parameters masked, like the session log does."""
+        out = []
+        if isinstance(hdr_dict, dict):
+            for k, v in hdr_dict.items():
+                val = "«masked»" if _SLOG_SECRET_NAME_RE.search(str(k)) else _slog_mask_urls(str(v))
+                out.append({"name": str(k), "value": val})
+        elif isinstance(hdr_dict, list):
+            for item in hdr_dict:
+                if isinstance(item, dict) and "name" in item and "value" in item:
+                    k = item["name"]
+                    v = item["value"]
+                    val = "«masked»" if _SLOG_SECRET_NAME_RE.search(str(k)) else _slog_mask_urls(str(v))
+                    out.append({"name": str(k), "value": val})
+        return out
+
+    first_wall = None
+    first_ts = None
+    for rec in records:
+        req_sent = rec.get("requestWillBeSent") or {}
+        w = req_sent.get("wallTime")
+        t = req_sent.get("timestamp")
+        if w is not None and t is not None:
+            first_wall = w
+            first_ts = t
+            break
+
+    entries = []
+    for rec in records:
+        req_sent = rec.get("requestWillBeSent", {})
+        resp_rec = rec.get("responseReceived", {})
+        load_fin = rec.get("loadingFinished")
+        load_fail = rec.get("loadingFailed")
+
+        wall_time = req_sent.get("wallTime")
+        start_ts = req_sent.get("timestamp")
+
+        derived_wall = None
+        missing_wall = False
+        if wall_time is not None:
+            derived_wall = wall_time
+        elif first_wall is not None and first_ts is not None and start_ts is not None:
+            derived_wall = first_wall + (start_ts - first_ts)
+        else:
+            missing_wall = True
+
+        if derived_wall is not None:
+            dt = datetime.datetime.fromtimestamp(derived_wall, tz=datetime.timezone.utc)
+            started_dt = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        else:
+            started_dt = "1970-01-01T00:00:00.000Z"
+
+        if load_fin and "timestamp" in load_fin and start_ts is not None:
+            entry_time = round((load_fin["timestamp"] - start_ts) * 1000, 2)
+            if entry_time < 0:
+                entry_time = -1
+        else:
+            entry_time = -1
+
+        url = _slog_mask_url(req_sent.get("url", ""))
+        method = req_sent.get("method", "GET")
+        protocol = resp_rec.get("protocol", "")
+        http_ver = _format_http_version(protocol)
+        req_headers = _mask_headers(req_sent.get("headers", {}))
+
+        parsed_url = urllib.parse.urlparse(url)
+        qsl = urllib.parse.parse_qsl(parsed_url.query, keep_blank_values=True)
+        query_string = [{"name": k, "value": v} for k, v in qsl]
+
+        body_size = req_sent.get("postDataLength", 0) or 0
+
+        status = resp_rec.get("status", 0) if resp_rec else 0
+        status_text = resp_rec.get("statusText", "") if resp_rec else ""
+        resp_headers = _mask_headers(resp_rec.get("headers", {})) if resp_rec else []
+        mime_type = resp_rec.get("mimeType", "") if resp_rec else ""
+        enc_length = load_fin.get("encodedDataLength", 0) if load_fin else 0
+
+        redirect_url = ""
+        if resp_rec and "headers" in resp_rec:
+            hdrs = resp_rec["headers"]
+            if isinstance(hdrs, dict):
+                for hk, hv in hdrs.items():
+                    if hk.lower() == "location":
+                        redirect_url = _slog_mask_url(str(hv))
+                        break
+            elif isinstance(hdrs, list):
+                for hitem in hdrs:
+                    if isinstance(hitem, dict) and str(hitem.get("name", "")).lower() == "location":
+                        redirect_url = _slog_mask_url(str(hitem.get("value", "")))
+                        break
+
+        timing = resp_rec.get("timing") if resp_rec else None
+        if timing:
+            def _tdiff(end_k, start_k):
+                s = timing.get(start_k)
+                e = timing.get(end_k)
+                if s is not None and e is not None and s != -1 and e != -1 and e >= s:
+                    return round(float(e - s), 2)
+                return -1
+
+            dns = _tdiff("dnsEnd", "dnsStart")
+            connect = _tdiff("connectEnd", "connectStart")
+            ssl = _tdiff("sslEnd", "sslStart")
+            send = _tdiff("sendEnd", "sendStart")
+            wait = _tdiff("receiveHeadersEnd", "sendEnd")
+
+            receive = -1
+            rec_headers_end = timing.get("receiveHeadersEnd")
+            req_time = timing.get("requestTime")
+            if req_time is None and start_ts is not None:
+                req_time = start_ts
+            fin_ts = load_fin.get("timestamp") if load_fin else None
+            if rec_headers_end is not None and rec_headers_end != -1 and req_time is not None and fin_ts is not None:
+                total_ms = (fin_ts - req_time) * 1000
+                if total_ms >= rec_headers_end:
+                    receive = round(float(total_ms - rec_headers_end), 2)
+
+            entry_timings = {
+                "blocked": -1,
+                "dns": dns,
+                "connect": connect,
+                "ssl": ssl,
+                "send": send,
+                "wait": wait,
+                "receive": receive,
+            }
+        else:
+            entry_timings = {
+                "blocked": -1,
+                "dns": -1,
+                "connect": -1,
+                "ssl": -1,
+                "send": -1,
+                "wait": -1,
+                "receive": -1,
+            }
+
+        entry = {
+            "pageref": "page_1",
+            "startedDateTime": started_dt,
+            "time": entry_time,
+            "request": {
+                "method": method,
+                "url": url,
+                "httpVersion": http_ver,
+                "headers": req_headers,
+                "queryString": query_string,
+                "cookies": [],
+                "headersSize": -1,
+                "bodySize": body_size,
+            },
+            "response": {
+                "status": status,
+                "statusText": status_text,
+                "httpVersion": http_ver,
+                "headers": resp_headers,
+                "cookies": [],
+                "content": {
+                    "size": enc_length,
+                    "mimeType": mime_type,
+                },
+                "redirectURL": redirect_url,
+                "headersSize": -1,
+                "bodySize": -1,
+            },
+            "cache": {},
+            "timings": entry_timings,
+            "serverIPAddress": resp_rec.get("remoteIPAddress", "") if resp_rec else "",
+            "_resourceType": resp_rec.get("type") or req_sent.get("type", ""),
+            "_sort_key": (derived_wall if derived_wall is not None else 0, started_dt),
+        }
+
+        if missing_wall:
+            entry["_comment"] = "wallTime missing"
+
+        if resp_rec.get("fromDiskCache"):
+            entry["_fromCache"] = "disk"
+        elif resp_rec.get("fromServiceWorker"):
+            entry["_fromCache"] = "serviceworker"
+
+        if load_fail:
+            entry["_error"] = load_fail.get("errorText", "Failed")
+
+        entries.append(entry)
+
+    entries.sort(key=lambda e: e.pop("_sort_key"))
+
+    ts_list = [r["requestWillBeSent"]["timestamp"] for r in records if (r.get("requestWillBeSent") or {}).get("timestamp") is not None]
+    earliest_ts = min(ts_list) if ts_list else None
+
+    if page_events.get("domContentEventFired") is not None and earliest_ts is not None:
+        diff = round((page_events["domContentEventFired"] - earliest_ts) * 1000, 2)
+        on_content_load = diff if diff >= 0 else -1
+    else:
+        on_content_load = -1
+
+    if page_events.get("loadEventFired") is not None and earliest_ts is not None:
+        diff = round((page_events["loadEventFired"] - earliest_ts) * 1000, 2)
+        on_load = diff if diff >= 0 else -1
+    else:
+        on_load = -1
+
+    page_title = page.get("title", "") if isinstance(page, dict) else ""
+    page_started = entries[0]["startedDateTime"] if entries else "1970-01-01T00:00:00.000Z"
+
+    pages = [{
+        "startedDateTime": page_started,
+        "id": "page_1",
+        "title": page_title,
+        "pageTimings": {
+            "onContentLoad": on_content_load,
+            "onLoad": on_load,
+        }
+    }]
+
+    return {
+        "log": {
+            "version": "1.2",
+            "creator": {
+                "name": "cdpilot",
+                "version": str(creator_version or globals().get("__version__", "1.0")),
+            },
+            "pages": pages,
+            "entries": entries,
+        }
+    }
+
+
+async def cmd_network(url=None, har=None):
     ws, page = get_page_ws()
     if url is None:
         url = page.get("url", "")
-    content, events = await navigate_collect(ws, url, network=True)
+    content, events = await navigate_collect(ws, url, network=True, har=bool(har))
+    if har:
+        har_dict = _har_from_events(events, page, __version__)
+        entry_count = len(har_dict.get("log", {}).get("entries", []))
+        if har == "-":
+            har_json = json.dumps(har_dict, indent=2, ensure_ascii=False)
+            sys.stdout.write(har_json + "\n")
+            sys.stdout.flush()
+            print(f"har: {entry_count} entries -> -", file=sys.stderr)
+        else:
+            _atomic_write_har(har, har_dict)
+            print(f"har: {entry_count} entries -> {har}", file=sys.stderr)
+        return
+
     print("=== Network Requests ===")
     for req in events["network"]:
         s = req.get("status", "?")
@@ -20027,6 +20419,15 @@ if __name__ == "__main__":
             print(f"cdpilot: {_e}", file=sys.stderr)
             sys.exit(2)
 
+    if cmd == "network":
+        for _i, _a in enumerate(args):
+            if _a == "--har":
+                if _i + 1 >= len(args):
+                    _har_usage_exit()
+            elif _a.startswith("--har="):
+                if not _a.split("=", 1)[1]:
+                    _har_usage_exit()
+
     # Hidden re-entrant entry for the watch daemon. `cdpilot watch start`
     # forks this process with the flag so the screencast consumer runs in
     # the background while the foreground process returns immediately.
@@ -20163,6 +20564,31 @@ if __name__ == "__main__":
             print(f"Usage: {usage}")
             sys.exit(1)
 
+    def _dispatch_network(net_args):
+        url = None
+        har_file = None
+        i = 0
+        while i < len(net_args):
+            a = net_args[i]
+            if a == "--har":
+                if i + 1 >= len(net_args):
+                    _har_usage_exit()
+                har_file = net_args[i + 1]
+                i += 2
+            elif a.startswith("--har="):
+                val = a.split("=", 1)[1]
+                if not val:
+                    _har_usage_exit()
+                har_file = val
+                i += 1
+            elif a.startswith("--"):
+                i += 1
+            else:
+                if url is None:
+                    url = a
+                i += 1
+        return cmd_network(url=url, har=har_file)
+
     async_map = {
         "go": lambda: (require_args(1, "go <url>"), cmd_go(args[0]))[1] if not args else cmd_go(args[0]),
         "content": cmd_content,
@@ -20204,7 +20630,7 @@ if __name__ == "__main__":
         ),
         "wait": lambda: (require_args(1, "wait <selector>"), None)[1] if not args else cmd_wait(args[0], int(args[1]) if len(args) > 1 else 5),
         "tabs": cmd_tabs,
-        "network": lambda: cmd_network(args[0] if args else None),
+        "network": lambda: _dispatch_network(args),
         "console": lambda: cmd_console(args[0] if args else None),
         "cookies": lambda: cmd_cookies(*args),
         "storage": cmd_storage,
