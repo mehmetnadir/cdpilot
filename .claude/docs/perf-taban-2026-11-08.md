@@ -49,3 +49,12 @@ CDPILOT_HOME=$(mktemp -d) CDPILOT_LOG=0 node bin/cdpilot.js connect 9333
 node bin/cdpilot.js eval "JSON.stringify(performance.getEntriesByType('paint').map(e=>[e.name, Math.round(e.startTime)]))"
 ```
 Açılan sekme `curl http://127.0.0.1:9333/json/close/<id>` ile kapatıldı; tarayıcı kapatılmadı.
+
+## 5. Adım A sonucu (08.11 15:55)
+
+`node bin/cdpilot.js record status` (tarayıcısız, uçtan uca, ms): önce 480 / 495 / 505 / 502 / 523 → sonra 265 / 269 / 276 / 279 / 270.
+İki değişiklik: runpy ile içe aktarma (bytecode önbelleği, −0,15 s) + yorumlayıcı seçiminin `python.json`'da tutulması
+(`findPython` her çağrıda `python3.13 --version` gibi probeler koşuyordu, −0,05…0,15 s). Kalan ~270 ms: node açılışı ~0,1 s,
+Python yorumlayıcı 0,03 s, `import asyncio` zinciri ~0,07 s (concurrent.futures → logging → traceback), `urllib.request` 0,04 s,
+modül gövdesi 0,008 s, komutun kendisi. B (tembel import) en çok ~0,03 s kazandırır (`-X importtime`: asyncio zorunlu, urllib ilk
+CDP çağrısında zaten yüklenir) → ayrı iş yapılmadı; C/D (daemon + sıcak oturum) asıl kaldıraç.

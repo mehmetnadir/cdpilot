@@ -19,6 +19,49 @@ const os = require('os');
 
 const SCRIPT = path.join(__dirname, '..', 'src', 'cdpilot.py');
 const VERSION = require('../package.json').version;
+const SRC_DIR = path.join(__dirname, '..', 'src');
+
+// Python runs src/cdpilot.py through the import system (runpy) instead of as a
+// script: a script named on the command line is recompiled on every call —
+// 0.15 s of the ~0.3 s Python start-up measured on 2026-11-08 for the 22k-line
+// file — while an imported module keeps its bytecode in src/__pycache__/.
+// sys.argv ends up exactly as for `python cdpilot.py <args>` (alter_sys), and
+// an unwritable src/ only means Python skips the cache, never an error.
+const PY_LOADER = "import sys, runpy; sys.path.insert(0, sys.argv[1]); del sys.argv[1]; "
+  + "runpy.run_module('cdpilot', run_name='__main__', alter_sys=True)";
+function pyArgs(...args) {
+  return ['-c', PY_LOADER, SRC_DIR, ...args];
+}
+
+// The interpreter choice is remembered in CDPILOT_HOME/python.json for a day:
+// probing candidates with `--version` cost 50-150 ms per command (a shell and
+// a Python start per candidate tried). CDPILOT_PYTHON is part of the key, an
+// absolute path that vanished is re-probed, and a failed spawn clears the entry.
+const PYTHON_CACHE_TTL_MS = 24 * 3600 * 1000;
+function pythonCachePath() {
+  return path.join(cdpilotHome(), 'python.json');
+}
+function readPythonCache() {
+  try {
+    const c = JSON.parse(fs.readFileSync(pythonCachePath(), 'utf8'));
+    if (c.python && c.key === (process.env.CDPILOT_PYTHON || '')
+        && Date.now() - c.at < PYTHON_CACHE_TTL_MS
+        && (!path.isAbsolute(c.python) || fs.existsSync(c.python))) {
+      return c.python;
+    }
+  } catch {}
+  return null;
+}
+function writePythonCache(python) {
+  try {
+    fs.mkdirSync(cdpilotHome(), { recursive: true });
+    fs.writeFileSync(pythonCachePath(),
+      JSON.stringify({ python, key: process.env.CDPILOT_PYTHON || '', at: Date.now() }));
+  } catch {}
+}
+function clearPythonCache() {
+  try { fs.unlinkSync(pythonCachePath()); } catch {}
+}
 
 // CDPILOT_HOME resolution — must match src/cdpilot.py exactly:
 //   CDPILOT_HOME = os.environ.get("CDPILOT_HOME") or os.path.expanduser("~/.cdpilot")
@@ -86,6 +129,8 @@ function findBrowser() {
 // ── Python Detection ──
 
 function findPython() {
+  const cached = readPythonCache();
+  if (cached) return cached;
   // cdpilot.py uses PEP 604 unions (dict | None) → requires Python 3.10+.
   // Prefer version-specific + Homebrew interpreters so a stale default python3
   // (e.g. macOS 3.9) is skipped instead of selected and crashing at runtime.
@@ -100,6 +145,7 @@ function findPython() {
       const ver = execSync(`${cmd} --version 2>&1`, { stdio: 'pipe' }).toString().trim();
       const match = ver.match(/(\d+)\.(\d+)/);
       if (match && (parseInt(match[1]) > 3 || (parseInt(match[1]) === 3 && parseInt(match[2]) >= 10))) {
+        writePythonCache(cmd);
         return cmd;
       }
     } catch {}
@@ -374,7 +420,7 @@ function botAuthLabel(port) {
   if (!signer) return fs.existsSync(path.join(home, 'bot-auth', 'config.json')) ? 'bot-auth: off' : null;
   const python = findPython();
   if (!python) return 'bot-auth: off';
-  const r = spawnSync(python, [SCRIPT, '--_bot-auth-label'], {
+  const r = spawnSync(python, pyArgs('--_bot-auth-label'), {
     encoding: 'utf-8', timeout: 20000,
     env: { ...process.env, CDP_PORT: String(port), CDPILOT_LOG: '0' },
   });
@@ -862,9 +908,15 @@ if (cmd === 'status') {
     env.CDPILOT_CHROME_BIN_AUTO = '1';
   }
 
-  const child = spawn(python, [SCRIPT, ...args], {
+  const child = spawn(python, pyArgs(...args), {
     stdio: 'inherit',
     env,
+  });
+  child.on('error', (err) => {
+    // A remembered interpreter that is gone: forget it so the next call probes again.
+    clearPythonCache();
+    console.error(`cdpilot: could not start ${python}: ${err.message}`);
+    process.exit(1);
   });
 
   // A child killed by a signal reports code === null. `code || 0` turned that

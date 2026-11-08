@@ -2,6 +2,11 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- **Faster command start-up: a browser-free command (`record status`) goes from ~500 ms to ~270 ms end to end on an M1 Max.** The launcher runs `src/cdpilot.py` through Python's import system (`runpy`), so the 22k-line file keeps its bytecode in `src/__pycache__/` instead of being recompiled on every call (0.15 s), and it remembers the chosen interpreter in `$CDPILOT_HOME/python.json` for a day instead of probing candidates with `--version` each time (50-150 ms; `CDPILOT_PYTHON` is part of the key, a vanished interpreter is re-probed, a failed start clears the entry). Behaviour is unchanged; an unwritable `src/` only disables the bytecode cache. Measurements and the remaining cost (asyncio import, CDP session set-up) in `.claude/docs/perf-taban-2026-11-08.md`.
+
 ## [0.9.5] - 2026-11-08
 
 ### Added
