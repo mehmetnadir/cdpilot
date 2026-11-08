@@ -17683,7 +17683,9 @@ class MCPServer:
             "browser_eval_batch": lambda a: ["eval-batch", json.dumps(a.get("expressions", []))],
             "browser_tabs": lambda a: ["tabs"],
             "browser_console": lambda a: ["console"] + ([a["url"]] if a.get("url") else []),
-            "browser_network": lambda a: ["network"] + ([a["url"]] if a.get("url") else []),
+            # "--" ends option parsing: a url shaped like "--har=/path" (an LLM client
+            # fed by a page) must never choose the HAR output file.
+            "browser_network": lambda a: ["network"] + (["--", a["url"]] if a.get("url") else []),
             "browser_a11y": lambda a: ["a11y"] + ([a["mode"]] if a.get("mode") and a["mode"] != "full" else []),
             "browser_fill": lambda a: ["fill", a.get("selector", ""), a.get("value", "")],
             "browser_launch": lambda a: ["launch"],
@@ -21176,6 +21178,8 @@ if __name__ == "__main__":
 
     if cmd == "network":
         for _i, _a in enumerate(args):
+            if _a == "--":
+                break
             if _a == "--har":
                 if _i + 1 >= len(args):
                     _har_usage_exit()
@@ -21322,11 +21326,19 @@ if __name__ == "__main__":
             sys.exit(1)
 
     def _dispatch_network(net_args):
+        """`network [url] [--har <file>]`; everything after `--` is positional
+        (the MCP server passes the url that way), so an argument that merely
+        looks like `--har=<path>` can never pick the output file."""
         url = None
         har_file = None
         i = 0
         while i < len(net_args):
             a = net_args[i]
+            if a == "--":
+                rest = net_args[i + 1:]
+                if url is None and rest:
+                    url = rest[0]
+                break
             if a == "--har":
                 if i + 1 >= len(net_args):
                     _har_usage_exit()
