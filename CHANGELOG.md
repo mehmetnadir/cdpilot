@@ -5,6 +5,7 @@ All notable changes to cdpilot will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Shadow DOM support for CSS selectors (`>>>` traversal and automatic deep piercing fallback).** `>>>` hops now step into open shadow roots when matching an element with a `shadowRoot` (`host.shadowRoot.querySelector(next)`). Frame and shadow hops mix freely (`iframe#pay >>> my-card >>> button.inner`, `my-app >>> my-panel >>> input`). Closed shadow roots are unreachable by design and fail with `'<hop>' has a closed shadow root; cdpilot cannot reach inside it`. Plain CSS selectors that match nothing at document level automatically retry with a depth-first walk of all open shadow roots, printing one stderr note (`note: '<sel>' found inside the shadow root of <host tag#id>`); explicit `>>>` chains do not print this note. Hops matching neither an iframe nor a shadow host keep literal fallback with note `note: '<hop>' matched no iframe or shadow host; used the selector as written`. `wait` and `wait-for` poll shadow roots every 200 ms alongside the MutationObserver.
 - **MCP tool profiles: `cdpilot mcp --tools core|all|a,b,c` (env `CDPILOT_MCP_TOOLS`, the flag wins).** `core` lists 10 tools plus `browser_tools`, which lists the other tools (name and description) or enables some and sends `notifications/tools/list_changed`. A call to a tool outside the profile returns "tool not enabled; call browser_tools enable". `tools/list` schema: 5,769 tokens (45 tools) down to 1,342 (11 tools). Default `all` is unchanged; WebMCP tools are unaffected.
 
 ## [0.9.4] - 2026-09-29

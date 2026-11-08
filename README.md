@@ -257,11 +257,19 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
   inside it and says so on stderr:
   `note: '#card-element' is not an iframe; using the iframe inside it`.
 - Selectors and texts that already contain `>>>` keep working: when the part
-  before the first `>>>` finds no iframe in the page, or a segment is empty
+  before the first `>>>` finds no iframe or shadow host in the page, or a segment is empty
   (`click "Next >>>"`), the whole string is used as written, exactly as
   before. If that fails too, one stderr line explains:
-  `note: 'Home' matched no iframe; used the selector as written`.
+  `note: 'Home' matched no iframe or shadow host; used the selector as written`.
   `--frame` never falls back: a frame it cannot find is an error (exit 1).
+- **Shadow DOM support**: `>>>` hops also pierce open shadow roots (`host.shadowRoot.querySelector(next)`).
+  Chains mix freely with iframes: `cdpilot click "iframe#pay >>> my-card >>> button.inner"` or
+  `cdpilot click "my-app >>> my-panel >>> input"`. A closed shadow root is unreachable by design
+  and fails with `'X' has a closed shadow root; cdpilot cannot reach inside it`.
+  When a plain CSS selector matches nothing at document level, cdpilot automatically falls back
+  to a depth-first search across all open shadow roots, printing one stderr note:
+  `note: '<sel>' found inside the shadow root of <host tag#id>`. Explicit `>>>` hops do not print this note.
+  `wait` and `wait-for` poll shadow roots every 200 ms alongside the document MutationObserver.
 - For `smart-click` / `smart-fill` / `smart-select` the part before the first
   `>>>` is a frame only if it looks like a selector (it has `#`, `.` or `[`,
   or starts with an `iframe`/`frame` tag) or is `url=…`; words stay text.
