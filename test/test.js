@@ -252,6 +252,88 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
     assert(served() >= before + 1, 'at least one call was served warm');
     cli(['daemon', 'stop']);
   });
+
+  test('daemon: the request executor restores env, streams and sys hooks, maps exits, forwards stdin, refuses spawn-only calls', () => {
+    // In-process: _cli_main is replaced by small mains, _daemon_run_request is
+    // driven with a fake connection. What a fresh process would have done at
+    // exit (atexit hooks, exit code) must happen at request end, and nothing a
+    // request did (environment, streams, sys.exit) may survive it.
+    const PYB = (typeof PY_BIN !== 'undefined' && PY_BIN) || 'python3';
+    const script = [
+      'import sys, os, json, atexit, asyncio, time, threading',
+      `sys.path.insert(0, ${JSON.stringify(path.join(__dirname, '..', 'src'))})`,
+      'import cdpilot as c',
+      'loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)',
+      'c._DAEMON.update(loop=loop, asyncio_run=asyncio.run); asyncio.run = c._daemon_asyncio_run',
+      'class Conn:',
+      '    def __init__(self, gone=False): self.buf, self.gone, self.closed = b"", gone, False',
+      '    def sendall(self, b): self.buf += b',
+      '    def recv(self, n):',
+      '        if self.gone: return b""',
+      '        while not self.closed: time.sleep(0.01)',
+      '        return b""',
+      'def run(main, req, gone=False):',
+      '    c._cli_main = main',
+      '    conn = Conn(gone); c._daemon_run_request(conn, req); conn.closed = True',
+      '    return [json.loads(l) for l in conn.buf.decode().split("\\n") if l]',
+      'orig = (sys.stdout, sys.stderr, sys.stdin, sys.exit, sys.excepthook, atexit.register)',
+      'def m1():',
+      '    os.environ["CDPILOT_T_LEAK"] = "1"; print("hello"); print("warn", file=sys.stderr)',
+      '    atexit.register(lambda: print("at-end"))',
+      'f = run(m1, {"argv": ["version"], "cwd": os.getcwd()})',
+      'assert f == [{"o": "hello\\n"}, {"e": "warn\\n"}, {"o": "at-end\\n"}, {"exit": 0}], f',
+      'assert "CDPILOT_T_LEAK" not in os.environ, "env leaked"',
+      'def m2(): print("x"); sys.exit(3)',
+      'assert run(m2, {"argv": ["version"]}) == [{"o": "x\\n"}, {"exit": 3}]',
+      'def m3(): sys.exit("bad thing")',
+      'assert run(m3, {"argv": ["version"]}) == [{"e": "bad thing\\n"}, {"exit": 1}]',
+      'def m4(): raise ValueError("boom")',
+      'f = run(m4, {"argv": ["version"]})',
+      'assert f[-1] == {"exit": 1} and any("ValueError: boom" in x.get("e", "") for x in f), f',
+      'calls = []',
+      'def m5(): calls.append(1)',
+      'for argv in (["--timeout", "5", "version"], ["launch"], ["--_daemon-serve", "x"], ["mcp"]):',
+      '    assert run(m5, {"argv": argv}) == [{"fallback": "command"}], argv',
+      'assert run(m5, {"argv": "version"}) == [{"fallback": "request"}]',
+      'assert calls == [], "a refused request must not run"',
+      'def m6(): print(sys.stdin.read().upper(), end="")',
+      'assert run(m6, {"argv": ["batch"], "stdin": "abc"}) == [{"o": "ABC"}, {"exit": 0}]',
+      'assert (sys.stdout, sys.stderr, sys.stdin, sys.exit, sys.excepthook, atexit.register) == orig, "sys state not restored"',
+      '# the caller environment is applied for the request and gone afterwards',
+      'def m7(): print(os.environ.get("FROM_CLIENT", "-"), os.environ.get("CDPILOT_T_ONLY_DAEMON", "-"))',
+      'os.environ["CDPILOT_T_ONLY_DAEMON"] = "d"',
+      'f = run(m7, {"argv": ["version"], "env": {**os.environ, "FROM_CLIENT": "yes"}})',
+      'assert f[0]["o"].startswith("yes d"), f',
+      'keep = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "CDPILOT_HOME", "CDPILOT_PROFILE", "CDP_PORT", "CDPILOT_PROJECT_ID")}',
+      'f = run(m7, {"argv": ["version"], "env": {**keep, "FROM_CLIENT": "only"}})',
+      'assert f[0]["o"].startswith("only -"), f',
+      'assert os.environ.get("CDPILOT_T_ONLY_DAEMON") == "d" and "FROM_CLIENT" not in os.environ',
+      '# pooled CDP sockets are closed at request end (session-bound state must not carry over)',
+      'class FakeWS:',
+      '    closed = False',
+      '    async def close(self): self.closed = True',
+      'w = FakeWS(); c._WS_POOL["ws://x"] = w; c._WS_LOCKS["ws://x"] = (loop, asyncio.Lock())',
+      'def m8(): print("p")',
+      'assert run(m8, {"argv": ["version"]})[-1] == {"exit": 0}',
+      'assert w.closed and not c._WS_POOL and not c._WS_LOCKS, "pool not torn down"',
+      '# a client that goes away cancels the running command instead of leaving it running',
+      'def m9(): asyncio.run(asyncio.sleep(8)); print("never")',
+      't0 = time.time(); f = run(m9, {"argv": ["version"]}, gone=True)',
+      'assert time.time() - t0 < 4 and f[-1] == {"exit": 130} and not any("never" in x.get("o", "") for x in f), f',
+      '# imported for another port/profile/project than a fresh process would get now: refuse, exit',
+      'real = c._resolve_project_config; c._resolve_project_config = lambda: (1, "/other", "other")',
+      'try:',
+      '    assert run(m5, {"argv": ["version"]}) == [{"fallback": "stale"}] and calls == []',
+      'finally:',
+      '    c._resolve_project_config = real',
+      'print("EXECUTOR-OK")',
+    ].join('\n');
+    const home = fs.mkdtempSync(path.join(osmod.tmpdir(), 'cdpilot-daemon-exec-'));
+    const r = spawnSync(PYB, ['-c', script], { encoding: 'utf-8', timeout: 60000,
+      env: { ...baseEnv, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile') } });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert(r.stdout.trim().endsWith('EXECUTOR-OK'), r.stdout);
+  });
 })();
 
 test('help shows usage', () => {
