@@ -15922,8 +15922,12 @@ def _diff_snapshots(old_map, new_actions):
     old_refs = set(old_map.keys())
     new_refs = set(new_map.keys())
 
-    added = list(new_refs - old_refs)
-    removed = list(old_refs - new_refs)
+    by_num = lambda r: int(r.lstrip('@')) if r.lstrip('@').isdigit() else 0
+    # Added entries are full descriptors (ref, role, name, value): a bare ref
+    # would send the agent back to a full observe — the thing a diff avoids.
+    added = [{k: v for k, v in new_map[r].items() if k != 'backend_node_id'}
+             for r in sorted(new_refs - old_refs, key=by_num)]
+    removed = sorted(old_refs - new_refs, key=by_num)
     value_changed = []
     for ref in new_refs & old_refs:
         old_val = old_map[ref].get('value', '')
@@ -15955,29 +15959,51 @@ async def _agent_full_snapshot():
     return page, nodes, actions, state
 
 
-async def cmd_agent_observe():
-    """Minimal-token page state for AI agents."""
+async def cmd_agent_observe(diff=False):
+    """Minimal-token page state for AI agents.
+
+    diff=True: only what changed since the last observe/act of this project
+    (added descriptors, removed refs, value changes; the text only when it
+    changed). Without a previous snapshot it is a full observe.
+    """
+    before = _load_agent_state()
+    old_map = dict(before.get('actions_map', {}))
     page, nodes, actions, state = await _agent_full_snapshot()
     text = _extract_text_summary(nodes)
+    text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
     # Actions for output — exclude backend_node_id (internal only)
     out_actions = [
         {k: v for k, v in a.items() if k != 'backend_node_id'}
         for a in actions
     ]
-    snap = {
-        'url': page.get('url', ''),
-        'title': page.get('title', ''),
-        'actions': out_actions,
-        'text': text,
-        'token_estimate': _estimate_tokens(out_actions),
-    }
-    snap_str = json.dumps(snap)
-    token_est = _estimate_tokens(snap_str)
-    snap['token_estimate'] = token_est
+    full_tok = _estimate_tokens({'actions': out_actions, 'text': text})
+    if diff and old_map:
+        snap = {
+            'url': page.get('url', ''),
+            'title': page.get('title', ''),
+            'changed': _diff_snapshots(old_map, actions),
+            'text_changed': text_hash != before.get('last_text_hash'),
+        }
+        if snap['text_changed']:
+            snap['text'] = text
+        token_est = _estimate_tokens(snap)
+        snap['token_estimate'] = token_est
+        snap['saved_vs_full'] = round(max(0.0, 1.0 - token_est / full_tok), 3) if full_tok else 0.0
+        state['total_tokens_diff'] = state.get('total_tokens_diff', 0) + token_est
+    else:
+        snap = {
+            'url': page.get('url', ''),
+            'title': page.get('title', ''),
+            'actions': out_actions,
+            'text': text,
+        }
+        token_est = _estimate_tokens(snap)
+        snap['token_estimate'] = token_est
+        state['total_tokens_full'] = state.get('total_tokens_full', 0) + token_est
     state['last_url'] = page.get('url', '')
-    state['last_snapshot_hash'] = hashlib.md5(snap_str.encode()).hexdigest()[:8]
+    state['last_snapshot_hash'] = hashlib.md5(json.dumps(snap).encode()).hexdigest()[:8]
+    state['last_text_hash'] = text_hash
     state['step'] = state.get('step', 0) + 1
-    state['total_tokens_full'] = state.get('total_tokens_full', 0) + token_est
     _save_agent_state(state)
     print(json.dumps(snap, indent=2))
 
@@ -15988,7 +16014,10 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None):
     old_map = dict(state.get('actions_map', {}))
 
     if url:
-        await cmd_go(url)
+        # cmd_go prints the whole page to stdout; the agent asked for a diff.
+        # Its stderr (drift, friction, CAPTCHA warnings) still comes through.
+        with contextlib.redirect_stdout(io.StringIO()):
+            await cmd_go(url)
     elif ref:
         if ref not in old_map:
             print(json.dumps({'error': f'Unknown ref {ref}. Run: cdpilot agent observe'}), file=sys.stderr)
@@ -16032,25 +16061,32 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None):
         print(json.dumps({'error': 'Provide --ref @N or --url URL'}), file=sys.stderr)
         sys.exit(1)
 
-    # Take new snapshot for diff
+    # Take new snapshot for diff. The action may have changed the tab's URL
+    # and title; the 0.5 s /json cache would still show the old ones.
+    cdp_cache_invalidate()
     page, nodes, new_actions, new_state = await _agent_full_snapshot()
     diff = _diff_snapshots(old_map, new_actions)
     new_text = _extract_text_summary(nodes)
-    diff_tok = _estimate_tokens(diff)
-    full_tok = _estimate_tokens(new_actions)
-    saved = max(0.0, 1.0 - diff_tok / full_tok) if full_tok > 0 else 0.0
-
-    new_state['total_tokens_diff'] = new_state.get('total_tokens_diff', 0) + diff_tok
-    new_state['step'] = new_state.get('step', 0)  # already incremented in _agent_full_snapshot
-    _save_agent_state(new_state)
-
+    text_hash = hashlib.md5(new_text.encode()).hexdigest()[:8]
     result = {
         'url': page.get('url', ''),
         'changed': diff,
-        'new_text_blocks': [b for b in new_text.split('. ') if b.strip()],
-        'token_estimate': diff_tok,
-        'saved_vs_full': round(saved, 3),
+        'text_changed': text_hash != state.get('last_text_hash'),
     }
+    if result['text_changed']:
+        result['text'] = new_text
+    diff_tok = _estimate_tokens(result)
+    out_actions = [{k: v for k, v in a.items() if k != 'backend_node_id'} for a in new_actions]
+    full_tok = _estimate_tokens({'actions': out_actions, 'text': new_text})
+    saved = max(0.0, 1.0 - diff_tok / full_tok) if full_tok > 0 else 0.0
+    result['token_estimate'] = diff_tok
+    result['saved_vs_full'] = round(saved, 3)
+
+    new_state['total_tokens_diff'] = new_state.get('total_tokens_diff', 0) + diff_tok
+    new_state['last_url'] = page.get('url', '')
+    new_state['last_text_hash'] = text_hash
+    new_state['step'] = new_state.get('step', 0) + 1
+    _save_agent_state(new_state)
     print(json.dumps(result, indent=2))
 
 
@@ -16085,7 +16121,7 @@ def _dispatch_agent_cmd(args):
     rest = args[1:]
 
     if sub == 'observe':
-        return cmd_agent_observe()
+        return cmd_agent_observe(diff=('--diff' in rest))
     if sub == 'reset':
         return cmd_agent_reset()
     if sub == 'stats':
@@ -16122,9 +16158,9 @@ def _dispatch_agent_cmd(args):
         return _dispatch_agent_twitter_cmd(rest)
 
     print(f"Usage: agent [observe|act|reset|stats|twitter]", file=sys.stderr)
-    print(f"  agent observe", file=sys.stderr)
-    print(f"  agent act --ref @N [--action click|type|fill|hover|submit] [--text X]", file=sys.stderr)
-    print(f"  agent act --url URL", file=sys.stderr)
+    print(f"  agent observe [--diff]        page state as numbered @refs (+text); --diff = only changes since last", file=sys.stderr)
+    print(f"  agent act --ref @N [--action click|type|fill|hover|submit] [--text X]   acts, prints the diff", file=sys.stderr)
+    print(f"  agent act --url URL           navigates silently, prints the diff", file=sys.stderr)
     print(f"  agent reset", file=sys.stderr)
     print(f"  agent stats", file=sys.stderr)
     print(f"  agent twitter --help", file=sys.stderr)
@@ -21971,9 +22007,20 @@ DAEMON_IDLE_DEFAULT = 1800
 DAEMON_SPAWN_CMDS = frozenset({
     'launch', 'stop', 'stop-all', 'project-stop', 'connect', 'disconnect',
     'serve', 'mcp', 'watch', 'setup', 'status', 'daemon', 'replay', 'run',
-    'agent', 'blog', 'bot-auth', 'browser', 'test', 'trace', 'heal', 'health',
+    'blog', 'bot-auth', 'browser', 'test', 'trace', 'heal', 'health',
     'session', 'sessions', 'session-close', 'projects', 'proxy', 'extensions',
     'tls-proxy', 'captcha-wait', 'help', '--help', '-h'})
+# Sub-commands that run fresh while their command is served warm ("cmd sub"):
+# `agent observe/act/reset/stats` are page steps (warm); `agent twitter` logs
+# in and posts (its own session, fresh). Mirrored in bin/cdpilot.js.
+DAEMON_SPAWN_SUBCMDS = frozenset({'agent twitter'})
+
+
+def _daemon_spawn_only(plain):
+    """True when argv (command first) must run in a fresh process."""
+    cmd = plain[0] if plain else None
+    return (cmd in DAEMON_SPAWN_CMDS or (cmd or "").startswith("--_")
+            or " ".join(plain[:2]) in DAEMON_SPAWN_SUBCMDS)
 _DAEMON = {"loop": None, "asyncio_run": None, "served": 0, "started": None, "task": None}
 
 
@@ -22177,7 +22224,7 @@ def _daemon_run_request(conn, req):
         except ValueError:
             timeout_s, plain = None, argv
         cmd = plain[0] if plain else None
-        if timeout_s or cmd in DAEMON_SPAWN_CMDS or (cmd or "").startswith("--_"):
+        if timeout_s or _daemon_spawn_only(plain):
             # --timeout ends a process with os._exit (see _arm_timeout_watchdog);
             # lifecycle commands fork, serve or wait — a fresh process for them.
             _daemon_send(conn, {"fallback": "command"})

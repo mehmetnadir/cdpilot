@@ -131,6 +131,29 @@ def ws_frames(conn):
             yield payload.decode("utf-8", "replace")
 
 
+def ax_tree_for(url):
+    """A small accessibility tree per page, for `agent observe` / `act`:
+    the inbox has a heading, a link, a button, a search box and a status
+    line; example.com has a heading, a link and a paragraph."""
+    def node(i, role, name, bid, value=None):
+        n = {"nodeId": str(i), "ignored": False,
+             "role": {"type": "role", "value": role},
+             "name": {"type": "computedString", "value": name},
+             "backendDOMNodeId": bid}
+        if value is not None:
+            n["value"] = {"type": "string", "value": value}
+        return n
+    if "example.com" in url:
+        return [node(1, "heading", "Example Domain", 201),
+                node(2, "link", "More information...", 202),
+                node(3, "staticText", "This domain is for use in illustrative examples.", 203)]
+    return [node(1, "heading", "Inbox", 101),
+            node(2, "link", "Compose", 102),
+            node(3, "button", "Archive", 103),
+            node(4, "textbox", "Search", 104, value=""),
+            node(5, "staticText", "3 unread messages", 105)]
+
+
 def answer(msg, path):
     method, p = msg.get("method", ""), msg.get("params") or {}
     events = []
@@ -193,6 +216,13 @@ def answer(msg, path):
         result = {"frameTree": {"frame": {"id": "F1", "url": "https://user.example/inbox"}}}
     elif method == "DOM.getDocument":
         result = {"root": {"nodeId": 1, "backendNodeId": 1}}
+    elif method == "Accessibility.getFullAXTree":
+        url = ""
+        with LOCK:
+            for pg in PAGES:
+                if path.endswith("/" + pg["id"]):
+                    url = pg["url"]
+        result = {"nodes": ax_tree_for(url)}
     reply = {"id": msg.get("id"), "result": result}
     if msg.get("sessionId"):
         reply["sessionId"] = msg["sessionId"]

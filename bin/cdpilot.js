@@ -80,9 +80,12 @@ const DAEMON_HELLO_MS = 150;
 const DAEMON_SPAWN_CMDS = new Set([
   'launch', 'stop', 'stop-all', 'project-stop', 'connect', 'disconnect',
   'serve', 'mcp', 'watch', 'setup', 'status', 'daemon', 'replay', 'run',
-  'agent', 'blog', 'bot-auth', 'browser', 'test', 'trace', 'heal', 'health',
+  'blog', 'bot-auth', 'browser', 'test', 'trace', 'heal', 'health',
   'session', 'sessions', 'session-close', 'projects', 'proxy', 'extensions',
   'tls-proxy', 'captcha-wait', 'help', '--help', '-h']);
+// "cmd sub" pairs that run fresh while the command itself is served warm
+// (agent observe/act are page steps; agent twitter logs in and posts).
+const DAEMON_SPAWN_SUBCMDS = new Set(['agent twitter']);
 
 function daemonEnabled() {
   return process.env.CDPILOT_DAEMON === '1' && process.platform !== 'win32';
@@ -90,6 +93,7 @@ function daemonEnabled() {
 
 function daemonEligible(cmd, args) {
   if (!daemonEnabled() || !cmd || DAEMON_SPAWN_CMDS.has(cmd) || cmd.startsWith('--_')) return false;
+  if (DAEMON_SPAWN_SUBCMDS.has(`${cmd} ${args[1] || ''}`)) return false;
   // --timeout ends its process with os._exit: a fresh process for it.
   if (commandIndex(args) !== 0 || process.env.CDPILOT_TIMEOUT) return false;
   return true;

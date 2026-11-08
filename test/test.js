@@ -130,7 +130,13 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
     const js = grab(BIN_SRC, /DAEMON_SPAWN_CMDS = new Set\(\[([\s\S]*?)\]\)/);
     assert.deepStrictEqual(js, py);
     for (const c of ['launch', 'stop', 'connect', 'mcp', 'serve', 'watch', 'daemon', 'replay', 'run']) assert(py.includes(c), c);
-    for (const c of ['go', 'click', 'content', 'shot', 'record', 'tools']) assert(!py.includes(c), `${c} is served warm`);
+    for (const c of ['go', 'click', 'content', 'shot', 'record', 'tools', 'agent']) assert(!py.includes(c), `${c} is served warm`);
+    const pySub = grab(PY_SRC, /DAEMON_SPAWN_SUBCMDS = frozenset\(\{([\s\S]*?)\}\)/);
+    const jsSub = grab(BIN_SRC, /DAEMON_SPAWN_SUBCMDS = new Set\(\[([\s\S]*?)\]\)/);
+    assert.deepStrictEqual(jsSub, pySub);
+    assert(pySub.includes('agent twitter'), 'agent twitter (login, posting) runs fresh');
+    assert(/DAEMON_SPAWN_SUBCMDS\.has\(`\$\{cmd\} \$\{args\[1\] \|\| ''\}`\)/.test(BIN_SRC), 'the launcher checks the pair');
+    assert(/" "\.join\(plain\[:2\]\) in DAEMON_SPAWN_SUBCMDS/.test(PY_SRC), 'the daemon checks the pair');
   });
 
   test('daemon: the request end never waits on the client watcher thread', () => {
@@ -1785,11 +1791,11 @@ test('_snapshot_to_actions reuses existing ref for same backend_node_id', () => 
 });
 
 test('cmd_agent_observe is async and outputs JSON with required fields', () => {
-  assert(/async def cmd_agent_observe\(\)/.test(PY_CONTENT),
-    "cmd_agent_observe must be async def");
-  const m = PY_CONTENT.match(/cmd_agent_observe[\s\S]{0,1000}?token_estimate/);
+  assert(/async def cmd_agent_observe\(diff=False\)/.test(PY_CONTENT),
+    "cmd_agent_observe must be async def, with the --diff switch");
+  const m = PY_CONTENT.match(/cmd_agent_observe[\s\S]{0,2500}?token_estimate/);  // the function grew a --diff branch
   assert(m, "cmd_agent_observe output must include token_estimate");
-  const m2 = PY_CONTENT.match(/cmd_agent_observe[\s\S]{0,1000}?'actions'/);
+  const m2 = PY_CONTENT.match(/cmd_agent_observe[\s\S]{0,2500}?'actions'/);
   assert(m2, "cmd_agent_observe output must include actions key");
 });
 
@@ -1838,8 +1844,8 @@ test('_dispatch_agent_cmd is synchronous and returns coroutine', () => {
   assert(/def _dispatch_agent_cmd\(args\):/.test(PY_CONTENT),
     "_dispatch_agent_cmd must be a sync function");
   // It returns coroutines from async fns, not calls asyncio.run
-  const m = PY_CONTENT.match(/_dispatch_agent_cmd[\s\S]{0,800}?return cmd_agent_observe\(\)/);
-  assert(m, "_dispatch_agent_cmd must return coroutine for observe");
+  const m = PY_CONTENT.match(/_dispatch_agent_cmd[\s\S]{0,800}?return cmd_agent_observe\(diff=\('--diff' in rest\)\)/);
+  assert(m, "_dispatch_agent_cmd must return the observe coroutine, passing --diff");
 });
 
 test('_dispatch_agent_cmd parses --ref, --action, --text, --url flags', () => {
@@ -7199,6 +7205,56 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert.strictEqual(tagged('captcha').length, 1, 'no standalone CAPTCHA detector after the probe');
       assert(evals.length <= 2, `after load only the page read and the probe: ${evals.length} evaluates`);
       assert(!/navigation drift/.test(r.stderr), `the probe's hostname satisfies the drift check: ${r.stderr}`);
+    } finally { fake.stop(); }
+  });
+
+  test('agent observe/act (token budget): @refs, silent --url navigation, diff with descriptors, --diff on a still page, reset', () => {
+    // Faz 3 of the roadmap: an agent works from numbered refs and gets only
+    // what changed after each step. The fake serves a small AX tree per page.
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const o = cli(['agent', 'observe'], env);
+      assert.strictEqual(o.status, 0, `observe exit ${o.status}: ${o.stderr}`);
+      const snap = JSON.parse(o.stdout);
+      // cdpilot opens its own tab in a connected browser (about:blank in the
+      // fake); the fake serves the inbox tree for every page but example.com.
+      assert(typeof snap.url === 'string' && typeof snap.title === 'string', JSON.stringify(snap));
+      const byName = Object.fromEntries(snap.actions.map((a) => [a.name, a]));
+      assert(byName.Compose && byName.Compose.role === 'link' && /^@\d+$/.test(byName.Compose.ref), JSON.stringify(snap.actions));
+      assert(byName.Archive && byName.Archive.role === 'button', JSON.stringify(snap.actions));
+      assert(byName.Search && byName.Search.role === 'textbox' && byName.Search.value === '', JSON.stringify(snap.actions));
+      for (const a of snap.actions) assert(!('backend_node_id' in a), 'internal node ids never leave the process');
+      assert(/3 unread/.test(snap.text), snap.text);
+      assert(typeof snap.token_estimate === 'number' && snap.token_estimate > 0);
+      // act --url: stdout is the diff JSON alone — cmd_go's page dump stays out of it
+      const a = cli(['agent', 'act', '--url', 'https://example.com/'], env);
+      assert.strictEqual(a.status, 0, `act exit ${a.status}: ${a.stderr}`);
+      assert(!/own tab/.test(a.stdout), `page content leaked to stdout: ${a.stdout.slice(0, 200)}`);
+      const res = JSON.parse(a.stdout);
+      assert.strictEqual(res.url, 'https://example.com/', 'the diff reports the new URL (the 0.5 s /json cache is dropped after the action)');
+      assert(res.changed.added.some((x) => x.name === 'More information...' && x.role === 'link' && /^@\d+$/.test(x.ref)),
+        `added entries are descriptors the agent can act on: ${JSON.stringify(res.changed)}`);
+      assert(res.changed.removed.includes(byName.Compose.ref) && res.changed.removed.includes(byName.Search.ref), JSON.stringify(res.changed));
+      assert.strictEqual(res.text_changed, true);
+      assert(/illustrative/.test(res.text), res.text);
+      assert(!('new_text_blocks' in res), 'the old all-blocks field is gone');
+      // observe --diff on a page that did not move: no entries, no text, fewer tokens than a full observe
+      const d = cli(['agent', 'observe', '--diff'], env);
+      assert.strictEqual(d.status, 0, `observe --diff exit ${d.status}: ${d.stderr}`);
+      const dd = JSON.parse(d.stdout);
+      assert.deepStrictEqual(dd.changed, { added: [], removed: [], value_changed: [] }, JSON.stringify(dd));
+      assert.strictEqual(dd.text_changed, false);
+      assert(!('text' in dd) && !('actions' in dd), JSON.stringify(dd));
+      assert(dd.token_estimate < snap.token_estimate && dd.saved_vs_full > 0, JSON.stringify(dd));
+      // stats count every step; reset forgets; --diff without a previous snapshot is a full observe
+      const st = JSON.parse(cli(['agent', 'stats'], env).stdout);
+      assert(st.step === 3 && st.total_tokens_diff > 0 && st.total_tokens_full > 0, JSON.stringify(st));
+      assert.strictEqual(cli(['agent', 'reset'], env).status, 0);
+      const d2 = JSON.parse(cli(['agent', 'observe', '--diff'], env).stdout);
+      assert(Array.isArray(d2.actions) && d2.actions.length >= 2, `full observe after reset: ${JSON.stringify(d2)}`);
     } finally { fake.stop(); }
   });
 
