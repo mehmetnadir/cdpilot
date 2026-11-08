@@ -172,6 +172,30 @@ gider → her istek 200 ms tavanı bekliyordu. `join` kaldırıldı (iş parçac
 Ders: istek başına eklenen her bekleme (join, sleep, zaman aşımı) sıcak yolda doğrudan gecikmedir; inceleme turu düzeltmeleri de
 ölçümle kapanır (§5.1 ile aynı betik `olc.sh`, 3/5 tekrar).
 
+### 5.3 Sıcak yolun bölünmesi: istemci mi, Python mı? (08.11 17:15–17:25, yük 10–21, şişkin)
+
+Ham soket isteği (node açılışı yok; `ham-istek.js` bağlan → hello → istek → exit):
+
+| İstek | bağlan+hello | ilk çerçeve | toplam |
+|---|---|---|---|
+| `version` (tarayıcısız) | 3 ms | 2 ms | 5–6 ms |
+| `eval 1+1` | 3 ms | 7–21 ms | 12–26 ms |
+| `content` | 3 ms | 12 ms | 17 ms |
+
+Yani sıcak `eval`in ~110–145 ms'sinin yalnız 12–26 ms'si Python/CDP; kalan istemcidir. İstemci tabanı (dönüşümlü ölçüm, aynı dakika):
+
+| İstemci | `-e 0` / boş | sıcak `eval 1+1` | not |
+|---|---|---|---|
+| node 26 arm64 (Homebrew, paylaşımlı openssl/icu dylib) | 123–134 | 142–152 | snapshot + code cache açık; dyld yükü |
+| node 20 x86_64 (Rosetta, PATH'teki) | 80–89 | 109–124 | daha hızlı! |
+| `sh` + `python3 -I -S` istemci (prototip, scratchpad) | 46–50 | 112–123 | json/socket import + env serileştirme ~50 ms |
+| `sh -c :` | 14 | — | kabuk tabanı (yük altında; normalde ~2) |
+
+Sonuç: istemci tabanı sıcak yolun %80–85'i. Hafif istemci (sh + python) node 26'ya karşı ~25 ms kazandırır, node 20'ye karşı
+hiç — yeterli değil, bin hikâyesini (Windows, npm shim) karmaşıklaştırır → yapılmadı. Resmî node ikilisi statik bağlıdır
+(~40 ms taban); Homebrew node'un dyld yükü kullanıcının ortamıdır. MCP kipinde (`cdpilot mcp`) istemci maliyeti zaten yoktur:
+araç çağrısı yalnız CDP işidir. Kalan kazanç Python tarafında (`go` için havuzlu oturum, §6) ve `go`'nun sondalarında (§6 #4 ✅).
+
 ## 6. Sonraki adım (D2): `go`'yu havuzlu oturuma taşımak
 
 | # | İş | Beklenen | Kapı |
@@ -180,7 +204,7 @@ Ders: istek başına eklenen her bekleme (join, sleep, zaman aşımı) sıcak yo
 | 1 | `navigate_collect` daemon'da `_WS_POOL` oturumunu kullansın (`_ws_lock` altında olay döngüsü); taze süreçte bugünkü yol | −(WS açılışı + 4 enable) ≈ 50–150 ms | aynı çıktı; e2e CI yeşil |
 | 2 | Stealth/UA/blokaj kaydı havuzlu oturumda kalıcı → "stealth go oturumuna bağlı" sınırı kalkar | davranış iyileşmesi | sannysoft e2e |
 | 3 | Olay hijyeni: navigasyon bitince `Network.disable`, `Log.disable`; `Page`/`Runtime` açık kalır | §3.1 riski kapanır | boşta 10 dk → sonraki `go` yeniden bağlanmıyor |
-| 4 | Yük sonrası 3 evaluate tek `Runtime.evaluate`'te (host + friction + captcha tek betik) | −2 tur ≈ 20–60 ms | aynı tespitler (fixture) |
+| 4 | ✅ Yük sonrası 4 evaluate (host, friction, friction içindeki captcha, captcha) tek `Runtime.evaluate` (`POST_NAV_PROBE_JS`, `_post_nav_probe`) | −3 tur; ölçüm (yük 11–17): sıcak `go` 229–236 ms, önce 230–242 → yerelde fark gürültü içinde (havuzlu WS'te tur 1–3 ms); kazanç uzak/yavaş CDP'de ve ağır sayfada (3 ayrı detector çalışması yerine 1) | sahte CDP testi: yükten sonra yalnız sayfa okuma + 1 sonda; süreç içi test: parçalar eksikse tekil sondaya düşüş |
 | 5 | Düşük yükte yeniden ölçüm (yük <10), tabloyu güncelle | — | `go` ≤150 ya da sınırın adı konur (node 110 + navigasyon) |
 
 node açılışının 110 ms'si ayrı iş: kabuk/C ince istemci (`cdpilot` ikilisi) ya da `node --snapshot-blob`; ölçülmeden söz verilmez.
