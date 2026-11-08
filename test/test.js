@@ -9357,6 +9357,740 @@ test('mcp profile: calling a tool outside the profile returns the enable hint', 
   assert.strictEqual(r.content[0].text, 'tool not enabled; call browser_tools enable');
 });
 
+// ── HAR Export Tests ──
+
+(function() {
+  const { spawn, spawnSync, execFileSync } = require('child_process');
+  const os = require('os');
+  const net = require('net');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+
+  const LOAD_HAR_MODULE_PY = `
+import importlib.util
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+`;
+
+  /**
+   * HAR 1.2 Specification — Required Fields List (http://www.softwareishard.com/blog/har-12-spec/)
+   *
+   * Top-level log object:
+   *   - version: string (must be "1.2")
+   *   - creator: object
+   *     - name: string
+   *     - version: string
+   *   - entries: array of entry objects
+   *   (optional: pages, browser, comment)
+   *
+   * Page object (pages[n]):
+   *   - startedDateTime: string (ISO 8601 date-time)
+   *   - id: string (unique page identifier)
+   *   - title: string
+   *   - pageTimings: object
+   *     - onContentLoad: number (ms from page start, -1 if not seen)
+   *     - onLoad: number (ms from page start, -1 if not seen)
+   *
+   * Entry object (entries[n]):
+   *   - startedDateTime: string (ISO 8601 date-time)
+   *   - time: number (total elapsed time in ms, -1 if unfinished/failed)
+   *   - request: object
+   *     - method: string
+   *     - url: string
+   *     - httpVersion: string
+   *     - cookies: array
+   *     - headers: array of {name: string, value: string}
+   *     - queryString: array of {name: string, value: string}
+   *     - headersSize: number (-1 if not available)
+   *     - bodySize: number (bytes)
+   *   - response: object
+   *     - status: number
+   *     - statusText: string
+   *     - httpVersion: string
+   *     - cookies: array
+   *     - headers: array of {name: string, value: string}
+   *     - content: object
+   *       - size: number (bytes)
+   *       - mimeType: string
+   *     - redirectURL: string
+   *     - headersSize: number (-1 if not available)
+   *     - bodySize: number (bytes)
+   *   - cache: object
+   *   - timings: object
+   *     - send: number
+   *     - wait: number
+   *     - receive: number
+   *     (optional in spec, present in cdpilot: blocked, dns, connect, ssl)
+   */
+  function validateHarRequiredFields(har) {
+    assert(har && typeof har === 'object', 'HAR must be an object');
+    const log = har.log;
+    assert(log && typeof log === 'object', 'log must be an object');
+    assert.strictEqual(log.version, '1.2', 'log.version must be "1.2"');
+    assert(log.creator && typeof log.creator === 'object', 'log.creator must be an object');
+    assert(typeof log.creator.name === 'string', 'log.creator.name must be string');
+    assert(typeof log.creator.version === 'string', 'log.creator.version must be string');
+    assert(Array.isArray(log.entries), 'log.entries must be an array');
+
+    if (log.pages) {
+      assert(Array.isArray(log.pages), 'log.pages must be an array');
+      for (const page of log.pages) {
+        assert(typeof page.startedDateTime === 'string', 'page.startedDateTime must be string');
+        assert(typeof page.id === 'string', 'page.id must be string');
+        assert(typeof page.title === 'string', 'page.title must be string');
+        assert(page.pageTimings && typeof page.pageTimings === 'object', 'page.pageTimings must be object');
+        assert(typeof page.pageTimings.onContentLoad === 'number', 'pageTimings.onContentLoad must be number');
+        assert(typeof page.pageTimings.onLoad === 'number', 'pageTimings.onLoad must be number');
+      }
+    }
+
+    for (const entry of log.entries) {
+      assert(typeof entry.startedDateTime === 'string', 'entry.startedDateTime must be string');
+      assert(typeof entry.time === 'number', 'entry.time must be number');
+
+      const req = entry.request;
+      assert(req && typeof req === 'object', 'entry.request must be an object');
+      assert(typeof req.method === 'string', 'req.method must be string');
+      assert(typeof req.url === 'string', 'req.url must be string');
+      assert(typeof req.httpVersion === 'string', 'req.httpVersion must be string');
+      assert(Array.isArray(req.cookies), 'req.cookies must be array');
+      assert(Array.isArray(req.headers), 'req.headers must be array');
+      for (const h of req.headers) {
+        assert(typeof h.name === 'string' && typeof h.value === 'string', 'header must be {name, value}');
+      }
+      assert(Array.isArray(req.queryString), 'req.queryString must be array');
+      for (const q of req.queryString) {
+        assert(typeof q.name === 'string' && typeof q.value === 'string', 'queryString must be {name, value}');
+      }
+      assert(typeof req.headersSize === 'number', 'req.headersSize must be number');
+      assert(typeof req.bodySize === 'number', 'req.bodySize must be number');
+
+      const resp = entry.response;
+      assert(resp && typeof resp === 'object', 'entry.response must be an object');
+      assert(typeof resp.status === 'number', 'resp.status must be number');
+      assert(typeof resp.statusText === 'string', 'resp.statusText must be string');
+      assert(typeof resp.httpVersion === 'string', 'resp.httpVersion must be string');
+      assert(Array.isArray(resp.cookies), 'resp.cookies must be array');
+      assert(Array.isArray(resp.headers), 'resp.headers must be array');
+      for (const h of resp.headers) {
+        assert(typeof h.name === 'string' && typeof h.value === 'string', 'header must be {name, value}');
+      }
+      assert(resp.content && typeof resp.content === 'object', 'resp.content must be object');
+      assert(typeof resp.content.size === 'number', 'resp.content.size must be number');
+      assert(typeof resp.content.mimeType === 'string', 'resp.content.mimeType must be string');
+      assert(!('text' in resp.content), 'resp.content.text must NOT be present (response bodies omitted)');
+      assert(typeof resp.redirectURL === 'string', 'resp.redirectURL must be string');
+      assert(typeof resp.headersSize === 'number', 'resp.headersSize must be number');
+      assert(typeof resp.bodySize === 'number', 'resp.bodySize must be number');
+      assert.strictEqual(resp.bodySize, -1, 'resp.bodySize must be -1 (unknown)');
+
+      assert(entry.cache && typeof entry.cache === 'object', 'entry.cache must be object');
+      assert(entry.timings && typeof entry.timings === 'object', 'entry.timings must be object');
+      assert(typeof entry.timings.send === 'number', 'timings.send must be number');
+      assert(typeof entry.timings.wait === 'number', 'timings.wait must be number');
+      assert(typeof entry.timings.receive === 'number', 'timings.receive must be number');
+    }
+  }
+
+  test('har: pure builder with hand-written event fixture (document, failed XHR, cached image, 302 redirect)', () => {
+    const src = LOAD_HAR_MODULE_PY + `
+import json, sys
+raw_events = json.load(sys.stdin)
+records = []
+active = {}
+page_events = {}
+for ev in raw_events:
+    m._process_har_event(ev, records, active, page_events)
+
+har = m._har_from_events({"records": records, "page_events": page_events}, {'title': 'HAR Test Page'}, '0.9.4')
+print(json.dumps(har))
+`;
+    const fixture = [
+      // 1. Document (h2, 200)
+      {
+        method: 'Network.requestWillBeSent',
+        params: {
+          requestId: '1',
+          request: {
+            url: 'https://example.com/page?query=yes&foo=bar',
+            method: 'GET',
+            headers: {
+              'User-Agent': 'cdpilot',
+              'Cookie': 'session=secret123; user=alice',
+              'Authorization': 'Bearer secret-jwt-token',
+            },
+          },
+          wallTime: 1700000000.100,
+          timestamp: 10.0,
+          type: 'Document',
+        },
+      },
+      {
+        method: 'Network.responseReceived',
+        params: {
+          requestId: '1',
+          type: 'Document',
+          response: {
+            status: 200,
+            statusText: 'OK',
+            protocol: 'h2',
+            headers: {
+              'content-type': 'text/html; charset=utf-8',
+              'Set-Cookie': 'uid=secret456; Path=/',
+            },
+            mimeType: 'text/html',
+            remoteIPAddress: '93.184.216.34',
+            remotePort: 443,
+            timing: {
+              requestTime: 10.0,
+              dnsStart: 1.5,
+              dnsEnd: 3.0,
+              connectStart: 3.0,
+              connectEnd: 15.0,
+              sslStart: 5.0,
+              sslEnd: 15.0,
+              sendStart: 15.0,
+              sendEnd: 16.0,
+              receiveHeadersEnd: 25.0,
+            },
+          },
+        },
+      },
+      {
+        method: 'Network.loadingFinished',
+        params: {
+          requestId: '1',
+          timestamp: 10.035, // total 35ms -> receive = 35 - 25 = 10ms
+          encodedDataLength: 4096,
+        },
+      },
+
+      // 2. Failed XHR (loadingFailed)
+      {
+        method: 'Network.requestWillBeSent',
+        params: {
+          requestId: '2',
+          request: {
+            url: 'https://example.com/api/data',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Api-Key': 'super-secret-key-99',
+            },
+            postData: '{"action":"test"}',
+            hasPostData: true,
+          },
+          wallTime: 1700000000.200,
+          timestamp: 10.100,
+          type: 'XHR',
+        },
+      },
+      {
+        method: 'Network.loadingFailed',
+        params: {
+          requestId: '2',
+          timestamp: 10.150,
+          errorText: 'net::ERR_CONNECTION_REFUSED',
+          canceled: false,
+        },
+      },
+
+      // 3. Cached image (fromDiskCache)
+      {
+        method: 'Network.requestWillBeSent',
+        params: {
+          requestId: '3',
+          request: {
+            url: 'https://example.com/logo.png',
+            method: 'GET',
+            headers: { 'Accept': 'image/png' },
+          },
+          wallTime: 1700000000.050, // earlier start time to test sorting
+          timestamp: 9.950,
+          type: 'Image',
+        },
+      },
+      {
+        method: 'Network.responseReceived',
+        params: {
+          requestId: '3',
+          type: 'Image',
+          response: {
+            status: 200,
+            statusText: 'OK',
+            protocol: 'http/1.1',
+            headers: { 'content-type': 'image/png' },
+            mimeType: 'image/png',
+            fromDiskCache: true,
+          },
+        },
+      },
+      {
+        method: 'Network.loadingFinished',
+        params: {
+          requestId: '3',
+          timestamp: 9.960,
+          encodedDataLength: 0,
+        },
+      },
+
+      // 4. 302 redirect with Location
+      {
+        method: 'Network.requestWillBeSent',
+        params: {
+          requestId: '4',
+          request: {
+            url: 'https://example.com/old-url',
+            method: 'GET',
+            headers: {},
+          },
+          wallTime: 1700000000.300,
+          timestamp: 10.200,
+          type: 'Document',
+        },
+      },
+      {
+        method: 'Network.responseReceived',
+        params: {
+          requestId: '4',
+          type: 'Document',
+          response: {
+            status: 302,
+            statusText: 'Found',
+            protocol: 'h2',
+            headers: {
+              'Location': 'https://example.com/new-url',
+            },
+            mimeType: 'text/html',
+          },
+        },
+      },
+      {
+        method: 'Network.loadingFinished',
+        params: {
+          requestId: '4',
+          timestamp: 10.220,
+          encodedDataLength: 300,
+        },
+      },
+
+      // Page events
+      {
+        method: 'Page.domContentEventFired',
+        params: { timestamp: 10.050 },
+      },
+      {
+        method: 'Page.loadEventFired',
+        params: { timestamp: 10.300 },
+      },
+    ];
+
+    const out = execFileSync(PYB, ['-c', src], {
+      input: JSON.stringify(fixture), encoding: 'utf-8', timeout: 10000,
+    });
+    const har = JSON.parse(out.trim());
+
+    // Validate HAR 1.2 required fields list
+    validateHarRequiredFields(har);
+
+    // General log attributes
+    assert.strictEqual(har.log.version, '1.2');
+    assert.deepStrictEqual(har.log.creator, { name: 'cdpilot', version: '0.9.4' });
+    assert.strictEqual(har.log.pages.length, 1);
+    assert.strictEqual(har.log.pages[0].id, 'page_1');
+    assert.strictEqual(har.log.pages[0].title, 'HAR Test Page');
+    // pageTimings arithmetic (page start is min timestamp = 9.950)
+    assert.strictEqual(har.log.pages[0].pageTimings.onContentLoad, 100.0);
+    assert.strictEqual(har.log.pages[0].pageTimings.onLoad, 350.0);
+
+    // Sorting: logo.png (0.050) -> page (0.100) -> api/data (0.200) -> old-url (0.300)
+    assert.strictEqual(har.log.entries.length, 4);
+    assert.strictEqual(har.log.entries[0].request.url, 'https://example.com/logo.png');
+    assert.strictEqual(har.log.entries[1].request.url, 'https://example.com/page?query=yes&foo=bar');
+    assert.strictEqual(har.log.entries[2].request.url, 'https://example.com/api/data');
+    assert.strictEqual(har.log.entries[3].request.url, 'https://example.com/old-url');
+
+    // Entry 0: Cached image (fromDiskCache)
+    const imgEntry = har.log.entries[0];
+    assert.strictEqual(imgEntry._fromCache, 'disk');
+    assert.strictEqual(imgEntry._resourceType, 'Image');
+    assert.strictEqual(imgEntry.response.status, 200);
+    assert.strictEqual(imgEntry.response.httpVersion, 'HTTP/1.1');
+    assert.strictEqual(imgEntry.response.content.size, 0);
+    assert.strictEqual(imgEntry.response.bodySize, -1);
+    assert.strictEqual(imgEntry.response.content.mimeType, 'image/png');
+    assert.deepStrictEqual(imgEntry.timings, {
+      blocked: -1, dns: -1, connect: -1, ssl: -1, send: -1, wait: -1, receive: -1,
+    });
+
+    // Entry 1: Document (h2, 200)
+    const docEntry = har.log.entries[1];
+    assert.strictEqual(docEntry.time, 35.0);
+    assert.strictEqual(docEntry.request.method, 'GET');
+    assert.strictEqual(docEntry.response.status, 200);
+    assert.strictEqual(docEntry.response.statusText, 'OK');
+    assert.strictEqual(docEntry.response.httpVersion, 'HTTP/2');
+    assert.strictEqual(docEntry.response.content.size, 4096);
+    assert.strictEqual(docEntry.response.bodySize, -1);
+    assert.strictEqual(docEntry.serverIPAddress, '93.184.216.34');
+    assert.strictEqual(docEntry._resourceType, 'Document');
+    assert.strictEqual(docEntry._fromCache, undefined);
+    assert.strictEqual(docEntry._error, undefined);
+    // Timings arithmetic
+    assert.deepStrictEqual(docEntry.timings, {
+      blocked: -1,
+      dns: 1.5,
+      connect: 12.0,
+      ssl: 10.0,
+      send: 1.0,
+      wait: 9.0,
+      receive: 10.0,
+    });
+    // Query string parsing
+    assert.deepStrictEqual(docEntry.request.queryString, [
+      { name: 'query', value: 'yes' },
+      { name: 'foo', value: 'bar' },
+    ]);
+    // Masked headers
+    const reqH = Object.fromEntries(docEntry.request.headers.map((h) => [h.name, h.value]));
+    assert.strictEqual(reqH['Cookie'], '«masked»');
+    assert.strictEqual(reqH['Authorization'], '«masked»');
+    assert.strictEqual(reqH['User-Agent'], 'cdpilot');
+    const respH = Object.fromEntries(docEntry.response.headers.map((h) => [h.name, h.value]));
+    assert.strictEqual(respH['Set-Cookie'], '«masked»');
+    assert.strictEqual(respH['content-type'], 'text/html; charset=utf-8');
+
+    // Entry 2: Failed XHR (loadingFailed)
+    const failEntry = har.log.entries[2];
+    assert.strictEqual(failEntry.time, -1);
+    assert.strictEqual(failEntry._error, 'net::ERR_CONNECTION_REFUSED');
+    assert.strictEqual(failEntry.response.status, 0);
+    assert.strictEqual(failEntry.response.content.size, 0);
+    assert.strictEqual(failEntry.response.bodySize, -1);
+    assert.strictEqual(failEntry.request.bodySize, 17);
+    const failReqH = Object.fromEntries(failEntry.request.headers.map((h) => [h.name, h.value]));
+    assert.strictEqual(failReqH['X-Api-Key'], '«masked»');
+    assert.deepStrictEqual(failEntry.timings, {
+      blocked: -1, dns: -1, connect: -1, ssl: -1, send: -1, wait: -1, receive: -1,
+    });
+
+    // Entry 3: 302 redirect with Location
+    const redirEntry = har.log.entries[3];
+    assert.strictEqual(redirEntry.response.status, 302);
+    assert.strictEqual(redirEntry.response.statusText, 'Found');
+    assert.strictEqual(redirEntry.response.content.size, 300);
+    assert.strictEqual(redirEntry.response.bodySize, -1);
+    assert.strictEqual(redirEntry.response.redirectURL, 'https://example.com/new-url');
+  });
+
+  test('har: secret query parameters, userinfo passwords and redirect URLs are masked like the session log', () => {
+    const src = LOAD_HAR_MODULE_PY + `
+import json
+records = [
+    {
+        "requestId": "s1",
+        "requestWillBeSent": {
+            "url": "https://alice:pw-secret-1@example.com/cb?code=abc123&state=xyz",
+            "method": "GET",
+            "headers": {"Referer": "https://example.com/start?session=sess-9&x=1"},
+            "wallTime": 1700000000.0,
+            "timestamp": 10.0,
+        },
+        "responseReceived": {
+            "status": 302,
+            "statusText": "Found",
+            "headers": {"Location": "https://example.com/home?token=t0k3n-value&page=2"},
+            "mimeType": "text/html",
+        },
+    }
+]
+har = m._har_from_events({"records": records, "page_events": {}})
+print(json.dumps(har))
+`;
+    const out = execFileSync(PYB, ['-c', src], { encoding: 'utf-8', timeout: 10000 });
+    const e = JSON.parse(out.trim()).log.entries[0];
+    const flat = JSON.stringify(e);
+    assert(!flat.includes('pw-secret-1'), `userinfo password must be masked: ${flat}`);
+    assert(!flat.includes('abc123'), `code= value must be masked: ${flat}`);
+    assert(!flat.includes('t0k3n-value'), `redirect token must be masked: ${flat}`);
+    assert(!flat.includes('sess-9'), `Referer session must be masked: ${flat}`);
+    assert(e.request.url.includes('state=xyz'), 'non-secret parameter kept verbatim');
+    assert(e.response.redirectURL.includes('page=2'), 'non-secret redirect parameter kept verbatim');
+    const q = Object.fromEntries(e.request.queryString.map((p) => [p.name, p.value]));
+    assert.strictEqual(q.state, 'xyz');
+    assert(q.code && !q.code.includes('abc123'), `code query value must be the mask: ${q.code}`);
+  });
+
+  test('har: -1 defaults when timings and page events are omitted', () => {
+    const src = LOAD_HAR_MODULE_PY + `
+import json, sys
+raw_events = json.load(sys.stdin)
+records = []
+active = {}
+page_events = {}
+for ev in raw_events:
+    m._process_har_event(ev, records, active, page_events)
+
+har = m._har_from_events({"har": {"records": records, "page_events": page_events}})
+print(json.dumps(har))
+`;
+    const minimalFixture = [
+      {
+        method: 'Network.requestWillBeSent',
+        params: {
+          requestId: 'm1',
+          request: { url: 'https://example.com/plain', method: 'GET', headers: {} },
+          wallTime: 1700000000.0,
+          timestamp: 50.0,
+        },
+      },
+    ];
+    const out = execFileSync(PYB, ['-c', src], {
+      input: JSON.stringify(minimalFixture), encoding: 'utf-8', timeout: 10000,
+    });
+    const har = JSON.parse(out.trim());
+    assert.strictEqual(har.log.pages[0].pageTimings.onContentLoad, -1);
+    assert.strictEqual(har.log.pages[0].pageTimings.onLoad, -1);
+    assert.strictEqual(har.log.entries[0].time, -1);
+    assert.strictEqual(har.log.entries[0].response.bodySize, -1);
+    assert.deepStrictEqual(har.log.entries[0].timings, {
+      blocked: -1, dns: -1, connect: -1, ssl: -1, send: -1, wait: -1, receive: -1,
+    });
+  });
+
+  test('har: timestamp fallback derives wallTime from anchor or falls back to Unix epoch with comment', () => {
+    const src = LOAD_HAR_MODULE_PY + `
+import json, sys
+
+# Case 1: Record 1 has wallTime (1700000000.0, ts 10.0), Record 2 has no wallTime (ts 10.5)
+records1 = [
+    {
+        "requestId": "r1",
+        "requestWillBeSent": {
+            "url": "https://example.com/first",
+            "method": "GET",
+            "headers": {},
+            "wallTime": 1700000000.0,
+            "timestamp": 10.0,
+        }
+    },
+    {
+        "requestId": "r2",
+        "requestWillBeSent": {
+            "url": "https://example.com/derived",
+            "method": "GET",
+            "headers": {},
+            "timestamp": 10.5,
+        }
+    }
+]
+har1 = m._har_from_events({"records": records1, "page_events": {}})
+
+# Case 2: No record has wallTime at all
+records2 = [
+    {
+        "requestId": "r3",
+        "requestWillBeSent": {
+            "url": "https://example.com/no-wall",
+            "method": "GET",
+            "headers": {},
+            "timestamp": 10.0,
+        }
+    }
+]
+har2 = m._har_from_events({"records": records2, "page_events": {}})
+
+# Case 3: Empty records
+har3 = m._har_from_events({"records": [], "page_events": {}})
+
+print(json.dumps({"har1": har1, "har2": har2, "har3": har3}))
+`;
+    const out = execFileSync(PYB, ['-c', src], { encoding: 'utf-8', timeout: 10000 });
+    const { har1, har2, har3 } = JSON.parse(out.trim());
+
+    // Case 1: Derived wallTime: 1700000000.0 + (10.5 - 10.0) = 1700000000.5 -> 2023-11-14T22:13:20.500Z
+    assert.strictEqual(har1.log.entries.length, 2);
+    assert.strictEqual(har1.log.entries[0].startedDateTime, '2023-11-14T22:13:20.000Z');
+    assert.strictEqual(har1.log.entries[0]._comment, undefined);
+    assert.strictEqual(har1.log.entries[1].startedDateTime, '2023-11-14T22:13:20.500Z');
+    assert.strictEqual(har1.log.entries[1]._comment, undefined);
+    assert.strictEqual(har1.log.pages[0].startedDateTime, '2023-11-14T22:13:20.000Z');
+
+    // Case 2: No wallTime in any record -> Unix epoch + _comment "wallTime missing"
+    assert.strictEqual(har2.log.entries.length, 1);
+    assert.strictEqual(har2.log.entries[0].startedDateTime, '1970-01-01T00:00:00.000Z');
+    assert.strictEqual(har2.log.entries[0]._comment, 'wallTime missing');
+    assert.strictEqual(har2.log.pages[0].startedDateTime, '1970-01-01T00:00:00.000Z');
+
+    // Case 3: Empty entries -> page startedDateTime is Unix epoch
+    assert.strictEqual(har3.log.entries.length, 0);
+    assert.strictEqual(har3.log.pages[0].startedDateTime, '1970-01-01T00:00:00.000Z');
+  });
+
+  test('har CLI: --har without value exits 2 and creates no file', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-har-cli-'));
+    const r = spawnSync(process.execPath, [CLI, 'network', '--har'], {
+      encoding: 'utf-8', timeout: 30000,
+      env: { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+        CDP_PORT: '19223', CHROME_BIN: path.join(home, 'no-such-browser'), CDPILOT_NO_AUTOLAUNCH: '1' },
+    });
+    assert.strictEqual(r.status, 2, `exit ${r.status}, stderr: ${r.stderr}`);
+    assert(/Usage: cdpilot network/.test(r.stderr), `stderr: ${r.stderr}`);
+    assert(/--har needs a value/.test(r.stderr), `stderr: ${r.stderr}`);
+    // Verify no HAR files were created in home
+    const harFiles = fs.readdirSync(home).filter((f) => f.endsWith('.har') || f.startsWith('.har-'));
+    assert.strictEqual(harFiles.length, 0, `no har file should be created: ${harFiles}`);
+  });
+
+  test('har CLI: --har= (empty) exits 2 and creates no file', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-har-cli-'));
+    const r = spawnSync(process.execPath, [CLI, 'network', 'https://example.com', '--har='], {
+      encoding: 'utf-8', timeout: 30000,
+      env: { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+        CDP_PORT: '19223', CHROME_BIN: path.join(home, 'no-such-browser'), CDPILOT_NO_AUTOLAUNCH: '1' },
+    });
+    assert.strictEqual(r.status, 2, `exit ${r.status}, stderr: ${r.stderr}`);
+    assert(/--har needs a value/.test(r.stderr), `stderr: ${r.stderr}`);
+  });
+
+  test('har CLI: docs — README section, CHANGELOG [Unreleased], help text in src', () => {
+    const root = path.join(__dirname, '..');
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
+
+    assert(/cdpilot network <url> --har/.test(readme), 'README must document cdpilot network --har');
+    assert(/HAR 1\.2/.test(readme), 'README must mention HAR 1.2');
+    assert(/Response bodies are not fetched/i.test(readme) || /Response bodies are omitted/i.test(readme),
+      'README must mention response bodies omitted');
+    assert(/«masked»/.test(readme), 'README must mention «masked»');
+
+    assert(/## \[Unreleased\][\s\S]*?HAR export for network monitoring/i.test(changelog),
+      'CHANGELOG [Unreleased] must document HAR export');
+
+    assert(/Network monitoring & HAR export:/.test(PY_CONTENT),
+      'src/cdpilot.py __doc__ must document network --har');
+  });
+
+  // ── Opt-in e2e test (CDPILOT_E2E=1) ──
+  if (process.env.CDPILOT_E2E !== '1') {
+    console.log('  - skipped: har e2e (set CDPILOT_E2E=1 to run it against a headless browser)');
+    return;
+  }
+
+  test('har e2e: navigation against local HTTP server exports valid HAR with masked headers', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-har-e2e-'));
+    const portFile = path.join(root, 'port');
+    const srv = spawn(process.execPath, ['-e', `
+      const http = require('http'), fs = require('fs');
+      const server = http.createServer((req, res) => {
+        if (req.url === '/test.html') {
+          res.writeHead(200, {
+            'Content-Type': 'text/html; charset=utf-8',
+            'X-Secret-Token': 'my-secret-token-12345',
+            'X-Custom-Header': 'safe-value',
+          });
+          res.end('<!DOCTYPE html><html><head><title>E2E HAR Test</title></head><body><h1>Hello HAR</h1></body></html>');
+        } else {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('Not Found');
+        }
+      });
+      server.listen(0, '127.0.0.1', () => {
+        const p = server.address().port;
+        fs.writeFileSync(${JSON.stringify(portFile)}, String(p));
+      });
+      setTimeout(() => process.exit(0), 120000);
+    `], { stdio: 'ignore' });
+
+    let httpPort = null;
+    const probe = spawnSync(process.execPath, ['-e', `
+      const fs = require('fs'), http = require('http');
+      const end = Date.now() + 30000;
+      const tick = () => {
+        let p;
+        try { p = fs.readFileSync(${JSON.stringify(portFile)}, 'utf8'); } catch (e) {
+          if (Date.now() > end) process.exit(3);
+          return setTimeout(tick, 50);
+        }
+        http.get({ host: '127.0.0.1', port: Number(p), path: '/test.html', timeout: 2000 }, (res) => {
+          res.resume();
+          res.on('end', () => { process.stdout.write(p); process.exit(0); });
+        }).on('error', () => {
+          if (Date.now() > end) process.exit(3);
+          setTimeout(tick, 50);
+        });
+      };
+      tick();
+    `], { encoding: 'utf-8', timeout: 60000 });
+    assert.strictEqual(probe.status, 0, `local node http server failed to start: ${probe.stderr}`);
+    httpPort = Number(probe.stdout.trim());
+
+    // Find free port for CDP
+    const [cdpPort] = JSON.parse(execFileSync(PYB, ['-c', [
+      'import json, socket', 's = socket.socket()', 's.bind(("127.0.0.1", 0))',
+      'print(json.dumps([s.getsockname()[1]]))', 's.close()',
+    ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
+
+    const home = path.join(root, 'home');
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(root, 'profile'),
+      CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1', CDPILOT_LOG: '0' };
+    delete env.CDPILOT_TARGET;
+    delete env.CDPILOT_TIMEOUT;
+    const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf-8', timeout: 60000, env });
+
+    const stop = () => {
+      c('stop');
+      try { srv.kill(); } catch (e) { /* ignore */ }
+      try { fs.rmSync(root, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+    };
+
+    try {
+      const pageUrl = `http://127.0.0.1:${httpPort}/test.html`;
+
+      // 1. Unchanged output without --har
+      const rPlain = c('network', pageUrl);
+      assert.strictEqual(rPlain.status, 0, `plain network status ${rPlain.status}: ${rPlain.stderr}`);
+      assert(rPlain.stdout.includes('=== Network Requests ==='), 'stdout must have header');
+      assert(rPlain.stdout.includes('Total:'), 'stdout must have total');
+      assert(rPlain.stdout.includes('=== Content (first 3000 chars) ==='), 'stdout must have content');
+
+      // 2. Export to HAR file
+      const harOut = path.join(root, 'output.har');
+      const rHar = c('network', pageUrl, '--har', harOut);
+      assert.strictEqual(rHar.status, 0, `har status ${rHar.status}: ${rHar.stderr}`);
+      assert(new RegExp(`har: \\d+ entries -> ${harOut.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}`).test(rHar.stderr),
+        `stderr must match har progress: ${rHar.stderr}`);
+      assert(fs.existsSync(harOut), 'output.har must exist');
+
+      const harContent = JSON.parse(fs.readFileSync(harOut, 'utf-8'));
+      validateHarRequiredFields(harContent);
+      assert(harContent.log.entries.length >= 1, 'must have at least 1 entry');
+      const e0 = harContent.log.entries[0];
+      assert.strictEqual(e0.response.status, 200);
+      assert.strictEqual(e0.response.content.mimeType, 'text/html');
+      assert(!('text' in e0.response.content), 'response body text must not be fetched');
+
+      // Check sensitive header masking in response headers
+      const secretH = e0.response.headers.find((h) => h.name.toLowerCase() === 'x-secret-token');
+      assert(secretH, 'X-Secret-Token header must be present');
+      assert.strictEqual(secretH.value, '«masked»', 'X-Secret-Token value must be masked');
+      const safeH = e0.response.headers.find((h) => h.name.toLowerCase() === 'x-custom-header');
+      assert(safeH, 'X-Custom-Header must be present');
+      assert.strictEqual(safeH.value, 'safe-value', 'non-secret header must not be masked');
+
+      // 3. Export to stdout via --har -
+      const rStdout = c('network', pageUrl, '--har', '-');
+      assert.strictEqual(rStdout.status, 0, `har stdout status ${rStdout.status}: ${rStdout.stderr}`);
+      assert(/har: \d+ entries -> -/.test(rStdout.stderr), `stderr must announce stdout har: ${rStdout.stderr}`);
+      const stdoutHar = JSON.parse(rStdout.stdout.trim());
+      validateHarRequiredFields(stdoutHar);
+      assert(stdoutHar.log.entries.length >= 1);
+    } finally {
+      stop();
+    }
+  });
+})();
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
