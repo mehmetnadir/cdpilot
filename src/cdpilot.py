@@ -17500,30 +17500,67 @@ WEBMCP_LIST_JS = r"""(async () => {
     url: location.href
   };
   if (!facts.api) return { facts };
-  let tools;
-  try {
-    tools = await document.modelContext.getTools();
-  } catch (e) {
-    return { facts, error: { name: String(e && e.name), message: String(e && e.message) } };
-  }
-  const out = [];
-  for (const t of tools) {
-    let schema = t.inputSchema;
-    if (typeof schema === 'string') {
-      try { schema = JSON.parse(schema); } catch (e) { /* keep the string */ }
+  // Every readable document in the frame tree is asked for its own tools. The
+  // top document's getTools() is meant to include its same-origin frames' tools,
+  // but Chromium 156 leaves out a frame that registered after the parent first
+  // touched document.modelContext (CI, 08.11; 153 never answered some frame
+  // registrations at all), so the lists are merged: one entry per (owning
+  // document, name), the owner being RegisteredTool.window. A cross-origin
+  // frame's document is unreadable and stays out, as the Permissions Policy
+  // 'tools' intends.
+  const docs = [window];
+  const walk = (w) => {
+    let n = 0;
+    try { n = w.frames.length; } catch (e) { return; }
+    for (let i = 0; i < n; i++) {
+      const f = w.frames[i];
+      try { if (!f.document) continue; } catch (e) { continue; }
+      docs.push(f);
+      walk(f);
     }
-    let frame = null, form = null;
+  };
+  walk(window);
+  const seen = new Map();
+  const out = [];
+  for (const w of docs) {
+    let mc = null;
+    try { mc = w.document.modelContext; } catch (e) { continue; }
+    if (!mc || typeof mc.getTools !== 'function') continue;
+    let tools;
     try {
-      if (t.window !== window) frame = t.window.location.href;
-      form = t.window.document.querySelector('form[toolname="' + CSS.escape(t.name) + '"]');
-    } catch (e) { /* not readable: leave frame/form unknown */ }
-    const rec = { name: t.name, title: t.title || '', description: t.description,
-                  inputSchema: schema === undefined ? null : schema,
-                  origin: t.origin, frame: frame, declarative: !!form };
-    if (form) rec.autosubmit = form.hasAttribute('toolautosubmit');
-    if (t.annotations) rec.annotations = t.annotations;
-    out.push(rec);
+      tools = await mc.getTools();
+    } catch (e) {
+      if (w === window) {
+        return { facts, error: { name: String(e && e.name), message: String(e && e.message) } };
+      }
+      continue;
+    }
+    for (const t of tools) {
+      let owner = w;
+      try { if (t.window) owner = t.window; } catch (e) { /* keep the document asked */ }
+      let names = seen.get(owner);
+      if (!names) { names = new Set(); seen.set(owner, names); }
+      if (names.has(t.name)) continue;
+      names.add(t.name);
+      let schema = t.inputSchema;
+      if (typeof schema === 'string') {
+        try { schema = JSON.parse(schema); } catch (e) { /* keep the string */ }
+      }
+      let frame = null, form = null;
+      try {
+        if (owner !== window) frame = owner.location.href;
+        form = owner.document.querySelector('form[toolname="' + CSS.escape(t.name) + '"]');
+      } catch (e) { /* not readable: leave frame/form unknown */ }
+      const rec = { name: t.name, title: t.title || '', description: t.description,
+                    inputSchema: schema === undefined ? null : schema,
+                    origin: t.origin, frame: frame, declarative: !!form };
+      if (form) rec.autosubmit = form.hasAttribute('toolautosubmit');
+      if (t.annotations) rec.annotations = t.annotations;
+      out.push(rec);
+    }
   }
+  out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1
+    : (a.frame || '') < (b.frame || '') ? -1 : (a.frame || '') > (b.frame || '') ? 1 : 0));
   return { facts, tools: out };
 })()"""
 
@@ -17531,15 +17568,42 @@ WEBMCP_LIST_JS = r"""(async () => {
 # fresh getTools(), then executeTool(tool, input, {signal}); the signal aborts
 # after __MS__ ms. Only local bindings: nothing is left on the page.
 WEBMCP_CALL_JS = r"""(async () => {
-  const mc = document.modelContext;
-  if (!mc || typeof mc.executeTool !== 'function') return { status: 'unavailable' };
+  const top = document.modelContext;
+  if (!top || typeof top.executeTool !== 'function') return { status: 'unavailable' };
   const name = __NAME__, frame = __FRAME__, input = __INPUT__;
-  const tools = await mc.getTools();
-  const tool = tools.find((t) => {
-    if (t.name !== name) return false;
-    try { return frame === null ? t.window === window : t.window.location.href === frame; }
-    catch (e) { return false; }
-  });
+  // Looked up again in every readable document (as WEBMCP_LIST_JS lists them)
+  // and run on the modelContext of the document that registered it; the top
+  // document's copy of a frame tool is only the fallback.
+  const docs = [window];
+  const walk = (w) => {
+    let n = 0;
+    try { n = w.frames.length; } catch (e) { return; }
+    for (let i = 0; i < n; i++) {
+      const f = w.frames[i];
+      try { if (!f.document) continue; } catch (e) { continue; }
+      docs.push(f);
+      walk(f);
+    }
+  };
+  walk(window);
+  let mc = null, tool = null;
+  for (const w of docs) {
+    let c = null;
+    try { c = w.document.modelContext; } catch (e) { continue; }
+    if (!c || typeof c.getTools !== 'function' || typeof c.executeTool !== 'function') continue;
+    let tools;
+    try { tools = await c.getTools(); } catch (e) { continue; }
+    const hit = tools.find((t) => {
+      if (t.name !== name) return false;
+      let owner = w;
+      try { if (t.window) owner = t.window; } catch (e) { /* keep the document asked */ }
+      try { return frame === null ? owner === window : owner.location.href === frame; }
+      catch (e) { return false; }
+    });
+    if (!hit) continue;
+    mc = c; tool = hit;
+    if (frame === null || w !== window) break;
+  }
   if (!tool) return { status: 'gone' };
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(new DOMException(
