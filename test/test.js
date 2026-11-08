@@ -9953,6 +9953,35 @@ print(json.dumps({"har1": har1, "har2": har2, "har3": har3}))
     assert(/--har needs a value/.test(r.stderr), `stderr: ${r.stderr}`);
   });
 
+  test('har CLI: "--" ends option parsing — a url shaped like --har=<path> never picks the output file', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-har-dd-'));
+    const target = path.join(home, 'pwn.har');
+    const r = spawnSync(process.execPath, [CLI, 'network', '--', `--har=${target}`], {
+      encoding: 'utf-8', timeout: 30000,
+      env: { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+        CDP_PORT: '19223', CHROME_BIN: path.join(home, 'no-such-browser'), CDPILOT_NO_AUTOLAUNCH: '1', CDPILOT_LOG: '0' },
+    });
+    assert.notStrictEqual(r.status, 0, 'no browser: the command fails');
+    assert.notStrictEqual(r.status, 2, `after "--" the value is a url, not a --har usage error: ${r.stderr}`);
+    assert(!fs.existsSync(target), 'no HAR file may be written');
+  });
+
+  test('har MCP: browser_network url "--har=<path>" cannot write a file (argument injection guard)', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-har-mcp-'));
+    const target = path.join(home, 'pwn.har');
+    const msgs = mcpSession([], {
+      CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'), CDP_PORT: '19223',
+      CHROME_BIN: path.join(home, 'no-such-browser'), CDPILOT_NO_AUTOLAUNCH: '1',
+    }, [
+      { jsonrpc: '2.0', id: 3, method: 'tools/call',
+        params: { name: 'browser_network', arguments: { url: `--har=${target}` } } },
+    ]);
+    const r = byId(msgs, 3).result;
+    assert.strictEqual(r.isError, true, JSON.stringify(r));
+    assert(!fs.existsSync(target), 'the MCP url argument must never choose a HAR output path');
+    assert(!/--har needs a value/.test(JSON.stringify(r)), 'the value is treated as a url, not as an option');
+  });
+
   test('har CLI: docs — README section, CHANGELOG [Unreleased], help text in src', () => {
     const root = path.join(__dirname, '..');
     const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
