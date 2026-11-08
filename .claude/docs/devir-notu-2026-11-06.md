@@ -89,3 +89,19 @@ Hepsi `src/cdpilot.py`'ye dokunur; çatışma olursa küçük olur (ayrı fonksi
 3. GitHub release `v0.9.5` (notlar = CHANGELOG [0.9.5]) → `publish.yml` OIDC ile npm'e basar, `.mcpb`'yi release'e ekler.
 4. `npm view cdpilot version` = 0.9.5 doğrulaması; MCP Registry `server.json` yeniden yayını (0.9.4'te yapıldığı gibi).
 5. 09.11 17:17 X paylaşımı: yayın o saatten önce olmazsa `post-2026-11-09-tools-core.json` metni "the next release" → "0.9.5" ya da ertele.
+
+## 7. Delta 08.11 14:18–15:05 (Nadir: push + release onayı, "devam et")
+- 14:18 push b7b1b57 (31 commit). CI 42475159785: 12 birim işi yeşil, e2e KIRMIZI — 3 `webmcp e2e` testi: shop.html'in iframe aracı `frame_echo` listede yok (649/652). Shadow DOM, HAR, record/replay e2e'leri ilk gerçek tarayıcıda GEÇTİ.
+- Teşhis: CI Chrome 156.0.8078 (önceki yeşil 16.10: 155). Üst belgenin `getTools()` listesi, üst belge `document.modelContext`'e ilk dokunduktan SONRA kaydolan aynı-kaynak çerçevenin aracını içermiyor (twoframes testi geçti: üst belge araçlara önce dokunmamıştı). Resmî belgede değişiklik notu yok. Düzeltme ae4a857: liste ve çağrı betikleri çerçeve ağacını yürür, her okunabilir belgeye kendi araçlarını sorar, aracı kaydeden belgenin modelContext'inde çalıştırır; sahte sayfa senaryosu `framesown` + test. CI 42477085265 yeşil (e2e dahil).
+- 14:24 press-hold zamanlama testi sertleştirildi 585b666 (damga kanıtı; tel eşikleri 40/60 ms minimumların altında); tutanak TT-20261108-142906-cd37e7 594/594 (yük 46).
+- X: bricks paylaşımı 08.11 14:09'da ikinci kez `httpx.ConnectTimeout` (5 sn, create_tweet) → failed/. srv21'den httpx probu 14:30'da 9/9 temiz; IPv6 yok, IPv4 0,25 sn. Öğe `post-2026-11-08-bricks-local-first-r2` olarak 17:30'a yeniden kuyruklandı. Poster düzeltmesi 286aec0: bağlantı hatası (hiç gönderilmedi) tweet için de bir kez yeniden denenir, sonra öğe kuyrukta kalır (3 deneme, 10 dk); ReadTimeout yine denenmez. xbot pytest 281/1 (bilinen eski)/2. srv21'e DAĞITILMADI (onay).
+- 14:44 tutanak TT-20261108-144423-57d206 GEÇTİ 595/595; 14:51 push 286aec0; CI yeşil; 14:52 release v0.9.5 (hedef 286aec0, notlar = CHANGELOG [0.9.5]); publish.yml yeşil: npm `cdpilot@0.9.5`, `cdpilot.mcpb` (316 KB) release ekinde.
+- srv21 `trend_listener` ve `news_flood` exit 1: `state/claude-oauth-token` 28.09'dan beri 0 bayt → claude CLI exit 1; flood'un nemotron yedeği yalnız lint üretiyor. Nadir yeniler.
+- 09.11 17:17 X paylaşımı metni: "the next release adds" → "cdpilot 0.9.5 adds" (sürüm çıktı).
+
+## 8. Nadir'e kalanlar (08.11 15:05)
+1. srv21 poster dağıtımı: `ops/poster_twikit.py` (286aec0) scp + md5 + `systemctl start cdpilot-poster.service` + journalctl — prod, onay bekler.
+2. cdpilot-site deploy a25cee1 (0.9.5 npm'de).
+3. srv21 `state/claude-oauth-token` yenileme (sır; trend/flood kanadı o yüzden ölü).
+4. Worktree temizliği: 6 şerit worktree + 24 `.claude/worktrees/agent-*` → `~/Silinecekler`.
+5. Show HN / Reddit zamanı, kredi org 1 (146,96 $/190 $), T2 tam denetim tarihi, fiyat katmanları (§4).

@@ -45,14 +45,14 @@
 | ✅ | v0.9.3 | 28.09: iframe (#1, `>>>` / `--frame`, cross-origin dahil; 3 tur review), boşta kendiliğinden kapanma (`CDPILOT_IDLE_CLOSE`), oturum günlüğü (`cdpilot log`, maskeli), Windows boruda UTF-8; CI'da gerçek tarayıcı e2e işi |
 | ✅ | v0.9.4 | 29.09: connect (kendi tarayıcın, sahiplik kanıtı), WebMCP köprüsü, Web Bot Auth (Cloudflare canlı doğruladı), insan gibi basılı tutma + exit 3, OOPIF fare yönlendirme düzeltmesi, Chrome for Testing, Claude Code eklenti mağazası + .mcpb, `examples/` (gerçek çıktılı) |
 | ⏳ | Eklenti API + cdpilot-jev | plan: `.claude/docs/plan-eklenti-api-ve-jev.md` (ölçüm kapısı önce) |
-| ⏳ | v0.9.5 (main'de 259620c; push → CI e2e → GitHub release → npm onayı bekler) | 08.11: shadow DOM (#3, `>>>` + derin geri düşüş), record/replay (#5, sırlar diske yazılmaz; kayıt maskesi = oturum günlüğü kuralları), HAR 1.2 (#4, maskeli), MCP `--tools core` (45→11 araç), bot-auth lsof düzeltmesi (macOS 26), `network -- <url>` enjeksiyon kapısı, vaat denetimi; 7 sürüm alanı 0.9.5, CHANGELOG `[0.9.5] - 2026-11-08`; tutanak TT-20261108-034616-4b0057 594/594 (GEÇTİ); e2e yalnız CI |
-| ⏳ | Sonraki | Stealth + UA override `go` oturumuna bağlı (WS kapanınca düşer; kalıcı tutucu süreç tasarımı gerekir); frame act bulamazsa sayfaya dönüş; perf tabanı (`.claude/docs/perf-taban-<tarih>.md`, makine boşken — 08.11 yük 46); oynak press-hold testi sertleştirildi (08.11, damga kanıtı + yük toleranslı tel eşikleri) |
+| ✅ | v0.9.5 | 08.11 14:52 yayında (Nadir onayı: push + release): npm 0.9.5, GitHub release `v0.9.5` + `cdpilot.mcpb`, MCP Registry publish.yml ile. İçerik: shadow DOM (#3), record/replay (#5, kayıt maskesi = oturum günlüğü kuralları), HAR 1.2 (#4), MCP `--tools core` (45→11 araç), bot-auth lsof (macOS 26), `network -- <url>` enjeksiyon kapısı, WebMCP çerçeve araçları Chrome 156 düzeltmesi, vaat denetimi. CI 12 birim + e2e yeşil (Chrome 156); tutanak TT-20261108-144423-57d206 595/595 |
+| ⏳ | Sonraki | Stealth + UA override `go` oturumuna bağlı (WS kapanınca düşer; kalıcı tutucu süreç tasarımı gerekir); frame act bulamazsa sayfaya dönüş; perf tabanı (`.claude/docs/perf-taban-<tarih>.md`, makine boşken — 08.11 yük 46); xbot poster bağlantı hatası politikası (286aec0) srv21'e dağıtılacak (onay) |
 | ⏳ | Sentinel takip | C6: daily_analytics gece yazmıyor (debug) · C8: 2 failed auto-like sebebi |
 | ⏳ | v0.9 tls-proxy | Optional local TLS-MITM (curl-impersonate semantics) |
 
 ## Son Oturum
-→ 2026-11-08 (gece, CEO kipi): 5 şerit birleşti (bot-auth, HAR, flow, shadow, redact), T1 güvenlik incelemesi (0 HIGH/MEDIUM; 2 düşük bulgu, ikisi de kapandı), sürüm 0.9.5 hazır (259620c), tutanak TT-20261108-034616-4b0057 594/594. Devir notu: `.claude/docs/devir-notu-2026-11-06.md` §5–§6.
-→ İlk iş: Nadir kararı — `git push origin main` (30 commit) → CI (shadow/HAR/record e2e ilk kez gerçek tarayıcıda) → GitHub release `v0.9.5` (`publish.yml` npm'e basar, `.mcpb` ekler). 09.11 17:17 X paylaşımı "the next release adds --tools core" diyor; yayın gecikirse metin düzeltilir.
+→ 2026-11-08 (CEO kipi, gece + gündüz): 5 şerit birleşti, T1 güvenlik (2 düşük bulgu kapandı), 0.9.5 yayınlandı. CI'da Chrome 156 WebMCP iframe arızası çıktı, aynı gün düzeltildi (ae4a857, e2e yeşil). X: bricks paylaşımı 14:09'da ikinci kez ConnectTimeout → 17:30'a yeniden kuyruklandı; poster artık bağlantı hatasında öğeyi kuyrukta tutar (286aec0). Devir notu: `.claude/docs/devir-notu-2026-11-06.md` §5–§7.
+→ İlk iş: Nadir kararları — srv21 poster dağıtımı, cdpilot-site deploy a25cee1, srv21 `state/claude-oauth-token` (0 bayt → trend/flood exit 1), worktree temizliği.
 
 Son Güncelleme: 2026-11-08
 
