@@ -1023,15 +1023,19 @@ test('scrollIntoView uses instant (not smooth) everywhere', () => {
     "At least one action should use scrollIntoView({behavior:'instant'}) — verifies the replacement actually landed");
 });
 
-test('navigate_collect post-load sleep cut from 1.5s to 0.3s', () => {
-  // The 1.5s blind wait after Page.loadEventFired was the single biggest
-  // contributor to the "amateur typing" feel. 0.3s is enough buffer for late
-  // JS without blocking on every navigation.
-  const m = PY_CONTENT.match(/async def navigate_collect[\s\S]*?Page\.loadEventFired[\s\S]*?asyncio\.sleep\(0\.3\)/);
-  assert(m, "navigate_collect should sleep 0.3s after loadEventFired (was 1.5s)");
-  // Negative assert: the old 1.5s must NOT come back here.
-  const neg = PY_CONTENT.match(/async def navigate_collect[\s\S]*?asyncio\.sleep\(1\.5\)/);
-  assert(!neg, "navigate_collect must not regress to the 1.5s sleep");
+test('navigate_collect post-load settle: event silence (100 ms), 300 ms cap, no blind sleep', () => {
+  // History: a 1.5 s blind wait after Page.loadEventFired, cut to 0.3 s, and on
+  // 08.11.2026 replaced by reading on until 100 ms pass without an event (300 ms
+  // at most) — the fixed 300 ms was most of a warm `go` once the daemon removed
+  // process start-up. The behaviour is measured against the fake CDP in the
+  // connect tests ('go: settles on event silence after load').
+  const body = (PY_CONTENT.match(/async def navigate_collect[\s\S]*?\n(?:async )?def /) || [''])[0];
+  assert(body, 'navigate_collect must exist');
+  assert(/loaded_at = time\.time\(\)/.test(body), 'the load event stamps loaded_at');
+  assert(/time\.time\(\) - loaded_at < 0\.3/.test(body), 'the settle is capped at 300 ms');
+  assert(/timeout=1 if loaded_at is None else 0\.1/.test(body), 'after load, 100 ms without an event ends the settle');
+  assert(!/asyncio\.sleep\(0\.3\)/.test(body) && !/asyncio\.sleep\(1\.5\)/.test(body),
+    'navigate_collect must not regress to a blind post-load sleep');
 });
 
 test('visual feedback config: default OFF', () => {
@@ -6987,6 +6991,29 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     const own = run(false);
     assert(own.methods.includes('Page.addScriptToEvaluateOnNewDocument'), `control: ${own.methods}`);
     assert.deepStrictEqual(own.tags, ['glow', 'input-blocker', 'stealth'], `control tags: ${own.tags}`);
+  });
+
+  test('go: settles on event silence after load — the page read follows the load event by ~100 ms, not a fixed 300 ms', () => {
+    // 08.11: navigate_collect slept 300 ms after Page.loadEventFired on every
+    // go. It now keeps reading events and stops at the first 100 ms without
+    // one (300 ms at most). The fake answers Page.navigate with the load event
+    // at once and then stays silent, so cdpilot's next call on that socket
+    // (the innerText read) must follow about 100 ms later — never 300.
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const r = cli(['go', 'https://example.com/'], isoEnv(home, fake.port, 'proj'));
+      assert.strictEqual(r.status, 0, `go exit ${r.status}: ${r.stdout}${r.stderr}`);
+      const ws = fake.entries().filter((e) => e.method && typeof e.t === 'number');
+      const nav = ws.findIndex((e) => e.method === 'Page.navigate');
+      assert(nav >= 0, 'go must navigate');
+      const read = ws.slice(nav + 1).find((e) => e.ws === ws[nav].ws && e.method === 'Runtime.evaluate');
+      assert(read, 'the page is read on the navigation socket after load');
+      const gap = read.t - ws[nav].t;
+      assert(gap >= 90 && gap < 260, `settle gap ${gap.toFixed(0)} ms: expected ~100 (the silence window), not the old 300`);
+      assert(!/await asyncio\.sleep\(0\.3\)\s*\n\s*break/.test(PY_CONTENT), 'the fixed 300 ms sleep after load is gone');
+    } finally { fake.stop(); }
   });
 
   test('external guard: connect refuses over a live cdpilot-launched browser (no orphan)', () => {

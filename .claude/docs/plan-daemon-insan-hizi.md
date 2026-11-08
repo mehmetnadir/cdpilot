@@ -117,10 +117,26 @@ Makine o anda ağır yüklüydü (taban ölçümünde yük ~10); mutlak sayılar
 - Yüklemeden sonra 3 ayrı `Runtime.evaluate` turu: `_assert_host`, `_detect_friction`, `_detect_captcha` (iz: `CDPILOT_CDP_TRACE`).
 - Komut sonrası `_update_session_timestamp`, `_enforce_tab_budget`, `_mark_owned_tab` dosya/`/json` işleri.
 
+### 5.1 Settle düzeltmesi sonrası (08.11 16:35, yük ~17)
+
+`navigate_collect` yükleme olayından sonra sabit `asyncio.sleep(0.3)` bekliyordu; şimdi olay okumaya devam eder, 100 ms olay
+gelmeyince durur, tavan 300 ms (eski davranışın üst sınırı korunur).
+
+| Komut | Taze | Sıcak (daemon) | Önceki sıcak |
+|---|---|---|---|
+| `go file://paint.html` | 502–826 | 227–298 | 426–515 |
+| `go https://example.com` | — | 217–322 | 523–600 |
+| `content` | 348–376 | 105–126 | 105–120 |
+| `eval 1+1` | 365–373 | 95–114 | 112–137 |
+
+Sıcak `go` ≈ node ~100 + WS açılışı/4 enable ~15 + navigasyon ~15 + sessizlik 100 + 3 evaluate ~10. Hedef ≤150 için
+sessizlik penceresi ve havuzlu oturum (aşağıda) gerekir; node tabanı ayrı iş.
+
 ## 6. Sonraki adım (D2): `go`'yu havuzlu oturuma taşımak
 
 | # | İş | Beklenen | Kapı |
 |---|---|---|---|
+| 0 | ✅ Sabit 300 ms uyku → 100 ms olay sessizliği (tavan 300) | −200 ms statik sayfada | ölçüldü §5.1 |
 | 1 | `navigate_collect` daemon'da `_WS_POOL` oturumunu kullansın (`_ws_lock` altında olay döngüsü); taze süreçte bugünkü yol | −(WS açılışı + 4 enable) ≈ 50–150 ms | aynı çıktı; e2e CI yeşil |
 | 2 | Stealth/UA/blokaj kaydı havuzlu oturumda kalıcı → "stealth go oturumuna bağlı" sınırı kalkar | davranış iyileşmesi | sannysoft e2e |
 | 3 | Olay hijyeni: navigasyon bitince `Network.disable`, `Log.disable`; `Page`/`Runtime` açık kalır | §3.1 riski kapanır | boşta 10 dk → sonraki `go` yeniden bağlanmıyor |
