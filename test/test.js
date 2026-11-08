@@ -88,6 +88,172 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
     '/nonexistent/python3', 'the vanished interpreter was re-probed');
 });
 
+// ── Warm process (daemon): CDPILOT_DAEMON=1 ──
+// The launcher hands page commands to one warm Python process per project and
+// environment over a Unix socket (src/cdpilot.py --_daemon-serve) and runs a
+// fresh process when there is none, it is busy, of another version, or refuses
+// the command. Browser-free here; the speed gate (`go` ≤ 150 ms warm) is
+// measured by hand against .claude/docs/perf-taban-2026-11-08.md.
+(() => {
+  if (process.platform === 'win32') return;
+  const osmod = require('os');
+  const { spawn, spawnSync } = require('child_process');
+  const PY_SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'cdpilot.py'), 'utf8');
+  const BIN_SRC = fs.readFileSync(CLI, 'utf8');
+  const VERSION = require('../package.json').version;
+  const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  const home = fs.mkdtempSync(path.join(osmod.tmpdir(), 'cdpilot-daemon-'));
+  const baseEnv = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+    CDPILOT_DAEMON: '1', CDPILOT_NO_AUTOLAUNCH: '1', CDP_PORT: '19779',
+    CHROME_BIN: path.join(home, 'no-such-browser'), CDPILOT_DAEMON_IDLE: '90' };
+  for (const k of ['CDPILOT_TIMEOUT', 'CDPILOT_LOG']) delete baseEnv[k];
+  const cli = (args, extra = {}, opts = {}) => spawnSync(process.execPath, [CLI, ...args],
+    { encoding: 'utf-8', timeout: 30000, env: { ...baseEnv, ...extra }, ...opts });
+  const status = (extra = {}) => cli(['daemon', 'status'], extra).stdout;
+  const served = (extra = {}) => {  // this environment's daemon: the line marked *
+    const m = status(extra).match(/^\* pid \d+ {2}served (\d+)/m);
+    return m ? Number(m[1]) : null;
+  };
+  const waitFor = (pred, ms = 8000) => {
+    const t = Date.now();
+    while (Date.now() - t < ms) { if (pred()) return true; sleep(100); }
+    return pred();
+  };
+
+  test('daemon: Python and Node agree on the commands that always run in a fresh process', () => {
+    const grab = (src, re) => {
+      const m = src.match(re);
+      assert(m, 'list literal');
+      return m[1].match(/'([^']+)'/g).map((x) => x.slice(1, -1)).sort();
+    };
+    const py = grab(PY_SRC, /DAEMON_SPAWN_CMDS = frozenset\(\{([\s\S]*?)\}\)/);
+    const js = grab(BIN_SRC, /DAEMON_SPAWN_CMDS = new Set\(\[([\s\S]*?)\]\)/);
+    assert.deepStrictEqual(js, py);
+    for (const c of ['launch', 'stop', 'connect', 'mcp', 'serve', 'watch', 'daemon', 'replay', 'run']) assert(py.includes(c), c);
+    for (const c of ['go', 'click', 'content', 'shot', 'record', 'tools']) assert(!py.includes(c), `${c} is served warm`);
+  });
+
+  test('daemon: the first call runs fresh and starts the daemon; later calls are served warm with identical output', () => {
+    const r1 = cli(['version']);
+    assert.strictEqual(r1.status, 0, r1.stderr);
+    assert(r1.stdout.includes(VERSION), r1.stdout);
+    assert(waitFor(() => served() !== null), `daemon did not appear: ${status()}`);
+    assert.strictEqual(served(), 0, 'the first call ran fresh');
+    const r2 = cli(['version']);
+    assert.strictEqual(r2.status, 0, r2.stderr);
+    assert.strictEqual(r2.stdout, r1.stdout, 'same output warm and fresh');
+    assert.strictEqual(r2.stderr, '');
+    const r3 = cli(['record', 'status']);
+    assert.strictEqual(r3.status, 0, r3.stderr);
+    assert(/No recording active/.test(r3.stdout), r3.stdout);
+    assert.strictEqual(served(), 2);
+    assert(/\* pid \d+ {2}served 2 {2}up \d+s/.test(status()), status());
+  });
+
+  test('daemon: stderr, exit codes and usage errors pass through exactly as from a fresh process', () => {
+    const before = served();
+    const r = cli(['nosuchcmd']);
+    assert.strictEqual(r.status, 1);
+    assert.strictEqual(r.stdout, '');
+    assert(r.stderr.includes('Unknown command: nosuchcmd'), r.stderr);
+    assert(r.stderr.includes('Available commands:'), r.stderr);
+    assert.strictEqual(served(), before + 1, 'the failing command was served warm');
+    const warm = cli(['go']);
+    const fresh = cli(['go'], { CDPILOT_DAEMON: '0' });
+    assert.strictEqual(warm.status, fresh.status);
+    assert.strictEqual(warm.stdout + warm.stderr, fresh.stdout + fresh.stderr);
+    assert.strictEqual(served(), before + 2);
+  });
+
+  test('daemon: --timeout, CDPILOT_TIMEOUT and lifecycle commands run in a fresh process', () => {
+    const before = served();
+    let r = cli(['--timeout', '5', 'version']);
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert(r.stdout.includes(VERSION), r.stdout);
+    r = cli(['version'], { CDPILOT_TIMEOUT: '5' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    r = cli(['stop']);
+    assert.notStrictEqual(r.status, null);
+    assert.strictEqual(served(), before, 'none of them touched the daemon');
+    const sockDir = path.dirname(status().match(/(\S+\.sock)/)[1]);
+    assert.strictEqual(fs.readdirSync(sockDir).filter((f) => f.endsWith('.sock')).length, 1,
+      'no second daemon was started for them');
+  });
+
+  test('daemon: the session log line and the record step are written at request end, files land in the caller\'s cwd', () => {
+    const dir = fs.mkdtempSync(path.join(osmod.tmpdir(), 'cdpilot-daemon-cwd-'));
+    let r = cli(['record', 'start', '--name', 'warm']);
+    assert.strictEqual(r.status, 0, r.stderr);
+    r = cli(['stealth']);
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert(/Stealth:/.test(r.stdout), r.stdout);
+    r = cli(['record', 'stop', '--save', 'flow.json'], {}, { cwd: dir });
+    assert.strictEqual(r.status, 0, r.stderr + r.stdout);
+    const flow = JSON.parse(fs.readFileSync(path.join(dir, 'flow.json'), 'utf8'));
+    assert.deepStrictEqual(flow.steps.map((x) => x.cmd), ['stealth']);
+    const log = cli(['log', '--json']).stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const entry = log.find((e) => e.cmd === 'stealth');
+    assert(entry, 'stealth is in the session log');
+    assert.strictEqual(entry.exit, 0);
+    assert(/Stealth:/.test(entry.summary), entry.summary);
+  });
+
+  test('daemon: a daemon of another version is asked to leave and the call still runs', () => {
+    cli(['daemon', 'stop']);
+    const m = status().match(/socket: (\S+\.sock)/);
+    assert(m, status());
+    const sock = m[1];
+    const script = path.join(home, 'fake-daemon.js');
+    const ops = path.join(home, 'fake-ops.txt');
+    fs.writeFileSync(script, [
+      "const net = require('net'), fs = require('fs');",
+      'const srv = net.createServer((c) => {',
+      "  c.write(JSON.stringify({ hello: 1, version: '0.0.0', pid: process.pid }) + '\\n');",
+      `  c.on('data', (d) => { fs.appendFileSync(${JSON.stringify(ops)}, d);`,
+      "    if (String(d).includes('shutdown')) { c.end(JSON.stringify({ exit: 0 }) + '\\n'); srv.close(); } });",
+      '});',
+      `srv.listen(${JSON.stringify(sock)});`,
+      'setTimeout(() => process.exit(0), 20000).unref();',
+    ].join('\n'));
+    const fake = spawn(process.execPath, [script], { stdio: 'ignore' });
+    try {
+      assert(waitFor(() => fs.existsSync(sock)), 'fake daemon socket');
+      const r = cli(['version']);
+      assert.strictEqual(r.status, 0, r.stderr);
+      assert(r.stdout.includes(VERSION), r.stdout);
+      assert(waitFor(() => fs.existsSync(ops) && fs.readFileSync(ops, 'utf8').includes('"shutdown"')),
+        'the old daemon was told to leave');
+    } finally {
+      fake.kill();
+    }
+  });
+
+  test('daemon: start, stop and idle exit', () => {
+    let r = cli(['daemon', 'start']);
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert(/daemon running: pid \d+/.test(r.stdout), r.stdout);
+    r = cli(['daemon', 'stop']);
+    assert(/stopped \d+ daemon/.test(r.stdout), r.stdout);
+    assert(/no daemon running/.test(status()), status());
+    const idle = { CDPILOT_DAEMON_IDLE: '1' };
+    cli(['version'], idle);
+    assert(waitFor(() => served(idle) !== null), 'idle daemon started');
+    assert(waitFor(() => served(idle) === null, 10000), 'idle daemon left by itself');
+  });
+
+  test('daemon: two simultaneous calls both succeed (warm or fresh, never twice)', () => {
+    cli(['version']);
+    assert(waitFor(() => served() !== null));
+    const before = served();
+    const r = spawnSync('sh', ['-c', `"${process.execPath}" "${CLI}" version & "${process.execPath}" "${CLI}" version & wait`],
+      { encoding: 'utf-8', timeout: 30000, env: baseEnv });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual((r.stdout.match(new RegExp(VERSION.replace(/\./g, '\\.'), 'g')) || []).length, 2, r.stdout);
+    assert(served() >= before + 1, 'at least one call was served warm');
+    cli(['daemon', 'stop']);
+  });
+})();
+
 test('help shows usage', () => {
   const out = run('help');
   assert(out.includes('cdpilot'), 'Should show cdpilot name');
@@ -214,6 +380,8 @@ test('python script has shebang', () => {
 
 const PY_PATH = path.join(__dirname, '..', 'src', 'cdpilot.py');
 const PY_CONTENT = fs.existsSync(PY_PATH) ? fs.readFileSync(PY_PATH, 'utf-8') : '';
+// The module docstring (__doc__): the help text python prints.
+const PY_DOC = PY_CONTENT.slice(0, PY_CONTENT.indexOf('"""', PY_CONTENT.indexOf('"""') + 3) + 3);
 
 // The CHANGELOG text for a feature that shipped in `version`: its [Unreleased] entry while it is
 // unreleased, its release section afterwards. Pin each docs test to its release so a version bump
@@ -5307,8 +5475,8 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
   }
 
   function mainBlock() {
-    const i = PY_CONTENT.indexOf('if __name__ == "__main__":');
-    assert(i > 0, '__main__ block required');
+    const i = PY_CONTENT.indexOf('def _cli_main():');  // the entry block (__main__ only calls it)
+    assert(i > 0, '_cli_main (the entry block) required');
     return PY_CONTENT.slice(i);
   }
 
@@ -5860,7 +6028,7 @@ print("RESULT=" + json.dumps(out))
       'an already-running browser returns before any spawn (attach never gets a watcher)');
     assert(/def _autolaunch_if_down\(\):[\s\S]*?cmd_launch\(auto=True\)/.test(PY_CONTENT),
       'auto-launch must launch with auto=True (idle close on by default)');
-    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('if __name__ == "__main__":'));
+    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('def _cli_main():'));
     assert(/'launch': lambda: cmd_launch\(idle_close=_idle_close_flag\(args\)\)/.test(main),
       'explicit launch passes --idle-close and defaults to auto=False');
     const flag = main.indexOf('if cmd == IDLE_WATCHER_FLAG:');
@@ -6151,7 +6319,8 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     const start = PY_CONTENT.indexOf('def _slog_exit_code');
     const body = PY_CONTENT.slice(start, PY_CONTENT.indexOf('\ndef ', start + 1));
     assert(start > 0 && !body.includes('__traceback__'), '_slog_exit_code must not read the traceback');
-    assert(/\n    _SLOG\["main_done"\] = True\s*$/.test(PY_CONTENT), '__main__ must end with the main_done marker');
+    assert(/\n    _SLOG\["main_done"\] = True\s*\n+if __name__ == "__main__":\s*\n\s+_cli_main\(\)\s*$/.test(PY_CONTENT),
+      '_cli_main must end with the main_done marker, and __main__ must only call it');
     const pys = ['python3.10', 'python3.11', 'python3.12', 'python3.13', PY_BIN].filter((py, i, all) =>
       all.indexOf(py) === i && spawnSync(py, ['-c', 'pass'], { timeout: 10000 }).status === 0);
     for (const py of pys) {
@@ -6170,7 +6339,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   // writing one code page while the server read another made the server log
   // the call twice. Both ends are UTF-8 now.
   test('output: UTF-8 on Windows pipes; MCP child and server agree on UTF-8', () => {
-    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('if __name__ == "__main__":'));
+    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('def _cli_main():'));
     const fix = main.indexOf('_stream.reconfigure(encoding="utf-8", errors="replace")');
     assert(fix > 0 && fix < main.indexOf('_slog_begin(_argv)'),
       '__main__ must switch stdout/stderr to UTF-8 on Windows before the session log wraps them');
@@ -6344,7 +6513,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
 
   test('log: wired into dispatch, never auto-launches, documented (README, CHANGELOG, help)', () => {
     assert(/'log':\s*lambda:\s*cmd_log\(\*args\)/.test(PY_CONTENT), "'log' must be in sync_cmds");
-    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('if __name__ == "__main__":'));
+    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('def _cli_main():'));
     assert(/_slog_begin\(_argv\)/.test(main), '__main__ must start the session log');
     const skip = PY_CONTENT.match(/AUTOLAUNCH_SKIP_CMDS = frozenset\(\{([\s\S]*?)\}\)/)[1];
     assert(/'log'/.test(skip), "'log' must never launch the browser");
@@ -6357,7 +6526,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert(unreleased && unreleased.includes('cdpilot log'), 'CHANGELOG [Unreleased] must describe `cdpilot log`');
     const help = run('--help');
     assert(help.includes('log --md') && help.includes('CDPILOT_LOG'), 'bin help must document log');
-    assert(PY_CONTENT.slice(0, 2000).includes('CDPILOT_LOG=0'), 'python __doc__ must document CDPILOT_LOG');
+    assert(PY_DOC.includes('CDPILOT_LOG=0'), 'python __doc__ must document CDPILOT_LOG');
   });
 })();
 
@@ -7344,6 +7513,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     const NOT_A_BROWSER = [  // signal 0 probes / cdpilot's own helper processes
       '_pid_alive', '_watch_pid_alive', '_watch_daemon_run', 'cmd_watch_start', 'cmd_watch_stop',
       '_arm_timeout_watchdog',
+      '_daemon_serve_entry',  // SIGTERM/SIGHUP handlers for the warm process itself; touches no browser
       // Web Bot Auth: the spawn lock (a docstring), the signer a launch just
       // spawned, and the signer stop, which signals only a pid proven to be
       // this port's signer and is reached only through _stop_browser_on_port
@@ -7428,7 +7598,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert(help.includes('disconnect'), 'help must mention disconnect');
     assert(/browser_connect/.test(PY_CONTENT), 'MCP must have browser_connect tool');
     assert(/browser_disconnect/.test(PY_CONTENT), 'MCP must have browser_disconnect tool');
-    assert(PY_CONTENT.slice(0, 2500).includes('CDPILOT_BROWSER_SEARCH_ROOT'),
+    assert(PY_DOC.includes('CDPILOT_BROWSER_SEARCH_ROOT'),
       'python __doc__ must document CDPILOT_BROWSER_SEARCH_ROOT');
   });
 
@@ -8929,7 +9099,7 @@ print("ok")
     const help = run('--help');
     assert(help.includes('launch --bot-auth') && help.includes('bot-auth directory --headers')
       && help.includes('bot-auth format'), 'bin help documents bot-auth');
-    assert(PY_CONTENT.slice(0, 3000).includes('launch --bot-auth'), 'python __doc__ documents bot-auth');
+    assert(PY_DOC.includes('launch --bot-auth'), 'python __doc__ documents bot-auth');
     const notes = changelogFor('0.9.4');
     assert(notes.includes('launch --bot-auth'), 'CHANGELOG 0.9.4 describes Web Bot Auth');
     for (const s of ['`bot-auth:` line', '`bot_auth` key', 'directory --headers', 'legacy']) {

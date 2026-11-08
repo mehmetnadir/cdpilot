@@ -63,6 +63,217 @@ function clearPythonCache() {
   try { fs.unlinkSync(pythonCachePath()); } catch {}
 }
 
+// ── Warm process (daemon) ──
+// CDPILOT_DAEMON=1: page commands go to one warm Python process per project
+// (src/cdpilot.py --_daemon-serve) over a Unix socket; it keeps the module,
+// the asyncio loop and the pooled CDP sockets between calls (2026-11-08: a
+// fresh process spent ~110 ms in node, ~140 ms starting Python and ~500 ms
+// setting the CDP session up before `go` even began). The client falls back
+// to a fresh process whenever the daemon is missing, busy (no hello within
+// DAEMON_HELLO_MS), of another version, or refuses the command — always before
+// anything ran, so a command never runs twice. POSIX only for now.
+const net = require('net');
+const DAEMON_SERVE_FLAG = '--_daemon-serve';
+const DAEMON_HELLO_MS = 150;
+// Mirrors DAEMON_SPAWN_CMDS in src/cdpilot.py (a test keeps them identical):
+// lifecycle, servers and forks, long-running loops, the daemon itself.
+const DAEMON_SPAWN_CMDS = new Set([
+  'launch', 'stop', 'stop-all', 'project-stop', 'connect', 'disconnect',
+  'serve', 'mcp', 'watch', 'setup', 'status', 'daemon', 'replay', 'run',
+  'agent', 'blog', 'bot-auth', 'browser', 'test', 'trace', 'heal', 'health',
+  'session', 'sessions', 'session-close', 'projects', 'proxy', 'extensions',
+  'tls-proxy', 'help', '--help', '-h']);
+
+function daemonEnabled() {
+  return process.env.CDPILOT_DAEMON === '1' && process.platform !== 'win32';
+}
+
+function daemonEligible(cmd, args) {
+  if (!daemonEnabled() || !cmd || DAEMON_SPAWN_CMDS.has(cmd) || cmd.startsWith('--_')) return false;
+  // --timeout ends its process with os._exit: a fresh process for it.
+  if (commandIndex(args) !== 0 || process.env.CDPILOT_TIMEOUT) return false;
+  return true;
+}
+
+// stdin a command reads (cmd_batch: always; cmd_check: without an argument)
+// travels inside the request; the daemon has no terminal.
+function daemonStdin(cmd, args) {
+  if (process.stdin.isTTY) return undefined;
+  if (cmd !== 'batch' && !(cmd === 'check' && args.length === 1)) return undefined;
+  try { return fs.readFileSync(0, 'utf8'); } catch { return ''; }
+}
+
+// The daemon is keyed by everything src/cdpilot.py reads at import time, so a
+// request never meets a process set up for another project, port, browser,
+// home or interpreter: a different key is a different socket and daemon.
+function daemonKey(env, python) {
+  const parts = { python, version: VERSION, src: SRC_DIR, home: env.HOME || '' };
+  for (const k of Object.keys(env).sort()) {
+    if (k.startsWith('CDPILOT_') || k.startsWith('CDP_') || k === 'CHROME_BIN') parts[k] = env[k];
+  }
+  return require('crypto').createHash('sha1').update(JSON.stringify(parts)).digest('hex').slice(0, 16);
+}
+
+// sun_path holds 104 bytes on macOS: a long CDPILOT_HOME moves the socket to
+// a private directory under the temp dir (the key still includes the home).
+function daemonDirs() {
+  const uid = typeof os.userInfo === 'function' ? os.userInfo().uid : 0;
+  return [path.join(cdpilotHome(), 'daemon'), path.join(os.tmpdir(), `cdpilot-${uid}-daemon`)];
+}
+
+function daemonSockPath(key) {
+  const [home, tmp] = daemonDirs();
+  const p = path.join(home, `${key}.sock`);
+  return Buffer.byteLength(p) <= 100 ? p : path.join(tmp, `${key}.sock`);
+}
+
+// One request on one connection. Resolves {handled: true, code} when the
+// daemon ran the command (every output frame went through onFrame), or
+// {handled: false, reason} when nothing ran and the caller must spawn.
+function daemonRequest(sockPath, payload, onFrame) {
+  return new Promise((resolve) => {
+    let settled = false, hello = false, buf = '', exitCode = null;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const sock = net.createConnection(sockPath);
+    sock.setEncoding('utf8');
+    const timer = setTimeout(() => {
+      if (!hello) { sock.destroy(); done({ handled: false, reason: 'busy' }); }
+    }, DAEMON_HELLO_MS);
+    sock.on('error', (e) => {
+      clearTimeout(timer);
+      done(hello ? { handled: true, code: 1, error: `daemon connection failed: ${e.message}` }
+                 : { handled: false, reason: e.code || 'error' });
+    });
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        let msg;
+        try { msg = JSON.parse(line); } catch { continue; }
+        if (!hello) {
+          hello = true;
+          clearTimeout(timer);
+          if (msg.version !== VERSION) {
+            // An older install's daemon: ask it to leave, run this call fresh.
+            sock.end(JSON.stringify({ op: 'shutdown' }) + '\n');
+            done({ handled: false, reason: 'version' });
+            return;
+          }
+          sock.write(JSON.stringify(payload) + '\n');
+          continue;
+        }
+        if (msg.fallback !== undefined) {
+          done({ handled: false, reason: String(msg.fallback) });
+          sock.destroy();
+          return;
+        }
+        if (msg.exit !== undefined) { exitCode = msg.exit; continue; }
+        onFrame(msg);
+      }
+    });
+    sock.on('close', () => {
+      clearTimeout(timer);
+      if (exitCode !== null) done({ handled: true, code: exitCode });
+      else done(hello ? { handled: true, code: 1, error: 'connection to the daemon was lost' }
+                      : { handled: false, reason: 'closed' });
+    });
+  });
+}
+
+// Fork the warm process for this key, detached; at most once per 5 s.
+function startDaemon(sockPath, python, env) {
+  const stamp = `${sockPath}.starting`;
+  try { if (Date.now() - fs.statSync(stamp).mtimeMs < 5000) return false; } catch {}
+  try {
+    fs.mkdirSync(path.dirname(sockPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(stamp, String(process.pid));
+    const child = spawn(python, pyArgs(DAEMON_SERVE_FLAG, sockPath),
+      { detached: true, stdio: 'ignore', env });
+    child.on('error', () => {});
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function daemonPing(sockPath) {
+  return new Promise((resolve) => {
+    let pong = null;
+    daemonRequest(sockPath, { op: 'ping' }, (m) => { if (m.pong) pong = m; })
+      .then(() => resolve(pong));
+  });
+}
+
+function listDaemonSockets() {
+  const out = [];
+  for (const dir of daemonDirs()) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names) if (n.endsWith('.sock')) out.push(path.join(dir, n));
+  }
+  return out;
+}
+
+// `cdpilot daemon start|stop|status`
+async function daemonCommand(sub, python, env) {
+  const what = sub[0] || 'status';
+  const mine = daemonSockPath(daemonKey(env, python));
+  if (what === 'start') {
+    if (process.platform === 'win32') {
+      console.error('cdpilot daemon: not available on Windows yet');
+      return 1;
+    }
+    let pong = await daemonPing(mine);
+    if (!pong) {
+      startDaemon(mine, python, env);
+      for (let i = 0; i < 30 && !pong; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        pong = await daemonPing(mine);
+      }
+    }
+    if (!pong) {
+      console.error('cdpilot daemon: did not start (see `cdpilot daemon status`)');
+      return 1;
+    }
+    console.log(`daemon running: pid ${pong.pid}, socket ${mine}`);
+    if (!daemonEnabled()) console.log('set CDPILOT_DAEMON=1 to send commands to it');
+    return 0;
+  }
+  if (what === 'stop') {
+    let n = 0;
+    for (const sock of listDaemonSockets()) {
+      const r = await daemonRequest(sock, { op: 'shutdown' }, () => {});
+      if (r.handled) n++;
+      else { try { fs.unlinkSync(sock); } catch {} }
+    }
+    console.log(n ? `stopped ${n} daemon${n === 1 ? '' : 's'}` : 'no daemon running');
+    return 0;
+  }
+  if (what === 'status') {
+    const socks = listDaemonSockets();
+    let live = 0;
+    for (const sock of socks) {
+      const pong = await daemonPing(sock);
+      if (!pong) continue;
+      live++;
+      const up = Math.max(0, Math.round(Date.now() / 1000 - pong.started));
+      console.log(`${sock === mine ? '*' : ' '} pid ${pong.pid}  served ${pong.served}  up ${up}s  idle-exit ${pong.idle}s  ${sock}`);
+    }
+    if (!live) {
+      console.log('no daemon running' + (daemonEnabled() ? '' : ' (CDPILOT_DAEMON=1 starts one on the next command)'));
+      console.log(`  socket: ${mine}`);
+    } else if (socks.includes(mine)) {
+      console.log('* = this project and environment');
+    }
+    return 0;
+  }
+  console.error(`cdpilot daemon: unknown subcommand '${what}' (start | stop | status)`);
+  return 2;
+}
+
 // CDPILOT_HOME resolution — must match src/cdpilot.py exactly:
 //   CDPILOT_HOME = os.environ.get("CDPILOT_HOME") or os.path.expanduser("~/.cdpilot")
 // A set-but-empty CDPILOT_HOME falls back to the default (empty string is
@@ -499,6 +710,11 @@ function showHelp() {
     An auto-launched (or MCP-launched) browser closes after 15 min without a
                        cdpilot command or page change (CDPILOT_IDLE_CLOSE=<minutes>,
                        0 = never); an explicit launch stays open unless asked (below).
+    CDPILOT_DAEMON=1   Keep one warm Python process per project and send page
+                       commands to it over a local socket (~0.4 s less per call;
+                       a fresh process when it is missing or busy; not with
+                       --timeout; 'daemon status|stop'; idle exit after
+                       CDPILOT_DAEMON_IDLE seconds, default 1800).
 
   SETUP
     setup              Auto-detect browser, create isolated profile
@@ -636,6 +852,10 @@ function showHelp() {
                        --load-extension, CfT does not. Used instead of Chrome
                        while dev extensions are registered. Not for stealth.
     health             JSON status: alive, port, tabs, browser, today's crashes
+    daemon start|stop|status
+                       The warm process behind CDPILOT_DAEMON=1: start it ahead
+                       of time, stop every running one, or list them (pid,
+                       requests served, uptime, socket).
 
   PROJECTS
     projects           List all project browser instances
@@ -867,22 +1087,7 @@ if (cmd === 'setup') {
   process.exit(0);
 }
 
-if (cmd === 'status') {
-  runStatus();
-  // Don't exit immediately — let http callback complete
-} else {
-  // Pre-flight check on first run or 'launch' command
-  if (cmd === 'launch') {
-    preflight();
-  }
-
-  // Delegate to Python
-  const python = findPython();
-  if (!python) {
-    console.error('Error: Python 3.10+ required. Install: https://www.python.org/downloads/');
-    process.exit(1);
-  }
-
+function pythonEnv() {
   const browser = findBrowser();
   const config = resolveProjectConfig();
 
@@ -907,7 +1112,10 @@ if (cmd === 'status') {
     // (Chrome -> Chrome for Testing) on top of it.
     env.CDPILOT_CHROME_BIN_AUTO = '1';
   }
+  return env;
+}
 
+function spawnPython(python, args, env) {
   const child = spawn(python, pyArgs(...args), {
     stdio: 'inherit',
     env,
@@ -929,4 +1137,49 @@ if (cmd === 'status') {
     }
     process.exit(code ?? 0);
   });
+}
+
+if (cmd === 'status') {
+  runStatus();
+  // Don't exit immediately — let http callback complete
+} else {
+  // Pre-flight check on first run or 'launch' command
+  if (cmd === 'launch') {
+    preflight();
+  }
+
+  // Delegate to Python
+  const python = findPython();
+  if (!python) {
+    console.error('Error: Python 3.10+ required. Install: https://www.python.org/downloads/');
+    process.exit(1);
+  }
+
+  const env = pythonEnv();
+
+  if (cmd === 'daemon') {
+    daemonCommand(args.slice(1), python, env).then((code) => { process.exitCode = code; });
+  } else if (daemonEligible(cmd, args)) {
+    const sockPath = daemonSockPath(daemonKey(env, python));
+    const payload = { argv: args, cwd: process.cwd() };
+    const stdin = daemonStdin(cmd, args);
+    if (stdin !== undefined) payload.stdin = stdin;
+    daemonRequest(sockPath, payload, (m) => {
+      if (m.o !== undefined) process.stdout.write(m.o);
+      if (m.e !== undefined) process.stderr.write(m.e);
+    }).then((r) => {
+      if (r.handled) {
+        if (r.error) console.error(`cdpilot: ${r.error}`);
+        process.exitCode = r.code;
+        return;
+      }
+      // No daemon (yet): start one for the next call; this call runs fresh.
+      if (['ENOENT', 'ECONNREFUSED', 'version', 'closed'].includes(r.reason)) {
+        startDaemon(sockPath, python, env);
+      }
+      spawnPython(python, args, env);
+    });
+  } else {
+    spawnPython(python, args, env);
+  }
 }

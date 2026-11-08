@@ -946,6 +946,36 @@ CDPILOT_TIMEOUT=60 cdpilot run flow.cdp   # default for every command (and each 
 For `mcp` and `serve` the value is not applied to the long-running server
 itself; it is passed on to every tool call / request it runs.
 
+### Warm process (`CDPILOT_DAEMON=1`)
+
+Every cdpilot call is a fresh process: node starts (~0.1 s), Python imports the
+core (~0.15 s) and a CDP session is set up (~0.5 s) before the command itself
+runs — a browser paints a page in 20 ms, `cdpilot go` took about a second
+(measurements: `.claude/docs/perf-taban-2026-11-08.md`). With
+`CDPILOT_DAEMON=1` the launcher keeps one warm Python process per project and
+environment and hands page commands to it over a Unix socket; the process keeps
+the module, its event loop and the pooled CDP connections between calls, so the
+second and later calls skip all of that.
+
+```bash
+export CDPILOT_DAEMON=1
+cdpilot go https://example.com      # first call: fresh process, starts the daemon
+cdpilot content                     # served warm
+cdpilot daemon status               # pid, requests served, uptime, socket
+cdpilot daemon stop                 # stop every running daemon (they also leave after 30 min idle)
+```
+
+Output, exit codes, the session log and recordings are the same either way:
+each request runs as its own process would (own argv, cwd and stdin, state
+reset between requests, exit-time hooks run at request end). The launcher runs
+a fresh process instead whenever the daemon is missing, busy with another call,
+of another version (that one is asked to leave), or the command is not a page
+command: `launch`, `stop`, `connect`, `mcp`, `serve`, `watch`, `replay`, `run`
+and the other lifecycle commands, and anything with `--timeout`. Nothing is
+ever executed twice. POSIX only for now; `CDPILOT_DAEMON_IDLE=<seconds>` sets
+the idle exit (default 1800). Opt-in in this release; the default may change
+once two weeks of use show no difference in error rates.
+
 ### Session log
 
 Every command (and every MCP tool call) appends one JSON line to a local,
