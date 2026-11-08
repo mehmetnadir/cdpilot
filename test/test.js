@@ -803,8 +803,8 @@ test('friction: FRICTION_DETECT_JS is read-only (no mutation/network/storage)', 
 });
 
 test('friction: _detect_friction defined + cmd_friction dispatched', () => {
-  assert(/async def _detect_friction\(ws_url\)/.test(PY_CONTENT),
-    'Should define async _detect_friction(ws_url)');
+  assert(/async def _detect_friction\(ws_url, raw=None, cap=None\)/.test(PY_CONTENT),
+    'Should define async _detect_friction(ws_url, raw=None, cap=None) — raw/cap come from _post_nav_probe');
   assert(/async def cmd_friction\(\)/.test(PY_CONTENT),
     'Should define async cmd_friction()');
   assert(/'friction':\s*cmd_friction/.test(PY_CONTENT),
@@ -1129,6 +1129,73 @@ test('navigate_collect post-load settle: event silence (100 ms), 300 ms cap, no 
   assert(/timeout=1 if loaded_at is None else 0\.1/.test(body), 'after load, 100 ms without an event ends the settle');
   assert(!/asyncio\.sleep\(0\.3\)/.test(body) && !/asyncio\.sleep\(1\.5\)/.test(body),
     'navigate_collect must not regress to a blind post-load sleep');
+});
+
+test('cmd_go: the post-load probes share one evaluate (probe → host assert, friction, CAPTCHA)', () => {
+  const body = (PY_CONTENT.match(/async def cmd_go\([\s\S]*?\n(?:async )?def /) || [''])[0];
+  assert(body, 'cmd_go must exist');
+  assert(/probe = await _post_nav_probe\(active_ws\)/.test(body), 'cmd_go runs the combined probe once after the page read');
+  assert(/_assert_host\(active_ws, expected_host, actual=probe\["host"\]\)/.test(body), 'host assert takes the probe hostname');
+  assert(/_detect_friction\(active_ws, raw=probe\["friction"\], cap=probe\["captcha"\]\)/.test(body), 'friction takes both probe parts');
+  assert(/_detect_captcha\(active_ws, pre=probe\["captcha"\]\)/.test(body), 'the captcha probe takes the probe part');
+  assert(body.indexOf('probe = await _post_nav_probe') < body.indexOf('_assert_host(active_ws, expected_host, actual='), 'probe before its consumers');
+});
+
+test('post-nav probe: parses the nested JSON, feeds the three consumers without another evaluate, falls back part by part', () => {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-probe-'));
+  const script = `
+import asyncio, json, importlib.util
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+calls = []
+def fake(value):
+    async def cdp_send(ws, batch, timeout=None, **kw):
+        calls.append((batch[0][1], batch[0][2].get("expression", "")[:17]))
+        return {batch[0][0]: {"result": {"type": "string", "value": value}}}
+    return cdp_send
+good = json.dumps({"probe": "cdpilot", "host": "www.example.com",
+    "friction": json.dumps({"level": "login_wall", "signals": ["form:password"], "detail": ""}),
+    "captcha": json.dumps({"detected": True, "types": ["recaptcha_v2"], "details": []})})
+mod.cdp_send = fake(good)
+p = asyncio.run(mod._post_nav_probe("ws://x"))
+assert p["host"] == "www.example.com", p
+assert p["friction"]["level"] == "login_wall", p
+assert p["captcha"]["detected"] is True, p
+assert calls == [("Runtime.evaluate", "/*cdpilot-probe*/")], calls
+calls.clear()
+fr = asyncio.run(mod._detect_friction("ws://x", raw=p["friction"], cap=p["captcha"]))
+assert fr["level"] == "login_wall" and calls == [], (fr, calls)   # login_wall outranks soft_captcha
+fr2 = asyncio.run(mod._detect_friction("ws://x", raw={"level": "none", "signals": [], "detail": ""}, cap=p["captcha"]))
+assert fr2["level"] == "soft_captcha" and "captcha:recaptcha_v2" in fr2["signals"] and calls == [], (fr2, calls)
+cap = asyncio.run(mod._detect_captcha("ws://x", pre=p["captcha"]))
+assert cap is p["captcha"] and calls == [], (cap, calls)
+asyncio.run(mod._assert_host("ws://x", "example.com", actual=p["host"]))   # www. stripped, no evaluate
+assert calls == [], calls
+# a page answering something else: every part None, the consumers probe singly
+for bad in ("user.example", json.dumps({"x": 1}), json.dumps({"probe": "cdpilot", "host": 5, "friction": "{", "captcha": "[]"}), "", None):
+    mod.cdp_send = fake(bad)
+    q = asyncio.run(mod._post_nav_probe("ws://x"))
+    assert q == {"host": None, "friction": None, "captcha": None}, (bad, q)
+calls.clear()
+mod.cdp_send = fake(json.dumps({"detected": False}))
+asyncio.run(mod._detect_friction("ws://x", raw=None, cap=None))
+assert [c[0] for c in calls] == ["Runtime.evaluate", "Runtime.evaluate"], calls   # friction + captcha single probes
+calls.clear()
+asyncio.run(mod._assert_host("ws://x", "example.com"))
+assert calls == [("Runtime.evaluate", "location.hostname")], calls
+# the combined expression: marker first, each detector embedded once, no newline-sensitive edges
+js = mod.POST_NAV_PROBE_JS
+assert js.startswith("/*cdpilot-probe*/(function(){"), js[:40]
+assert js.count("var out = { level:") == 1 and js.count("var result = { detected:") == 1, "each detector once"
+assert "probe:'cdpilot'" in js and js.endswith("})()"), js[-30:]
+print("ok")
+`;
+  const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
+    { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
+  assert.strictEqual(r.status, 0, `probe test failed: ${r.stderr}`);
+  assert(/^ok/m.test(r.stdout), r.stdout);
 });
 
 test('visual feedback config: default OFF', () => {
@@ -7106,6 +7173,32 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       const gap = read.t - ws[nav].t;
       assert(gap >= 90 && gap < 260, `settle gap ${gap.toFixed(0)} ms: expected ~100 (the silence window), not the old 300`);
       assert(!/await asyncio\.sleep\(0\.3\)\s*\n\s*break/.test(PY_CONTENT), 'the fixed 300 ms sleep after load is gone');
+    } finally { fake.stop(); }
+  });
+
+  test('go: one Runtime.evaluate serves the three post-load probes (hostname, friction, CAPTCHA)', () => {
+    // 08.11: after the page read cmd_go ran four more evaluates — hostname,
+    // friction, captcha (inside friction), captcha again. They are one now
+    // (POST_NAV_PROBE_JS, marked "probe" in the fake's probes list); a standalone friction
+    // or captcha detector after the navigation means the fallback fired.
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const r = cli(['go', 'https://example.com/'], isoEnv(home, fake.port, 'proj'));
+      assert.strictEqual(r.status, 0, `go exit ${r.status}: ${r.stdout}${r.stderr}`);
+      const ws = fake.entries().filter((e) => e.method);
+      const nav = ws.findIndex((e) => e.method === 'Page.navigate');
+      assert(nav >= 0, 'go must navigate');
+      const evals = ws.slice(nav + 1).filter((e) => e.method === 'Runtime.evaluate');
+      const tagged = (tag) => evals.filter((e) => (e.probes || []).includes(tag));
+      assert.strictEqual(tagged('probe').length, 1, `one combined probe after load, got ${tagged('probe').length}`);
+      const probeTags = tagged('probe')[0].probes;
+      assert(probeTags.includes('friction') && probeTags.includes('captcha'), `the probe embeds both detectors: ${probeTags}`);
+      assert.strictEqual(tagged('friction').length, 1, 'no standalone friction detector after the probe');
+      assert.strictEqual(tagged('captcha').length, 1, 'no standalone CAPTCHA detector after the probe');
+      assert(evals.length <= 2, `after load only the page read and the probe: ${evals.length} evaluates`);
+      assert(!/navigation drift/.test(r.stderr), `the probe's hostname satisfies the drift check: ${r.stderr}`);
     } finally { fake.stop(); }
   });
 

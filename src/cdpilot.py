@@ -1136,6 +1136,19 @@ FRICTION_DETECT_JS = r"""
 })()
 """
 
+# One Runtime.evaluate for everything cmd_go wants to know right after a
+# navigation: the hostname (drift check), the friction rung and the CAPTCHA
+# scan. Each detector keeps its own IIFE and JSON contract; the wrapper nests
+# their JSON strings. The leading marker lets tests (and the fake CDP) tell
+# the combined probe from a standalone detector. 08.11.2026: four round trips
+# (hostname, friction, captcha inside friction, captcha) became one.
+POST_NAV_PROBE_JS = (
+    "/*cdpilot-probe*/(function(){var h='';try{h=location.hostname;}catch(e){}"
+    "var f=null,c=null;try{f=" + FRICTION_DETECT_JS.strip() + ";}catch(e){}"
+    "try{c=" + CAPTCHA_DETECT_JS.strip() + ";}catch(e){}"
+    "return JSON.stringify({probe:'cdpilot',host:h,friction:f,captcha:c});})()"
+)
+
 PROXY_CONFIG_FILE = os.path.join(PROFILE_DIR, 'proxy.json')
 HEADLESS_CONFIG_FILE = os.path.join(PROFILE_DIR, 'headless.json')
 STEALTH_CONFIG_FILE = os.path.join(PROFILE_DIR, 'stealth.json')
@@ -7416,9 +7429,14 @@ async def cmd_go(url):
         content, _ = await navigate_collect(active_ws, url)
         print(content)
 
+        # One Runtime.evaluate for the three post-load probes (hostname,
+        # friction rung, CAPTCHA) instead of four round trips; each consumer
+        # below runs its own probe only when its part is missing.
+        probe = await _post_nav_probe(active_ws)
+
         # Fix 4: Host assert — detect silent wrong-site landings immediately.
         try:
-            await _assert_host(active_ws, expected_host)
+            await _assert_host(active_ws, expected_host, actual=probe["host"])
         except NavigationDrift:
             raise
         except Exception:
@@ -7429,7 +7447,7 @@ async def cmd_go(url):
         # -> stderr handoff warning only (NO autonomous bypass — ethics line).
         # The captcha rung is left to the dedicated probe below.
         try:
-            fr = await _detect_friction(active_ws)
+            fr = await _detect_friction(active_ws, raw=probe["friction"], cap=probe["captcha"])
             fr_level = fr.get('level', 'none')
             if fr_level == 'rate_limited' and _friction_backoff_enabled():
                 attempt = 0
@@ -7464,7 +7482,7 @@ async def cmd_go(url):
 
         # Post-navigation CAPTCHA probe. Non-blocking: stderr warning only.
         try:
-            info = await _detect_captcha(active_ws)
+            info = await _detect_captcha(active_ws, pre=probe["captcha"])
             if info.get("detected"):
                 types = ",".join(info.get("types", [])) or "unknown"
                 sys.stderr.write(f"⚠️  CAPTCHA tespit edildi ({types}). Çözüm için: cdpilot captcha-wait\n")
@@ -11321,17 +11339,19 @@ async def _adaptive_current_host(ws_url):
         return ""
 
 
-async def _assert_host(ws_url, expected_host):
+async def _assert_host(ws_url, expected_host, actual=None):
     """Verify that the active tab's host matches expected_host.
 
     Strips leading 'www.' from both sides before comparing.
     If CDPILOT_ADAPTIVE_STRICT=1: raises NavigationDrift on mismatch.
     Otherwise: writes a warning to stderr (silent log, never breaks callers).
+    actual: hostname already read by _post_nav_probe; None reads it here.
     """
     if not expected_host:
         return
     try:
-        actual = await _adaptive_current_host(ws_url)
+        if actual is None:
+            actual = await _adaptive_current_host(ws_url)
         norm = lambda h: h[4:] if h.startswith("www.") else h
         if norm(actual) != norm(expected_host):
             msg = f"navigation drift: expected {expected_host}, got {actual}"
@@ -11525,12 +11545,48 @@ def cmd_entropy(state=None):
         print('  Effect: next click/fill/type/hover will use humanized timing (2-5x slower).')
 
 
-async def _detect_captcha(ws_url):
+async def _post_nav_probe(ws_url):
+    """One Runtime.evaluate (POST_NAV_PROBE_JS) for the three post-load probes.
+
+    Returns {"host": str|None, "friction": dict|None, "captcha": dict|None}. A
+    part is None when the page answered something else (no JSON, foreign
+    JSON, evaluate failed); the consumer then runs its single probe as before.
+    Never raises.
+    """
+    out = {"host": None, "friction": None, "captcha": None}
+    try:
+        r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {
+            "expression": POST_NAV_PROBE_JS,
+            "returnByValue": True,
+        })], timeout=5)
+        raw = r.get(1, {}).get("result", {}).get("value")
+        d = json.loads(raw) if raw else None
+        if isinstance(d, dict) and d.get("probe") == "cdpilot":
+            if isinstance(d.get("host"), str):
+                out["host"] = d["host"]
+            for k in ("friction", "captcha"):
+                v = d.get(k)
+                if isinstance(v, str):
+                    try:
+                        parsed = json.loads(v)
+                    except (ValueError, TypeError):
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        out[k] = parsed
+    except Exception:
+        pass
+    return out
+
+
+async def _detect_captcha(ws_url, pre=None):
     """Run CAPTCHA_DETECT_JS in the active page, return parsed dict.
 
+    pre: the dict _post_nav_probe already read; returned as is.
     Returns: {"detected": bool, "types": [...], "details": [...], "error"?: str}
     Never raises — failures return {"detected": False, "error": "..."}.
     """
+    if isinstance(pre, dict):
+        return pre
     try:
         r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {
             "expression": CAPTCHA_DETECT_JS,
@@ -11619,38 +11675,46 @@ def _friction_action(level):
     return {'action': 'proceed', 'level': 'none', 'autonomous': True, 'message': 'No friction.'}
 
 
-async def _detect_friction(ws_url):
+async def _detect_friction(ws_url, raw=None, cap=None):
     """Detect the highest anti-bot friction rung on the active page.
 
     Runs FRICTION_DETECT_JS (rate-limit / login-wall / OTP / hard-block) and
     merges in the existing _detect_captcha result (soft_captcha). Returns the
     HIGHEST rung present per FRICTION_LEVELS ordering.
 
+    raw / cap: the friction and captcha dicts _post_nav_probe already read in
+    one evaluate; None runs the single probe here as before.
+
     Returns: {"level": str, "signals": [...], "detail": str, "captcha"?: {...}}
     Never raises — failures degrade to {"level": "none", ...}.
     """
     friction = {"level": "none", "signals": [], "detail": ""}
-    try:
-        r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {
-            "expression": FRICTION_DETECT_JS,
-            "returnByValue": True,
-        })], timeout=5)
-        raw = r.get(1, {}).get("result", {}).get("value")
-        if raw:
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict) and parsed.get("level") in FRICTION_LEVELS:
-                    friction = parsed
-            except (ValueError, TypeError):
-                pass
-    except Exception as e:
-        friction = {"level": "none", "signals": [], "detail": "", "error": str(e)[:120]}
+    if isinstance(raw, dict):
+        if raw.get("level") in FRICTION_LEVELS:
+            friction = raw
+    else:
+        try:
+            r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {
+                "expression": FRICTION_DETECT_JS,
+                "returnByValue": True,
+            })], timeout=5)
+            raw = r.get(1, {}).get("result", {}).get("value")
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict) and parsed.get("level") in FRICTION_LEVELS:
+                        friction = parsed
+                except (ValueError, TypeError):
+                    pass
+        except Exception as e:
+            friction = {"level": "none", "signals": [], "detail": "", "error": str(e)[:120]}
 
     # Merge soft_captcha from the dedicated captcha detector.
-    try:
-        cap = await _detect_captcha(ws_url)
-    except Exception:
-        cap = {"detected": False}
+    if not isinstance(cap, dict):
+        try:
+            cap = await _detect_captcha(ws_url)
+        except Exception:
+            cap = {"detected": False}
     if cap.get("detected"):
         cap_level = 'soft_captcha'
         # Keep whichever rung is higher in the ladder.

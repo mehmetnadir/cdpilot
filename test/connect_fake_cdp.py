@@ -137,7 +137,19 @@ def answer(msg, path):
     result = {}
     if method == "Runtime.evaluate":
         expr = p.get("expression", "")
-        if "readyState" in expr:
+        if "cdpilot-probe" in expr:
+            # cmd_go's combined post-load probe: hostname of the tab this
+            # socket is attached to, no friction, no CAPTCHA.
+            host = ""
+            with LOCK:
+                for pg in PAGES:
+                    if path.endswith("/" + pg["id"]):
+                        host = (pg["url"].split("//", 1)[-1].split("/", 1)[0].split(":")[0]
+                                if "//" in pg["url"] else "")
+            value = json.dumps({"probe": "cdpilot", "host": host,
+                                "friction": json.dumps({"level": "none", "signals": [], "detail": ""}),
+                                "captcha": json.dumps({"detected": False, "types": [], "details": []})})
+        elif "readyState" in expr:
             value = "complete"
         elif "location.href" in expr:
             value = "https://user.example/inbox"
@@ -211,6 +223,14 @@ def handle_ws(conn, path, headers):
                 if marker in text]
         if tags:
             entry["tags"] = tags
+        # Read-only probes cmd_go runs after a navigation (not injections, so
+        # not in "tags": the external guard expects no injection at all).
+        probes = [tag for tag, marker in (("probe", "cdpilot-probe"),
+                                          ("friction", "var out = { level:"),
+                                          ("captcha", "var result = { detected:"))
+                  if marker in text]
+        if probes:
+            entry["probes"] = probes
         log(entry)
         reply, events = answer(msg, path)
         ws_send(conn, json.dumps(reply))
