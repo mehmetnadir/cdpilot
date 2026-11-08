@@ -10383,6 +10383,9 @@ print(json.dumps({"har1": har1, "har2": har2, "har3": har3}))
     r = runCli(['record', 'stop', '--save', savePath], env);
     assert.strictEqual(r.status, 0);
     assert(fs.existsSync(savePath), 'flow file must exist');
+    if (process.platform !== 'win32') {
+      assert.strictEqual(fs.statSync(savePath).mode & 0o777, 0o600, 'saved flow file mode must be 0600');
+    }
 
     const flow = JSON.parse(fs.readFileSync(savePath, 'utf-8'));
     assert.strictEqual(flow.cdpilot_flow, 1);
@@ -10463,6 +10466,93 @@ print(json.dumps(res))
     // Case 2: #email -> kept verbatim and no new vars entry
     assert.deepStrictEqual(out[1].args, ['#email', 'a@b.c']);
     assert.strictEqual(out[1].vars.email, undefined);
+  });
+
+  test('record: placeholders every secret the session log would have masked (T1 security review)', () => {
+    const script = `
+import json, sys, importlib.util
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+cases = json.load(sys.stdin)
+res = []
+vars_dict = {}
+for idx, (cmd, args) in enumerate(cases, 1):
+    new_args, vars_dict = m._record_detect_placeholders(cmd, args, step_num=idx, vars_dict=vars_dict)
+    res.append({"args": new_args, "vars": dict(vars_dict)})
+print(json.dumps(res))
+`;
+    const inputCases = [
+      ['fill', ['#login-pw', 'hunter2']],
+      ['fill', ['input[name=cardnumber]', '4242424242424242']],
+      ['intercept', ['headers', '*api*', 'X-Api-Key:abc123']],
+      ['eval', ["localStorage.setItem('api_key','s3cr3t')"]],
+      ['tools', ['call', 'login', '{"password":"x","user":"u"}']],
+      ['assert-value', ['#pw', 'hunter2']],
+      ['connect', ['--password=x', '--api-key', 'secret_key']],
+      ['fill', ['#email', 'a@b.c']],
+      ['fill', ['#q', 'shoes']],
+      ['click', ['#card-title']],
+    ];
+    const out = JSON.parse(execFileSync(PYB, ['-c', script], {
+      input: JSON.stringify(inputCases), encoding: 'utf-8', timeout: 10000,
+    }).trim());
+
+    // 1. fill "#login-pw" hunter2 -> slug login_pw
+    assert.deepStrictEqual(out[0].args, ['#login-pw', '{{login_pw}}']);
+    assert(out[0].vars.login_pw, 'vars must contain login_pw');
+    assert.strictEqual(out[0].vars.login_pw.step, 1);
+
+    // 2. fill "input[name=cardnumber]" 4242424242424242 -> slug cardnumber
+    assert.deepStrictEqual(out[1].args, ['input[name=cardnumber]', '{{cardnumber}}']);
+    assert(out[1].vars.cardnumber, 'vars must contain cardnumber');
+    assert.strictEqual(out[1].vars.cardnumber.step, 2);
+
+    // 3. intercept headers "*api*" X-Api-Key:abc123 -> slug x_api_key
+    assert.deepStrictEqual(out[2].args, ['headers', '*api*', 'X-Api-Key:{{x_api_key}}']);
+    assert(out[2].vars.x_api_key, 'vars must contain x_api_key');
+    assert.strictEqual(out[2].vars.x_api_key.step, 3);
+
+    // 4. eval "localStorage.setItem('api_key','s3cr3t')" -> literal becomes {{v1}}
+    assert.deepStrictEqual(out[3].args, ["localStorage.setItem('api_key','{{v1}}')"]);
+    assert(out[3].vars.v1, 'vars must contain v1');
+    assert.strictEqual(out[3].vars.v1.step, 4);
+
+    // 5. tools call login '{"password":"x","user":"u"}' -> JSON secret key masked, compact
+    assert.deepStrictEqual(out[4].args, ['call', 'login', '{"password":"{{password}}","user":"u"}']);
+    assert(out[4].vars.password, 'vars must contain password');
+    assert.strictEqual(out[4].vars.password.step, 5);
+
+    // 6. assert-value #pw hunter2 -> slug pw
+    assert.deepStrictEqual(out[5].args, ['#pw', '{{pw}}']);
+    assert(out[5].vars.pw, 'vars must contain pw');
+    assert.strictEqual(out[5].vars.pw.step, 6);
+
+    // 7. --password=x / --api-key x flags
+    assert.deepStrictEqual(out[6].args, ['--password={{password}}', '--api-key', '{{api_key}}']);
+    assert(out[6].vars.password, 'vars must contain password');
+    assert(out[6].vars.api_key, 'vars must contain api_key');
+    assert.strictEqual(out[6].vars.api_key.step, 7);
+
+    // 8. fill "#email" a@b.c -> verbatim
+    assert.deepStrictEqual(out[7].args, ['#email', 'a@b.c']);
+
+    // 9. fill "#q" shoes -> verbatim
+    assert.deepStrictEqual(out[8].args, ['#q', 'shoes']);
+
+    // 10. click "#card-title" -> verbatim
+    assert.deepStrictEqual(out[9].args, ['#card-title']);
+
+    // Check final vars keys
+    const finalVars = out[9].vars;
+    assert.strictEqual(finalVars.email, undefined);
+    assert.strictEqual(finalVars.q, undefined);
+    assert.strictEqual(finalVars.card_title, undefined);
+    assert.deepStrictEqual(
+      Object.keys(finalVars).sort(),
+      ['api_key', 'cardnumber', 'login_pw', 'password', 'pw', 'v1', 'x_api_key']
+    );
   });
 
   test('replay: --dry-run prints substitutions and never prints secret value', () => {
