@@ -45,15 +45,16 @@
 | ✅ | v0.9.3 | 28.09: iframe (#1, `>>>` / `--frame`, cross-origin dahil; 3 tur review), boşta kendiliğinden kapanma (`CDPILOT_IDLE_CLOSE`), oturum günlüğü (`cdpilot log`, maskeli), Windows boruda UTF-8; CI'da gerçek tarayıcı e2e işi |
 | ✅ | v0.9.4 | 29.09: connect (kendi tarayıcın, sahiplik kanıtı), WebMCP köprüsü, Web Bot Auth (Cloudflare canlı doğruladı), insan gibi basılı tutma + exit 3, OOPIF fare yönlendirme düzeltmesi, Chrome for Testing, Claude Code eklenti mağazası + .mcpb, `examples/` (gerçek çıktılı) |
 | ⏳ | Eklenti API + cdpilot-jev | plan: `.claude/docs/plan-eklenti-api-ve-jev.md` (ölçüm kapısı önce) |
-| ⏳ | Sonraki | CSS seçicide shadow DOM (#3); UA override `go` bağlantısıyla sınırlı; `--entropy=on` click ayrıca `el.click()` → çift tıklama; frame act bulamazsa sayfaya dönüş |
+| ⏳ | v0.9.5 (main'de, push/PR/npm onayı bekler) | 08.11: shadow DOM (#3, `>>>` + derin geri düşüş), record/replay (#5, sırlar diske yazılmaz), HAR 1.2 (#4, maskeli), MCP `--tools core` (45→11 araç), bot-auth lsof düzeltmesi (macOS 26), MCP `--har` enjeksiyon kapısı, vaat denetimi; tutanak TT-20261108-032740-36a312 593/593; e2e yalnız CI; redact şeridi (kayıt maskesi) sürüyor |
+| ⏳ | Sonraki | UA override `go` bağlantısıyla sınırlı; `--entropy=on` click ayrıca `el.click()` → çift tıklama; frame act bulamazsa sayfaya dönüş; perf tabanı (`.claude/docs/perf-taban-<tarih>.md`); oynak press-hold zamanlama testi |
 | ⏳ | Sentinel takip | C6: daily_analytics gece yazmıyor (debug) · C8: 2 failed auto-like sebebi |
 | ⏳ | v0.9 tls-proxy | Optional local TLS-MITM (curl-impersonate semantics) |
 
 ## Son Oturum
-→ 2026-09-28: v0.9.3 (iframe + idle close + session log + Windows UTF-8); günlük çıkış kodu Python 3.10/3.11 düzeltmesi.
-→ İlk iş: pain_hunter'ın ilk canlı kayıtlarını oku (`/opt/cdpilot-twitter-bot/pains/2026-09.jsonl`); srv21 Claude token'ı (Nadir yazacak).
+→ 2026-11-08 (gece, CEO kipi): 4 şerit birleşti, T1 güvenlik incelemesi (0 HIGH/MEDIUM, 2 düşük → 1 düzeltildi, 1 şerit), tutanak 593/593. Devir notu: `.claude/docs/devir-notu-2026-11-06.md`.
+→ İlk iş: `lane/redact` şeridini incele + birleştir; Nadir kararları devir notu §4 (push/PR/npm, site deploy a25cee1, srv21 token, T2 denetim zamanı).
 
-Son Güncelleme: 2026-09-29
+Son Güncelleme: 2026-11-08
 
 <!-- gitnexus:start -->
 ## GitNexus — Code Intelligence
