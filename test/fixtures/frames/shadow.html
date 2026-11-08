@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Shadow DOM Test</title>
+</head>
+<body data-log="">
+  <!-- Open shadow host -->
+  <my-card id="card1"></my-card>
+
+  <!-- Nested shadow host -->
+  <my-app id="app1"></my-app>
+
+  <!-- Host inside an iframe -->
+  <iframe id="frame1" src="shadow_iframe.html"></iframe>
+
+  <!-- Closed shadow host -->
+  <my-closed id="closed1"></my-closed>
+
+  <script>
+    function log(msg) {
+      document.body.dataset.log = (document.body.dataset.log || '') + msg + ';';
+    }
+
+    // 1. Open shadow host
+    var card = document.getElementById('card1');
+    var cardRoot = card.attachShadow({mode: 'open'});
+    var cardBtn = document.createElement('button');
+    cardBtn.className = 'inner';
+    cardBtn.id = 'card-btn';
+    cardBtn.textContent = 'Card Button';
+    cardBtn.onclick = function() { log('card-btn-clicked'); };
+    cardRoot.appendChild(cardBtn);
+
+    setTimeout(function() {
+      var lateBtn = document.createElement('button');
+      lateBtn.id = 'late-btn';
+      lateBtn.textContent = 'Late Button';
+      cardRoot.appendChild(lateBtn);
+    }, 600);
+
+    // 2. Nested shadow host
+    var app = document.getElementById('app1');
+    var appRoot = app.attachShadow({mode: 'open'});
+    var panel = document.createElement('my-panel');
+    panel.id = 'panel1';
+    appRoot.appendChild(panel);
+    var panelRoot = panel.attachShadow({mode: 'open'});
+    var nestedBtn = document.createElement('button');
+    nestedBtn.className = 'nested-btn';
+    nestedBtn.textContent = 'Nested Button';
+    nestedBtn.onclick = function() { log('nested-btn-clicked'); };
+    panelRoot.appendChild(nestedBtn);
+
+    // 3. Closed shadow root
+    var closedElem = document.getElementById('closed1');
+    var closedRoot = closedElem.attachShadow({mode: 'closed'});
+    var closedBtn = document.createElement('button');
+    closedBtn.id = 'closed-btn';
+    closedBtn.textContent = 'Closed Button';
+    closedBtn.onclick = function() { log('closed-btn-clicked'); };
+    closedRoot.appendChild(closedBtn);
+  </script>
+</body>
+</html>
