@@ -38,6 +38,7 @@ Environment:
   CHROME_BIN           Browser binary path (auto-detected if not set)
   CDPILOT_PROFILE      Isolated browser profile directory
   CDPILOT_LOG=0        Do not write the session log
+  CDPILOT_VAR_<NAME>   Value for flow placeholder {{name}} in replay
   CDPILOT_TIMEOUT      Default for --timeout (the flag wins)
   CDPILOT_NO_AUTOLAUNCH=1  Do not start the browser when a page command
                        finds it not running (print the error instead)
@@ -68,6 +69,14 @@ pip install cryptography):
                        and Signature-Agent to every request the browser makes
                        (tabs, popups, iframes, workers), until `stop`
   cdpilot bot-auth status      Agent URL, keyid, signer on/off
+
+Record & replay:
+  cdpilot record start [--name <n>]        Start recording commands into active session
+  cdpilot record status                    Show active recording status
+  cdpilot record cancel                    Cancel and discard active recording
+  cdpilot record stop [--save <file.json>] Stop recording and emit flow JSON
+  cdpilot replay <file.json> [--var k=v] [--delay real|none|<ms>] [--dry-run] [--continue]
+                       Replay a recorded flow with variable substitution
 
 Exit codes: 0 ok, 1 error (batch / run: a step failed), 124 --timeout;
   exit 3 from click / smart-click (batch / run: one, and no failed step):
@@ -1471,6 +1480,7 @@ AUTOLAUNCH_SKIP_CMDS = frozenset({
     'tabs', 'session', 'sessions', 'projects', 'heal',
     'headless', 'proxy', 'browser', 'extensions', 'ext-install', 'ext-remove',
     'mcp', 'serve', 'log', 'connect', 'disconnect',
+    'record', 'replay',
 })
 # cmd is set by the CLI dispatcher; None (module imported) means never launch.
 _AUTOLAUNCH = {"cmd": None, "attempted": False, "failure": None}
@@ -1579,6 +1589,7 @@ IDLE_POLL_MAX_S = 30.0
 IDLE_PASSIVE_CMDS = frozenset({
     'status', 'health', 'projects', 'version', '--version', '-v',
     'help', '--help', '-h', 'setup', 'connect', 'disconnect',
+    'record', 'replay',
 })
 _IDLE_WARNED = []
 
@@ -19088,7 +19099,10 @@ SLOG_JS_LITERAL_CHARS = 40
 SLOG_MAX_FILES = 20
 # Long-running servers (their tool calls are logged), the reader itself
 # (reading the log must not grow it) and help.
-SLOG_SKIP_CMDS = frozenset({'mcp', 'serve', 'log', 'help', '--help', '-h', 'bot-auth'})
+SLOG_SKIP_CMDS = frozenset({'mcp', 'serve', 'log', 'help', '--help', '-h', 'bot-auth', 'record', 'replay'})
+RECORD_SKIP_CMDS = frozenset({'record', 'replay', 'log', 'help', '--help', '-h',
+                              'version', '--version', '-v', 'status', 'health',
+                              'mcp', 'serve', 'bot-auth', 'setup', 'connect', 'disconnect'})
 SLOG_CMD_ALIASES = {'open': 'go', '--version': 'version', '-v': 'version'}
 SLOG_VALUE_CMDS = frozenset({'fill', 'type'})  # <selector> <value...>, flags anywhere
 SLOG_VALUE_CMD_FLAGS = frozenset({'--no-heal'})  # their bare flags; --name=value is kept
@@ -19696,13 +19710,17 @@ def _slog_exit_code():
 def _slog_begin(argv):
     """Start recording this CLI invocation (argv without the program name)."""
     try:
-        if not argv or not _slog_enabled():
+        if not argv:
             return
         cmd = SLOG_CMD_ALIASES.get(argv[0], argv[0])
-        if cmd in SLOG_SKIP_CMDS or cmd in (WATCH_DAEMON_FLAG, BOT_AUTH_SIGNER_FLAG,
-                                            BOT_AUTH_LABEL_FLAG):
+        if cmd in (WATCH_DAEMON_FLAG, BOT_AUTH_SIGNER_FLAG, BOT_AUTH_LABEL_FLAG, IDLE_WATCHER_FLAG):
+            return
+        slog_wants = _slog_enabled() and cmd not in SLOG_SKIP_CMDS
+        rec_wants = _record_active() and cmd not in RECORD_SKIP_CMDS and os.environ.get("CDPILOT_REPLAY_ACTIVE") != "1"
+        if not slog_wants and not rec_wants:
             return
         _SLOG.update(active=True, done=False, cmd=cmd, args=list(argv[1:]),
+                     slog_wants=slog_wants, rec_wants=rec_wants,
                      started=datetime.datetime.now().astimezone(), t0=time.monotonic(),
                      t0_wall=time.time(), lock=threading.Lock(), url=None, title=None,
                      via=os.environ.get(SLOG_VIA_ENV) or None, exit_exc=None,
@@ -19742,11 +19760,14 @@ def _slog_finish(forced_code=None, forced_error=None):
         code = forced_code if forced_code is not None else _slog_exit_code()
         out = st["stdout"].captured() if st.get("stdout") else ""
         err = st["stderr"].captured() if st.get("stderr") else ""
-        _slog_append(_slog_build_entry(
-            st["cmd"], st["args"], code, int((time.monotonic() - st["t0"]) * 1000),
-            st["started"], url=st.get("url"), title=st.get("title"), stdout=out, stderr=err,
-            error=forced_error or st.get("error"), files=_slog_files((out, err), st["t0_wall"]),
-            via=st.get("via")))
+        if st.get("slog_wants"):
+            _slog_append(_slog_build_entry(
+                st["cmd"], st["args"], code, int((time.monotonic() - st["t0"]) * 1000),
+                st["started"], url=st.get("url"), title=st.get("title"), stdout=out, stderr=err,
+                error=forced_error or st.get("error"), files=_slog_files((out, err), st["t0_wall"]),
+                via=st.get("via")))
+        if st.get("rec_wants"):
+            _record_hook_step(st["cmd"], st["args"], code)
     except Exception as e:
         _slog_warn(e)
     finally:
@@ -19755,12 +19776,15 @@ def _slog_finish(forced_code=None, forced_error=None):
 
 def _slog_record_external(argv, code, started, duration_ms, error, via):
     """Log a command whose own process could not (an MCP tool call killed on timeout)."""
-    if not argv or not _slog_enabled():
+    if not argv:
         return
     try:
         cmd = SLOG_CMD_ALIASES.get(argv[0], argv[0])
-        _slog_append(_slog_build_entry(cmd, argv[1:], code, duration_ms, started,
-                                       error=error, via=via))
+        if _slog_enabled() and cmd not in SLOG_SKIP_CMDS:
+            _slog_append(_slog_build_entry(cmd, argv[1:], code, duration_ms, started,
+                                           error=error, via=via))
+        if _record_active() and cmd not in RECORD_SKIP_CMDS and os.environ.get("CDPILOT_REPLAY_ACTIVE") != "1":
+            _record_hook_step(cmd, argv[1:], code)
     except Exception as e:
         _slog_warn(e)
 
@@ -19960,6 +19984,737 @@ def cmd_log(*args):
         _slog_print(_slog_format_table(entries, PROJECT_ID, days))
 
 
+# ─── Record & Replay (issue #5) ───
+
+RECORD_INPUT_CMDS = frozenset({'fill', 'type', 'smart-fill', 'smart-select', 'select'})
+
+
+def _record_dir():
+    home = os.environ.get("CDPILOT_HOME") or CDPILOT_HOME
+    return os.path.join(home, "record")
+
+
+def _record_active_path():
+    return os.path.join(_record_dir(), "active.json")
+
+
+def _record_active():
+    return os.path.isfile(_record_active_path())
+
+
+def _record_hook_step(cmd, args, code):
+    """Append a step to active recording if one is in progress."""
+    if os.environ.get("CDPILOT_REPLAY_ACTIVE") == "1":
+        return
+    cmd = SLOG_CMD_ALIASES.get(cmd, cmd)
+    if cmd in RECORD_SKIP_CMDS:
+        return
+    active_path = _record_active_path()
+    if not os.path.isfile(active_path):
+        return
+    lock_path = active_path + ".lock"
+    lock_file = None
+    has_flock = False
+    try:
+        import fcntl
+        lock_file = open(lock_path, "w")
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        has_flock = True
+    except (ImportError, OSError):
+        pass
+
+    try:
+        if not os.path.isfile(active_path):
+            return
+        with open(active_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        started_at = state.get("started_at")
+        t_ms = 0
+        if started_at:
+            try:
+                clean_iso = started_at.replace("Z", "+00:00")
+                dt = datetime.datetime.fromisoformat(clean_iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                now = datetime.datetime.now(datetime.timezone.utc)
+                t_ms = max(0, int((now - dt).total_seconds() * 1000))
+            except Exception:
+                pass
+        steps_list = state.setdefault("steps", [])
+        step_num = len(steps_list) + 1
+        vars_dict = state.setdefault("vars", {})
+        redacted_args, vars_dict = _record_detect_placeholders(
+            cmd, args, step_num=step_num, vars_dict=vars_dict
+        )
+        step = {
+            "cmd": cmd,
+            "args": redacted_args,
+            "t_ms": t_ms,
+            "exit": code if isinstance(code, int) else 0
+        }
+        steps_list.append(step)
+        tmp_dir = os.path.dirname(active_path)
+        import tempfile
+        fd, tmp_file = tempfile.mkstemp(prefix=".active-", suffix=".tmp", dir=tmp_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_file, active_path)
+    except Exception as e:
+        _slog_warn(e)  # one stderr line, like a failed session-log write; never changes the command's exit code
+    finally:
+        if has_flock and lock_file:
+            try:
+                import fcntl
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                lock_file.close()
+            except Exception:
+                pass
+
+
+def _record_slug_from_selector(sel):
+    """Derive a clean variable slug from a selector or label."""
+    if not sel:
+        return None
+    # 1. ID selector: #foo or [id="foo"] or [id=foo]
+    m = _re.search(r"#([A-Za-z0-9_-]+)", sel)
+    if m:
+        return _re.sub(r"[^A-Za-z0-9]+", "_", m.group(1)).strip("_").lower()
+    m = _re.search(r"""\[\s*id\s*=\s*["']?([^"'\]]+)["']?\s*\]""", sel)
+    if m:
+        return _re.sub(r"[^A-Za-z0-9]+", "_", m.group(1)).strip("_").lower()
+    # 2. Name attribute: [name="foo"] or [name=foo]
+    m = _re.search(r"""\[\s*name\s*=\s*["']?([^"'\]]+)["']?\s*\]""", sel)
+    if m:
+        return _re.sub(r"[^A-Za-z0-9]+", "_", m.group(1)).strip("_").lower()
+    # 3. Type attribute: [type="password"] or [type=password]
+    m = _re.search(r"""\[\s*type\s*=\s*["']?([^"'\]]+)["']?\s*\]""", sel)
+    if m:
+        t = _re.sub(r"[^A-Za-z0-9]+", "_", m.group(1)).strip("_").lower()
+        if t in ("password", "pwd"):
+            return "password"
+        return t
+    # 4. Clean free label (e.g. "API key" -> "api_key")
+    clean = _re.sub(r"[^A-Za-z0-9]+", "_", sel).strip("_").lower()
+    if clean and len(clean) <= 30 and not clean.startswith(("input", "button", "select")):
+        return clean
+    return None
+
+
+def _record_detect_placeholders(cmd, args, step_num=1, vars_dict=None):
+    """Detect secrets in a step's args and replace with {{name}} placeholders.
+
+    Returns (new_args, vars_dict).
+    """
+    if vars_dict is None:
+        vars_dict = {}
+    args = ["" if a is None else str(a) for a in (args or [])]
+    if not args:
+        return list(args), vars_dict
+
+    def next_v_name():
+        n = 1
+        while f"v{n}" in vars_dict:
+            n += 1
+        return f"v{n}"
+
+    # (a) Input commands with secret-shaped selector / label
+    if cmd in RECORD_INPUT_CMDS:
+        if cmd in ('fill', 'type'):
+            non_flags = [i for i, a in enumerate(args) if not a.startswith("--")]
+            if non_flags:
+                sel_idx = non_flags[0]
+                sel = args[sel_idx]
+                val_idxs = non_flags[1:]
+                if _SLOG_SECRET_NAME_RE.search(sel) and val_idxs:
+                    slug = _record_slug_from_selector(sel) or next_v_name()
+                    var_name = slug
+                    if var_name not in vars_dict:
+                        vars_dict[var_name] = {"step": step_num, "hint": f"{cmd} {sel}"}
+                    new_args = []
+                    val_placed = False
+                    for i, a in enumerate(args):
+                        if i in val_idxs:
+                            if not val_placed:
+                                new_args.append(f"{{{{{var_name}}}}}")
+                                val_placed = True
+                        else:
+                            new_args.append(a)
+                    return new_args, vars_dict
+        elif cmd in ('smart-fill', 'smart-select', 'select'):
+            if len(args) >= 2:
+                sel = args[0]
+                if _SLOG_SECRET_NAME_RE.search(sel):
+                    slug = _record_slug_from_selector(sel) or next_v_name()
+                    var_name = slug
+                    if var_name not in vars_dict:
+                        vars_dict[var_name] = {"step": step_num, "hint": f"{cmd} {sel}"}
+                    return [sel, f"{{{{{var_name}}}}}"], vars_dict
+
+    # (b) Value itself matches secret patterns:
+    # _SLOG_TOKEN_PREFIX_RE, _SLOG_BEARER_RE, secret URL params via _slog_mask_url
+    new_args = list(args)
+    for i, arg in enumerate(args):
+        # 1. Secret URL params or userinfo password
+        if ("://" in arg or arg.startswith(("http:", "https:"))) and _slog_mask_url(arg) != arg:
+            from urllib.parse import urlsplit, urlunsplit, unquote_plus
+            try:
+                parts = urlsplit(arg)
+                netloc = parts.netloc
+                if "@" in netloc:
+                    userinfo, _, host = netloc.rpartition("@")
+                    if ":" in userinfo:
+                        user, _, password = userinfo.partition(":")
+                        var_name = "password"
+                        if var_name in vars_dict and vars_dict[var_name].get("step") != step_num:
+                            var_name = f"password_{step_num}"
+                        vars_dict[var_name] = {"step": step_num, "hint": f"{cmd} password"}
+                        netloc = f"{user}:{{{{{var_name}}}}}@{host}"
+                qs_parts = []
+                for p in parts.query.split("&") if parts.query else []:
+                    k, sep, v = p.partition("=")
+                    if sep and v and _SLOG_SECRET_PARAM_RE.search(unquote_plus(k)):
+                        slug = _re.sub(r"[^A-Za-z0-9]+", "_", k).strip("_").lower() or next_v_name()
+                        var_name = slug
+                        if var_name in vars_dict and vars_dict[var_name].get("step") != step_num:
+                            var_name = f"{slug}_{step_num}"
+                        vars_dict[var_name] = {"step": step_num, "hint": f"{cmd} {k}"}
+                        p = f"{k}={{{{{var_name}}}}}"
+                    qs_parts.append(p)
+                new_q = "&".join(qs_parts)
+                frag_parts = []
+                for p in parts.fragment.split("&") if parts.fragment else []:
+                    k, sep, v = p.partition("=")
+                    if sep and v and _SLOG_SECRET_PARAM_RE.search(unquote_plus(k)):
+                        slug = _re.sub(r"[^A-Za-z0-9]+", "_", k).strip("_").lower() or next_v_name()
+                        var_name = slug
+                        if var_name in vars_dict and vars_dict[var_name].get("step") != step_num:
+                            var_name = f"{slug}_{step_num}"
+                        vars_dict[var_name] = {"step": step_num, "hint": f"{cmd} {k}"}
+                        p = f"{k}={{{{{var_name}}}}}"
+                    frag_parts.append(p)
+                new_frag = "&".join(frag_parts)
+                new_args[i] = urlunsplit((parts.scheme, netloc, parts.path, new_q, new_frag))
+                continue
+            except Exception:
+                pass
+
+        # 2. Bearer token
+        m_bearer = _SLOG_BEARER_RE.search(arg)
+        if m_bearer:
+            var_name = next_v_name()
+            vars_dict[var_name] = {"step": step_num, "hint": f"{cmd} {m_bearer.group(1)}"}
+            new_args[i] = _SLOG_BEARER_RE.sub(
+                lambda m: f"{m.group(1)}{m.group(2)}{{{{{var_name}}}}}", arg)
+            continue
+
+        # 3. Token prefix
+        m_tok = _SLOG_TOKEN_PREFIX_RE.search(arg)
+        if m_tok:
+            var_name = next_v_name()
+            hint_str = f"{cmd} {args[0]}" if args else cmd
+            vars_dict[var_name] = {"step": step_num, "hint": hint_str}
+            new_args[i] = _SLOG_TOKEN_PREFIX_RE.sub(f"{{{{{var_name}}}}}", arg)
+            continue
+
+    return new_args, vars_dict
+
+
+def cmd_record_start(*args):
+    """Start a recording session."""
+    name = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--name":
+            if i + 1 >= len(args):
+                print("cdpilot: --name requires a name", file=sys.stderr)
+                sys.exit(2)
+            name = args[i + 1]
+            i += 2
+            continue
+        elif a.startswith("--name="):
+            name = a.split("=", 1)[1]
+            i += 1
+            continue
+        elif a.startswith("--"):
+            print(f"cdpilot: unknown record option: {a}", file=sys.stderr)
+            sys.exit(2)
+        i += 1
+
+    active_path = _record_active_path()
+    if os.path.isfile(active_path):
+        name_found = "(unnamed)"
+        try:
+            with open(active_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            name_found = state.get("name") or "(unnamed)"
+        except Exception:
+            pass
+        print(f"cdpilot: recording already active: {name_found!r}", file=sys.stderr)
+        sys.exit(1)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if not name:
+        name = f"flow-{now.strftime('%Y%m%d-%H%M%S')}"
+
+    rec_dir = _record_dir()
+    os.makedirs(rec_dir, exist_ok=True)
+    state = {
+        "name": name,
+        "started_at": now.isoformat(),
+        "steps": [],
+        "vars": {}
+    }
+    import tempfile
+    fd, tmp_file = tempfile.mkstemp(prefix=".active-", suffix=".tmp", dir=rec_dir)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_file, active_path)
+    print(f"Recording started: {name}")
+
+
+def cmd_record_status(*args):
+    """Report status of the active recording session."""
+    active_path = _record_active_path()
+    if not os.path.isfile(active_path):
+        print("No recording active.")
+        return
+    try:
+        with open(active_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        name = state.get("name") or "(unnamed)"
+        steps = state.get("steps") or []
+        started_at = state.get("started_at") or ""
+        print(f"Recording active: {name} ({len(steps)} steps, started {started_at})")
+    except Exception as e:
+        print(f"cdpilot: error reading active recording: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_record_cancel(*args):
+    """Cancel and discard the active recording session."""
+    active_path = _record_active_path()
+    if not os.path.isfile(active_path):
+        print("No recording active.")
+        return
+    try:
+        with open(active_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        name = state.get("name") or "(unnamed)"
+        os.remove(active_path)
+        lock_path = active_path + ".lock"
+        if os.path.isfile(lock_path):
+            os.remove(lock_path)
+        print(f"Recording cancelled: {name}")
+    except Exception as e:
+        print(f"cdpilot: error cancelling recording: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_record_stop(*args):
+    """Stop recording session and output flow JSON."""
+    save_path = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--save":
+            if i + 1 >= len(args):
+                print("cdpilot: --save requires a file path", file=sys.stderr)
+                sys.exit(2)
+            save_path = args[i + 1]
+            i += 2
+            continue
+        elif a.startswith("--save="):
+            save_path = a.split("=", 1)[1]
+            i += 1
+            continue
+        elif a.startswith("--"):
+            print(f"cdpilot: unknown record option: {a}", file=sys.stderr)
+            sys.exit(2)
+        i += 1
+
+    active_path = _record_active_path()
+    if not os.path.isfile(active_path):
+        print("cdpilot: no recording active", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with open(active_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception as e:
+        print(f"cdpilot: error reading active recording: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    name = state.get("name") or "flow"
+    all_steps = state.get("steps") or []
+    recorded_vars = state.get("vars") or {}
+    successful_steps = [s for s in all_steps if s.get("exit") == 0]
+    dropped_count = len(all_steps) - len(successful_steps)
+    if dropped_count > 0:
+        print(f"dropped {dropped_count} failed steps", file=sys.stderr)
+
+    flow_steps = []
+    for s in successful_steps:
+        flow_steps.append({
+            "cmd": s.get("cmd", ""),
+            "args": s.get("args", []),
+            "t_ms": s.get("t_ms", 0)
+        })
+
+    var_pattern = _re.compile(r"\{\{([A-Za-z0-9_-]+)\}\}")
+    first_seen_step = {}
+    for step_idx, s in enumerate(flow_steps, 1):
+        for arg in s.get("args", []):
+            for m in var_pattern.finditer(str(arg)):
+                v_name = m.group(1)
+                if v_name not in first_seen_step:
+                    first_seen_step[v_name] = step_idx
+
+    final_vars = {}
+    for v_name, first_step in first_seen_step.items():
+        if v_name in recorded_vars:
+            v_info = dict(recorded_vars[v_name])
+            v_info["step"] = first_step
+            final_vars[v_name] = v_info
+        else:
+            final_vars[v_name] = {"step": first_step, "hint": v_name}
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    flow_data = {
+        "cdpilot_flow": 1,
+        "name": name,
+        "recorded_at": now.isoformat(),
+        "cdpilot_version": __version__,
+        "steps": flow_steps,
+        "vars": final_vars
+    }
+
+    if save_path:
+        try:
+            save_dir = os.path.dirname(os.path.abspath(save_path))
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(flow_data, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+        except Exception as e:
+            print(f"cdpilot: could not write {save_path}: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            os.remove(active_path)
+            lock_path = active_path + ".lock"
+            if os.path.isfile(lock_path):
+                os.remove(lock_path)
+        except OSError:
+            pass
+        print(f"Saved flow to {save_path}")
+    else:
+        try:
+            os.remove(active_path)
+            lock_path = active_path + ".lock"
+            if os.path.isfile(lock_path):
+                os.remove(lock_path)
+        except OSError:
+            pass
+        print(json.dumps(flow_data, indent=2, ensure_ascii=False))
+
+
+def cmd_record_dispatch(args):
+    """Dispatch cdpilot record subcommands."""
+    if not args:
+        print("Usage: cdpilot record <subcommand> [options]\n\n"
+              "Subcommands:\n"
+              "  start [--name <n>]        Start recording commands into active session\n"
+              "  status                    Show active recording status\n"
+              "  cancel                    Cancel and discard active recording\n"
+              "  stop [--save <file.json>] Stop recording and emit flow JSON\n",
+              file=sys.stderr)
+        sys.exit(2)
+
+    if args[0] in ('--help', '-h', 'help'):
+        print("Usage: cdpilot record <subcommand> [options]\n\n"
+              "Subcommands:\n"
+              "  start [--name <n>]        Start recording commands into active session\n"
+              "  status                    Show active recording status\n"
+              "  cancel                    Cancel and discard active recording\n"
+              "  stop [--save <file.json>] Stop recording and emit flow JSON\n",
+              file=sys.stderr)
+        sys.exit(0)
+
+    sub = args[0].lower()
+    rest = args[1:]
+    if sub == 'start':
+        cmd_record_start(*rest)
+    elif sub == 'status':
+        cmd_record_status(*rest)
+    elif sub == 'cancel':
+        cmd_record_cancel(*rest)
+    elif sub == 'stop':
+        cmd_record_stop(*rest)
+    else:
+        print(f"Unknown record subcommand: {sub}. Run: cdpilot record --help", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_replay(*args):
+    """Replay a recorded flow JSON file."""
+    if not args:
+        print("Usage: cdpilot replay <flow.json> [--var k=v ...] [--delay real|none|<ms>] [--dry-run] [--continue]",
+              file=sys.stderr)
+        sys.exit(2)
+
+    flow_path = None
+    cli_vars = {}
+    delay_mode = "real"
+    delay_fixed_ms = 0
+    dry_run = False
+    continue_on_error = False
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--dry-run":
+            dry_run = True
+            i += 1
+        elif a == "--continue":
+            continue_on_error = True
+            i += 1
+        elif a == "--var":
+            if i + 1 < len(args):
+                kv = args[i + 1]
+                k, sep, v = kv.partition("=")
+                if sep:
+                    cli_vars[k.strip()] = v
+                else:
+                    print(f"cdpilot: invalid --var format: {kv!r} (expected k=v)", file=sys.stderr)
+                    sys.exit(2)
+                i += 2
+            else:
+                print("cdpilot: --var requires k=v", file=sys.stderr)
+                sys.exit(2)
+        elif a.startswith("--var="):
+            kv = a.split("=", 1)[1]
+            k, sep, v = kv.partition("=")
+            if sep:
+                cli_vars[k.strip()] = v
+            else:
+                print(f"cdpilot: invalid --var format: {kv!r} (expected k=v)", file=sys.stderr)
+                sys.exit(2)
+            i += 1
+        elif a == "--delay":
+            if i + 1 < len(args):
+                val = args[i + 1].strip()
+                if val == "real":
+                    delay_mode = "real"
+                elif val == "none":
+                    delay_mode = "none"
+                else:
+                    v = val[:-2] if val.endswith("ms") else val
+                    if v.isdigit():
+                        delay_mode = "fixed"
+                        delay_fixed_ms = int(v)
+                    else:
+                        print(f"cdpilot: invalid delay: {val} (expected 'real', 'none', or milliseconds)", file=sys.stderr)
+                        sys.exit(2)
+                i += 2
+            else:
+                print("cdpilot: --delay requires a value ('real', 'none', or milliseconds)", file=sys.stderr)
+                sys.exit(2)
+        elif a.startswith("--delay="):
+            val = a.split("=", 1)[1].strip()
+            if val == "real":
+                delay_mode = "real"
+            elif val == "none":
+                delay_mode = "none"
+            else:
+                v = val[:-2] if val.endswith("ms") else val
+                if v.isdigit():
+                    delay_mode = "fixed"
+                    delay_fixed_ms = int(v)
+                else:
+                    print(f"cdpilot: invalid delay: {val} (expected 'real', 'none', or milliseconds)", file=sys.stderr)
+                    sys.exit(2)
+            i += 1
+        elif a.startswith("--"):
+            print(f"cdpilot: unknown replay option: {a}", file=sys.stderr)
+            sys.exit(2)
+        else:
+            if flow_path is None:
+                flow_path = a
+            i += 1
+
+    if not flow_path:
+        print("cdpilot: flow file path required", file=sys.stderr)
+        sys.exit(2)
+
+    if not os.path.isfile(flow_path):
+        print(f"cdpilot: file not found: {flow_path}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        with open(flow_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"cdpilot: invalid JSON in flow file: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if not isinstance(data, dict):
+        print(f"cdpilot: invalid flow file shape (expected JSON object): {flow_path}", file=sys.stderr)
+        sys.exit(2)
+
+    if "cdpilot_flow" not in data or data.get("cdpilot_flow") != 1:
+        print(f"cdpilot: unknown or missing flow version: {data.get('cdpilot_flow')!r} (expected 1)", file=sys.stderr)
+        sys.exit(2)
+
+    steps = data.get("steps")
+    if not isinstance(steps, list):
+        print("cdpilot: invalid flow file: 'steps' must be a list", file=sys.stderr)
+        sys.exit(2)
+
+    for idx, s in enumerate(steps, 1):
+        if (not isinstance(s, dict)
+                or not isinstance(s.get("cmd"), str)
+                or not s.get("cmd").strip()
+                or not isinstance(s.get("args"), list)
+                or not all(isinstance(x, str) for x in s.get("args"))):
+            print(f"cdpilot: invalid flow file: step {idx} malformed", file=sys.stderr)
+            sys.exit(2)
+
+    collected_vars = {}
+    for env_k, env_v in os.environ.items():
+        if env_k.startswith("CDPILOT_VAR_"):
+            var_name = env_k[len("CDPILOT_VAR_"):].lower()
+            collected_vars[var_name] = env_v
+            collected_vars[env_k[len("CDPILOT_VAR_"):]] = env_v
+
+    collected_vars.update(cli_vars)
+
+    needed_vars = set(data.get("vars", {}).keys())
+    for s in steps:
+        if isinstance(s, dict):
+            for a in s.get("args", []):
+                for m in _re.finditer(r"\{\{([A-Za-z0-9_-]+)\}\}", str(a)):
+                    needed_vars.add(m.group(1))
+
+    def get_var_value(name):
+        if name in collected_vars:
+            return collected_vars[name]
+        if name.lower() in collected_vars:
+            return collected_vars[name.lower()]
+        if name.upper() in collected_vars:
+            return collected_vars[name.upper()]
+        return None
+
+    missing = []
+    for var_name in sorted(needed_vars):
+        if get_var_value(var_name) is None:
+            missing.append(var_name)
+
+    if missing:
+        print(f"cdpilot: missing required variable(s): {', '.join(missing)}", file=sys.stderr)
+        sys.exit(2)
+
+    total_steps = len(steps)
+    if dry_run:
+        for idx, step in enumerate(steps, 1):
+            cmd = step.get("cmd", "")
+            args_list = [str(a) for a in step.get("args", [])]
+            args_str = " ".join(args_list)
+            line = f"[{idx}/{total_steps}] {cmd} {args_str}".strip()
+            print(line)
+        sys.exit(0)
+
+    had_failure = False
+    for idx, step in enumerate(steps, 1):
+        if idx > 1:
+            if delay_mode == "real":
+                prev_t = steps[idx - 2].get("t_ms", 0) if idx >= 2 else 0
+                curr_t = step.get("t_ms", 0)
+                gap_ms = max(0, curr_t - prev_t)
+                sleep_s = min(gap_ms, 10000) / 1000.0
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+            elif delay_mode == "fixed":
+                if delay_fixed_ms > 0:
+                    time.sleep(delay_fixed_ms / 1000.0)
+
+        cmd = step.get("cmd", "")
+        raw_args = step.get("args", [])
+        sub_args = []
+        for a in raw_args:
+            s_val = str(a)
+            sub = _re.sub(r"\{\{([A-Za-z0-9_-]+)\}\}",
+                          lambda m: str(get_var_value(m.group(1)) if get_var_value(m.group(1)) is not None else m.group(0)),
+                          s_val)
+            sub_args.append(sub)
+
+        # Collect substituted variable values for placeholders in this step
+        step_subs = {}
+        for a in raw_args:
+            for m in _re.finditer(r"\{\{([A-Za-z0-9_-]+)\}\}", str(a)):
+                vname = m.group(1)
+                vval = get_var_value(vname)
+                if vval is not None and str(vval) != "":
+                    step_subs[vname] = str(vval)
+
+        def sanitize_output(text):
+            if not text:
+                return text
+            # Replace longest value first; skip empty values
+            sorted_subs = sorted(step_subs.items(), key=lambda kv: len(kv[1]), reverse=True)
+            for vname, vval in sorted_subs:
+                if vval:
+                    text = text.replace(vval, f"{{{{{vname}}}}}")
+            return text
+
+        if cmd in RECORD_INPUT_CMDS and raw_args:
+            target = next((a for a in raw_args if not a.startswith("--")), raw_args[0])
+            step_label = f"{cmd} {target}"
+        elif raw_args:
+            step_label = f"{cmd} {' '.join(str(a) for a in raw_args)}"
+        else:
+            step_label = cmd
+
+        env = os.environ.copy()
+        env["CDPILOT_REPLAY_ACTIVE"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        t0 = time.monotonic()
+        child_cmd = [sys.executable, os.path.abspath(__file__), cmd] + sub_args
+        res = subprocess.run(
+            child_cmd,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env
+        )
+        dur = time.monotonic() - t0
+
+        if res.returncode == 0:
+            print(f"[{idx}/{total_steps}] {step_label} ... ok {dur:.1f}s")
+        else:
+            print(f"[{idx}/{total_steps}] {step_label} ... failed ({res.returncode}) {dur:.1f}s")
+            raw_err = res.stderr.rstrip() if res.stderr else res.stdout.rstrip()
+            err_msg = sanitize_output(raw_err)
+            if err_msg:
+                print(err_msg, file=sys.stderr)
+            had_failure = True
+            if not continue_on_error:
+                sys.exit(1)
+
+    if had_failure:
+        sys.exit(1)
+
+
+def cmd_replay_dispatch(args):
+    """Dispatch cdpilot replay command."""
+    if not args or args[0] in ('--help', '-h', 'help'):
+        print("Usage: cdpilot replay <flow.json> [--var k=v ...] [--delay real|none|<ms>] [--dry-run] [--continue]\n",
+              file=sys.stderr)
+        sys.exit(0 if (args and args[0] in ('--help', '-h', 'help')) else 2)
+    cmd_replay(*args)
+
+
 # ─── CLI ───
 
 if __name__ == "__main__":
@@ -19994,7 +20749,7 @@ if __name__ == "__main__":
     # work in CI and for users who skip the Node wrapper entirely.
     if cmd in ('--version', '-v'):
         cmd = 'version'
-    elif cmd in ('--help', '-h'):
+    elif cmd in ('--help', '-h', 'help'):
         print(__doc__)
         sys.exit(0)
 
@@ -20084,6 +20839,8 @@ if __name__ == "__main__":
         'watch': lambda: _dispatch_watch_cmd(args),
         'bot-auth': lambda: cmd_bot_auth(*args),
         'log': lambda: cmd_log(*args),
+        'record': lambda: cmd_record_dispatch(args),
+        'replay': lambda: cmd_replay_dispatch(args),
         'connect': lambda: cmd_connect(*args),
         'disconnect': cmd_disconnect,
     }
