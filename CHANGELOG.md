@@ -5,6 +5,7 @@ All notable changes to cdpilot will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **HAR export for network monitoring: `cdpilot network <url> --har <file>` (or `--har -` for stdout).** Exports the HTTP requests of that navigation as valid HAR 1.2 JSON, written atomically (`tmp + os.replace`). Entries capture URLs (userinfo passwords and secret-named query parameters masked like the session log), methods, headers, status codes, query strings, and CDP timing breakdowns (DNS, connect, SSL, send, wait, receive). Response bodies are omitted to avoid transfer and memory overhead. Header values carrying secrets (`Cookie`, `Authorization`, `X-Api-Key`, tokens) are masked as `"«masked»"`. Prints `"har: N entries -> <file>"` to stderr.
 - **MCP tool profiles: `cdpilot mcp --tools core|all|a,b,c` (env `CDPILOT_MCP_TOOLS`, the flag wins).** `core` lists 10 tools plus `browser_tools`, which lists the other tools (name and description) or enables some and sends `notifications/tools/list_changed`. A call to a tool outside the profile returns "tool not enabled; call browser_tools enable". `tools/list` schema: 5,769 tokens (45 tools) down to 1,342 (11 tools). Default `all` is unchanged; WebMCP tools are unaffected.
 
 ## [0.9.4] - 2026-09-29

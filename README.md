@@ -307,13 +307,21 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
 ### Debugging
 
 ```bash
-cdpilot console [url]         # Capture console logs
-cdpilot network [url]         # Monitor network requests
-cdpilot debug [url]           # Full diagnostic (console+network+perf+shot)
-cdpilot perf                  # Performance metrics
-cdpilot eval <js>             # Execute JavaScript
-cdpilot eval-batch <json>     # Run N JS expressions in 1 roundtrip (5-30x faster)
+cdpilot console [url]                 # Capture console logs
+cdpilot network [url]                 # Monitor network requests
+cdpilot network <url> --har trace.har # Export navigation traffic as HAR 1.2 JSON (--har - for stdout)
+cdpilot debug [url]                   # Full diagnostic (console+network+perf+shot)
+cdpilot perf                          # Performance metrics
+cdpilot eval <js>                     # Execute JavaScript
+cdpilot eval-batch <json>             # Run N JS expressions in 1 roundtrip (5-30x faster)
 ```
+
+#### Network monitoring & HAR export
+
+`cdpilot network <url> --har <file>` exports all HTTP requests of a navigation as standard HAR 1.2 JSON (`--har -` writes to stdout).
+- **Included:** URLs, methods, headers, status codes, query strings, and CDP timing breakdowns (DNS, connect, SSL, send, wait, receive).
+- **Omitted:** Response bodies are not fetched or stored (avoids memory bloat and round-trip overhead); content.size reflects transfer length; bodySize is -1.
+- **Masking:** Sensitive header values matching security patterns (`Cookie`, `Set-Cookie`, `Authorization`, `X-Api-Key`, token, secret) are replaced with `"«masked»"`. URLs are masked the same way as the session log: userinfo passwords and query/fragment parameters named like secrets (`token`, `key`, `code`, `session`, …) in `request.url`, `queryString`, `redirectURL` and URL-bearing header values (`Location`, `Referer`, `Link`); a `data:` URL keeps only its media type.
 
 ```bash
 # Example: read 4 DOM values in a single CDP roundtrip instead of 4
