@@ -154,6 +154,24 @@ gelmeyince durur, tavan 300 ms (eski davranışın üst sınırı korunur).
 Sıcak `go` ≈ node ~100 + WS açılışı/4 enable ~15 + navigasyon ~15 + sessizlik 100 + 3 evaluate ~10. Hedef ≤150 için
 sessizlik penceresi ve havuzlu oturum (aşağıda) gerekir; node tabanı ayrı iş.
 
+### 5.2 İnceleme turu gerilemesi ve düzeltmesi (08.11 17:00–17:10, yük 11–17)
+
+İnceleme commit'i 2c2be74 sonrası düşük yükte ölçüm sıcak yolu geri gitmiş gösterdi: `content` 316–331, `eval` 310–320,
+`go` 437–531 ms. Sebep tek satırdı: `_daemon_run_request`'in `finally` bloğundaki `watcher.join(0.2)`. İzleyici iş parçacığı
+`conn.recv(1)`'de bekler; istemci bağlantıyı ancak `{"exit"}` çerçevesinden sonra kapatır, çerçeve ise `finally`'den sonra
+gider → her istek 200 ms tavanı bekliyordu. `join` kaldırıldı (iş parçacığı bağlantı kapanınca kendi biter); kaynak testi
+`daemon: the request end never waits on the client watcher thread` tripwire.
+
+| Komut | Taze | Sıcak (2c2be74, gerileme) | Sıcak (düzeltme sonrası) |
+|---|---|---|---|
+| `go file://paint.html` | 483–882 | 437–531 | 230–370 (ilk 2 ısınma, sonra 230–242) |
+| `go https://example.com` | — | — | 227–304 |
+| `content` | 408–466 | 316–331 | 105–124 |
+| `eval 1+1` | 383–400 | 310–320 | 108–137 |
+
+Ders: istek başına eklenen her bekleme (join, sleep, zaman aşımı) sıcak yolda doğrudan gecikmedir; inceleme turu düzeltmeleri de
+ölçümle kapanır (§5.1 ile aynı betik `olc.sh`, 3/5 tekrar).
+
 ## 6. Sonraki adım (D2): `go`'yu havuzlu oturuma taşımak
 
 | # | İş | Beklenen | Kapı |

@@ -22174,10 +22174,11 @@ def _daemon_run_request(conn, req):
                 _DAEMON["loop"].run_until_complete(asyncio.wait_for(_daemon_request_teardown(), 5))
             except BaseException:
                 pass
-        if watcher is not None:
-            watcher.join(0.2)
     if code is not None:
         _daemon_send(conn, {"exit": code})
+    # The watcher thread ends by itself when the caller closes the connection
+    # (right after this return): never wait for it — a join here cost 200 ms
+    # per request on 08.11, the client closes only after the exit frame.
     return outcome
 
 

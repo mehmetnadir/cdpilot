@@ -133,6 +133,17 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
     for (const c of ['go', 'click', 'content', 'shot', 'record', 'tools']) assert(!py.includes(c), `${c} is served warm`);
   });
 
+  test('daemon: the request end never waits on the client watcher thread', () => {
+    // 08.11.2026: a watcher.join(0.2) in the executor's finally cost 200 ms per
+    // warm request (content 110 -> 320 ms): the watcher's recv() only returns
+    // once the client closes the connection, which happens after the exit frame.
+    const body = (PY_SRC.match(/def _daemon_run_request\([\s\S]*?\ndef _daemon_serve_entry/) || [''])[0];
+    assert(body, '_daemon_run_request must exist');
+    assert(/watcher = threading\.Thread\(/.test(body), 'the watcher thread is still started per request');
+    assert(!/watcher\.join\(/.test(body), 'the executor must not join the watcher (200 ms per request)');
+    assert(/_daemon_send\(conn, \{"exit": code\}\)/.test(body), 'the exit frame is sent from the executor');
+  });
+
   test('daemon: the first call runs fresh and starts the daemon; later calls are served warm with identical output', () => {
     const r1 = cli(['version']);
     assert.strictEqual(r1.status, 0, r1.stderr);
