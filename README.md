@@ -472,6 +472,31 @@ when it changed (`text_changed`). Refs are stable while the element exists (keye
 position); a navigation starts a new set. `token_estimate` is `len(json)/4`; `saved_vs_full` compares the diff
 with a full observe of the same page. State lives in `~/.cdpilot/projects/<id>/agent-state.json`.
 
+#### Learned flows: drive a site once, replay it with no model
+
+```bash
+cdpilot agent observe && cdpilot agent act --ref @3 --action click && cdpilot agent act --ref @4 --action fill --text "cdpilot"
+cdpilot agent flow save inbox-triage        # the acts since the last navigation → ~/.cdpilot/projects/<id>/flows/inbox_triage.json
+cdpilot agent run inbox-triage              # replays by anchors; prints one JSON: {status:"ok", steps, url, title, ms, tokens_avoided}
+cdpilot agent run login --var password=…    # a typed secret was saved as {{password}}; --var or CDPILOT_VAR_PASSWORD supplies it
+cdpilot agent flow list | show <name> | delete <name>
+```
+
+Every `agent act` leaves a trail entry addressed by an *anchor*, the element's accessibility role, name and
+position among equals (`{"role":"button","name":"Archive","nth":0}`), never a `@ref` or a DOM node id, which
+belong to one session. `agent flow save` writes the trail as a flow; `agent run` finds each anchor on the live
+page (exact name, then case-insensitive, then a longer name containing it when that is unambiguous) and acts,
+with no model in the loop. The result's `tokens_avoided` is what a model would have read observing the page
+before each step. When a site has a flow, `agent observe` lists it under `known_flows`.
+
+**Drift stops, never guesses.** If a step's anchor is gone, or the step lands on another host than it did
+when recorded, `agent run` exits 4 and prints that page's full observation (`status:"drift"`, `step`,
+`expected`, `actions`, `text`): the agent acts on those refs, finishes the task, and `agent flow save <name>`
+rewrites the flow. Exit 2: unknown flow or a `{{variable}}` without a value (checked before any step runs);
+`--dry-run` prints the steps with placeholders, never values. Values typed into secret-named fields
+(password, one-time code, API key, …) or token-shaped values are placeholders on disk; the same fields show
+`«masked»` as their value in `observe` output.
+
 ### Session Management
 
 ```bash

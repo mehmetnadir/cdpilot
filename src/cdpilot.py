@@ -15809,6 +15809,15 @@ AGENT_SKIP_ROLES = {
     'ignored', 'unknown', 'RootWebArea',
 }
 
+# A field whose accessible name says it holds a secret: its value is masked in
+# descriptors (observe/act output, agent-state.json) and a value typed into it
+# is saved in a flow as a {{placeholder}}. Deliberately narrower than the
+# session log's name regex ("Keyword", "Compass" are not secrets).
+_AGENT_SECRET_FIELD_RE = _re.compile(
+    r"passw|passcode|\bpwd\b|\bpin\b|\botp\b|one[ -]?time|token|secret|api[ _-]?key|access[ _-]?key"
+    r"|secret[ _-]?key|private[ _-]?key|\bcvv\b|\bcvc\b|card ?number|\biban\b|\bssn\b|credential",
+    _re.I)
+
 
 def _agent_state_path():
     return os.path.join(CDPILOT_HOME, 'projects', PROJECT_ID, 'agent-state.json')
@@ -15828,6 +15837,7 @@ def _load_agent_state():
             'total_tokens_full': 0,
             'total_tokens_diff': 0,
             'step': 0,
+            'trail': [],
         }
 
 
@@ -15910,7 +15920,7 @@ def _snapshot_to_actions(nodes, state):
         if role in ('textbox', 'combobox', 'searchbox'):
             val = node.get('value', {}).get('value')
             if val is not None:
-                action['value'] = val
+                action['value'] = '«masked»' if (val and _AGENT_SECRET_FIELD_RE.search(name)) else val
         new_actions.append(action)
 
     return new_actions
@@ -15997,6 +16007,9 @@ async def cmd_agent_observe(diff=False):
             'actions': out_actions,
             'text': text,
         }
+        known = _agent_flows_for_host(_agent_host_path(page.get('url', ''))[0])
+        if known:
+            snap['known_flows'] = known
         token_est = _estimate_tokens(snap)
         snap['token_estimate'] = token_est
         state['total_tokens_full'] = state.get('total_tokens_full', 0) + token_est
@@ -16008,55 +16021,91 @@ async def cmd_agent_observe(diff=False):
     print(json.dumps(snap, indent=2))
 
 
+async def _agent_go_silent(url):
+    """cmd_go prints the whole page to stdout; an agent asked for a diff.
+    Its stderr (drift, friction, CAPTCHA warnings) still comes through."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        await cmd_go(url)
+
+
+async def _agent_settle(ws_url, max_ms=1500):
+    """After a click or submit: a navigation it started needs time to commit
+    before the next snapshot, or the diff (and a flow's next anchor) would be
+    read off the old document. Two consecutive reads, 50 ms apart, of the
+    same complete document end the wait: ~100 ms when nothing happened."""
+    t_end = time.monotonic() + max_ms / 1000
+    last = None
+    while time.monotonic() < t_end:
+        await asyncio.sleep(0.05)
+        try:
+            r = await cdp_send(ws_url, [(1, 'Runtime.evaluate', {
+                'expression': 'document.readyState + " " + location.href', 'returnByValue': True})], timeout=2)
+            cur = r.get(1, {}).get('result', {}).get('value')
+        except Exception:
+            cur = None  # mid-navigation: the context is gone for a moment
+        if isinstance(cur, str) and cur.startswith('complete') and cur == last:
+            return
+        last = cur
+
+
+async def _agent_perform(ref, action, text, old_map):
+    """Run one action on a ref of `old_map` (the last snapshot's descriptors)."""
+    if ref not in old_map:
+        print(json.dumps({'error': f'Unknown ref {ref}. Run: cdpilot agent observe'}), file=sys.stderr)
+        sys.exit(1)
+    bid = old_map[ref]['backend_node_id']
+    ws_url, _ = get_page_ws()
+    if action == 'click':
+        with contextlib.redirect_stdout(io.StringIO()):  # "Clicked @N …" is not part of the JSON
+            await cmd_click_ref(ref)
+        await _agent_settle(ws_url)
+    elif action in ('type', 'fill'):
+        # Focus via backendNodeId then insert text
+        await cdp_send(ws_url, [(1, 'DOM.enable', {})])
+        res_r = await cdp_send(ws_url, [(2, 'DOM.resolveNode', {'backendNodeId': bid})])
+        oid = res_r.get(2, {}).get('object', {}).get('objectId')
+        if oid:
+            await cdp_send(ws_url, [(3, 'Runtime.callFunctionOn', {
+                'objectId': oid,
+                'functionDeclaration': 'function(){this.focus();}',
+                'returnByValue': True,
+            })])
+        await cdp_send(ws_url, [(4, 'Input.insertText', {'text': text or ''})])
+    elif action == 'hover':
+        res_b = await cdp_send(ws_url, [(5, 'DOM.getBoxModel', {'backendNodeId': bid})])
+        content = res_b.get(5, {}).get('model', {}).get('content', [])
+        if len(content) >= 8:
+            mx = int((content[0] + content[2] + content[4] + content[6]) / 4)
+            my = int((content[1] + content[3] + content[5] + content[7]) / 4)
+            await cdp_send(ws_url, [(6, 'Input.dispatchMouseEvent', {
+                'type': 'mouseMoved', 'x': mx, 'y': my,
+            })])
+    elif action == 'submit':
+        await cdp_send(ws_url, [(7, 'DOM.enable', {})])
+        res_r = await cdp_send(ws_url, [(8, 'DOM.resolveNode', {'backendNodeId': bid})])
+        oid = res_r.get(8, {}).get('object', {}).get('objectId')
+        if oid:
+            await cdp_send(ws_url, [(9, 'Runtime.callFunctionOn', {
+                'objectId': oid,
+                'functionDeclaration': "function(){var f=this.closest('form');if(f)f.submit();else this.click();}",
+                'returnByValue': True,
+            })])
+        await _agent_settle(ws_url)
+    else:
+        print(json.dumps({'error': f'Unknown action {action!r} (click|type|fill|hover|submit)'}), file=sys.stderr)
+        sys.exit(1)
+
+
 async def cmd_agent_act(ref=None, url=None, action='click', text=None):
     """Perform action, return diff observation."""
     state = _load_agent_state()
     old_map = dict(state.get('actions_map', {}))
+    url_before = state.get('last_url')
 
     if url:
-        # cmd_go prints the whole page to stdout; the agent asked for a diff.
-        # Its stderr (drift, friction, CAPTCHA warnings) still comes through.
-        with contextlib.redirect_stdout(io.StringIO()):
-            await cmd_go(url)
+        await _agent_go_silent(url)
     elif ref:
-        if ref not in old_map:
-            print(json.dumps({'error': f'Unknown ref {ref}. Run: cdpilot agent observe'}), file=sys.stderr)
-            sys.exit(1)
-        bid = old_map[ref]['backend_node_id']
-        ws_url, _ = get_page_ws()
-        if action == 'click':
-            await cmd_click_ref(ref)
-        elif action in ('type', 'fill'):
-            # Focus via backendNodeId then insert text
-            await cdp_send(ws_url, [(1, 'DOM.enable', {})])
-            res_r = await cdp_send(ws_url, [(2, 'DOM.resolveNode', {'backendNodeId': bid})])
-            oid = res_r.get(2, {}).get('object', {}).get('objectId')
-            if oid:
-                await cdp_send(ws_url, [(3, 'Runtime.callFunctionOn', {
-                    'objectId': oid,
-                    'functionDeclaration': 'function(){this.focus();}',
-                    'returnByValue': True,
-                })])
-            await cdp_send(ws_url, [(4, 'Input.insertText', {'text': text or ''})])
-        elif action == 'hover':
-            res_b = await cdp_send(ws_url, [(5, 'DOM.getBoxModel', {'backendNodeId': bid})])
-            content = res_b.get(5, {}).get('model', {}).get('content', [])
-            if len(content) >= 8:
-                mx = int((content[0] + content[2] + content[4] + content[6]) / 4)
-                my = int((content[1] + content[3] + content[5] + content[7]) / 4)
-                await cdp_send(ws_url, [(6, 'Input.dispatchMouseEvent', {
-                    'type': 'mouseMoved', 'x': mx, 'y': my,
-                })])
-        elif action == 'submit':
-            await cdp_send(ws_url, [(7, 'DOM.enable', {})])
-            res_r = await cdp_send(ws_url, [(8, 'DOM.resolveNode', {'backendNodeId': bid})])
-            oid = res_r.get(8, {}).get('object', {}).get('objectId')
-            if oid:
-                await cdp_send(ws_url, [(9, 'Runtime.callFunctionOn', {
-                    'objectId': oid,
-                    'functionDeclaration': "function(){var f=this.closest('form');if(f)f.submit();else this.click();}",
-                    'returnByValue': True,
-                })])
+        await _agent_perform(ref, action, text, old_map)
     else:
         print(json.dumps({'error': 'Provide --ref @N or --url URL'}), file=sys.stderr)
         sys.exit(1)
@@ -16065,6 +16114,19 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None):
     # and title; the 0.5 s /json cache would still show the old ones.
     cdp_cache_invalidate()
     page, nodes, new_actions, new_state = await _agent_full_snapshot()
+    # The trail: what a flow is saved from. Anchors, never refs or node ids;
+    # a typed secret is a {{placeholder}} before it reaches agent-state.json.
+    if url:
+        entry = {'kind': 'go', 'url': _slog_mask_url(url)}
+    else:
+        anchor = _agent_anchor(old_map[ref], old_map)
+        entry = {'kind': 'act', 'action': action, 'anchor': anchor}
+        if action in ('type', 'fill'):
+            entry['text'] = _agent_mask_text(anchor['name'], text or '')
+        entry['url_before'] = url_before
+    entry['url_after'] = page.get('url', '')
+    entry['ts'] = int(time.time())
+    _agent_trail_push(new_state, entry)
     diff = _diff_snapshots(old_map, new_actions)
     new_text = _extract_text_summary(nodes)
     text_hash = hashlib.md5(new_text.encode()).hexdigest()[:8]
@@ -16112,13 +16174,417 @@ async def cmd_agent_stats():
         'total_tokens_diff': diff_tok,
         'estimated_savings': saved,
         'savings_pct': pct,
+        'tokens_avoided_by_flows': state.get('total_tokens_avoided', 0),
+        'flows': len(_agent_flow_files()),
     }, indent=2))
+
+
+# ─── Learned flows: act trail → flow file → replay by anchors ────────────────
+#
+# A model that drives a site through `agent observe` / `agent act` teaches
+# cdpilot the sequence as a side effect: every act leaves a trail entry whose
+# address is an *anchor* (AX role + accessible name + position among equals),
+# never a @ref or a DOM node id — those belong to one session. `agent flow
+# save` turns the trail into a flow file; `agent run` replays it with no model
+# in the loop and stops at the first step whose anchor the page no longer has
+# (exit 4, with the page's observation, so the model re-plans that one step).
+# Design and measurements: .claude/docs/plan-ogrenen-akis.md
+
+AGENT_TRAIL_MAX = 50
+AGENT_FLOW_VERSION = 1
+AGENT_RUN_DRIFT_EXIT = 4
+_AGENT_VAR_RE = _re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
+
+
+def _agent_flows_dir():
+    return os.path.join(CDPILOT_HOME, 'projects', PROJECT_ID, 'flows')
+
+
+def _agent_flow_path(name):
+    slug = _record_slug(name or '')
+    if not slug:
+        print(json.dumps({'error': f'invalid flow name {name!r}'}), file=sys.stderr)
+        sys.exit(2)
+    return os.path.join(_agent_flows_dir(), slug + '.json'), slug
+
+
+def _agent_flow_files():
+    try:
+        return sorted(f for f in os.listdir(_agent_flows_dir()) if f.endswith('.json'))
+    except OSError:
+        return []
+
+
+def _agent_flow_load(path):
+    with open(path, encoding='utf-8') as f:
+        flow = json.load(f)
+    if not isinstance(flow, dict) or not isinstance(flow.get('steps'), list):
+        raise ValueError('not a flow file')
+    return flow
+
+
+def _agent_flow_write(path, flow):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(flow, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _agent_flows_for_host(host):
+    """Names of the saved flows recorded on `host` (for `observe`)."""
+    if not host:
+        return []
+    names = []
+    for fn in _agent_flow_files()[:50]:
+        try:
+            flow = _agent_flow_load(os.path.join(_agent_flows_dir(), fn))
+        except (OSError, ValueError):
+            continue
+        if flow.get('host') == host:
+            names.append(flow.get('name') or fn[:-5])
+    return names
+
+
+def _agent_host_path(url):
+    """(host, path) of a URL; a file:// page counts as host "file", so flows
+    recorded on local pages are listed and host-checked like the others."""
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(url or '')
+        host = (u.hostname or '').lower()
+        if not host and u.scheme == 'file':
+            host = 'file'
+        return host, (u.path or '/')
+    except Exception:
+        return '', '/'
+
+
+def _agent_trail_push(state, entry):
+    trail = state.setdefault('trail', [])
+    trail.append(entry)
+    del trail[:-AGENT_TRAIL_MAX]
+
+
+def _agent_anchor(desc, amap):
+    """Session-independent address of a descriptor: role + accessible name +
+    position among the elements sharing both, in AX order."""
+    role, name = desc.get('role', ''), desc.get('name', '') or ''
+    by_num = lambda r: int(r.lstrip('@')) if r.lstrip('@').isdigit() else 0
+    same = [r for r in sorted(amap, key=by_num)
+            if amap[r].get('role') == role and (amap[r].get('name') or '') == name]
+    nth = same.index(desc['ref']) if desc.get('ref') in same else 0
+    return {'role': role, 'name': name, 'nth': nth}
+
+
+def _agent_mask_text(field_name, text):
+    """A typed value becomes {{name}} when the field is secret-named or the
+    value is token-shaped. The value itself never reaches disk; `agent run`
+    takes it from --var or CDPILOT_VAR_<NAME>."""
+    if _AGENT_SECRET_FIELD_RE.search(field_name or '') or _slog_tokenish(text) \
+            or _SLOG_TOKEN_PREFIX_RE.search(text):
+        return '{{%s}}' % (_record_slug(field_name) or 'secret')
+    return text
+
+
+def _agent_find_anchor(anchor, actions):
+    """The descriptor an anchor names on this page, or None (drift).
+    Exact name, then case-insensitive, then — only when unambiguous — the
+    recorded name contained in a longer one ("Archive" → "Archive all")."""
+    role, name = anchor.get('role'), anchor.get('name') or ''
+    nth = int(anchor.get('nth') or 0)
+    same_role = [a for a in actions if a.get('role') == role]
+    exact = [a for a in same_role if (a.get('name') or '') == name]
+    if exact:
+        return exact[nth] if nth < len(exact) else exact[-1], 'exact'
+    folded = [a for a in same_role if (a.get('name') or '').lower() == name.lower()]
+    if folded:
+        return folded[nth] if nth < len(folded) else folded[-1], 'case'
+    if name:
+        partial = [a for a in same_role if name.lower() in (a.get('name') or '').lower()]
+        if len(partial) == 1:
+            return partial[0], 'partial'
+    return None, None
+
+
+def _agent_flow_stats_bump(path, key, ms=None):
+    try:
+        flow = _agent_flow_load(path)
+    except (OSError, ValueError):
+        return
+    st = flow.setdefault('stats', {})
+    st[key] = st.get(key, 0) + 1
+    st['runs'] = st.get('runs', 0) + 1
+    st['last_run'] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+    if ms is not None:
+        st['last_ms'] = ms
+    _agent_flow_write(path, flow)
+
+
+async def cmd_agent_flow_save(name, last=None):
+    """Write the trail (default: since the last navigation) as a flow file."""
+    state = _load_agent_state()
+    trail = state.get('trail') or []
+    if not trail:
+        print(json.dumps({'error': 'nothing to save: no agent act in the trail yet'}), file=sys.stderr)
+        sys.exit(2)
+    if last:
+        src = trail[-last:]
+    else:
+        first_go = max((i for i, e in enumerate(trail) if e.get('kind') == 'go'), default=0)
+        src = trail[first_go:]
+    path, slug = _agent_flow_path(name)
+    steps, vars_dict, host = [], {}, ''
+    for n, e in enumerate(src, 1):
+        if e.get('kind') == 'go':
+            step = {'n': n, 'kind': 'go', 'url': e.get('url', '')}
+        else:
+            step = {'n': n, 'kind': 'act', 'action': e.get('action', 'click'), 'anchor': e.get('anchor', {})}
+            if e.get('text') is not None:
+                step['text'] = e['text']
+            h, p = _agent_host_path(e.get('url_after'))
+            if h:
+                step['after'] = {'host': h, 'path': p}
+        for m in _AGENT_VAR_RE.finditer(step.get('text') or step.get('url') or ''):
+            label = (step.get('anchor') or {}).get('name') or step.get('kind')
+            vars_dict.setdefault(m.group(1), {'step': n, 'hint': f"{step.get('action', 'go')} {label}"})
+        host = host or _agent_host_path(e.get('url_after'))[0]
+        steps.append(step)
+    stats = {'runs': 0, 'ok': 0, 'drift': 0}
+    if os.path.isfile(path):
+        try:
+            stats = _agent_flow_load(path).get('stats') or stats
+        except (OSError, ValueError):
+            pass
+    flow = {'name': slug, 'version': AGENT_FLOW_VERSION,
+            'created': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+            'host': host, 'steps': steps, 'vars': vars_dict, 'stats': stats}
+    _agent_flow_write(path, flow)
+    print(json.dumps({'saved': slug, 'steps': len(steps), 'host': host,
+                      'vars': sorted(vars_dict), 'path': path}))
+
+
+async def cmd_agent_flow_list():
+    out = []
+    for fn in _agent_flow_files():
+        try:
+            flow = _agent_flow_load(os.path.join(_agent_flows_dir(), fn))
+        except (OSError, ValueError):
+            continue
+        st = flow.get('stats') or {}
+        out.append({'name': flow.get('name') or fn[:-5], 'host': flow.get('host', ''),
+                    'steps': len(flow.get('steps') or []), 'vars': sorted(flow.get('vars') or {}),
+                    'runs': st.get('runs', 0), 'ok': st.get('ok', 0), 'drift': st.get('drift', 0),
+                    'last_run': st.get('last_run')})
+    print(json.dumps(out, indent=2))
+
+
+async def cmd_agent_flow_show(name):
+    path, slug = _agent_flow_path(name)
+    try:
+        flow = _agent_flow_load(path)
+    except FileNotFoundError:
+        print(json.dumps({'error': f'unknown flow {slug!r}; see: agent flow list'}), file=sys.stderr)
+        sys.exit(2)
+    except ValueError as e:
+        print(json.dumps({'error': f'{path}: {e}'}), file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(flow, indent=2, ensure_ascii=False))
+
+
+async def cmd_agent_flow_delete(name):
+    path, slug = _agent_flow_path(name)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        print(json.dumps({'error': f'unknown flow {slug!r}'}), file=sys.stderr)
+        sys.exit(2)
+    print(json.dumps({'deleted': slug}))
+
+
+async def cmd_agent_run(name, var_values=None, dry_run=False):
+    """Replay a saved flow by anchors, no model in the loop.
+
+    Exit 0: every step found its anchor (one result JSON: url, title, ms,
+    tokens_avoided). Exit 4: a step's anchor is gone or the step landed on
+    another host; stdout carries that page's full observation (refs valid),
+    so the agent acts with `agent act --ref` and then `agent flow save <name>`
+    repairs the flow. Exit 2: unknown flow or a {{variable}} without a value.
+    """
+    path, slug = _agent_flow_path(name)
+    try:
+        flow = _agent_flow_load(path)
+    except FileNotFoundError:
+        print(json.dumps({'error': f'unknown flow {slug!r}; see: agent flow list'}), file=sys.stderr)
+        sys.exit(2)
+    except ValueError as e:
+        print(json.dumps({'error': f'{path}: {e}'}), file=sys.stderr)
+        sys.exit(1)
+    values = dict(var_values or {})
+    needed = set(flow.get('vars') or {})
+    for step in flow['steps']:
+        needed.update(_AGENT_VAR_RE.findall(step.get('text') or step.get('url') or ''))
+    missing = []
+    for k in sorted(needed):
+        if k not in values:
+            env_v = os.environ.get(f'CDPILOT_VAR_{k.upper()}')
+            if env_v is None:
+                missing.append(k)
+            else:
+                values[k] = env_v
+    if missing:
+        print(json.dumps({'error': 'missing variables', 'missing': missing,
+                          'hint': '--var name=value or CDPILOT_VAR_<NAME>'}), file=sys.stderr)
+        sys.exit(2)
+    subst = lambda s: _AGENT_VAR_RE.sub(lambda m: values.get(m.group(1), m.group(0)), s or '')
+    if dry_run:
+        # Placeholders stay placeholders: a dry run never prints a value.
+        print(json.dumps({'flow': slug, 'dry_run': True, 'host': flow.get('host', ''),
+                          'steps': flow['steps'], 'vars': sorted(needed)}, indent=2, ensure_ascii=False))
+        return
+
+    t0 = time.monotonic()
+    tokens_avoided = 0
+    done = []
+    state = None
+
+    async def snapshot():
+        cdp_cache_invalidate()
+        page, nodes, actions, st = await _agent_full_snapshot()
+        text = _extract_text_summary(nodes)
+        out = [{k: v for k, v in a.items() if k != 'backend_node_id'} for a in actions]
+        return page, actions, out, text, st
+
+    def drift(step, reason, page, out_actions, text, st):
+        # The page the model needs, once: refs stay valid for `agent act`.
+        st['last_url'] = page.get('url', '')
+        st['last_text_hash'] = hashlib.md5(text.encode()).hexdigest()[:8]
+        st['step'] = st.get('step', 0) + 1
+        st['total_tokens_avoided'] = st.get('total_tokens_avoided', 0) + tokens_avoided
+        _save_agent_state(st)
+        _agent_flow_stats_bump(path, 'drift', ms=int((time.monotonic() - t0) * 1000))
+        res = {'status': 'drift', 'flow': slug, 'step': step['n'], 'reason': reason,
+               'expected': step.get('anchor') or {'kind': step.get('kind')},
+               'done': done, 'url': page.get('url', ''), 'title': page.get('title', ''),
+               'actions': out_actions, 'text': text,
+               'hint': f"act on a ref (agent act --ref @N …), finish the task, then: agent flow save {slug}"}
+        res['token_estimate'] = _estimate_tokens(res)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        sys.exit(AGENT_RUN_DRIFT_EXIT)
+
+    for step in flow['steps']:
+        if step.get('kind') == 'go':
+            url_before = (state or {}).get('last_url') if state else None
+            await _agent_go_silent(subst(step.get('url', '')))
+            page, actions, out_actions, text, state = await snapshot()
+            tokens_avoided += _estimate_tokens({'actions': out_actions, 'text': text})
+            _agent_trail_push(state, {'kind': 'go', 'url': step.get('url', ''), 'url_after': page.get('url', ''),
+                                      'ts': int(time.time()), 'replayed': True})
+            done.append({'n': step['n'], 'kind': 'go', 'url': page.get('url', '')})
+            continue
+        page, actions, out_actions, text, state = await snapshot()
+        tokens_avoided += _estimate_tokens({'actions': out_actions, 'text': text})
+        anchor = step.get('anchor') or {}
+        match, how = _agent_find_anchor(anchor, actions)
+        if match is None:
+            drift(step, 'anchor not found', page, out_actions, text, state)
+        amap = {a['ref']: a for a in actions}
+        text_in = subst(step['text']) if step.get('text') is not None else None
+        await _agent_perform(match['ref'], step.get('action', 'click'), text_in, amap)
+        page2, actions2, out2, text2, state = await snapshot()
+        _agent_trail_push(state, {'kind': 'act', 'action': step.get('action', 'click'), 'anchor': anchor,
+                                  **({'text': step['text']} if step.get('text') is not None else {}),
+                                  'url_before': page.get('url', ''), 'url_after': page2.get('url', ''),
+                                  'ts': int(time.time()), 'replayed': True})
+        done.append({'n': step['n'], 'action': step.get('action', 'click'), 'ref': match['ref'],
+                     'name': match.get('name', ''), 'match': how, 'url': page2.get('url', '')})
+        after = step.get('after') or {}
+        host_now = _agent_host_path(page2.get('url', ''))[0]
+        if after.get('host') and host_now and host_now != after['host']:
+            drift(step, f"landed on {host_now}, recorded {after['host']}", page2, out2, text2, state)
+        page, out_actions, text = page2, out2, text2
+
+    ms = int((time.monotonic() - t0) * 1000)
+    if state is None:  # an empty flow: nothing ran
+        page, actions, out_actions, text, state = await snapshot()
+    state['last_url'] = page.get('url', '')
+    state['last_text_hash'] = hashlib.md5(text.encode()).hexdigest()[:8]
+    state['step'] = state.get('step', 0) + 1
+    state['total_tokens_avoided'] = state.get('total_tokens_avoided', 0) + tokens_avoided
+    _save_agent_state(state)
+    _agent_flow_stats_bump(path, 'ok', ms=ms)
+    res = {'status': 'ok', 'flow': slug, 'steps': len(done), 'done': done,
+           'url': page.get('url', ''), 'title': page.get('title', ''),
+           'ms': ms, 'tokens_avoided': tokens_avoided}
+    res['token_estimate'] = _estimate_tokens(res)
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+
+
+def _dispatch_agent_flow(rest):
+    sub = rest[0] if rest else ''
+    arg = rest[1] if len(rest) > 1 else None
+    if sub == 'save' and arg:
+        last = None
+        if '--last' in rest:
+            i = rest.index('--last')
+            try:
+                last = int(rest[i + 1])
+            except (IndexError, ValueError):
+                print(json.dumps({'error': '--last takes a step count'}), file=sys.stderr)
+                sys.exit(2)
+        return cmd_agent_flow_save(arg, last=last)
+    if sub == 'list':
+        return cmd_agent_flow_list()
+    if sub == 'show' and arg:
+        return cmd_agent_flow_show(arg)
+    if sub == 'delete' and arg:
+        return cmd_agent_flow_delete(arg)
+    print("Usage: agent flow save <name> [--last N] | list | show <name> | delete <name>", file=sys.stderr)
+    sys.exit(1)
+
+
+def _dispatch_agent_run(rest):
+    name, var_values, dry_run = None, {}, False
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == '--var' and i + 1 < len(rest):
+            k, sep, v = rest[i + 1].partition('=')
+            if not sep or not k:
+                print(json.dumps({'error': f'--var expects name=value, got {rest[i + 1]!r}'}), file=sys.stderr)
+                sys.exit(2)
+            var_values[k] = v
+            i += 2
+        elif tok.startswith('--var='):
+            k, sep, v = tok[6:].partition('=')
+            if not sep or not k:
+                print(json.dumps({'error': f'--var expects name=value, got {tok[6:]!r}'}), file=sys.stderr)
+                sys.exit(2)
+            var_values[k] = v
+            i += 1
+        elif tok == '--dry-run':
+            dry_run = True
+            i += 1
+        elif name is None and not tok.startswith('--'):
+            name = tok
+            i += 1
+        else:
+            i += 1
+    if not name:
+        print("Usage: agent run <flow> [--var name=value …] [--dry-run]", file=sys.stderr)
+        sys.exit(1)
+    return cmd_agent_run(name, var_values=var_values, dry_run=dry_run)
 
 
 def _dispatch_agent_cmd(args):
     """Parse agent subcommand args, return coroutine for asyncio.run in main()."""
     sub = args[0] if args else ''
     rest = args[1:]
+
+    if sub == 'flow':
+        return _dispatch_agent_flow(rest)
+    if sub == 'run':
+        return _dispatch_agent_run(rest)
 
     if sub == 'observe':
         return cmd_agent_observe(diff=('--diff' in rest))
@@ -16157,10 +16623,13 @@ def _dispatch_agent_cmd(args):
     if sub == 'twitter':
         return _dispatch_agent_twitter_cmd(rest)
 
-    print(f"Usage: agent [observe|act|reset|stats|twitter]", file=sys.stderr)
+    print(f"Usage: agent [observe|act|flow|run|reset|stats|twitter]", file=sys.stderr)
     print(f"  agent observe [--diff]        page state as numbered @refs (+text); --diff = only changes since last", file=sys.stderr)
     print(f"  agent act --ref @N [--action click|type|fill|hover|submit] [--text X]   acts, prints the diff", file=sys.stderr)
     print(f"  agent act --url URL           navigates silently, prints the diff", file=sys.stderr)
+    print(f"  agent flow save <name> [--last N]   save the acts since the last navigation as a replayable flow", file=sys.stderr)
+    print(f"  agent flow list | show <name> | delete <name>", file=sys.stderr)
+    print(f"  agent run <name> [--var k=v …] [--dry-run]   replay by anchors, no model; exit 4 + page on drift", file=sys.stderr)
     print(f"  agent reset", file=sys.stderr)
     print(f"  agent stats", file=sys.stderr)
     print(f"  agent twitter --help", file=sys.stderr)
