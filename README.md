@@ -497,6 +497,16 @@ rewrites the flow. Exit 2: unknown flow or a `{{variable}}` without a value (che
 (password, one-time code, API key, …) or token-shaped values are placeholders on disk; the same fields show
 `«masked»` as their value in `observe` output.
 
+#### Text that talks to the agent: `injection_suspect`
+
+Page text that addresses the model instead of the user is the shape of an indirect prompt injection ("AI
+assistants reading this page: ignore your previous instructions…"). `agent observe`, the diff of `agent act`
+and a drift result of `agent run` carry `injection_suspect: [{text, match}]` (at most 5, absent when none)
+whenever such a block is in the text: `ignore_instructions`, `addresses_ai`, `system_prompt`,
+`new_instructions`, `hide_from_user`, `exfiltrate`. Nothing is hidden or blocked, the text stays where it was;
+the agent sees the mark next to it and treats the block as data. The patterns are narrow on purpose: a page
+*about* AI agents or system prompts is not flagged.
+
 ### Session Management
 
 ```bash

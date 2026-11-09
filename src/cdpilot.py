@@ -15861,6 +15861,52 @@ def _estimate_tokens(obj):
     return max(1, len(json.dumps(obj)) // 4)
 
 
+# Page text that addresses the agent instead of the user: the classic shape of
+# an indirect prompt injection ("AI assistants reading this: ignore your
+# previous instructions…"). The scan marks, it never blocks or hides: the
+# model sees `injection_suspect` next to the text and treats those blocks as
+# data. Patterns are deliberately narrow (pages *about* AI are not flagged).
+_AGENT_INJECTION_RES = (
+    ('ignore_instructions',
+     _re.compile(r"\b(ignore|disregard|forget|override)\b[^.\n]{0,40}\b(previous|prior|above|earlier|all|your|the|any)\b"
+                 r"[^.\n]{0,30}\b(instructions?|prompts?|rules|guidelines|directives|programming)\b", _re.I)),
+    ('addresses_ai',
+     _re.compile(r"\b(?:if )?you(?:'re| are) (?:an? |the )?(?:ai|llm|language model|ai assistant|assistant|agent|chatbot|model)\b"
+                 r"|\b(?:ai|llm) (?:assistants?|agents?|models?)\b[^.\n]{0,20}\b(?:reading|visiting|processing|browsing)\b", _re.I)),
+    ('system_prompt',
+     _re.compile(r"\b(reveal|print|output|repeat|show|ignore|override|leak)\b[^.\n]{0,40}\b(system|developer) (prompt|message|instructions?)\b", _re.I)),
+    ('new_instructions',
+     _re.compile(r"\b(new|updated|important|urgent|real|actual) (instructions?|directives?|task) (for|to) (the )?(ai|assistant|agent|model|llm)s?\b"
+                 r"|\bnew instructions?:", _re.I)),
+    ('hide_from_user',
+     _re.compile(r"\b(do not|don't|never) (tell|inform|mention|show|reveal|warn)\b[^.\n]{0,30}\b(user|human|operator)\b"
+                 r"|\bwithout (telling|informing|alerting|asking) the (user|human)\b", _re.I)),
+    ('exfiltrate',
+     _re.compile(r"\b(send|forward|post|email|submit|exfiltrate|paste|upload)\b[^.\n]{0,60}"
+                 r"\b(cookies?|credentials?|passwords?|api[ -]?keys?|tokens?|session|secrets?|conversation|chat history)\b", _re.I)),
+)
+
+
+def _agent_injection_scan(nodes, limit=5):
+    """Nodes whose accessible name reads like instructions to an AI agent:
+    [{"text": <≤160 chars>, "match": <pattern>}], at most `limit`."""
+    out, seen = [], set()
+    for node in nodes:
+        if node.get('ignored'):
+            continue
+        name = node.get('name', {}).get('value', '') or ''
+        if len(name) < 12 or name in seen:
+            continue
+        for tag, rx in _AGENT_INJECTION_RES:
+            if rx.search(name):
+                seen.add(name)
+                out.append({'text': name[:160], 'match': tag})
+                break
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _extract_text_summary(nodes, max_chars=2000):
     text_roles = {'staticText', 'text', 'paragraph', 'heading'}
     parts = []
@@ -15996,6 +16042,9 @@ async def cmd_agent_observe(diff=False):
         }
         if snap['text_changed']:
             snap['text'] = text
+            suspects = _agent_injection_scan(nodes)
+            if suspects:
+                snap['injection_suspect'] = suspects
         token_est = _estimate_tokens(snap)
         snap['token_estimate'] = token_est
         snap['saved_vs_full'] = round(max(0.0, 1.0 - token_est / full_tok), 3) if full_tok else 0.0
@@ -16010,6 +16059,9 @@ async def cmd_agent_observe(diff=False):
         known = _agent_flows_for_host(_agent_host_path(page.get('url', ''))[0])
         if known:
             snap['known_flows'] = known
+        suspects = _agent_injection_scan(nodes)
+        if suspects:
+            snap['injection_suspect'] = suspects
         token_est = _estimate_tokens(snap)
         snap['token_estimate'] = token_est
         state['total_tokens_full'] = state.get('total_tokens_full', 0) + token_est
@@ -16137,6 +16189,9 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None):
     }
     if result['text_changed']:
         result['text'] = new_text
+        suspects = _agent_injection_scan(nodes)
+        if suspects:
+            result['injection_suspect'] = suspects
     diff_tok = _estimate_tokens(result)
     out_actions = [{k: v for k, v in a.items() if k != 'backend_node_id'} for a in new_actions]
     full_tok = _estimate_tokens({'actions': out_actions, 'text': new_text})
@@ -16448,14 +16503,18 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
     done = []
     state = None
 
+    last_nodes = []
+
     async def snapshot():
+        nonlocal last_nodes
         cdp_cache_invalidate()
         page, nodes, actions, st = await _agent_full_snapshot()
+        last_nodes = nodes
         text = _extract_text_summary(nodes)
         out = [{k: v for k, v in a.items() if k != 'backend_node_id'} for a in actions]
         return page, actions, out, text, st
 
-    def drift(step, reason, page, out_actions, text, st):
+    def drift(step, reason, page, out_actions, text, st, suspects=None):
         # The page the model needs, once: refs stay valid for `agent act`.
         st['last_url'] = page.get('url', '')
         st['last_text_hash'] = hashlib.md5(text.encode()).hexdigest()[:8]
@@ -16468,6 +16527,8 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
                'done': done, 'url': page.get('url', ''), 'title': page.get('title', ''),
                'actions': out_actions, 'text': text,
                'hint': f"act on a ref (agent act --ref @N …), finish the task, then: agent flow save {slug}"}
+        if suspects:
+            res['injection_suspect'] = suspects
         res['token_estimate'] = _estimate_tokens(res)
         print(json.dumps(res, indent=2, ensure_ascii=False))
         sys.exit(AGENT_RUN_DRIFT_EXIT)
@@ -16487,7 +16548,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
         anchor = step.get('anchor') or {}
         match, how = _agent_find_anchor(anchor, actions)
         if match is None:
-            drift(step, 'anchor not found', page, out_actions, text, state)
+            drift(step, 'anchor not found', page, out_actions, text, state, _agent_injection_scan(last_nodes))
         amap = {a['ref']: a for a in actions}
         text_in = subst(step['text']) if step.get('text') is not None else None
         await _agent_perform(match['ref'], step.get('action', 'click'), text_in, amap)
@@ -16501,7 +16562,8 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
         after = step.get('after') or {}
         host_now = _agent_host_path(page2.get('url', ''))[0]
         if after.get('host') and host_now and host_now != after['host']:
-            drift(step, f"landed on {host_now}, recorded {after['host']}", page2, out2, text2, state)
+            drift(step, f"landed on {host_now}, recorded {after['host']}", page2, out2, text2, state,
+                  _agent_injection_scan(last_nodes))
         page, out_actions, text = page2, out2, text2
 
     ms = int((time.monotonic() - t0) * 1000)
