@@ -86,8 +86,14 @@ Not: `tokens_avoided` adım başına tam gözlemi sayar; diff kullanan bir ajan 
 altında mutlak süreler 2–3× şişkin; oran geçerlidir. Model gecikmesi (adım başına saniyeler) tabana dahil değildir;
 gerçek kazanç ondan büyüktür.
 
-## 7. İkinci hat (ayrı commit): enjeksiyon farkındalı gözlem
+## 7. İkinci hat (ayrı commit, 09.11): enjeksiyon farkındalı gözlem — UYGULANDI v0
 
-`agent observe` metin bloklarında ajana hitap eden cümleyi (`ignore previous instructions`, `you are an AI`, `system
-prompt`, "assistant" + emir) `injection_suspect: true` ile işaretler; gizli metin (AX `ignored`, `aria-hidden`) zaten dışarıda.
-Bu v0'a girmez; öğrenen akış v0 tutanaktan geçince sıradaki iş.
+`_agent_injection_scan(nodes)`: AX düğüm adlarında ajana hitap eden metni 6 dar desenle tarar
+(`ignore_instructions`, `addresses_ai`, `system_prompt` yalnız emirle, `new_instructions`, `hide_from_user`, `exfiltrate`);
+`agent observe` (tam ve diff), `agent act` diff'i (metin değiştiyse) ve `agent run` sapma sonucu `injection_suspect: [{text, match}]`
+taşır (en çok 5, yoksa alan yok). Metin gizlenmez, engellenmez; model işareti metnin yanında görür. AX `ignored` düğümler
+taranmaz (zaten metinde yok). Birim testi: 11 işaretli / 10 temiz cümle (yapay zekâ *hakkında* sayfa işaretlenmez); sahte
+example.com ağacında bir enjeksiyon satırı, uçtan uca test.
+
+Sınır (bilinçli): görünmez-ama-AX'te metin (beyaz üstüne beyaz, ekran dışı) ayırt edilmez; desen İngilizce; `go`/`content`
+çıktısına girmedi. Ölçüm için sıradaki iş: 20 gerçek enjeksiyon örneği + 20 temiz sayfa ile yakalama/yanlış alarm oranı.

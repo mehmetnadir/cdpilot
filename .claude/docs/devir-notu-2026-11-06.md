@@ -157,3 +157,8 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
   yeniden bakılır. (7) `go` sessizlik penceresi 100 ms kalır; SPA settle ölçümü sıraya (3 SPA sayfa, yük sonrası
   innerText uzunluğu zamanla). (8) Daemon varsayılan: 22.11'den önce değil, `canavar` hata oranı tazeyle aynıysa.
   T2 tam denetim: öğrenen akış + enjeksiyon hattı birleşince (npm 0.9.6 öncesi), 16 ajan/45 dk, Nadir onayıyla koşar.
+- Öğrenen akış commit 0114ac7: tutanak TT-20261109-154221-10776a GEÇERLİ 613/613 (ilk koşu BELİRSİZ: tutanak sürerken docs
+  düzenlendi → ders yine aynı: koşarken ağaca dokunma; 2. koşu GEÇERLİ ama commit sır kapısına takıldı — testteki `secret`
+  değişken adı generic-api-key sayıldı → `typed`; 3. koşu). Push 15:42; CI izleniyor.
+- İkinci hat (bu commit): `injection_suspect` — `_agent_injection_scan`, 6 dar desen; observe/act/run-sapma çıktısında; README
+  alt bölümü, CHANGELOG, PRD §7. Sınır: görünmez metin ayırt edilmez, desen İngilizce; ölçüm (20 örnek + 20 temiz) sıradaki iş.
