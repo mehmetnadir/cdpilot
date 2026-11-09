@@ -132,6 +132,28 @@ Hepsi `src/cdpilot.py`'ye dokunur; çatışma olursa küçük olur (ayrı fonksi
 - D2 #4 (bu commit): `go` yük sonrası 4 `Runtime.evaluate` → 1 (`POST_NAV_PROBE_JS`, `_post_nav_probe`; `_assert_host`/`_detect_friction`/`_detect_captcha` hazır parçayı alır, eksikse tekil sondaya düşer). Sahte CDP `probe/friction/captcha` etiketleri + 1 sonda testi; süreç içi parse/düşüş testi. Yerel ölçüm fark gürültü içinde (tur 1–3 ms).
 - D2 #4 commit eb9cd83: tutanak TT-20261108-173809-8f4ac9 GEÇERLİ 610/610 (ilk koşu 609/610: sahte CDP'nin sonda etiketleri `tags`e girince dış tarayıcı 'enjeksiyon yok' testi düştü → sondalar ayrı `probes` alanında); push 17:38; CI yeşil. X: bricks paylaşımı 17:34'te yayında — x.com/cdpilot_dev/status/2119438185444872526 (+ takip 2119438371118318033); kuyrukta 09.11 tools-core + 1 auto-reply taslağı.
 - Faz 3 (bu commit, token hedefi): `agent observe --diff` (son gözlemden bu yana değişen: eklenen tam tanımlayıcı, silinen ref, değer; metin yalnız değiştiyse), `agent act` çıktısı aynı biçim (`new_text_blocks` kalktı, `--url` sayfa dökümünü basmıyor, step sayılıyor), `agent observe/act/reset/stats` daemon'da sıcak (`agent twitter` taze; `DAEMON_SPAWN_SUBCMDS` iki tarafta, parite testi). Sahte CDP `Accessibility.getFullAXTree` (sayfa başına küçük ağaç) + uçtan uca test; README 'Agent mode' bölümü (özellik belgesizdi), CHANGELOG. Yol haritası 'A11y token-efficient agent IF: Yarım' → tamam sayılır; kalan: MCP aracı `browser_agent_observe/act` (yok), gerçek sayfada token ölçümü.
-- Faz 3 commit e21912e: tutanak TT-20261108-175531-b84fb3 GEÇERLİ 611/611 (ilk koşular: sahte CDP'de cdpilot kendi sekmesini açar → URL about:blank; `act --url` sonrası 0,5 s /json önbelleği eski URL → `cdp_cache_invalidate()`; 2 imza pin testi + 2 pencere genişletildi); push 17:55; CI izleniyor.
+- Faz 3 commit e21912e: tutanak TT-20261108-175531-b84fb3 GEÇERLİ 611/611 (ilk koşular: sahte CDP'de cdpilot kendi sekmesini açar → URL about:blank; `act --url` sonrası 0,5 s /json önbelleği eski URL → `cdp_cache_invalidate()`; 2 imza pin testi + 2 pencere genişletildi); push 17:55; CI yeşil (18:05).
 - D2 #1 (havuzlu `go` oturumu) ERTELENDİ, plan §6.1: envanter tamam ama yerel kazanç ≤15 ms; kaldıraç 100 ms sessizlik penceresi (bekleyen istek yoksa 30 ms önerisi) → SPA settle ölçümü + Nadir kararı.
 - Canlı tuval PRD taslağı `.claude/docs/plan-canli-tuval.md` (kod yok): v0 komutları, ölçüm kapıları (son token → ilk boyama ≤100 ms), güvenlik varsayılanı önerisi (ağ kapalı, satır içi betik serbest), var-olan-çözüm tablosu, 3 gün iş, Nadir'e 4 soru.
+
+## 11. Delta 09.11 (Nadir: "sen olsan hangi yönde?" → "kararları kendin alabilirsin, devam et")
+
+Yön kararı D-0035 (Kovan), iş K-0017. Aday problemler tablosu ve gerekçe sohbette; özet: **öğrenen akış** ana hat
+(tekrar eden tarayıcı işinde LLM'e 0 token, daemon hızı), **enjeksiyon farkındalı gözlem** ikinci hat (küçük, sonda
+alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrenen-akis.md`.
+
+- Öğrenen akış v0 (bu commit): her `agent act` iz bırakır (çapa = AX rol + ad + sıra; `@ref`/düğüm kimliği yok; sır
+  alanına yazılan metin `{{placeholder}}`, `_AGENT_SECRET_FIELD_RE` dar); `agent flow save|list|show|delete`;
+  `agent run <ad> [--var k=v] [--dry-run]` çapayla oynatır, sapmada çıkış 4 + o sayfanın tam gözlemi (ref'ler geçerli →
+  `act` → `flow save` onarır); `observe` `known_flows`; `stats` `tokens_avoided_by_flows`. Yan düzeltmeler: sır adlı
+  alanın değeri tanımlayıcıda `«masked»` (observe çıktısı + agent-state.json), `cmd_click_ref`'in "Clicked @N" satırı
+  act JSON'unun önüne düşmüyor, tık/submit sonrası `_agent_settle` (navigasyon yarışı; ~100 ms). Sahte CDP: Password
+  kutusu, DOM.getBoxModel/resolveNode, odak + Input.insertText. Testler: süreç içi birim (çapa, eşleme merdiveni, maske)
+  + sahte tarayıcı uçtan uca (iz, save, known_flows, run, placeholder, env değişken, sapma 4, onarım, show/delete).
+- Ölçüm (yük 40, fixture 3 sayfa): model döngüde 5.049 token / 1.655 ms → `agent run` 237 token / ~650 ms; sapma
+  denemesi doğru durdu (PRD §6).
+- Nadir'e kalanlar §8 için şef kararları (09.11): (5) HN/Reddit metinleri hazır, hesaplar Nadir'in → o paylaşır, tarih:
+  öğrenen akış sürümü npm'de olduktan sonraki Salı; X hesabı mandat gereği Claude paylaşır. (6) Tuval park, v0 sonrası
+  yeniden bakılır. (7) `go` sessizlik penceresi 100 ms kalır; SPA settle ölçümü sıraya (3 SPA sayfa, yük sonrası
+  innerText uzunluğu zamanla). (8) Daemon varsayılan: 22.11'den önce değil, `canavar` hata oranı tazeyle aynıysa.
+  T2 tam denetim: öğrenen akış + enjeksiyon hattı birleşince (npm 0.9.6 öncesi), 16 ajan/45 dk, Nadir onayıyla koşar.

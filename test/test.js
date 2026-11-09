@@ -1204,6 +1204,59 @@ print("ok")
   assert(/^ok/m.test(r.stdout), r.stdout);
 });
 
+test('learned flows (unit): anchors by role+name+nth, matching ladder, secret fields masked in descriptors and as {{placeholders}}', () => {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-flowunit-'));
+  const script = `
+import json, importlib.util
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+# anchors: the second "Delete" button is nth 1; refs and node ids never enter the anchor
+amap = {"@1": {"ref": "@1", "role": "button", "name": "Delete", "backend_node_id": 11},
+        "@2": {"ref": "@2", "role": "link", "name": "Delete", "backend_node_id": 12},
+        "@3": {"ref": "@3", "role": "button", "name": "Delete", "backend_node_id": 13},
+        "@10": {"ref": "@10", "role": "textbox", "name": "Keyword", "backend_node_id": 20, "value": "x"}}
+assert mod._agent_anchor(amap["@3"], amap) == {"role": "button", "name": "Delete", "nth": 1}, mod._agent_anchor(amap["@3"], amap)
+assert mod._agent_anchor(amap["@2"], amap) == {"role": "link", "name": "Delete", "nth": 0}
+# matching ladder on a new page: exact → case-insensitive → partial only when unambiguous
+page = [{"ref": "@7", "role": "button", "name": "delete"}, {"ref": "@8", "role": "button", "name": "Delete"},
+        {"ref": "@9", "role": "button", "name": "Archive all"}, {"ref": "@11", "role": "link", "name": "Archive"},
+        {"ref": "@12", "role": "button", "name": "Save draft"}, {"ref": "@13", "role": "button", "name": "Save as"}]
+m, how = mod._agent_find_anchor({"role": "button", "name": "Delete", "nth": 0}, page)
+assert (m["ref"], how) == ("@8", "exact"), (m, how)
+m, how = mod._agent_find_anchor({"role": "button", "name": "DELETE", "nth": 5}, page)   # nth past the end → last of its kind
+assert (m["ref"], how) == ("@8", "case"), (m, how)
+m, how = mod._agent_find_anchor({"role": "button", "name": "Archive", "nth": 0}, page)  # role must match: the link is not it
+assert (m["ref"], how) == ("@9", "partial"), (m, how)
+m, how = mod._agent_find_anchor({"role": "button", "name": "Save", "nth": 0}, page)     # two partials → drift, never a guess
+assert (m, how) == (None, None), (m, how)
+m, how = mod._agent_find_anchor({"role": "checkbox", "name": "Delete", "nth": 0}, page)
+assert (m, how) == (None, None), (m, how)
+# masking: secret-named fields and token-shaped values become placeholders; ordinary text stays
+assert mod._agent_mask_text("Password", "hunter2") == "{{password}}"
+assert mod._agent_mask_text("API key", "abc") == "{{api_key}}"
+assert mod._agent_mask_text("Search", "cdpilot") == "cdpilot"
+assert mod._agent_mask_text("Keyword", "browser automation") == "browser automation"      # "Keyword" is not a secret field
+assert mod._agent_mask_text("Search", "sk-ant-api03-" + "A" * 40) == "{{search}}"       # a token typed anywhere
+assert mod._agent_mask_text("", "ghp_" + "x" * 36) == "{{secret}}"
+# descriptors: a secret field's value is masked at snapshot time (observe output and agent-state.json)
+def node(role, name, bid, value):
+    return {"ignored": False, "role": {"value": role}, "name": {"value": name}, "backendDOMNodeId": bid,
+            "value": {"value": value}}
+state = {"actions_map": {}, "ref_counter": 0}
+acts = mod._snapshot_to_actions([node("textbox", "Password", 1, "hunter2"), node("textbox", "Keyword", 2, "cdpilot"),
+                                 node("textbox", "One-time code", 3, "123456"), node("textbox", "Password", 4, "")], state)
+vals = {a["name"] + str(a["backend_node_id"]): a.get("value") for a in acts}
+assert vals == {"Password1": "«masked»", "Keyword2": "cdpilot", "One-time code3": "«masked»", "Password4": ""}, vals
+print("ok")
+`;
+  const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
+    { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
+  assert.strictEqual(r.status, 0, `flow unit test failed: ${r.stderr}`);
+  assert(/^ok/m.test(r.stdout), r.stdout);
+});
+
 test('visual feedback config: default OFF', () => {
   // The whole "professional feel" change. Default OFF means new users don't
   // see the glow/cursor unless they opt in via `cdpilot show on` or env.
@@ -1836,7 +1889,7 @@ test('cmd_agent_reset deletes state file and outputs JSON', () => {
 test('cmd_agent_stats outputs token savings JSON', () => {
   assert(/async def cmd_agent_stats\(\)/.test(PY_CONTENT),
     "cmd_agent_stats must be async def");
-  const m = PY_CONTENT.match(/cmd_agent_stats[\s\S]{0,400}?savings_pct|savings_pct[\s\S]{0,400}?cmd_agent_stats/);
+  const m = PY_CONTENT.match(/async def cmd_agent_stats\(\)[\s\S]{0,900}?'savings_pct'/);
   assert(m, "cmd_agent_stats must output savings_pct");
 });
 
@@ -7255,6 +7308,111 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert.strictEqual(cli(['agent', 'reset'], env).status, 0);
       const d2 = JSON.parse(cli(['agent', 'observe', '--diff'], env).stdout);
       assert(Array.isArray(d2.actions) && d2.actions.length >= 2, `full observe after reset: ${JSON.stringify(d2)}`);
+    } finally { fake.stop(); }
+  });
+
+  test('learned flows (fake browser): acts leave an anchored trail, flow save, known_flows, run with no model, placeholders, exit 4 on drift with the page', () => {
+    // The thing a flow is for: the second time a site is driven, no model
+    // reads the page. The fake serves the inbox tree (now with a password
+    // box) and takes typed text into the focused field.
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const ok = (args, extra) => {
+        const r = cli(args, { ...env, ...(extra || {}) });
+        assert.strictEqual(r.status, 0, `${args.join(' ')} exit ${r.status}: ${r.stderr}\n${r.stdout}`);
+        return r;
+      };
+      const flowPath = path.join(home, 'projects', 'proj', 'flows', 'inbox_triage.json');
+      const statePath = path.join(home, 'projects', 'proj', 'agent-state.json');
+      const typed = 'hunter2-never-on-disk';  // the value typed into the Password box
+      // teach: navigate (cdpilot's own tab starts at about:blank), observe once, then three acts (click, fill, fill a secret)
+      ok(['agent', 'act', '--url', 'https://user.example/inbox']);
+      const snap = JSON.parse(ok(['agent', 'observe']).stdout);
+      assert(!('known_flows' in snap), 'no flows yet: the field is absent, not an empty list');
+      const byName = Object.fromEntries(snap.actions.map((a) => [a.name, a]));
+      assert(byName.Password && byName.Password.role === 'textbox', JSON.stringify(snap.actions));
+      const clicked = ok(['agent', 'act', '--ref', byName.Archive.ref, '--action', 'click']);
+      assert(!/^Clicked/m.test(clicked.stdout), `click-ref's line must not precede the JSON: ${clicked.stdout.slice(0, 80)}`);
+      JSON.parse(clicked.stdout);
+      const filled = JSON.parse(ok(['agent', 'act', '--ref', byName.Search.ref, '--action', 'fill', '--text', 'cdpilot']).stdout);
+      assert(filled.changed.value_changed.some((v) => v.startsWith(byName.Search.ref + ':') && /cdpilot/.test(v)),
+        `the fake typed into the focused field: ${JSON.stringify(filled.changed)}`);
+      const pw = ok(['agent', 'act', '--ref', byName.Password.ref, '--action', 'fill', '--text', typed]);
+      assert(!pw.stdout.includes(typed), `a secret field's value is masked in the diff: ${pw.stdout}`);
+      assert(!fs.readFileSync(statePath, 'utf-8').includes(typed), 'nor in agent-state.json (descriptor value, trail text)');
+      // trail → flow file: since the last navigation (go + 3 acts); anchors, masked text, no refs or node ids
+      const saved = JSON.parse(ok(['agent', 'flow', 'save', 'Inbox triage']).stdout);
+      assert.deepStrictEqual([saved.saved, saved.steps, saved.host, saved.vars], ['inbox_triage', 4, 'user.example', ['password']], JSON.stringify(saved));
+      const flowText = fs.readFileSync(flowPath, 'utf-8');
+      const flow = JSON.parse(flowText);
+      assert(flow.steps[0].kind === 'go' && flow.steps[0].url === 'https://user.example/inbox', JSON.stringify(flow.steps[0]));
+      assert.deepStrictEqual(flow.steps[1].anchor, { role: 'button', name: 'Archive', nth: 0 }, JSON.stringify(flow.steps[1]));
+      assert.strictEqual(flow.steps[1].after.host, 'user.example');
+      assert.strictEqual(flow.steps[2].text, 'cdpilot');
+      assert.strictEqual(flow.steps[3].text, '{{password}}');
+      assert(flow.vars.password && flow.vars.password.step === 4, JSON.stringify(flow.vars));
+      assert(!flowText.includes(typed) && !/backend_node_id|"@\d+"/.test(flowText), 'anchors only, no secret');
+      // --last N: the acts alone (no navigation step) — the drift case below runs this one
+      const saved2 = JSON.parse(ok(['agent', 'flow', 'save', 'acts_only', '--last', '3']).stdout);
+      assert.deepStrictEqual([saved2.steps, saved2.host], [3, 'user.example'], JSON.stringify(saved2));
+      // observe now names the flows for this host; list shows them unrun
+      const snap2 = JSON.parse(ok(['agent', 'observe']).stdout);
+      assert.deepStrictEqual(snap2.known_flows, ['acts_only', 'inbox_triage'], JSON.stringify(snap2));
+      const list = JSON.parse(ok(['agent', 'flow', 'list']).stdout);
+      const tri = list.find((f) => f.name === 'inbox_triage');
+      assert(list.length === 2 && tri && tri.steps === 4 && tri.runs === 0 && tri.host === 'user.example', JSON.stringify(list));
+      // run: a missing variable stops before any step; a dry run prints placeholders, never values
+      const miss = cli(['agent', 'run', 'inbox_triage'], env);
+      assert.strictEqual(miss.status, 2, miss.stdout + miss.stderr);
+      assert(/missing variables/.test(miss.stderr) && /"password"/.test(miss.stderr), miss.stderr);
+      const dry = ok(['agent', 'run', 'inbox_triage', '--dry-run', '--var', `password=${typed}`]);
+      assert(!dry.stdout.includes(typed) && JSON.parse(dry.stdout).dry_run === true, dry.stdout);
+      // run for real: every step finds its anchor, the result is one small JSON
+      const run = JSON.parse(ok(['agent', 'run', 'inbox_triage', '--var', `password=${typed}`]).stdout);
+      assert.strictEqual(run.status, 'ok', JSON.stringify(run));
+      assert.strictEqual(run.steps, 4);
+      assert(run.done[0].kind === 'go' && run.done[0].url === 'https://user.example/inbox', JSON.stringify(run.done));
+      assert(run.done.slice(1).every((d) => /^@\d+$/.test(d.ref) && d.match === 'exact'), JSON.stringify(run.done));
+      assert(run.tokens_avoided > 0 && run.token_estimate < run.tokens_avoided,
+        `the model reads less than it would have: ${JSON.stringify({ t: run.token_estimate, a: run.tokens_avoided })}`);
+      assert(typeof run.ms === 'number');
+      // the variable may come from the environment too; stats count runs and tokens kept away
+      const run2 = JSON.parse(ok(['agent', 'run', 'inbox_triage'], { CDPILOT_VAR_PASSWORD: typed }).stdout);
+      assert.strictEqual(run2.status, 'ok');
+      assert(!fs.readFileSync(statePath, 'utf-8').includes(typed) && !fs.readFileSync(flowPath, 'utf-8').includes(typed),
+        'two runs later the typed value is still not on disk');
+      const tri2 = JSON.parse(ok(['agent', 'flow', 'list']).stdout).find((f) => f.name === 'inbox_triage');
+      assert(tri2.runs === 2 && tri2.ok === 2 && tri2.drift === 0 && tri2.last_run, JSON.stringify(tri2));
+      const st = JSON.parse(ok(['agent', 'stats']).stdout);
+      assert(st.tokens_avoided_by_flows >= run.tokens_avoided + run2.tokens_avoided && st.flows === 2, JSON.stringify(st));
+      // drift: the tab moved to example.com, "Archive" is gone → exit 4 and that page's observation, refs valid
+      ok(['agent', 'act', '--url', 'https://example.com/']);
+      const dr = cli(['agent', 'run', 'acts_only', '--var', 'password=x'], env);
+      assert.strictEqual(dr.status, 4, `drift exit ${dr.status}: ${dr.stdout}${dr.stderr}`);
+      const d = JSON.parse(dr.stdout);
+      assert.strictEqual(d.status, 'drift');
+      assert.strictEqual(d.step, 1);
+      assert.deepStrictEqual(d.expected, { role: 'button', name: 'Archive', nth: 0 });
+      assert.deepStrictEqual(d.done, []);
+      const more = d.actions.find((a) => a.name === 'More information...');
+      assert(more && /^@\d+$/.test(more.ref) && /illustrative/.test(d.text), JSON.stringify(d));
+      // repair path: the agent acts on a ref from the drift page, then saves the flow again
+      ok(['agent', 'act', '--ref', more.ref, '--action', 'click']);
+      const re = JSON.parse(ok(['agent', 'flow', 'save', 'acts_only']).stdout);
+      assert.strictEqual(re.steps, 2, JSON.stringify(re));   // since the last navigation: go + click
+      const flow2 = JSON.parse(fs.readFileSync(path.join(home, 'projects', 'proj', 'flows', 'acts_only.json'), 'utf-8'));
+      assert(flow2.steps[0].kind === 'go' && flow2.steps[0].url === 'https://example.com/', JSON.stringify(flow2.steps));
+      assert.deepStrictEqual(flow2.steps[1].anchor, { role: 'link', name: 'More information...', nth: 0 });
+      assert(flow2.stats.runs === 1 && flow2.stats.drift === 1, 'stats survive a re-save: ' + JSON.stringify(flow2.stats));
+      // show / delete / unknown
+      assert.strictEqual(JSON.parse(ok(['agent', 'flow', 'show', 'inbox_triage']).stdout).name, 'inbox_triage');
+      ok(['agent', 'flow', 'delete', 'inbox_triage']);
+      ok(['agent', 'flow', 'delete', 'acts_only']);
+      assert.strictEqual(cli(['agent', 'run', 'inbox_triage'], env).status, 2);
+      assert(!('known_flows' in JSON.parse(ok(['agent', 'observe']).stdout)));
     } finally { fake.stop(); }
   });
 

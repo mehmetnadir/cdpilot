@@ -131,11 +131,16 @@ def ws_frames(conn):
             yield payload.decode("utf-8", "replace")
 
 
-def ax_tree_for(url):
+def ax_tree_for(url, values=None):
     """A small accessibility tree per page, for `agent observe` / `act`:
-    the inbox has a heading, a link, a button, a search box and a status
-    line; example.com has a heading, a link and a paragraph."""
+    the inbox has a heading, a link, a button, a search box, a password box
+    and a status line; example.com has a heading, a link and a paragraph.
+    `values` (backend node id -> text) is what Input.insertText typed into
+    a focused field, so a filled box shows its value like a real tree."""
+    values = values or {}
     def node(i, role, name, bid, value=None):
+        if value is not None:
+            value = values.get(str(bid), value)
         n = {"nodeId": str(i), "ignored": False,
              "role": {"type": "role", "value": role},
              "name": {"type": "computedString", "value": name},
@@ -151,7 +156,16 @@ def ax_tree_for(url):
             node(2, "link", "Compose", 102),
             node(3, "button", "Archive", 103),
             node(4, "textbox", "Search", 104, value=""),
-            node(5, "staticText", "3 unread messages", 105)]
+            node(5, "staticText", "3 unread messages", 105),
+            node(6, "textbox", "Password", 106, value="")]
+
+
+def page_for(path):
+    with LOCK:
+        for pg in PAGES:
+            if path.endswith("/" + pg["id"]):
+                return pg
+    return None
 
 
 def answer(msg, path):
@@ -217,12 +231,31 @@ def answer(msg, path):
     elif method == "DOM.getDocument":
         result = {"root": {"nodeId": 1, "backendNodeId": 1}}
     elif method == "Accessibility.getFullAXTree":
-        url = ""
-        with LOCK:
-            for pg in PAGES:
-                if path.endswith("/" + pg["id"]):
-                    url = pg["url"]
-        result = {"nodes": ax_tree_for(url)}
+        pg = page_for(path)
+        result = {"nodes": ax_tree_for(pg["url"] if pg else "", (pg or {}).get("values"))}
+    # Enough of DOM/Input for `agent act` / `agent run` on the fake tree:
+    # every node has a box, a click lands, a focused field takes typed text.
+    elif method == "DOM.getBoxModel":
+        bid = int(p.get("backendNodeId") or 0)
+        x, y = 100, 20 * bid
+        result = {"model": {"content": [x, y, x + 80, y, x + 80, y + 16, x, y + 16],
+                            "width": 80, "height": 16}}
+    elif method == "DOM.resolveNode":
+        result = {"object": {"type": "object", "objectId": f"O{p.get('backendNodeId')}"}}
+    elif method == "Runtime.callFunctionOn":
+        pg = page_for(path)
+        if pg is not None and "focus()" in (p.get("functionDeclaration") or ""):
+            with LOCK:
+                pg["focus"] = str(p.get("objectId", ""))[1:]
+        result = {"result": {"type": "undefined"}}
+    elif method == "Input.insertText":
+        pg = page_for(path)
+        if pg is not None and pg.get("focus"):
+            with LOCK:
+                pg.setdefault("values", {})[pg["focus"]] = p.get("text", "")
+        result = {}
+    elif method == "Input.dispatchMouseEvent":
+        result = {}
     reply = {"id": msg.get("id"), "result": result}
     if msg.get("sessionId"):
         reply["sessionId"] = msg["sessionId"]

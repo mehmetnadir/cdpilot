@@ -48,6 +48,7 @@
 | ✅ | v0.9.5 | 08.11 14:52 yayında (Nadir onayı: push + release): npm 0.9.5, GitHub release `v0.9.5` + `cdpilot.mcpb`, MCP Registry publish.yml ile. İçerik: shadow DOM (#3), record/replay (#5, kayıt maskesi = oturum günlüğü kuralları), HAR 1.2 (#4), MCP `--tools core` (45→11 araç), bot-auth lsof (macOS 26), `network -- <url>` enjeksiyon kapısı, WebMCP çerçeve araçları Chrome 156 düzeltmesi, vaat denetimi. CI 12 birim + e2e yeşil (Chrome 156); tutanak TT-20261108-144423-57d206 595/595 |
 | ✅ | Hız A + daemon v1 | 08.11: runpy bytecode önbelleği + yorumlayıcı önbelleği (01f47fc, ~500 → ~270 ms); `CDPILOT_DAEMON=1` kalıcı süreç (opt-in, POSIX): `content`/`eval` ~370 → ~110 ms. Tasarım/ölçüm `.claude/docs/plan-daemon-insan-hizi.md` |
 | ✅ | Faz 3 agent diff | 08.11: `agent observe --diff` + `act` diff tanımlayıcılı, sessiz `--url`, README bölümü, sahte AX ağacı testi; agent komutları daemon'da sıcak (`agent twitter` taze). Kalan: MCP `browser_agent_*` aracı yok, gerçek sayfa token ölçümü |
+| ✅ | Öğrenen akış v0 | 09.11 (şef kararı D-0035): `agent act` izi → `agent flow save` → `agent run` (çapa = rol+ad+sıra, sapmada çıkış 4 + sayfa); fixture ölçümü 5.049 → 237 token, 1.655 → ~650 ms. PRD/ölçüm `.claude/docs/plan-ogrenen-akis.md`. Kalan: MCP aracı, gerçek site ölçümü, enjeksiyon farkındalı gözlem (ikinci hat) |
 | ⏳ | Sonraki | **Canlı tuval PRD** `.claude/docs/plan-canli-tuval.md` (v0: `canvas open/set/patch/stream/watch/events`, son token → ilk boyama ≤100 ms; 4 soru Nadir'e). HIZ: daemon inceleme turu 2c2be74 + join gerilemesi c74e04d, tek evaluate eb9cd83; sıcak `go` ~230 ms = node ~125 + sessizlik 100 + Python ≤15 → havuzlu oturum (D2 #1) ertelendi (plan-daemon §6.1), kaldıraç sessizlik penceresi (Nadir kararı + SPA ölçümü); 2 hafta sonra daemon varsayılan; stealth + UA override `go` oturumuna bağlı; frame act bulamazsa sayfaya dönüş |
 | ⏳ | Sentinel takip | C6: daily_analytics gece yazmıyor (debug) · C8: 2 failed auto-like sebebi |
 | ⏳ | v0.9 tls-proxy | Optional local TLS-MITM (curl-impersonate semantics) |
@@ -56,7 +57,7 @@
 → 2026-11-08 (CEO kipi, gece + gündüz): 5 şerit birleşti, T1 güvenlik (2 düşük bulgu kapandı), 0.9.5 yayınlandı. CI'da Chrome 156 WebMCP iframe arızası çıktı, aynı gün düzeltildi (ae4a857, e2e yeşil). X: bricks paylaşımı 14:09'da ikinci kez ConnectTimeout → 17:30'a yeniden kuyruklandı; poster artık bağlantı hatasında öğeyi kuyrukta tutar (286aec0). Devir notu: `.claude/docs/devir-notu-2026-11-06.md` §5–§7.
 → İlk iş: hız hedefi A→D (perf tabanına karşı ölç); Nadir kararı: canlı tuval hedefi; srv21 claude-oauth-token şimdilik bu Mac'ten (Nadir 08.11).
 
-Son Güncelleme: 2026-11-08
+Son Güncelleme: 2026-11-09
 
 <!-- gitnexus:start -->
 ## GitNexus — Code Intelligence
