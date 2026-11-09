@@ -148,7 +148,16 @@ tools (navigate, click, fill, content, screenshot, eval, wait_for, assert, tabs,
 plus `browser_tools`. The agent calls `browser_tools` with `list` to see the other
 tools, or `enable` to add some (the server sends `tools/list_changed`). `--tools a,b,c`
 picks tools by name; `all` (default) is unchanged. Schema size of `tools/list`
-(tiktoken `o200k_base`): 45 tools = 5,769 tokens, `core` = 11 tools = 1,342 tokens.
+(tiktoken `o200k_base`): 45 tools = 5,769 tokens, `core` = 11 tools = 1,342 tokens; the four
+`browser_agent_*` tools add ~11% of schema (49 tools ≈ 6,400 tokens, scaled from the measurement).
+
+### Agent mode over MCP
+
+`browser_agent_observe` (`diff`), `browser_agent_act` (`ref`/`url`, `action`, `text`), `browser_agent_flow_save`
+(`name`, `last`) and `browser_agent_run` (`flow`, `vars`, `dry_run`) wrap the agent commands below, so a model
+on MCP works from numbered refs, gets diffs, and replays a learned flow with no page read at all. They are
+outside the `core` profile; `browser_tools enable` adds them. A drift or a missing variable comes back as
+`isError` with the command's JSON (`status:"drift"` carries the page's observation).
 
 ### MCP Bundle (.mcpb)
 
