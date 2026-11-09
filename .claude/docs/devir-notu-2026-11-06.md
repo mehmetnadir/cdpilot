@@ -166,3 +166,4 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
   ölçekli tahmin 6.400 token); `core` değişmedi. Sahte tarayıcıyla stdio testi (act --url, observe, flow save, dry-run,
   bilinmeyen akış isError, observe --diff). Not: MCP her araç çağrısında taze Python süreci açıyor (`subprocess.run([sys.executable,
   __file__] …)`) → daemon kazancı MCP yoluna henüz yansımıyor; HIZ için sıradaki aday (plan-daemon'a eklenecek).
+- CI 09.11: 0114ac7, b9d7e8c, 03161c6 üçü de yeşil (12 birim + e2e). 0.9.6 npm Nadir onayı bekler.
