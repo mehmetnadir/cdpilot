@@ -162,3 +162,7 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
   değişken adı generic-api-key sayıldı → `typed`; 3. koşu). Push 15:42; CI izleniyor.
 - İkinci hat (bu commit): `injection_suspect` — `_agent_injection_scan`, 6 dar desen; observe/act/run-sapma çıktısında; README
   alt bölümü, CHANGELOG, PRD §7. Sınır: görünmez metin ayırt edilmez, desen İngilizce; ölçüm (20 örnek + 20 temiz) sıradaki iş.
+- MCP (bu commit): `browser_agent_observe/act/flow_save/run` — 4 araç, CLI'ye sarmalayıcı; 45 → 49 araç (şema ≈ +%11,
+  ölçekli tahmin 6.400 token); `core` değişmedi. Sahte tarayıcıyla stdio testi (act --url, observe, flow save, dry-run,
+  bilinmeyen akış isError, observe --diff). Not: MCP her araç çağrısında taze Python süreci açıyor (`subprocess.run([sys.executable,
+  __file__] …)`) → daemon kazancı MCP yoluna henüz yansımıyor; HIZ için sıradaki aday (plan-daemon'a eklenecek).

@@ -26,7 +26,7 @@ ikinci koşu: agent run <ad> ──▶ adım: AX ağacı → çapa bul → eylem
 | `agent run <ad> [--var k=v] [--dry-run]` | çapayla yeniden oynatır; her adımda "LLM okusaydı kaç token" toplar (`tokens_avoided`) |
 | `agent observe` | sayfanın host'una kayıtlı akış varsa `known_flows: [ad…]` ekler (yoksa alan yok) |
 
-Dışarıda (v1+): MCP `browser_agent_*` araçları, akışların paylaşımı, seçici yedeği (CSS), otomatik `save` önerisi,
+Dışarıda (v1+): akışların paylaşımı, seçici yedeği (CSS), otomatik `save` önerisi,
 koşullu adımlar, bekleme adımı.
 
 ## 2. Çapa ve sapma kuralı
@@ -97,3 +97,9 @@ example.com ağacında bir enjeksiyon satırı, uçtan uca test.
 
 Sınır (bilinçli): görünmez-ama-AX'te metin (beyaz üstüne beyaz, ekran dışı) ayırt edilmez; desen İngilizce; `go`/`content`
 çıktısına girmedi. Ölçüm için sıradaki iş: 20 gerçek enjeksiyon örneği + 20 temiz sayfa ile yakalama/yanlış alarm oranı.
+
+## 8. MCP araçları (09.11, aynı gün)
+
+`browser_agent_observe` (`diff`), `browser_agent_act` (`ref`/`url`, `action`, `text`), `browser_agent_flow_save` (`name`, `last`),
+`browser_agent_run` (`flow`, `vars` nesnesi, `dry_run`). `core` profili dışında (`browser_tools enable`). Sapma / eksik değişken
+`isError` + komutun JSON'u. Sınır: MCP sunucusu her çağrıda taze Python süreci açar; daemon sıcak yolu MCP'de yok → HIZ adayı.

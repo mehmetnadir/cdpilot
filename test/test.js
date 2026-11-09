@@ -7477,6 +7477,56 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     } finally { fake.stop(); }
   });
 
+  test('mcp: browser_agent_observe/act/flow_save/run map to the agent commands (fake browser)', () => {
+    // The MCP path is how most models use cdpilot: the four tools wrap the
+    // agent commands; a drift or a missing flow comes back as isError with the
+    // command's JSON, the model never needs the CLI.
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const calls = [
+        { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'browser_agent_act', arguments: { url: 'https://user.example/inbox' } } },
+        { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'browser_agent_observe', arguments: {} } },
+        { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'browser_agent_flow_save', arguments: { name: 'via-mcp' } } },
+        { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'browser_agent_run', arguments: { flow: 'via-mcp', dry_run: true } } },
+        { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'browser_agent_run', arguments: { flow: 'nope', vars: { password: 'x' } } } },
+        { jsonrpc: '2.0', id: 15, method: 'tools/call', params: { name: 'browser_agent_observe', arguments: { diff: true } } },
+      ];
+      // (the mcpSession/byId/names helpers are declared later in this file: a local copy)
+      const lines = [
+        { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+        { jsonrpc: '2.0', method: 'notifications/initialized' },
+        { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+        ...calls,
+      ].map((m) => JSON.stringify(m)).join('\n') + '\n';
+      const r = spawnSync(process.execPath, [CLI, 'mcp'], {
+        input: lines, encoding: 'utf-8', timeout: 60000,
+        env: { ...process.env, ...env, CDPILOT_WEBMCP: '0', CDPILOT_MCP_TOOLS: '', CDPILOT_PROFILE: path.join(home, 'profile') },
+      });
+      assert.strictEqual(r.status, 0, r.stderr);
+      const msgs = r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+      const byId = (id) => msgs.find((m) => m.id === id);
+      const listed = byId(2).result.tools.map((t) => t.name);
+      for (const n of ['browser_agent_observe', 'browser_agent_act', 'browser_agent_flow_save', 'browser_agent_run']) {
+        assert(listed.includes(n), `${n} listed`);
+      }
+      const text = (id) => byId(id).result.content.map((c) => c.text).join('\n');
+      const json = (id) => JSON.parse(byId(id).result.content.find((c) => c.text.trim().startsWith('{')).text);
+      assert.strictEqual(byId(10).result.isError, false, text(10));
+      assert(json(10).url === 'https://user.example/inbox' && 'changed' in json(10), text(10));
+      const snap = json(11);
+      assert(byId(11).result.isError === false && snap.actions.some((a) => a.name === 'Archive' && /^@\d+$/.test(a.ref)), text(11));
+      const saved = json(12);
+      assert(byId(12).result.isError === false && saved.saved === 'via_mcp' && saved.steps === 1, text(12));   // the navigation alone
+      assert(byId(13).result.isError === false && json(13).dry_run === true && json(13).steps[0].kind === 'go', text(13));
+      assert(byId(14).result.isError === true && /unknown flow 'nope'/.test(text(14)), text(14));
+      const diff = json(15);
+      assert(byId(15).result.isError === false && 'changed' in diff && diff.known_flows === undefined, text(15));
+    } finally { fake.stop(); }
+  });
+
   test('external guard: connect refuses over a live cdpilot-launched browser (no orphan)', () => {
     const fake = startFake();
     try {
@@ -8686,18 +8736,18 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     return { names: res.find((x) => x.id === 1).result.tools.map((t) => t.name), call: res.find((x) => x.id === 2) };
   }
 
-  test('webmcp: MCP tools/list is 45 tools with WebMCP off (43 + browser_connect/browser_disconnect), 47 with it on', () => {
+  test('webmcp: MCP tools/list is 49 tools with WebMCP off (43 + browser_connect/browser_disconnect + 4 browser_agent_*), 51 with it on', () => {
     const off = mcpTools({});
-    assert.strictEqual(off.names.length, 45, `off: ${off.names.length}`);
+    assert.strictEqual(off.names.length, 49, `off: ${off.names.length}`);
     assert(!off.names.some((n) => n.startsWith('browser_site_')), 'off: no browser_site_* tools');
     assert(off.names.includes('browser_connect') && off.names.includes('browser_disconnect'), 'connect tools');
     assert(/Unknown tool: browser_site_tools/.test(JSON.stringify(off.call)), 'off: not callable');
     const offByFile = mcpTools({}, false);
-    assert.strictEqual(offByFile.names.length, 45);
+    assert.strictEqual(offByFile.names.length, 49);
     for (const on of [mcpTools({ CDPILOT_WEBMCP: '1' }), mcpTools({}, true)]) {
-      assert.strictEqual(on.names.length, 47, `on: ${on.names.length}`);
-      assert.deepStrictEqual(on.names.slice(0, 45), off.names, 'the 45 base tools are unchanged');
-      assert.deepStrictEqual(on.names.slice(45), ['browser_site_tools', 'browser_site_tool_call']);
+      assert.strictEqual(on.names.length, 51, `on: ${on.names.length}`);
+      assert.deepStrictEqual(on.names.slice(0, 49), off.names, 'the 49 base tools are unchanged');
+      assert.deepStrictEqual(on.names.slice(49), ['browser_site_tools', 'browser_site_tool_call']);
       assert(!/Unknown tool/.test(JSON.stringify(on.call)), 'on: browser_site_tools routes to the CLI');
     }
   });
@@ -10147,13 +10197,13 @@ test('mcp profile: CDPILOT_MCP_TOOLS=core lists the 10 core tools plus browser_t
 
 test('mcp profile: --tools flag beats the env var', () => {
   const msgs = mcpSession(['--tools', 'all'], { CDPILOT_MCP_TOOLS: 'core' }, []);
-  assert.strictEqual(names(byId(msgs, 2)).length, 45);
+  assert.strictEqual(names(byId(msgs, 2)).length, 49);
 });
 
-test('mcp profile: default stays all 45 tools, no browser_tools, no listChanged', () => {
+test('mcp profile: default stays all 49 tools, no browser_tools, no listChanged', () => {
   const msgs = mcpSession([], {}, []);
   const list = names(byId(msgs, 2));
-  assert.strictEqual(list.length, 45);
+  assert.strictEqual(list.length, 49);
   assert(!list.includes('browser_tools'));
   assert.deepStrictEqual(byId(msgs, 1).result.capabilities, { tools: {} });
 });
