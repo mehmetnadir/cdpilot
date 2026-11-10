@@ -542,7 +542,8 @@ the "ignore previous instructions" family also covers Spanish, French, Turkish, 
 The patterns were tuned on two sets (`test/fixtures/injection-korpus.json`, `injection-heldout.json`), so their
 numbers there (20 of 20 and 24 of 24 caught, 0 false alarms) are in-sample. On a set never used for tuning
 (`injection-heldout-2.json`, 30 + 30 lines in 7 languages) they catch 8 of 30 with 1 of 30 false alarms (a recipe
-line); fake chat turns, homoglyphs, base64 and Chinese/Russian/Arabic lines still pass.
+line); on a third such set (`injection-heldout-3.json`, 40 + 40 lines in 12 languages) 7 of 40 with 2 of 40
+(before this pass: 2 of 40). Fake chat turns, homoglyphs, base64 and Chinese/Russian/Arabic lines still pass.
 Treat the mark as a hint, not a filter: a page without it can still carry an injection.
 
 ### Session Management
