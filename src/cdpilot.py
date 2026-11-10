@@ -15873,13 +15873,19 @@ _AGENT_INJECTION_RES = (
      _re.compile(r"\b(ignore|disregard|forget|override)\b[^.\n]{0,40}\b(previous|prior|above|earlier|all|your|the|any)\b"
                  r"[^.\n]{0,30}\b(instructions?|prompts?|rules|guidelines|directives|programming)\b", _re.I)),
     ('addresses_ai',
-     _re.compile(r"\b(?:if )?you(?:'re| are) (?:an? |the )?(?:ai|llm|language model|ai assistant|assistant|agent|chatbot|model)\b"
-                 r"|\b(?:ai|llm) (?:assistants?|agents?|models?)\b[^.\n]{0,20}\b(?:reading|visiting|processing|browsing)\b", _re.I)),
+     # "you are a helpful assistant" (one adjective), "Hey ChatGPT," / "Note to any automated reader:",
+     # "if this text is being read by a language model" — added after the 20 + 20 corpus (10.11, 13 → 19 caught, 0 alarms)
+     _re.compile(r"\b(?:if )?you(?:'re| are) (?:now )?(?:an? |the )?(?:\w+ )?(?:ai|llm|language model|ai assistant|assistant|agent|chatbot|model)\b"
+                 r"|\b(?:ai|llm) (?:assistants?|agents?|models?)\b[^.\n]{0,20}\b(?:reading|visiting|processing|browsing)\b"
+                 r"|\b(?:hey|dear|attention|note|notice),?:? (?:to |for )?(?:any |all |the )?(?:chatgpt|gpt|claude|gemini|copilot|ai|llm"
+                 r"|language models?|ai assistants?|assistants?|agents?|models?|automated readers?|bots?)\b"
+                 r"|\bif (?:this|the) (?:text|page|content|message|document) is (?:being )?(?:read|processed|parsed|seen|visited) by\b", _re.I)),
     ('system_prompt',
      _re.compile(r"\b(reveal|print|output|repeat|show|ignore|override|leak)\b[^.\n]{0,40}\b(system|developer) (prompt|message|instructions?)\b", _re.I)),
     ('new_instructions',
      _re.compile(r"\b(new|updated|important|urgent|real|actual) (instructions?|directives?|task) (for|to) (the )?(ai|assistant|agent|model|llm)s?\b"
-                 r"|\bnew instructions?:", _re.I)),
+                 r"|\bnew instructions?(?::| follow\b| below\b)"
+                 r"|\b(?:important|urgent)\b:? (?:for|to) (?:all |any |the )?(?:ai|llm|language model|assistant|agent|model|bot)s?\b", _re.I)),
     ('hide_from_user',
      _re.compile(r"\b(do not|don't|never) (tell|inform|mention|show|reveal|warn)\b[^.\n]{0,30}\b(user|human|operator)\b"
                  r"|\bwithout (telling|informing|alerting|asking) the (user|human)\b", _re.I)),
