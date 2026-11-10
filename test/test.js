@@ -4175,6 +4175,45 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
   }
 });
 
+test('metadata: dependency and superiority claims stay corrected (0.9.6 audit)', () => {
+  const root = path.join(__dirname, '..');
+  const filesToCheck = [
+    { file: 'README.md' },
+    { file: 'package.json' },
+    { file: 'manifest.json' },
+    { file: 'server.json' },
+    { file: path.join('bin', 'cdpilot.js') },
+    { file: path.join('src', 'cdpilot.py'), maxLines: 120 },
+  ];
+
+  const zeroDepPattern = /zero[- ]dependenc(y|ies)/i;
+  for (const { file, maxLines } of filesToCheck) {
+    const fullPath = path.join(root, file);
+    let content = fs.readFileSync(fullPath, 'utf8');
+    let lines = content.split('\n');
+    if (maxLines) lines = lines.slice(0, maxLines);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (zeroDepPattern.test(line)) {
+        assert(/npm/i.test(line),
+          `${file}:${i + 1} has zero-dependency claim without mentioning npm: "${line.trim()}"`);
+      }
+    }
+  }
+
+  const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+  assert(!readme.includes('The only browser MCP'), 'README.md should not claim "The only browser MCP"');
+  assert(!readme.includes('5-30x'), 'README.md should not claim "5-30x"');
+
+  const manifest = fs.readFileSync(path.join(root, 'manifest.json'), 'utf8');
+  for (const sentence of manifest.split(/[.\n]/)) {
+    if (/70\+\s+commands/i.test(sentence)) {
+      assert(!/MCP\s+tools/i.test(sentence),
+        `manifest.json mixes "70+ commands" and "MCP tools" in the same sentence: "${sentence.trim()}"`);
+    }
+  }
+});
+
 // ── iframe targeting (#1) ──
 // `click "iframe#card >>> input"` / `--frame <f>` for element commands, over
 // CDP (flat sessions for out-of-process frames), never contentDocument.
