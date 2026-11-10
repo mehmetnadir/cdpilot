@@ -12779,6 +12779,469 @@ print(json.dumps(out))
 
 
 // ═══ CANVAS-D TESTS BEGIN ═══ (lane D: "canvas events:" tests)
+(function() {
+  const { spawn, spawnSync } = require('child_process');
+  const PY_SRC = path.join(__dirname, '..', 'src', 'cdpilot.py');
+  const FAKE_HOST_PY = path.join(__dirname, 'canvas_events_fake.py');
+  const PY_TEXT = fs.readFileSync(PY_SRC, 'utf8');
+  const B_MERGED = !/canvas is not implemented yet/.test(PY_TEXT);
+
+  // Pick a local arm64 Python 3 interpreter (cached via cdpilot's own python.json when present).
+  function pickPython() {
+    if (process.env.CDPILOT_PYTHON && fs.existsSync(process.env.CDPILOT_PYTHON)) {
+      return process.env.CDPILOT_PYTHON;
+    }
+    for (const cand of ['/opt/homebrew/bin/python3.13', '/opt/homebrew/bin/python3', 'python3']) {
+      const r = spawnSync(cand, ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' });
+      if (r.status === 0 && r.stdout.trim()) return r.stdout.trim();
+    }
+    return 'python3';
+  }
+  const PYB = pickPython();
+
+  function sleepMs(ms) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  }
+
+  // Short /tmp directory keeps AF_UNIX socket paths well under macOS's 104-byte sun_path limit.
+  function makeSandbox() {
+    const dir = fs.mkdtempSync('/tmp/cdp-cvd-');
+    const home = path.join(dir, 'h');
+    const profile = path.join(dir, 'p');
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(profile, { recursive: true });
+    return {
+      dir,
+      home,
+      profile,
+      cleanup() {
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      },
+    };
+  }
+
+  function startFakeHost(sb, opts = {}) {
+    const name = opts.name || 'main';
+    const readyFile = path.join(sb.dir, `${name}.ready`);
+    const recordFile = path.join(sb.dir, `${name}.rec.jsonl`);
+    const scriptFile = path.join(sb.dir, `${name}.script.json`);
+    fs.writeFileSync(scriptFile, JSON.stringify(opts.script || []));
+    const args = [
+      '-I', FAKE_HOST_PY,
+      '--profile', sb.profile,
+      '--name', name,
+      '--ring-max', String(opts.ringMax || 1000),
+      '--ring-bytes', String(opts.ringBytes || 65536),
+      '--item-max', String(opts.itemMax || 1024),
+      '--script-file', scriptFile,
+      '--ready-file', readyFile,
+      '--record-file', recordFile,
+      '--max-seconds', '20',
+    ];
+    const child = spawn(PYB, args, { stdio: 'ignore' });
+    const deadline = Date.now() + 5000;
+    while (!fs.existsSync(readyFile) && Date.now() < deadline) {
+      sleepMs(15);
+    }
+    assert(fs.existsSync(readyFile), 'fake canvas host did not become ready');
+    return {
+      recordFile,
+      records() {
+        if (!fs.existsSync(recordFile)) return [];
+        return fs.readFileSync(recordFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      },
+      stop() {
+        try { child.kill('SIGTERM'); } catch {}
+        // Reap synchronously so no helper outlives the test.
+        spawnSync(PYB, ['-I', '-c', `
+import os, time
+pid = ${child.pid}
+for _ in range(40):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        break
+    time.sleep(0.02)
+`]);
+      },
+    };
+  }
+
+  // Runs `cdpilot canvas events ...` via CLI once Lane B merges, or via the exact
+  // `_canvas_resolve_name -> _canvas_events_args -> cmd_canvas_events` entrypoint before merge.
+  const EVENTS_SHIM = `
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cdpilot", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+try:
+    name, rest = mod._canvas_resolve_name(sys.argv[2:])
+    follow, after, max_n, wait_ms = mod._canvas_events_args(rest)
+    mod.cmd_canvas_events(name, follow, after, max_n, wait_ms)
+except mod.CanvasError as e:
+    print(f"cdpilot: {e}", file=sys.stderr)
+    sys.exit(e.code)
+`;
+
+  function runCanvasEvents(evArgs, sb, extraEnv = {}) {
+    const env = {
+      ...process.env,
+      CDPILOT_HOME: sb.home,
+      CDPILOT_PROFILE: sb.profile,
+      CDPILOT_PYTHON: PYB,
+      CDPILOT_LOG: '0',
+      CDPILOT_NO_AUTOLAUNCH: '1',
+      CDP_PORT: '19229',
+      ...extraEnv,
+    };
+    if (B_MERGED) {
+      return spawnSync(process.execPath, [CLI, 'canvas', 'events', ...evArgs], {
+        encoding: 'utf8', timeout: 15000, env,
+      });
+    }
+    return spawnSync(PYB, ['-I', '-c', EVENTS_SHIM, PY_SRC, ...evArgs], {
+      encoding: 'utf8', timeout: 15000, env,
+    });
+  }
+
+  test('canvas events: cursor after/max/next/dropped and >= 1 KB data cut against fake host', () => {
+    const sb = makeSandbox();
+    const bigPayload = 'D'.repeat(1500);
+    const script = [
+      { event: { t: 1001, src: 'page', type: 'click', action: 'a1', id: 'b1', data: { n: 1 } } },
+      { event: { t: 1002, src: 'page', type: 'click', action: 'a2', id: 'b2', data: { n: 2 } } },
+      { event: { t: 1003, src: 'page', type: 'input', action: 'a3', id: 'b3', data: { v: 'hi' } } },
+      { event: { t: 1004, src: 'host', type: 'blocked', action: null, id: null, data: { url: 'http://x' } } },
+      { event: { t: 1005, src: 'page', type: 'submit', action: 'save', id: 'f1', data: { ok: true } } },
+      { event: { t: 1006, src: 'page', type: 'input', action: 'big', id: 't1', data: bigPayload } },
+    ];
+    const host = startFakeHost(sb, { ringMax: 4, itemMax: 1024, script });
+    try {
+      // Ring max 4 with 6 pushed events -> seq 1..2 dropped (dropped=2), seq 3..6 kept.
+      const p1 = runCanvasEvents(['--after', '0', '--max', '2'], sb);
+      assert.strictEqual(p1.status, 0, p1.stderr);
+      const e1 = p1.stdout.trim().split('\n').map((l) => JSON.parse(l));
+      assert.deepStrictEqual(e1.map((x) => x.seq), [3, 4]);
+      assert.strictEqual(e1[1].src, 'host');
+      assert.strictEqual(e1[1].type, 'blocked');
+      assert.strictEqual(p1.stderr.trim(), 'next=4 dropped=2');
+
+      const p2 = runCanvasEvents(['--after=4', '--max=2'], sb);
+      assert.strictEqual(p2.status, 0, p2.stderr);
+      const e2 = p2.stdout.trim().split('\n').map((l) => JSON.parse(l));
+      assert.deepStrictEqual(e2.map((x) => x.seq), [5, 6]);
+      assert.strictEqual(p2.stderr.trim(), 'next=6 dropped=2');
+      // 1500-byte payload cut to 1024 bytes by the host arrives intact as given by the host.
+      assert.strictEqual(e2[1].data.length, 1024);
+      assert.strictEqual(e2[1].data, 'D'.repeat(1024));
+
+      const p3 = runCanvasEvents(['--after', '6', '--max', '10'], sb);
+      assert.strictEqual(p3.status, 0, p3.stderr);
+      assert.strictEqual(p3.stdout.trim(), '');
+      assert.strictEqual(p3.stderr.trim(), 'next=6 dropped=2');
+
+      // Missing canvas -> runtime error exit 1.
+      const miss = runCanvasEvents(['--name', 'nonexistent'], sb);
+      assert.strictEqual(miss.status, 1);
+    } finally {
+      host.stop();
+      sb.cleanup();
+    }
+  });
+
+  test('canvas events: arg validation exits 2 for out-of-range --max, --wait-ms, --after, and bad flags', () => {
+    const sb = makeSandbox();
+    try {
+      const badCases = [
+        ['--max', '0'],
+        ['--max', '101'],
+        ['--max=abc'],
+        ['--max'],
+        ['--wait-ms', '-1'],
+        ['--wait-ms', '25001'],
+        ['--wait-ms=1.5'],
+        ['--wait-ms'],
+        ['--after', '-1'],
+        ['--after=nope'],
+        ['--after'],
+        ['--unknown'],
+        ['extra-arg'],
+        ['--name', '../escape'],
+      ];
+      for (const bad of badCases) {
+        const r = runCanvasEvents(bad, sb);
+        assert.strictEqual(r.status, 2, `expected exit 2 for ${JSON.stringify(bad)}, got ${r.status}: ${r.stderr}`);
+      }
+
+      // Direct unit check on _canvas_events_args valid boundary values.
+      const ok = spawnSync(PYB, ['-I', '-c', `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("cdpilot", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+out = {
+    "defaults": list(mod._canvas_events_args([])),
+    "bounds_lo": list(mod._canvas_events_args(["--after", "0", "--max", "1", "--wait-ms", "0"])),
+    "bounds_hi": list(mod._canvas_events_args(["--follow", "--after=99", "--max=100", "--wait-ms=25000"])),
+}
+print(json.dumps(out))
+`, PY_SRC], { encoding: 'utf8', timeout: 15000 });
+      assert.strictEqual(ok.status, 0, ok.stderr);
+      const parsed = JSON.parse(ok.stdout.trim());
+      assert.deepStrictEqual(parsed.defaults, [false, 0, 100, 0]);
+      assert.deepStrictEqual(parsed.bounds_lo, [false, 0, 1, 0]);
+      assert.deepStrictEqual(parsed.bounds_hi, [true, 99, 100, 25000]);
+    } finally {
+      sb.cleanup();
+    }
+  });
+
+  test('canvas events: --follow streams new events with advancing cursor and exits 0 on SIGINT', () => {
+    const sb = makeSandbox();
+    const script = [
+      { event: { t: 2001, src: 'page', type: 'click', action: 'first', id: 'k1', data: {} } },
+      { after_polls: 1, delay_ms: 40, event: { t: 2002, src: 'page', type: 'click', action: 'second', id: 'k2', data: { step: 2 } } },
+      { after_polls: 2, delay_ms: 40, event: { t: 2003, src: 'page', type: 'submit', action: 'third', id: 'k3', data: { step: 3 } } },
+    ];
+    const host = startFakeHost(sb, { name: 'live', script });
+    try {
+      const driver = `
+import json, os, signal, subprocess, sys
+b_merged = sys.argv[1] == "1"
+cli_js, py_src, shim = sys.argv[2], sys.argv[3], sys.argv[4]
+cmd = (["node", cli_js, "canvas", "events", "--name", "live", "--follow", "--wait-ms", "500"]
+       if b_merged else [sys.executable, "-I", "-c", shim, py_src, "--name", "live", "--follow", "--wait-ms", "500"])
+proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+got = []
+try:
+    for _ in range(3):
+        line = proc.stdout.readline()
+        if not line:
+            break
+        got.append(json.loads(line.strip()))
+    proc.send_signal(signal.SIGINT)
+    rc = proc.wait(timeout=8.0)
+finally:
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait()
+err = proc.stderr.read() if proc.stderr else ""
+print(json.dumps({"rc": rc, "events": got, "stderr": err}))
+`;
+      const env = {
+        ...process.env,
+        CDPILOT_HOME: sb.home,
+        CDPILOT_PROFILE: sb.profile,
+        CDPILOT_PYTHON: PYB,
+        CDPILOT_LOG: '0',
+        CDPILOT_NO_AUTOLAUNCH: '1',
+      };
+      const r = spawnSync(PYB, ['-I', '-c', driver, B_MERGED ? '1' : '0', CLI, PY_SRC, EVENTS_SHIM], {
+        encoding: 'utf8', timeout: 20000, env,
+      });
+      assert.strictEqual(r.status, 0, r.stderr);
+      const out = JSON.parse(r.stdout.trim());
+      assert.strictEqual(out.rc, 0, `--follow must exit 0 on SIGINT, got ${out.rc}: ${out.stderr}`);
+      assert.deepStrictEqual(out.events.map((e) => e.seq), [1, 2, 3]);
+      assert.deepStrictEqual(out.events.map((e) => e.action), ['first', 'second', 'third']);
+    } finally {
+      host.stop();
+      sb.cleanup();
+    }
+  });
+
+  test('canvas events: MCP tools/list exposes the 3 canvas tools by default and hides them under --tools core', () => {
+    const sb = makeSandbox();
+    try {
+      const runMcp = (mcpArgs, calls, extraEnv = {}) => {
+        const lines = [
+          { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+          { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+          ...calls,
+        ].map((m) => JSON.stringify(m)).join('\n') + '\n';
+        const r = spawnSync(process.execPath, [CLI, 'mcp', ...mcpArgs], {
+          input: lines,
+          encoding: 'utf8',
+          timeout: 20000,
+          env: {
+            ...process.env,
+            CDPILOT_HOME: sb.home,
+            CDPILOT_PROFILE: sb.profile,
+            CDPILOT_PYTHON: PYB,
+            CDPILOT_LOG: '0',
+            CDPILOT_WEBMCP: '0',
+            CDPILOT_MCP_TOOLS: '',
+            ...extraEnv,
+          },
+        });
+        assert.strictEqual(r.status, 0, r.stderr);
+        return r.stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      };
+
+      const canvasNames = ['browser_canvas_set', 'browser_canvas_patch', 'browser_canvas_events'];
+      const defMsgs = runMcp([], []);
+      const defTools = defMsgs.find((m) => m.id === 2).result.tools;
+      const defNames = defTools.map((t) => t.name);
+      for (const n of canvasNames) {
+        assert(defNames.includes(n), `default tools/list must include ${n}`);
+      }
+      const evTool = defTools.find((t) => t.name === 'browser_canvas_events');
+      assert.strictEqual(evTool.inputSchema.properties.max.maximum, 100);
+      assert.strictEqual(evTool.inputSchema.properties.wait_ms.maximum, 25000);
+
+      const coreMsgs = runMcp(['--tools', 'core'], [
+        { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'browser_canvas_set', arguments: { html: '<p>x</p>' } } },
+        { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'browser_tools', arguments: { action: 'list' } } },
+        { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'browser_tools', arguments: { action: 'enable', names: canvasNames } } },
+        { jsonrpc: '2.0', id: 6, method: 'tools/list' },
+      ]);
+      const coreNames = coreMsgs.find((m) => m.id === 2).result.tools.map((t) => t.name);
+      for (const n of canvasNames) {
+        assert(!coreNames.includes(n), `--tools core must hide ${n}`);
+      }
+      const blockedCall = coreMsgs.find((m) => m.id === 3).result;
+      assert.strictEqual(blockedCall.isError, true);
+      assert(/browser_tools enable/.test(blockedCall.content[0].text));
+      const discText = coreMsgs.find((m) => m.id === 4).result.content[0].text;
+      for (const n of canvasNames) {
+        assert(discText.includes(`${n}: `), `browser_tools list must show ${n}`);
+      }
+      const enabledNames = coreMsgs.find((m) => m.id === 6).result.tools.map((t) => t.name);
+      for (const n of canvasNames) {
+        assert(enabledNames.includes(n), `enabled tools/list must include ${n}`);
+      }
+    } finally {
+      sb.cleanup();
+    }
+  });
+
+  test('canvas events: MCP 256 KB limit, set/patch/events round-trip, wait_ms cap, no argv, and redacted session log', () => {
+    const sb = makeSandbox();
+    const script = [
+      { event: { t: 3001, src: 'page', type: 'click', action: 'buy_now', id: 'btn-buy', data: { sku: 'X1' } } },
+    ];
+    const host = startFakeHost(sb, { script });
+    try {
+      const secretSetHtml = '<main id="c"><h1>SECRET_CANVAS_SET_MARKER_901</h1></main>';
+      const secretPatchHtml = '<main id="c"><h1>SECRET_CANVAS_PATCH_MARKER_902</h1><button data-action="buy_now">Buy</button></main>';
+      const overLimitHtml = '<p>SECRET_OVERLIMIT_MARKER_903</p>' + 'A'.repeat(256 * 1024);
+
+      const reqs = [
+        { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'browser_canvas_set', arguments: { html: overLimitHtml } } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'browser_canvas_set', arguments: { html: secretSetHtml } } },
+        { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'browser_canvas_patch', arguments: { html: secretPatchHtml } } },
+        { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'browser_canvas_events', arguments: { after: 0, max: 10, wait_ms: 25000 } } },
+        { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'browser_log', arguments: { format: 'json' } } },
+      ];
+      const r = spawnSync(process.execPath, [CLI, 'mcp'], {
+        input: reqs.map((x) => JSON.stringify(x)).join('\n') + '\n',
+        encoding: 'utf8',
+        timeout: 25000,
+        env: {
+          ...process.env,
+          CDPILOT_HOME: sb.home,
+          CDPILOT_PROFILE: sb.profile,
+          CDPILOT_PYTHON: PYB,
+          CDPILOT_PROJECT_ID: 'cvd-log-test',
+          CDPILOT_LOG: '1',
+          CDPILOT_WEBMCP: '0',
+          CDPILOT_MCP_TOOLS: '',
+          CDPILOT_NO_AUTOLAUNCH: '1',
+        },
+      });
+      assert.strictEqual(r.status, 0, r.stderr);
+      const msgs = r.stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      const byId = (id) => msgs.find((m) => m.id === id).result;
+
+      // 1) > 256 KB rejected with isError: true before touching the host.
+      assert.strictEqual(byId(1).isError, true);
+      assert(/262144|256 KB/i.test(byId(1).content[0].text), byId(1).content[0].text);
+
+      // 2) set compact line: "ok <ms> ms"
+      assert.strictEqual(byId(2).isError, false, JSON.stringify(byId(2)));
+      assert.strictEqual(byId(2).content[0].text, 'ok 4 ms');
+
+      // 3) patch compact line: "ok +add -del ~upd ↕move <ms> ms" with final=true on the wire.
+      assert.strictEqual(byId(3).isError, false, JSON.stringify(byId(3)));
+      assert.strictEqual(byId(3).content[0].text, 'ok +2 -1 ~3 \u21950 5 ms');
+
+      // 4) events returns JSON {events, next, dropped}.
+      assert.strictEqual(byId(4).isError, false, JSON.stringify(byId(4)));
+      const evRes = JSON.parse(byId(4).content[0].text);
+      assert.strictEqual(evRes.next, 1);
+      assert.strictEqual(evRes.dropped, 0);
+      assert.strictEqual(evRes.events.length, 1);
+      assert.strictEqual(evRes.events[0].action, 'buy_now');
+
+      const hostRecs = host.records();
+      assert.deepStrictEqual(hostRecs.map((x) => x.op), ['set', 'patch', 'events']);
+      assert.strictEqual(hostRecs[0].html_len, secretSetHtml.length);
+      assert.strictEqual(hostRecs[1].final, true);
+      assert.strictEqual(hostRecs[1].html_len, secretPatchHtml.length);
+
+      // 5) Session log: «html:N chars» recorded, zero raw HTML anywhere on disk or via browser_log.
+      assert.strictEqual(byId(5).isError, false, JSON.stringify(byId(5)));
+      const projectsDir = path.join(sb.home, 'projects');
+      const projIds = fs.readdirSync(projectsDir);
+      assert.strictEqual(projIds.length, 1);
+      const logDir = path.join(projectsDir, projIds[0], 'log');
+      const rawLog = fs.readdirSync(logDir)
+        .filter((f) => f.endsWith('.jsonl'))
+        .map((f) => fs.readFileSync(path.join(logDir, f), 'utf8'))
+        .join('');
+      for (const secret of [
+        'SECRET_CANVAS_SET_MARKER_901',
+        'SECRET_CANVAS_PATCH_MARKER_902',
+        'SECRET_OVERLIMIT_MARKER_903',
+        '<main',
+        '<button',
+      ]) {
+        assert(!rawLog.includes(secret), `session log leaked HTML fragment: ${secret}`);
+        assert(!byId(5).content[0].text.includes(secret), `browser_log leaked HTML fragment: ${secret}`);
+      }
+      const entries = rawLog.trim().split('\n').map((l) => JSON.parse(l));
+      assert.strictEqual(entries.length, 4);
+      assert.deepStrictEqual(entries[0].args, ['set', `«html:${overLimitHtml.length} chars»`]);
+      assert.strictEqual(entries[0].exit, 2);
+      assert.strictEqual(entries[0].via, 'mcp:browser_canvas_set');
+      assert.deepStrictEqual(entries[1].args, ['set', `«html:${secretSetHtml.length} chars»`]);
+      assert.strictEqual(entries[1].exit, 0);
+      assert.deepStrictEqual(entries[2].args, ['patch', `«html:${secretPatchHtml.length} chars»`]);
+      assert.strictEqual(entries[2].via, 'mcp:browser_canvas_patch');
+      assert.strictEqual(entries[3].via, 'mcp:browser_canvas_events');
+
+      // 6) Jury C2 & wait_ms cap: in-process call spawns zero subprocesses and caps wait_ms < TOOL_TIMEOUT_S.
+      const inProc = spawnSync(PYB, ['-I', '-c', `
+import importlib.util, json, subprocess, sys
+spec = importlib.util.spec_from_file_location("cdpilot", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+def forbid(*a, **k):
+    raise AssertionError("subprocess must never be called by _canvas_mcp_call")
+subprocess.run = forbid
+subprocess.Popen = forbid
+srv = mod.MCPServer("all")
+srv.TOOL_TIMEOUT_S = 4
+r1 = mod._canvas_mcp_call(srv, 10, "browser_canvas_patch", {"html": "<p>inproc</p>"})
+r2 = mod._canvas_mcp_call(srv, 11, "browser_canvas_events", {"after": 1, "max": 5, "wait_ms": 25000})
+print(json.dumps({"r1": r1["result"], "r2": r2["result"]}))
+`, PY_SRC], {
+        encoding: 'utf8',
+        timeout: 15000,
+        env: { ...process.env, CDPILOT_HOME: sb.home, CDPILOT_PROFILE: sb.profile, CDPILOT_LOG: '0' },
+      });
+      assert.strictEqual(inProc.status, 0, inProc.stderr);
+      const ip = JSON.parse(inProc.stdout.trim());
+      assert.strictEqual(ip.r1.isError, false);
+      assert.strictEqual(ip.r2.isError, false);
+      const lastEvRec = host.records().slice(-1)[0];
+      assert(lastEvRec.wait_ms < 4000, `wait_ms must be capped below TOOL_TIMEOUT_S (4000ms), got ${lastEvRec.wait_ms}`);
+    } finally {
+      host.stop();
+      sb.cleanup();
+    }
+  });
+})();
 // ═══ CANVAS-D TESTS END ═══
 
 
