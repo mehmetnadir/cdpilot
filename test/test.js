@@ -7063,6 +7063,185 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert(help.includes('log --md') && help.includes('CDPILOT_LOG'), 'bin help must document log');
     assert(PY_DOC.includes('CDPILOT_LOG=0'), 'python __doc__ must document CDPILOT_LOG');
   });
+
+  test('log warm: warm CLI and warm MCP calls set warm:true, fresh calls omit warm, and cdpilot log marks (warm)', () => {
+    const unreleased = fs.readFileSync(path.join(__dirname, '..', 'CHANGELOG.md'), 'utf8')
+      .split(/^## \[/m).find((s) => s.startsWith('Unreleased]')) || '';
+    assert(unreleased.includes('Session log marks warm calls (`warm: true`)'),
+      'CHANGELOG [Unreleased] must record warm session-log marker');
+    if (process.platform === 'win32') return;
+    const home = newHome();
+    try {
+      const freshCli = cli(home, ['version'], { CDPILOT_DAEMON: '0' });
+      assert.strictEqual(freshCli.status, 0, freshCli.stderr);
+      const started = cli(home, ['daemon', 'start'], { CDPILOT_DAEMON: '1' });
+      assert.strictEqual(started.status, 0, started.stderr);
+      const warmCli = cli(home, ['stealth'], { CDPILOT_DAEMON: '1' });
+      assert.strictEqual(warmCli.status, 0, warmCli.stderr);
+
+      const mcpFresh = spawnSync(PY_BIN, [PY_PATH, 'mcp'], {
+        input: JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'tools/call',
+          params: { name: 'browser_mode', arguments: {} },
+        }) + '\n',
+        encoding: 'utf-8', timeout: 60000, env: baseEnv(home, { CDPILOT_DAEMON: '0' }),
+      });
+      assert.strictEqual(mcpFresh.status, 0, mcpFresh.stderr);
+
+      const mcpWarmReqs = [
+        { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'browser_fill', arguments: { selector: '#pw', value: SECRET } } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'browser_disconnect', arguments: {} } },
+      ];
+      const mcpWarm = spawnSync(PY_BIN, [PY_PATH, 'mcp'], {
+        input: mcpWarmReqs.map((x) => JSON.stringify(x)).join('\n') + '\n',
+        encoding: 'utf-8', timeout: 60000, env: baseEnv(home, { CDPILOT_DAEMON: '1' }),
+      });
+      assert.strictEqual(mcpWarm.status, 0, mcpWarm.stderr);
+
+      const entries = logFileLines(home).map((l) => JSON.parse(l));
+      const byCmd = (c) => entries.find((e) => e.cmd === c);
+      assert.strictEqual('warm' in byCmd('version'), false, 'fresh CLI must carry no warm key');
+      assert.strictEqual(byCmd('stealth').warm, true, 'warm CLI must have warm:true');
+      assert.strictEqual(byCmd('mode').via, 'mcp:browser_mode');
+      assert.strictEqual('warm' in byCmd('mode'), false, 'fresh MCP must carry no warm key');
+      assert.strictEqual(byCmd('fill').via, 'mcp:browser_fill');
+      assert.strictEqual(byCmd('fill').warm, true, 'warm MCP must have warm:true');
+      assert.strictEqual(byCmd('disconnect').via, 'mcp:browser_disconnect');
+      assert.strictEqual('warm' in byCmd('disconnect'), false,
+        'spawn-only MCP tool under CDPILOT_DAEMON=1 must carry no warm key');
+
+      const asJson = lines(cli(home, ['log', '--json']).stdout).map((l) => JSON.parse(l));
+      assert.strictEqual(asJson.find((e) => e.cmd === 'stealth').warm, true);
+      assert.strictEqual('warm' in asJson.find((e) => e.cmd === 'version'), false);
+
+      const tbl = cli(home, ['log']).stdout;
+      const tblLines = lines(tbl);
+      assert(tblLines.some((l) => l.includes('stealth (warm)')), `table warm marker: ${tbl}`);
+      assert(tblLines.some((l) => l.includes('version') && !l.includes('(warm)')), `table fresh unchanged: ${tbl}`);
+
+      const md = cli(home, ['log', '--md']).stdout;
+      assert(md.includes('`stealth` (warm)'), `md warm CLI: ${md}`);
+      assert(md.includes(' (mcp) (warm)'), `md warm MCP: ${md}`);
+      assert(md.includes('`version` |'), `md fresh CLI unchanged: ${md}`);
+      assert(md.includes('`mode` (mcp) |'), `md fresh MCP unchanged: ${md}`);
+    } finally {
+      cli(home, ['daemon', 'stop'], { CDPILOT_DAEMON: '1' });
+    }
+  });
+
+  test('log warm: gunluk-hata-sinifi.py counts paths/sessions, isolates warm-only classes and never prints planted URLs or args', () => {
+    const py313 = spawnSync('python3.13', ['-I', '-V'], { encoding: 'utf-8', timeout: 10000 });
+    if (py313.status !== 0) return;
+    const scriptPath = path.join(__dirname, '..', '.claude', 'docs', 'olcum', 'gunluk-hata-sinifi.py');
+    const home = newHome();
+    const PLANTED_URL_A = 'https://planted-secret-alpha.example/login?tok=zz99';
+    const PLANTED_URL_B = 'https://planted-secret-beta.example/orders/4421';
+    const PLANTED_ARG = 'PLANTED_SECRET_ARG_TOKEN_88';
+    const PLANTED_SEL = '#planted-private-selector';
+    const PLANTED_TITLE = 'Planted Private Title';
+    const PLANTED_SUMMARY = 'Planted Private Summary';
+    const PROJ_A = 'planted-proj-alpha';
+    const PROJ_B = 'planted-proj-beta';
+
+    const writeLog = (proj, day, rows) => {
+      const dir = path.join(home, 'projects', proj, 'log');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${day}.jsonl`),
+        rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    };
+
+    writeLog(PROJ_A, '2026-11-05', [
+      { ts: '2026-11-05T09:00:00.000+03:00', cmd: 'go', args: [PLANTED_URL_A, PLANTED_ARG],
+        exit: 1, duration_ms: 20, url: PLANTED_URL_A, title: PLANTED_TITLE, summary: PLANTED_SUMMARY,
+        error: 'Old pre-window error 77', files: [] },
+    ]);
+    writeLog(PROJ_A, '2026-11-10', [
+      { ts: '2026-11-10T10:00:00.000+03:00', cmd: 'go', args: [PLANTED_URL_A, PLANTED_ARG],
+        exit: 0, duration_ms: 15, url: PLANTED_URL_A, title: PLANTED_TITLE, summary: PLANTED_SUMMARY,
+        error: null, files: ['/Users/alice/secret-shot.png'] },
+      { ts: '2026-11-10T10:01:00.000+03:00', cmd: 'go', args: [PLANTED_URL_A],
+        exit: 1, duration_ms: 30, url: PLANTED_URL_A, title: PLANTED_TITLE, summary: '',
+        error: `Nav failed ${PLANTED_URL_A} (/Users/alice/secret/a.html) tab E3B0C44298FC1C149AFBF4C8996FB924 after 5000ms`,
+        files: [] },
+    ]);
+    writeLog(PROJ_A, '2026-11-11', [
+      { ts: '2026-11-11T11:00:00.000+03:00', cmd: 'go', args: [PLANTED_URL_B],
+        exit: 1, duration_ms: 9, url: PLANTED_URL_B, title: PLANTED_TITLE, summary: '',
+        error: `Nav failed ${PLANTED_URL_B} (/tmp/other/b.html) tab 0123456789ABCDEF0123456789ABCDEF after 250ms`,
+        files: [], warm: true },
+      { ts: '2026-11-11T11:02:00.000+03:00', cmd: 'content', args: [PLANTED_ARG],
+        exit: 0, duration_ms: 4, url: PLANTED_URL_B, title: PLANTED_TITLE, summary: PLANTED_SUMMARY,
+        error: null, files: [], warm: true },
+    ]);
+    writeLog(PROJ_B, '2026-11-10', [
+      { ts: '2026-11-10T14:00:00.000+03:00', cmd: 'click', args: [PLANTED_SEL],
+        exit: 1, duration_ms: 50, url: PLANTED_URL_A, title: PLANTED_TITLE, summary: '',
+        error: `Error: selector '${PLANTED_SEL}' not resolved.`, files: [], via: 'mcp:browser_click' },
+    ]);
+    writeLog(PROJ_B, '2026-11-11', [
+      { ts: '2026-11-11T12:34:56.789+03:00', cmd: 'eval', args: [PLANTED_SEL, PLANTED_ARG],
+        exit: 1, duration_ms: 3, url: PLANTED_URL_B, title: PLANTED_TITLE, summary: '',
+        error: `BrokenPipeError: [Errno 32] socket /tmp/cdpilot/abcdef0123456789.sock '${PLANTED_SEL}' ${PLANTED_ARG}`,
+        files: [], warm: true },
+      { ts: '2026-11-11T13:00:00.000+03:00', cmd: 'tabs', args: [PLANTED_ARG],
+        exit: 0, duration_ms: 2, url: PLANTED_URL_B, title: PLANTED_TITLE, summary: PLANTED_SUMMARY,
+        error: null, files: [], via: 'mcp:browser_tabs', warm: true },
+      { ts: '2026-11-11T13:05:00.000+03:00', cmd: 'eval', args: [PLANTED_SEL, PLANTED_ARG],
+        exit: 1, duration_ms: 5, url: PLANTED_URL_A, title: PLANTED_TITLE, summary: '',
+        error: `BrokenPipeError: [Errno 9] socket /var/tmp/fedcba9876543210.sock '${PLANTED_SEL}' ${PLANTED_ARG}`,
+        files: [], via: 'mcp:browser_eval', warm: true },
+    ]);
+
+    const runScript = (extraArgs = []) => spawnSync('python3.13', ['-I', scriptPath, ...extraArgs], {
+      encoding: 'utf-8', timeout: 20000, env: { ...process.env, CDPILOT_HOME: home },
+    });
+
+    const txt = runScript();
+    assert.strictEqual(txt.status, 0, txt.stderr);
+    const jAll = runScript(['--json']);
+    assert.strictEqual(jAll.status, 0, jAll.stderr);
+    const jSince = runScript(['--since', '2026-11-10', '--json']);
+    assert.strictEqual(jSince.status, 0, jSince.stderr);
+
+    const all = JSON.parse(jAll.stdout);
+    assert.strictEqual(all.paths['cli-fresh'].calls, 3);
+    assert.strictEqual(all.paths['cli-fresh'].sessions, 2);
+    assert.strictEqual(all.paths['cli-fresh'].errors, 2);
+    assert.strictEqual(all.paths['cli-warm'].calls, 3);
+    assert.strictEqual(all.paths['cli-warm'].sessions, 2);
+    assert.strictEqual(all.paths['cli-warm'].errors, 2);
+    assert.strictEqual(all.paths['mcp-fresh'].calls, 1);
+    assert.strictEqual(all.paths['mcp-fresh'].sessions, 1);
+    assert.strictEqual(all.paths['mcp-fresh'].errors, 1);
+    assert.strictEqual(all.paths['mcp-warm'].calls, 2);
+    assert.strictEqual(all.paths['mcp-warm'].sessions, 1);
+    assert.strictEqual(all.paths['mcp-warm'].errors, 1);
+    assert.strictEqual(all.totals.warm_sessions, 2);
+    assert.strictEqual(all.gate3_warm_only_count, 1,
+      `shared Nav failed class must merge across fresh/warm; got: ${JSON.stringify(all.warm_only_classes)}`);
+    assert.strictEqual(all.warm_only_classes[0].count, 2);
+    assert.deepStrictEqual(all.warm_only_classes[0].paths, { 'cli-warm': 1, 'mcp-warm': 1 });
+    assert.strictEqual(all.warm_only_classes[0].example_ts, '2026-11-11T12:34:56.789+03:00');
+    assert.strictEqual(all.warm_only_classes[0].error,
+      "BrokenPipeError: [Errno <n>] socket <path> '<arg>' <arg>");
+    assert(txt.stdout.includes('warm-only error classes (gate 3): 1'), txt.stdout);
+    assert(txt.stdout.includes('2026-11-11T12:34:56.789+03:00'), txt.stdout);
+
+    const since = JSON.parse(jSince.stdout);
+    assert.strictEqual(since.since, '2026-11-10');
+    assert.strictEqual(since.paths['cli-fresh'].calls, 2);
+    assert.strictEqual(since.paths['cli-fresh'].sessions, 1);
+    assert.strictEqual(since.paths['cli-fresh'].errors, 1);
+
+    const combined = txt.stdout + txt.stderr + jAll.stdout + jAll.stderr + jSince.stdout + jSince.stderr;
+    for (const secret of [
+      'planted-secret-alpha', 'planted-secret-beta', PLANTED_ARG, 'planted-private-selector',
+      PLANTED_TITLE, PLANTED_SUMMARY, PROJ_A, PROJ_B, '/Users/alice', 'secret-shot.png',
+      'E3B0C44298FC1C149AFBF4C8996FB924', 'abcdef0123456789',
+    ]) {
+      assert(!combined.includes(secret), `privacy leak (${secret}) in output:\n${combined}`);
+    }
+  });
 })();
 
 // ── Connect / Disconnect (human-in-the-loop) ──

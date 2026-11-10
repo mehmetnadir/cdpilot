@@ -21532,7 +21532,7 @@ def _slog_files(texts, since):
 
 
 def _slog_build_entry(cmd, args, code, duration_ms, started, url=None, title=None,
-                      stdout="", stderr="", error=None, files=(), via=None):
+                      stdout="", stderr="", error=None, files=(), via=None, warm=False):
     """The JSON object written for one command. All free text goes through redaction."""
     red_args, secrets = _slog_redact_args(cmd, args)
     if error is None and code not in (0, None):
@@ -21555,6 +21555,8 @@ def _slog_build_entry(cmd, args, code, duration_ms, started, url=None, title=Non
     }
     if via:
         entry["via"] = via
+    if warm:
+        entry["warm"] = True
     return entry
 
 
@@ -21720,8 +21722,9 @@ def _slog_begin(argv):
                      slog_wants=slog_wants, rec_wants=rec_wants,
                      started=datetime.datetime.now().astimezone(), t0=time.monotonic(),
                      t0_wall=time.time(), lock=threading.Lock(), url=None, title=None,
-                     via=os.environ.get(SLOG_VIA_ENV) or None, exit_exc=None,
-                     forced_code=None, error=None, stdout=None, stderr=None)
+                     via=os.environ.get(SLOG_VIA_ENV) or None,
+                     warm=_DAEMON.get("loop") is not None or "gone" in _DAEMON,
+                     exit_exc=None, forced_code=None, error=None, stdout=None, stderr=None)
         if sys.stdout is not None:
             _SLOG["stdout"] = sys.stdout = _SlogTee(sys.stdout, 8192)
         if sys.stderr is not None:
@@ -21762,7 +21765,7 @@ def _slog_finish(forced_code=None, forced_error=None):
                 st["cmd"], st["args"], code, int((time.monotonic() - st["t0"]) * 1000),
                 st["started"], url=st.get("url"), title=st.get("title"), stdout=out, stderr=err,
                 error=forced_error or st.get("error"), files=_slog_files((out, err), st["t0_wall"]),
-                via=st.get("via")))
+                via=st.get("via"), warm=bool(st.get("warm"))))
         if st.get("rec_wants"):
             _record_hook_step(st["cmd"], st["args"], code)
     except Exception as e:
@@ -21843,8 +21846,9 @@ def _slog_format_table(entries, project, days):
         if _slog_failed(e) and e.get("error"):
             result = "! " + str(e["error"])
         code = "" if e.get("exit") is None else str(e.get("exit"))
+        cmd_text = _slog_command_text(e) + (" (warm)" if e.get("warm") else "")
         lines.append(f"{_slog_entry_time(e, days > 1):<{tw}}  {code:>4}  "
-                     f"{_slog_cell(_slog_command_text(e), 32, middle=True)}  "
+                     f"{_slog_cell(cmd_text, 32, middle=True)}  "
                      f"{_slog_cell(e.get('url'), 40, middle=True)}  "
                      f"{_slog_cell(result, 60).rstrip()}")
     return "\n".join(lines)
@@ -21887,9 +21891,10 @@ def _slog_format_md(entries, project, days, today):
         out += ["| # | Time | Command | Exit | ms | Result |", "|---|---|---|---|---|---|"]
         for n, e in enumerate(entries, 1):
             via = " (mcp)" if str(e.get("via") or "").startswith("mcp") else ""
+            warm = " (warm)" if e.get("warm") else ""
             result = e.get("error") if _slog_failed(e) and e.get("error") else e.get("summary")
             out.append(f"| {n} | {_slog_entry_time(e, with_date)} | "
-                       f"`{_slog_md(_slog_clip(_slog_command_text(e), 120), True)}`{via} | "
+                       f"`{_slog_md(_slog_clip(_slog_command_text(e), 120), True)}`{via}{warm} | "
                        f"{'' if e.get('exit') is None else e.get('exit')} | "
                        f"{e.get('duration_ms') if e.get('duration_ms') is not None else ''} | "
                        f"{_slog_md(_slog_clip(str(result or ''), 120), True)} |")
