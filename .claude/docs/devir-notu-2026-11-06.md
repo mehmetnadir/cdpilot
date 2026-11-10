@@ -226,3 +226,11 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
 - X: 10.11 startup-cost paylaşımı 14:23 → 17:30'a kaydırıldı (followup 0.9.6 sonrası güncellenir); 11.11 followup metni hazır (278 ağırlıklı).
 - Ölçüm notu: `agy-filo` jüri koşuları Ultra kotasından 7,5 M (tur 1) + 0,6 M (karar) girdi; tur 2 ve T1-3 ayrıca. Spec'e "ham dosyayı
   bağlama okuma" satırı girmeli (önceki ISRAF notuyla aynı ders).
+- **16:03 yayın:** GitHub release `v0.9.6` (hedef 29b452b; `gh release create` kısa SHA'yı reddeder, tam SHA gerekir) → publish.yml
+  42820973411 yeşil: npm `cdpilot@0.9.6` (`npm view` 0.9.6, 1,16 MB açık), MCP Registry publish, `cdpilot.mcpb` 345 KB ekte. Kapılar:
+  tutanak TT-20261110-152548-e202f1 GEÇERLİ 618/618 · CI 42814997483 yeşil (çift kip işi bilgi amaçlı kırmızı, IDLE=30 de yavaşlığı
+  değiştirmedi → K-0027) · jüri 2. tur YAYINLA ×2 · T1 4 tur, açık bulgu 0. Yayın sonrası: X 10.11 (17:30) ve 11.11 followup metinleri
+  "shipped in 0.9.6" oldu; cdpilot-site da617f1 (agy-filo `kod` + şef düzeltmesi) deploy edildi.
+- **Sonraki sürüm işleri (K-0027 + notlar):** çift kip CI yavaşlığının kaynağı · ≥500 çağrılık soak · bin --help AI AGENT bölümü agent
+  flow/run · daemon içi Chrome stderr → DEVNULL · README sıcak MCP yolunda senkron takılma notu · `replay` komutunun `CDPILOT_VAR_*`
+  okuması host'a bağlı değil (T1-4 notu; 0.9.5'ten beri, ayrı değerlendirme).
