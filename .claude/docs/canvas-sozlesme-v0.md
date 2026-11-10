@@ -72,7 +72,7 @@ Satır sınırı `CANVAS_HTML_MAX + 64 KB`.
 `t_cli` = `time.time_ns()` (son bayt okuma anı, C). Eval, ham CDP geçişi, CSP ya da `--allow-net` değiştirme
 YOK; `--allow-net` yalnız host açılışında verilir.
 
-İstemci (B yazar, herkes çağırır):
+İstemci (lider gün 0'da yazdı, ortak alanda; herkes çağırır, kimse değiştirmez):
 - `_canvas_request(name, msg, timeout=10.0) -> dict` — host yok / zaman aşımı → `CanvasError(code 1)`.
 - `_canvas_resolve_name(args) -> (name, kalan_args)` — `--name n` ya da `--name=n`.
 - `_canvas_read_html(src) -> str` — dosya yolu ya da `-` (stdin); sınır aşımı → `CanvasError(code 2)`.

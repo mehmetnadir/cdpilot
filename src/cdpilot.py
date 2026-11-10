@@ -23400,7 +23400,7 @@ def _daemon_serve_entry(args):
 # ═══════════════════════════════════════════════════════════════════════════
 
 CANVAS_HOST_FLAG = '--_canvas-host'          # hidden: `cdpilot.py --_canvas-host <name> [--allow-net h]...`
-CANVAS_NAME_RE = re.compile(r'^[a-z0-9_-]{1,32}$')
+CANVAS_NAME_RE = _re.compile(r'^[a-z0-9_-]{1,32}$')
 CANVAS_DEFAULT_NAME = 'main'
 CANVAS_URL_FMT = 'http://cdpilot-canvas.invalid/{name}/'
 CANVAS_BINDING = '__cdpilotCanvasEmit'
@@ -23449,6 +23449,78 @@ def _canvas_paths(name):
             (('sock', 'sock'), ('reg', 'json'), ('ready', 'ready'))}
 
 
+
+def _canvas_resolve_name(args):
+    """(name, remaining args): `--name n` or `--name=n` anywhere, default CANVAS_DEFAULT_NAME.
+    A bad name raises CanvasError(code 2)."""
+    name, rest, i = CANVAS_DEFAULT_NAME, [], 0
+    args = list(args)
+    while i < len(args):
+        a = args[i]
+        if a == '--name':
+            if i + 1 >= len(args):
+                raise CanvasError("--name needs a value", 2)
+            name, i = args[i + 1], i + 2
+            continue
+        if a.startswith('--name='):
+            name = a.split('=', 1)[1]
+        else:
+            rest.append(a)
+        i += 1
+    return _canvas_check_name(name), rest
+
+
+def _canvas_read_html(src, limit=None):
+    """HTML text from a file path or '-' (stdin); over the limit -> CanvasError(code 2)."""
+    limit = CANVAS_HTML_MAX if limit is None else limit
+    try:
+        if src == '-':
+            data = sys.stdin.buffer.read(limit + 1)
+        else:
+            with open(src, 'rb') as f:
+                data = f.read(limit + 1)
+    except OSError as e:
+        raise CanvasError(f"cannot read {src}: {e.strerror or e}", 2)
+    if len(data) > limit:
+        raise CanvasError(f"HTML is over {limit} bytes", 2)
+    return data.decode('utf-8', errors='replace')
+
+
+def _canvas_request(name, msg, timeout=10.0):
+    """One JSON line to the canvas host of `name`, one JSON line back (contract §4).
+    No host, a refused connection or a timeout -> CanvasError(code 1); a reply
+    that is not a JSON object -> CanvasError(code 1)."""
+    if not isinstance(msg, dict) or msg.get('op') not in CANVAS_OPS:
+        raise CanvasError(f"unknown canvas op: {msg.get('op') if isinstance(msg, dict) else msg!r}", 2)
+    if not hasattr(socket, 'AF_UNIX'):
+        raise CanvasError("canvas is not supported on Windows", 1)
+    sock_path = _canvas_paths(name)['sock']
+    line = (json.dumps(msg, ensure_ascii=False) + '\n').encode('utf-8')
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(sock_path)
+            s.sendall(line)
+            buf = b''
+            while not buf.endswith(b'\n'):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > CANVAS_HTML_MAX + (64 << 10):
+                    raise CanvasError("canvas host reply is too large", 1)
+    except FileNotFoundError:
+        raise CanvasError(f"no canvas named {name!r} is open (cdpilot canvas open --name {name})", 1)
+    except (ConnectionRefusedError, socket.timeout, OSError) as e:
+        raise CanvasError(f"canvas {name!r} host did not answer: {e}", 1)
+    try:
+        reply = json.loads(buf.decode('utf-8'))
+    except ValueError:
+        raise CanvasError(f"canvas {name!r} host sent a bad reply", 1)
+    if not isinstance(reply, dict):
+        raise CanvasError(f"canvas {name!r} host sent a bad reply", 1)
+    return reply
+
 # ═══ CANVAS-A BEGIN ═══ (lane A: morph + page runtime)
 # Contract: CANVAS_RUNTIME_JS defines window.__cdpilotCanvas = Object.freeze({
 #   v: CANVAS_RUNTIME_V,
@@ -23467,7 +23539,7 @@ CANVAS_RUNTIME_JS = ''        # lane A
 
 
 # ═══ CANVAS-B BEGIN ═══ (lane B: host process, socket client, open/set/patch/close/list, security)
-# Contract (other regions call only these):
+# Contract (the client helpers above the regions are the lead's; B writes the server side):
 #   _canvas_request(name, msg: dict, timeout: float = 10.0) -> dict
 #       one JSON line to the host socket, one JSON line back; msg['op'] in CANVAS_OPS.
 #       Replies: set -> {ok, ms, t_paint}; patch -> {ok, ops, ms, t_paint};
