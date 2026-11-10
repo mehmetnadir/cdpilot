@@ -8,6 +8,8 @@ All notable changes to cdpilot will be documented in this file.
 - fill, smart-fill (and the Amazon CAPTCHA fill): the value setter now comes from the element's own type (textarea, input, select) instead of always `HTMLInputElement`; filling a `<textarea>` no longer throws "Illegal invocation" (it printed `?`). React-style input/change events are unchanged.
 - fill and click now exit 1 (message on stderr) when the element is not found within the timeout or the page script fails. Before they printed the message on stdout and exited 0. This changes the exit code: scripts that relied on exit 0 for a missing element must check for it. The session log records exit 1 and MCP tool results are errors.
 - `agent act --ref @N` with `hover`, `submit`, `fill` or `type` on a stale ref (the node is not in the page any more) now exits 1 with the same "stale ref ... run 'agent observe' again" message as `click`; before it exited 0 and did nothing (`fill`/`type` typed into whatever had focus). The exit code changes from 0 to 1 in that case.
+### Added
+- Session log marks warm calls (`warm: true`).
 
 ## [0.9.7] - 2026-11-11
 
