@@ -7630,6 +7630,58 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     } finally { fake.stop(); }
   });
 
+  test('agent act on a stale ref (fake browser): exit 1 with a message that says the page changed and to observe again (soak 2026-11-11: shared tab)', () => {
+    // A ref whose node is not in the page (another process navigated the tab after observe)
+    // has no box model. The old text was only "Could not get coordinates".
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const snap = JSON.parse(cli(['agent', 'observe'], env).stdout);
+      const btn = snap.actions.find((a) => a.role === 'button');
+      const good = cli(['agent', 'act', '--ref', btn.ref, '--action', 'click'], env);
+      assert.strictEqual(good.status, 0, `a live ref still works: ${good.stderr}`);
+      // act resolves the ref through the a11y ref file observe wrote; point it at a node the fake does not have
+      const refsPath = path.join(home, 'profile', 'a11y-refs.json');
+      const refs = JSON.parse(fs.readFileSync(refsPath, 'utf-8'));
+      assert(btn.ref.slice(1) in refs, `a11y-refs.json holds ${btn.ref}: ${JSON.stringify(refs)}`);
+      refs[btn.ref.slice(1)] = 9999;  // the fake has no box for ids >= 9000
+      fs.writeFileSync(refsPath, JSON.stringify(refs));
+      const r = cli(['agent', 'act', '--ref', btn.ref, '--action', 'click'], env);
+      assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+      assert(/Could not get coordinates for @\d+/.test(r.stderr), r.stderr);
+      assert(/stale ref/.test(r.stderr) && /agent observe/.test(r.stderr), r.stderr);
+    } finally { fake.stop(); }
+  });
+
+  for (const act of ['hover', 'submit', 'fill', 'type']) {
+    test(`agent act --action ${act} on a stale ref (fake browser): exit 1 and the stale-ref wording, never a silent success`, () => {
+      // The ref's node is not in the page (no box, no resolveNode result).
+      // hover / submit / fill / type used to exit 0 and do nothing (or type into the focused field).
+      const fake = startFake();
+      try {
+        const home = mkHome();
+        writeRegistry(home, { proj: externalEntry(fake.port) });
+        const env = isoEnv(home, fake.port, 'proj');
+        assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+        const snap = JSON.parse(cli(['agent', 'observe'], env).stdout);
+        const btn = snap.actions.find((a) => a.role === 'button');
+        const live = cli(['agent', 'act', '--ref', btn.ref, '--action', act, '--text', 'x'], env);
+        assert.strictEqual(live.status, 0, `a live ref still works: ${live.stderr}`);
+        const statePath = path.join(home, 'projects', 'proj', 'agent-state.json');
+        const st = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
+        assert(st.actions_map && st.actions_map[btn.ref], `agent-state holds ${btn.ref}`);
+        st.actions_map[btn.ref].backend_node_id = 9999;  // the fake has no box / node for ids >= 9000
+        fs.writeFileSync(statePath, JSON.stringify(st));
+        const r = cli(['agent', 'act', '--ref', btn.ref, '--action', act, '--text', 'x'], env);
+        assert.strictEqual(r.status, 1, `${act}: ${r.stdout}${r.stderr}`);
+        assert(/@\d+/.test(r.stderr) && /stale ref/.test(r.stderr) && /agent observe/.test(r.stderr), r.stderr);
+      } finally { fake.stop(); }
+    });
+  }
+
   test('learned flows (fake browser): acts leave an anchored trail, flow save, known_flows, run with no model, placeholders, exit 4 on drift with the page', () => {
     // The thing a flow is for: the second time a site is driven, no model
     // reads the page. The fake serves the inbox tree (now with a password
