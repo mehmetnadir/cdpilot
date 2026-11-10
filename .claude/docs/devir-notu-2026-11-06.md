@@ -179,3 +179,11 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
   diye görünür (gerçek sebep ModuleNotFoundError, `_browser_ws_call` yutuyor).
 - Kalan: SPA settle ölçümü, enjeksiyon 20+20 ölçümü, gerçek site token ölçümü; 0.9.6 Nadir onayı; daemon varsayılan 22.11'den
   önce değil (MCP yolu da aynı karara bağlı).
+- Enjeksiyon ölçümü (10.11, ayrı commit): korpus 20 + 20 → 09.11 desenleri 13/20 yakalama, 0 yanlış alarm; `addresses_ai` ve
+  `new_instructions` genişletildi → 19/20, 0 alarm (kaçan: Almanca). Korpus `test/fixtures/injection-korpus.json`, birim testi
+  sabitler. PRD §7 tablosu.
+- Ölçüm şeritleri (10.11, agy-filo `run`, 2 iş, 2/2 başarılı; şef ham denetimi yaptı): SPA settle → `olcum/spa-settle-2026-11-10.md`
+  (metin `go` dönüşünde yerleşmiş 12/12, kaynaklar angular'da +400 ms; karar Nadir'de, plan-daemon §6). Gerçek site token →
+  `olcum/gercek-site-token-2026-11-10.md` (HN 18.331 → 90, Wikipedia 15.474 → 136, httpbin 2.292 → 119; sapma 0/9; PRD §6).
+  İsraf: gercek-site şeridi 9,3 M girdi token (ham JSON'ları bağlama okudu) — sonraki spec'e "ham dosyayı okuma, alan çek" satırı.
+- e049878 CI yeşil (10.11 11:57, 42786717450). Enjeksiyon korpusu + ölçüm belgeleri: tutanak TT-20261110-121959-027e63 GEÇERLİ.

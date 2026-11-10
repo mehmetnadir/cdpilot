@@ -222,7 +222,9 @@ WS açılışı + 4 enable + betik kaydı yerelde ≤ 15 ms. Kalan kaldıraç **
 bekleyen istek yoksa (`Network.requestWillBeSent` − `loadingFinished/Failed` = 0) pencere 30 ms'ye inebilir (−70 ms);
 SPA'da yük sonrası DOM değişimini kaçırma riski ölçülmeden karar verilmez (bekleyen iş: SPA settle ölçümü — 3 SPA
 sayfasında `innerText` uzunluğunun yük sonrası zaman eğrisi). Nadir kararı: pencere sabit kalsın mı, "bekleyen istek yok"
-kısayolu mu?
+kısayolu mu? **Ölçüm 10.11** (`.claude/docs/olcum/spa-settle-2026-11-10.md`, react/angular/vue/example × 3): `go` dönüşünden
+~150 ms sonrasından 2,2 sn'ye kadar `innerText` 12/12 koşuda değişmedi; kaynak sayısı angular'da +402 ms, vue ısınmada +204 ms
+arttı (geç yazı tipi/ölçüm betiği). 100 ms pencere metni kaçırmadı; 30 ms kısayolu da metin açısından kaçırmazdı. Karar Nadir'de.
 
 ## 7. MCP araç çağrısı sıcak süreçte (10.11, şef kararı; Kovan K-0021) — UYGULANDI
 

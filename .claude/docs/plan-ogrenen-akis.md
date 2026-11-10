@@ -82,6 +82,14 @@ Düzenek: 3 sayfalık yerel fixture (`a.html` 6,4 KB: 15 bağlantılı menü, fo
 | Duvar süresi | 1.655 ms (5 komut) | 638–706 ms (iç 527–577) | −%60; LLM bekleme süresi ayrıca sıfır |
 | Sapma denemesi (Next → "Continue to review") | — | çıkış 4, adım 3, `anchor not found`, aday listesi sayfadan | tahmin yok |
 
+Gerçek site (10.11, agy-filo şeridi, şef ham denetimi; `.claude/docs/olcum/gercek-site-token-2026-11-10.md`):
+
+| Site / akış | Model döngüde (act --url + observe + act'ler + diff) | `agent run` sonuç | Fark | run duvar ms (3 koşu) | Sapma |
+|---|---|---|---|---|---|
+| Hacker News, "new" tıkla (2 adım) | 18.331 | 90 | −%99,5 | 864–928 | 0/3 |
+| Wikipedia, ara + tıkla (3 adım) | 15.474 | 136 | −%99,1 | 1.136–1.282 | 0/3 |
+| httpbin form, doldur + gönder (3 adım) | 2.292 | 119 | −%94,8 | 639–667 | 0/3 |
+
 Not: `tokens_avoided` adım başına tam gözlemi sayar; diff kullanan bir ajan daha az okur (ölçülen 5.049). Yük 40
 altında mutlak süreler 2–3× şişkin; oran geçerlidir. Model gecikmesi (adım başına saniyeler) tabana dahil değildir;
 gerçek kazanç ondan büyüktür.
@@ -96,7 +104,21 @@ taranmaz (zaten metinde yok). Birim testi: 11 işaretli / 10 temiz cümle (yapay
 example.com ağacında bir enjeksiyon satırı, uçtan uca test.
 
 Sınır (bilinçli): görünmez-ama-AX'te metin (beyaz üstüne beyaz, ekran dışı) ayırt edilmez; desen İngilizce; `go`/`content`
-çıktısına girmedi. Ölçüm için sıradaki iş: 20 gerçek enjeksiyon örneği + 20 temiz sayfa ile yakalama/yanlış alarm oranı.
+çıktısına girmedi.
+
+Ölçüm (10.11, `test/fixtures/injection-korpus.json`: 20 enjeksiyon metni — "ignore previous", adıyla hitap, gizli not,
+sızdırma, Almanca 1 — + 20 zor temiz metin — yapay zekâ *hakkında*, "previous instructions in the 1.x guide", "Export your
+API keys", "Hey Siri" yok):
+
+| Sürüm | Yakalama | Yanlış alarm | Kaçan |
+|---|---|---|---|
+| 09.11 desenleri | 13/20 | 0/20 | "New instructions follow", "Hey ChatGPT, ignore the content", "you are a helpful assistant", "Note to any automated reader", "IMPORTANT FOR AI MODELS", "if this text is being read by a language model", Almanca |
+| 10.11 genişletme | 19/20 | 0/20 | Almanca (desen İngilizce) |
+
+Genişletme: `addresses_ai` bir sıfat kabul eder ("you are a helpful assistant"), model adıyla hitabı ("Hey ChatGPT,", "Note to any
+automated reader") ve "if this text is being read by …" koşulunu tanır; `new_instructions` "new instructions follow/below" ve
+"IMPORTANT FOR AI MODELS:" biçimlerini tanır. Birim testi korpusu sabitler: ≥ 19 yakalama, 0 yanlış alarm; İngilizce bir
+kaçak testi kırar.
 
 ## 8. MCP araçları (09.11, aynı gün)
 
