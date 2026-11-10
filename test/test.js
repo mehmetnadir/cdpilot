@@ -12540,15 +12540,24 @@ print(json.dumps(res))
     const env = varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'bank.example' });
     const head = [{ cmd: 'go', args: ['https://bank.example/login'], t_ms: 0 },
       { cmd: 'fill', args: ['#password', '{{password}}'], t_ms: 1 }];
+    const CC = '/*' + '*/';  // a CSS comment, empty
     for (const [cmd, args] of [
       ['wait-for', ['input#password[value^="a"]', '3000']], ['assert-count', ['input[ VALUE *= b]', '1']],
       ['click', ['form:has(input:placeholder-shown) a']], ['wait', ['//input[@value="x"]']], ['click', ['value=abc']],
       ['hover', ['input[v\\61 lue^=a]']], ['wait-for', ['#password:valid']], ['assert-visible', ['input:invalid']],
       ['scroll-to', ['input:user-invalid']], ['click', [':is(input:out-of-range) + a']], ['wait', ['input:in-range']],
       ['fill', ['#password:-webkit-placeholder-shown', 'x']], ['click', ['#go', '--ladder=input[value=a],#go']],
-      ['smart-click', ['[*|value]']]]) {
+      ['smart-click', ['[*|value]']],
+      // round-2: any XPath (the ladder evaluates one starting with / or .//), CSS comments
+      // before and after unescaping, and the checked/default/indeterminate/autofill states
+      ['click', ['//button[@id="go"]']], ['wait-for', ['xpath=//div', '3000']], ['click', ['(//a)[1]']],
+      ['hover', ['.//span']], ['click', ['../a']], ['assert-visible', [' //p']], ['wait', ['XPATH=//p']],
+      ['wait-for', [`input[${CC}value^="a"]`]], ['click', [`input[va${CC}lue^=a] + a`]],
+      ['assert-count', [`input[v\\61 ${CC}lue^=a]`, '1']], ['click', [`input[${'/'}*x*${'/'}value]`]],
+      ['click', ['input:checked + label']], ['wait-for', ['input:\\63hecked']], ['wait', ['option:default']],
+      ['assert-count', ['input:indeterminate', '1']], ['wait-for', ['input:-webkit-autofill']], ['hover', ['input:autofill']]]) {
       const e = refusedAt(runCli(['replay', writeFlow(home, head.concat([{ cmd, args, t_ms: 2 }])), '--dry-run'], env), 3, cmd);
-      assert(/reacts to a typed value/.test(e.refused[0].why), `${cmd} ${args}: ${e.refused[0].why}`);
+      assert(/names an XPath or a selector that reacts to a typed value/.test(e.refused[0].why), `${cmd} ${args}: ${e.refused[0].why}`);
     }
     // a --var value is checked after it fills the selector
     const e = refusedAt(runCli(['replay', writeFlow(home, head.concat([{ cmd: 'click', args: ['{{sel}}'], t_ms: 2 }])),
@@ -12557,7 +12566,8 @@ print(json.dumps(res))
     // ordinary selectors, typed text and labels pass
     const r = runCli(['replay', writeFlow(home, head.concat([
       { cmd: 'click', args: ['button.valid'], t_ms: 2 }, { cmd: 'wait-for', args: ['#values-table'], t_ms: 3 },
-      { cmd: 'fill', args: ['#note', 'my value=1 is :valid'], t_ms: 4 }, { cmd: 'wait-for-text', args: ['Welcome'], t_ms: 5 }])),
+      { cmd: 'fill', args: ['#note', 'my value=1 is :valid'], t_ms: 4 }, { cmd: 'wait-for-text', args: ['Welcome'], t_ms: 5 },
+      { cmd: 'click', args: ['#default-btn.checkout'], t_ms: 6 }, { cmd: 'fill', args: ['#path', '//not/a/selector'], t_ms: 7 }])),
     '--dry-run'], env);
     assert.strictEqual(r.status, 0, r.stderr);
     noSecret(r);
@@ -12589,33 +12599,94 @@ print(json.dumps(res))
     return { ...JSON.parse(fs.readFileSync(out, 'utf-8')), stdout: r.stdout || '', stderr: r.stderr || '' };
   }
 
-  test('replay: env var — after a value is typed the page is checked before every later step; off the hosts stops with 2', () => {
+  test('replay: env var — after a value is typed every later step runs only on that exact origin; another page stops with 2', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envafter-'));
     const env = { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'bank.example' };
     const steps = [{ cmd: 'go', args: ['https://bank.example/login'], t_ms: 0 },
       { cmd: 'fill', args: ['#password', '{{password}}'], t_ms: 1 },
       { cmd: 'click', args: ['a#partner-link'], t_ms: 2 }, { cmd: 'wait-for', args: ['#x'], t_ms: 3 },
       { cmd: 'click', args: ['#y'], t_ms: 4 }];
+    // page reads: after the go (where it landed), before step 2, before each later step;
     // the click followed a link: the page read before step 4 is evil.example
-    let h = replayHarness(home, steps,
-      ['https://bank.example/login', 'https://bank.example/login', 'https://evil.example/landing'], env);
+    let h = replayHarness(home, steps, ['https://bank.example/login', 'https://bank.example/login',
+      'https://bank.example/login', 'https://evil.example/landing'], env);
     assert.strictEqual(h.code, 2, h.stdout + h.stderr);
     assert.strictEqual(h.calls.length, 3, 'steps 1-3 ran, step 4 did not');
     assert(h.stdout.includes('[4/5] wait-for #x ... refused') && !h.stdout.includes('[5/5]'), h.stdout);
-    const e = errJson(h);
-    assert(e.step === 4 && /step 4 \(wait-for\) not run: the page left the hosts CDPILOT_VAR_HOSTS names after step 2/.test(e.error), h.stderr);
+    let e = errJson(h);
+    assert(e.step === 4 && /step 4 \(wait-for\) not run: the page left https:\/\/bank\.example after step 2/.test(e.error), h.stderr);
     assert(/evil\.example/.test(e.why), e.why);
     noSecret(h);
-    // all on the listed hosts: every step runs; no page read before step 1 (nothing typed yet)
-    h = replayHarness(home, steps,
-      ['https://bank.example/login', 'https://bank.example/home', 'https://www.bank.example/', 'https://bank.example/x'], env);
+    // round-2: a host entry covers subdomains, the pin does not: typed on login.bank.example,
+    // a later step on www.bank.example stops the replay
+    const sub = [{ cmd: 'go', args: ['https://login.bank.example/'], t_ms: 0 },
+      { cmd: 'fill', args: ['#password', '{{password}}'], t_ms: 1 },
+      { cmd: 'click', args: ['#next'], t_ms: 2 }, { cmd: 'click', args: ['#y'], t_ms: 3 }];
+    h = replayHarness(home, sub, ['https://login.bank.example/', 'https://login.bank.example/',
+      'https://www.bank.example/'], env);
+    assert.strictEqual(h.code, 2, h.stdout + h.stderr);
+    assert.strictEqual(h.calls.length, 2, 'go and fill ran, step 3 did not');
+    assert.strictEqual(h.calls[1].env.CDPILOT_REPLAY_ORIGIN, 'https://login.bank.example', 'the child types only there');
+    assert(h.stdout.includes('[3/4] click #next ... refused'), h.stdout);
+    e = errJson(h);
+    assert(/not run: the page left https:\/\/login\.bank\.example after step 2/.test(e.error), e.error);
+    assert(/https:\/\/www\.bank\.example, not https:\/\/login\.bank\.example where/.test(e.why), e.why);
+    noSecret(h);
+    // all on that origin: every step runs, and no step line shows a duration (a wait that
+    // ends early or times out would tell about the page)
+    h = replayHarness(home, steps, ['https://bank.example/login', 'https://bank.example/login',
+      'https://bank.example/home', 'https://bank.example/x', 'https://bank.example/y'], env);
     assert.strictEqual(h.code, 0, h.stdout + h.stderr);
     assert.strictEqual(h.calls.length, 5);
+    assert(h.stdout.includes('[5/5] click #y ... ok\n') && !/\d\.\ds/.test(h.stdout), h.stdout);
     // a --var value keeps today's behaviour: no page is read at all (an empty list would raise)
     h = replayHarness(home, steps, [], {}, ['--var', `password=${PLANTED}`]);
     assert.strictEqual(h.code, 0, h.stdout + h.stderr);
     assert.strictEqual(h.calls.length, 5);
+    assert(/\[5\/5\] click #y \.\.\. ok \d+\.\ds/.test(h.stdout), 'durations stay without an environment value');
     assert(h.calls.every((c) => Object.keys(c.env).every((k) => k === 'CDPILOT_REPLAY_ACTIVE')), JSON.stringify(h.calls));
+  });
+
+  test('replay: env var — a URL the browser could read as another host is refused (backslash, user info, %, control, whitespace); IDNA works; the page a go lands on is checked', () => {
+    const NO = 'has a backslash, a control character or whitespace';
+    const AT = 'has user info or an escape (@, %) before its path';
+    const cases = [
+      ['https://evil.example\\@bank.example/', 'bank.example', NO], ['https://evil.example\\.bank.example/', 'bank.example', NO],
+      ['https://bank.exam\tple/', 'bank.example', NO], ['https://bank.example\n/', 'bank.example', NO],
+      ['https://bank.example /x', 'bank.example', NO], ['https://bank.example/\u0000', 'bank.example', NO],
+      ['https://bank.example/\u007f', 'bank.example', NO], ['https://bank.example/ ', 'bank.example', NO],
+      ['https://user@bank.example/', 'bank.example', AT], ['https://bank.example%2F@evil.example/', 'bank.example', AT],
+      ['https://bank%2Eexample/', 'bank.example', AT],
+      ['https://xn--bcher-kva.example/', 'bücher.example', null], ['https://bücher.example/', 'xn--bcher-kva.example', null],
+      ['https://a.BÜCHER.example/', 'bücher.example', null], ['https://bank.example/login?next=%2Fhome', 'bank.example', null],
+    ];
+    const got = py('import sys, json; sys.path.insert(0, "src")\n'
+      + 'from cdpilot import _var_url_allowed as ua, _var_host_entries as he\n'
+      + 'print(json.dumps([ua(u, he(h)) for u, h in json.loads(sys.argv[1])]))', [JSON.stringify(cases.map((c) => c.slice(0, 2)))]);
+    cases.forEach(([u, h, want], i) => {
+      if (want === null) assert.strictEqual(got[i], null, `${JSON.stringify(u)} / ${h}: ${got[i]}`);
+      else assert(got[i] && got[i].includes(want), `${JSON.stringify(u)} / ${h}: ${got[i]}`);
+    });
+    // the same rule settles a flow's go/open before step 1
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envurl-'));
+    const env = varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'bank.example' });
+    for (const url of ['https://evil.example\\@bank.example/login', 'https://user:pw@bank.example/', 'https://bank.example\t.evil/']) {
+      const e = refusedAt(runCli(['replay', writeFlow(home, [{ cmd: 'go', args: [url], t_ms: 0 },
+        { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 1 }]), '--dry-run'], env), 1, 'go');
+      assert(/opens a page an environment value may not be typed on: the go URL has/.test(e.refused[0].why), e.refused[0].why);
+    }
+    // the page the browser committed after a go is read back: a redirect off the hosts ends the replay
+    const steps = [{ cmd: 'go', args: ['https://bank.example/login'], t_ms: 0 },
+      { cmd: 'fill', args: ['#password', '{{password}}'], t_ms: 1 }, { cmd: 'click', args: ['#next'], t_ms: 2 }];
+    const h = replayHarness(home, steps, ['https://evil.example/landing'],
+      { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'bank.example' });
+    assert.strictEqual(h.code, 2, h.stdout + h.stderr);
+    assert.strictEqual(h.calls.length, 1, 'only the go ran');
+    assert(h.stdout.includes('[1/3] go https://bank.example/login ... ok') && !h.stdout.includes('[2/3]'), h.stdout);
+    const e = errJson(h);
+    assert(/step 1 \(go\) landed on a page an environment value may not be typed on/.test(e.error), e.error);
+    assert(/evil\.example/.test(e.why), e.why);
+    noSecret(h);
   });
 
   test('replay: env var — the value reaches the child in its environment, never argv; a per-run sentinel, other steps get nothing', () => {
@@ -12749,7 +12820,67 @@ print(json.dumps(res))
     p = page('https://user.example/inbox');
     assert(/not https:\/\/other\.example/.test(p.fn.call(trap, 'S', { kind: 'fill', origin: 'https://other.example', hosts: null }).refused));
     assert.strictEqual(p.fn.call(p.el('INPUT', { type: 'text' }), 'S', { kind: 'fill', origin: 'https://user.example', hosts: null }).ok, true);
+    // round-2: an environment value never goes into a search or url field (rule.noUrlFields:
+    // replay, and agent run for an environment value); without the flag both are text fields
+    for (const type of ['search', 'url']) {
+      p = page('https://bank.example/');
+      assert(new RegExp(`input of type ${type}`).test(p.fn.call(p.el('INPUT', { type }), 'S', { ...fill, noUrlFields: true }).refused), type);
+      assert.deepStrictEqual(p.log, [], 'no focus, no value');
+      assert.strictEqual(p.fn.call(p.el('INPUT', { type }), 'S', fill).ok, true, type);
+    }
+    // no page rule at all fails closed; with both an origin and hosts the page must pass both
+    p = page('https://bank.example/');
+    assert.strictEqual(p.fn.call(trap, 'S', { kind: 'fill', origin: null, hosts: null }).refused, 'no page rule');
+    assert(/not a host/.test(p.fn.call(trap, 'S', { kind: 'fill', origin: 'https://bank.example', hosts: [['other.example', null]] }).refused));
+    p = page('https://www.bank.example/');
+    assert(/not https:\/\/login\.bank\.example/.test(p.fn.call(trap, 'S', { ...fill, origin: 'https://login.bank.example' }).refused));
     assert.deepStrictEqual(touched, []);
+    // the rule a strict replay child builds from its environment
+    const rule = py('import sys, os, json; sys.path.insert(0, "src")\n'
+      + 'os.environ.update(CDPILOT_REPLAY_STRICT_TARGET="1", CDPILOT_REPLAY_ALLOWED_HOSTS="bank.example,bücher.example:8443", '
+      + 'CDPILOT_REPLAY_ORIGIN="https://login.bank.example")\n'
+      + 'from cdpilot import _replay_strict_rule\nprint(json.dumps(_replay_strict_rule()))', []);
+    assert.deepStrictEqual(rule, { origin: 'https://login.bank.example', hosts: [['bank.example', null],
+      ['xn--bcher-kva.example', 8443]], ce: false, noUrlFields: true });
+  });
+
+  test('replay/smart-click: an input value is a label only on submit/button/reset inputs, never a text field value (vm, no browser)', () => {
+    // round-2: [tabindex] catches a text field too; scoring its .value let a flow click by
+    // (and so test) what was typed into it
+    const vm = require('vm');
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-smartclick-vm-'));
+    const out = path.join(home, 'finder.js');
+    const r = spawnSync(PYB, ['-c', [
+      'import sys, asyncio; sys.path.insert(0, "src")',
+      'import cdpilot',
+      'got = []',
+      'cdpilot.get_page_ws = lambda *a, **k: ("ws://fake", None)',
+      'cdpilot.cdp_get = lambda *a, **k: []',
+      'async def ev(ws, js, label, **kw):',
+      '    got.append(js)',
+      '    return \'{"found": false}\'',
+      'cdpilot._smart_eval = ev',
+      'try:',
+      '    asyncio.run(cdpilot.cmd_smart_click("Sign in"))',
+      'except SystemExit:',
+      '    pass',
+      'open(sys.argv[1], "w").write(cdpilot._smart_wrap(got[0], probe=True))',
+    ].join('\n'), out], { cwd: REPO, encoding: 'utf-8', timeout: 20000, env: varEnv(home, {}) });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const js = fs.readFileSync(out, 'utf-8');
+    const el = (tag, type, value) => ({ tagName: tag, type, value, textContent: '', disabled: false,
+      getAttribute: (k) => (k === 'tabindex' ? '0' : null), closest: () => null,
+      getBoundingClientRect: () => ({ x: 0, y: 0, width: 80, height: 20 }) });
+    const run = (els) => JSON.parse(vm.runInNewContext(js, {
+      window: { getComputedStyle: () => ({ display: 'block', visibility: 'visible' }) },
+      document: { querySelectorAll: (sel) => (sel === '*' ? [] : els) } }));
+    for (const [tag, type] of [['INPUT', 'text'], ['INPUT', 'password'], ['INPUT', 'search'], ['TEXTAREA', undefined]]) {
+      assert.strictEqual(run([el(tag, type, 'Sign in')]).found, false, `${tag} ${type}: its typed value is no label`);
+    }
+    for (const type of ['submit', 'button', 'reset', 'SUBMIT']) {
+      const hit = run([el('INPUT', type, 'Sign in')]);
+      assert(hit.found && hit.probe && hit.score === 100, `${type}: ${JSON.stringify(hit)}`);
+    }
   });
 
   test('record & replay e2e: go -> fill -> record stop -> replay (gated by CDPILOT_E2E=1)', () => {
