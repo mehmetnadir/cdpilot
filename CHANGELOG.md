@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- `agent act --ref @N` with `hover`, `submit`, `fill` or `type` on a stale ref (the node is not in the page any more) now exits 1 with the same "stale ref ... run 'agent observe' again" message as `click`; before it exited 0 and did nothing (`fill`/`type` typed into whatever had focus). The exit code changes from 0 to 1 in that case.
+
 ## [0.9.7] - 2026-11-11
 
 ### Security

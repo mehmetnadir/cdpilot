@@ -15877,6 +15877,17 @@ async def cmd_a11y_snapshot():
     print(f"\n[{interactive_count} interactive, {ref_count} total shown]")
 
 
+def _stale_ref_exit(ref, what="Could not get coordinates for"):
+    """A ref whose node is not in the page any more (the tab navigated or reloaded
+    since the snapshot): say so on stderr and exit 1. One wording for every
+    ref-taking path; never a silent success."""
+    num = str(ref).lstrip("@")
+    print(f"Error: {what} @{num}. The element is not in the "
+          "current page (stale ref: the page changed since the last snapshot). "
+          "Run 'agent observe' (or 'a11y-snapshot') again and use a fresh @ref.", file=sys.stderr)
+    sys.exit(1)
+
+
 async def cmd_click_ref(ref_str):
     """Click an element by its @N reference from the last a11y-snapshot."""
     ws_url, _ = get_page_ws()
@@ -15926,10 +15937,7 @@ async def cmd_click_ref(ref_str):
         # The box model is gone when the ref's node is not in the page any more:
         # the tab navigated or reloaded since the snapshot (another command, a
         # second process on the same tab). The ref belongs to the old document.
-        print(f"Error: Could not get coordinates for @{ref_num}. The element is not in the "
-              "current page (stale ref: the page changed since the last snapshot). "
-              "Run 'agent observe' (or 'a11y-snapshot') again and use a fresh @ref.", file=sys.stderr)
-        sys.exit(1)
+        _stale_ref_exit(ref_num)
 
     x, y = val["x"], val["y"]
     await _vfx_ripple(ws_url, x, y)
@@ -16373,32 +16381,39 @@ async def _agent_perform(ref, action, text, old_map):
         await cdp_send(ws_url, [(1, 'DOM.enable', {})])
         res_r = await cdp_send(ws_url, [(2, 'DOM.resolveNode', {'backendNodeId': bid})])
         oid = res_r.get(2, {}).get('object', {}).get('objectId')
-        if oid:
-            await cdp_send(ws_url, [(3, 'Runtime.callFunctionOn', {
-                'objectId': oid,
-                'functionDeclaration': 'function(){this.focus();}',
-                'returnByValue': True,
-            })])
+        if not oid:
+            _stale_ref_exit(ref, 'Could not focus')
+        res_f = await cdp_send(ws_url, [(3, 'Runtime.callFunctionOn', {
+            'objectId': oid,
+            'functionDeclaration': 'function(){if(!this.isConnected)return false;this.focus();return true;}',
+            'returnByValue': True,
+        })])
+        if res_f.get(3, {}).get('result', {}).get('value') is False:
+            _stale_ref_exit(ref, 'Could not focus')
         await cdp_send(ws_url, [(4, 'Input.insertText', {'text': text or ''})])
     elif action == 'hover':
         res_b = await cdp_send(ws_url, [(5, 'DOM.getBoxModel', {'backendNodeId': bid})])
         content = res_b.get(5, {}).get('model', {}).get('content', [])
-        if len(content) >= 8:
-            mx = int((content[0] + content[2] + content[4] + content[6]) / 4)
-            my = int((content[1] + content[3] + content[5] + content[7]) / 4)
-            await cdp_send(ws_url, [(6, 'Input.dispatchMouseEvent', {
-                'type': 'mouseMoved', 'x': mx, 'y': my,
-            })])
+        if len(content) < 8:
+            _stale_ref_exit(ref, 'Could not get coordinates for')
+        mx = int((content[0] + content[2] + content[4] + content[6]) / 4)
+        my = int((content[1] + content[3] + content[5] + content[7]) / 4)
+        await cdp_send(ws_url, [(6, 'Input.dispatchMouseEvent', {
+            'type': 'mouseMoved', 'x': mx, 'y': my,
+        })])
     elif action == 'submit':
         await cdp_send(ws_url, [(7, 'DOM.enable', {})])
         res_r = await cdp_send(ws_url, [(8, 'DOM.resolveNode', {'backendNodeId': bid})])
         oid = res_r.get(8, {}).get('object', {}).get('objectId')
-        if oid:
-            await cdp_send(ws_url, [(9, 'Runtime.callFunctionOn', {
-                'objectId': oid,
-                'functionDeclaration': "function(){var f=this.closest('form');if(f)f.submit();else this.click();}",
-                'returnByValue': True,
-            })])
+        if not oid:
+            _stale_ref_exit(ref, 'Could not submit')
+        res_s = await cdp_send(ws_url, [(9, 'Runtime.callFunctionOn', {
+            'objectId': oid,
+            'functionDeclaration': "function(){if(!this.isConnected)return false;var f=this.closest('form');if(f)f.submit();else this.click();return true;}",
+            'returnByValue': True,
+        })])
+        if res_s.get(9, {}).get('result', {}).get('value') is False:
+            _stale_ref_exit(ref, 'Could not submit')
         await _agent_settle(ws_url)
     else:
         print(json.dumps({'error': f'Unknown action {action!r} (click|type|fill|hover|submit)'}), file=sys.stderr)
