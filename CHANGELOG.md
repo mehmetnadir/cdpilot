@@ -4,6 +4,8 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-11-11
+
 ### Security
 - replay: a CDPILOT_VAR_<NAME> environment value now fills only the value of an input step (fill/type…), never a frame-routed step, on a host named by CDPILOT_VAR_HOSTS, checked live before the step; go/eval and other commands take --var only. Before, a crafted flow file could send an environment secret to any host (since 0.9.5, not reachable over MCP).
 
@@ -13,6 +15,7 @@ All notable changes to cdpilot will be documented in this file.
 - Docs: claims audit after 0.9.6 — zero npm dependencies wording everywhere, MCP tool count in the bundle manifest, origin (not host) for placeholder steps, exit codes 2/4 for agent commands, tokens_avoided is an upper bound, injection patterns are English-only, comparison table aligned with cdpilot.dev/compare.
 
 ### Fixed
+- **Warm process (`CDPILOT_DAEMON=1`) no longer adds ~10 s per call on Linux.** The daemon ends every request with `shutdown()` and the launcher finishes at the exit frame; before, a watcher thread held the socket open until its 10 s timeout (Linux only; macOS was unaffected). Dual-mode CI: warm 209 s vs fresh 233 s (before 1,072 s vs 303 s).
 - **`cmd_launch` starts the browser with `stderr=subprocess.DEVNULL`.** Nothing reads the pipe, so a browser outliving a long-lived (warm) process will not block on a full or closed pipe.
 - **Clearer error when `CDP_PORT` in the environment overrides a connected browser.** With both `CDP_PORT` and `CDPILOT_PROFILE` set, environment variables take precedence over project registry settings; probing the environment port while the registry pointed to a connected browser on a different port caused misleading "your connected browser is gone" errors. When `CDP_PORT` in the environment overrides the connected browser's port, `cdpilot` now reports that `CDP_PORT=<env> in the environment overrides the connected browser on port <registry>` and suggests unsetting `CDP_PORT` or setting it to `<registry>`, and `cdpilot connect <port>` prints a warning to stderr when `CDP_PORT` is set to a different port.
 

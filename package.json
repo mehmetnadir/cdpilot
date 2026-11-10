@@ -1,6 +1,6 @@
 {
   "name": "cdpilot",
-  "version": "0.9.6",
+  "version": "0.9.7",
   "mcpName": "io.github.mehmetnadir/cdpilot",
   "description": "Browser automation CLI with zero npm dependencies (Python: websockets). Raw CDP, 70+ commands, friction ladder, 3-tier stealth, CAPTCHA + press-and-hold solvers, proxy pools, MCP server. No Puppeteer/Playwright/Selenium.",
   "bin": {
