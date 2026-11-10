@@ -12597,7 +12597,9 @@ print(json.dumps(res))
       'json.dump({"code": code, "calls": calls}, open(sys.argv[3], "w"))',
     ].join('\n'), writeFlow(home, steps), JSON.stringify(urls), out, ...extraArgs],
     { cwd: REPO, encoding: 'utf-8', timeout: 30000, env: varEnv(home, extraEnv) });
-    return { ...JSON.parse(fs.readFileSync(out, 'utf-8')), stdout: r.stdout || '', stderr: r.stderr || '' };
+    // Windows print() writes \r\n; the assertions below match \n
+    return { ...JSON.parse(fs.readFileSync(out, 'utf-8')), stdout: (r.stdout || '').replace(/\r\n/g, '\n'),
+      stderr: (r.stderr || '').replace(/\r\n/g, '\n') };
   }
 
   test('replay: env var — after a value is typed every later step runs only on that exact origin; another page stops with 2', () => {
@@ -12865,7 +12867,7 @@ print(json.dumps(res))
       '    asyncio.run(cdpilot.cmd_smart_click("Sign in"))',
       'except SystemExit:',
       '    pass',
-      'open(sys.argv[1], "w").write(cdpilot._smart_wrap(got[0], probe=True))',
+      'open(sys.argv[1], "w", encoding="utf-8").write(cdpilot._smart_wrap(got[0], probe=True))',
     ].join('\n'), out], { cwd: REPO, encoding: 'utf-8', timeout: 20000, env: varEnv(home, {}) });
     assert.strictEqual(r.status, 0, r.stderr);
     const js = fs.readFileSync(out, 'utf-8');
