@@ -513,8 +513,13 @@ when recorded, `agent run` exits 4 and prints that page's full observation (`sta
 `expected`, `actions`, `text`): the agent acts on those refs, finishes the task, and `agent flow save <name>`
 rewrites the flow. Exit 2: unknown flow or a `{{variable}}` without a value (checked before any step runs);
 `--dry-run` prints the steps with placeholders, never values. Values typed into secret-named fields
-(password, one-time code, API key, …) or token-shaped values are placeholders on disk; the same fields show
-`«masked»` as their value in `observe` output.
+(password, one-time code, API key, PIN, card number, …) or token-shaped values are placeholders on disk; the
+same fields show `«masked»` as their value in `observe` output. Masking goes by field name or token shape: a
+secret typed into a field named otherwise is stored in clear, so review a flow before sharing it (flow files
+and `agent-state.json` are 0600). A `{{placeholder}}` typed into `agent act --text` or `--url` is refused
+(exit 2): placeholders are cdpilot's own, so a flow replays only values the user recorded, and a step that
+types one runs only on the host it was recorded on. `--var` values are visible in the process list for the
+duration of the call; `CDPILOT_VAR_<NAME>` is not; the session log redacts both.
 
 #### Text that talks to the agent: `injection_suspect`
 
@@ -1057,7 +1062,7 @@ sets the idle exit (default 1800). Opt-in in this release; the default may
 change once two weeks of use show no difference in error rates.
 
 The MCP server (`cdpilot mcp`) reads the same variable: with `CDPILOT_DAEMON=1`
-in its environment it runs each tool call in its own process the same way (the
+in its environment it runs each tool call in the server process the same way (the
 same executor, no socket involved) instead of starting a Python process per
 call — ~400 ms → ~10 ms before the CDP work. Lifecycle tools and a project
 configuration that moved since the server started still run fresh; a call past

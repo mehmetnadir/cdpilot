@@ -23,12 +23,16 @@ const SRC_DIR = path.join(__dirname, '..', 'src');
 
 // Python runs src/cdpilot.py through the import system (runpy) instead of as a
 // script: a script named on the command line is recompiled on every call —
-// 0.15 s of the ~0.3 s Python start-up measured on 2026-11-08 for the 22k-line
+// 0.15 s of the ~0.3 s Python start-up measured on 2026-11-08 for the 23k-line
 // file — while an imported module keeps its bytecode in src/__pycache__/.
 // sys.argv ends up exactly as for `python cdpilot.py <args>` (alter_sys), and
 // an unwritable src/ only means Python skips the cache, never an error.
-const PY_LOADER = "import sys, runpy; sys.path.insert(0, sys.argv[1]); del sys.argv[1]; "
-  + "runpy.run_module('cdpilot', run_name='__main__', alter_sys=True)";
+// An interpreter started with -c puts '' (the working directory) first on
+// sys.path, so a runpy.py or json.py planted in an untrusted checkout would run
+// before cdpilot does (2026-11-10 review); the loader drops that entry before
+// any other import. `python src/cdpilot.py` had src/ there instead.
+const PY_LOADER = "import sys; sys.path[:] = [p for p in sys.path if p]; sys.path.insert(0, sys.argv[1]); del sys.argv[1]; "
+  + "import runpy; runpy.run_module('cdpilot', run_name='__main__', alter_sys=True)";
 function pyArgs(...args) {
   return ['-c', PY_LOADER, SRC_DIR, ...args];
 }
@@ -65,8 +69,9 @@ function clearPythonCache() {
 
 // ── Warm process (daemon) ──
 // CDPILOT_DAEMON=1: page commands go to one warm Python process per project
-// (src/cdpilot.py --_daemon-serve) over a Unix socket; it keeps the module,
-// the asyncio loop and the pooled CDP sockets between calls (2026-11-08: a
+// (src/cdpilot.py --_daemon-serve) over a Unix socket; it keeps the module and
+// the asyncio loop between calls — the CDP connections a request opened are
+// closed at its end, as a process exit closed them (2026-11-08: a
 // fresh process spent ~110 ms in node, ~140 ms starting Python and ~500 ms
 // setting the CDP session up before `go` even began). The client falls back
 // to a fresh process whenever the daemon is missing, busy (no hello within
@@ -755,7 +760,8 @@ function showHelp() {
                        cdpilot command or page change (CDPILOT_IDLE_CLOSE=<minutes>,
                        0 = never); an explicit launch stays open unless asked (below).
     CDPILOT_DAEMON=1   Keep one warm Python process per project and send page
-                       commands to it over a local socket (~0.4 s less per call;
+                       commands to it over a local socket (browser-free command
+                       ~270 -> ~140 ms, content/eval ~360 -> ~110 ms, M1 Max;
                        a fresh process when it is missing or busy; not with
                        --timeout; 'daemon status|stop'; idle exit after
                        CDPILOT_DAEMON_IDLE seconds, default 1800).

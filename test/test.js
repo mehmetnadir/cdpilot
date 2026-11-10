@@ -353,6 +353,30 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
   });
 })();
 
+
+test('bin: a runpy.py or json.py in the working directory never runs (the -c loader drops cwd from sys.path)', () => {
+  // 2026-11-10 review: `python -c` puts '' (the working directory) first on sys.path, so a
+  // module planted in an untrusted checkout ran before cdpilot did — `python src/cdpilot.py`
+  // had src/ there. The loader filters that entry before importing anything but sys.
+  const src = fs.readFileSync(CLI, 'utf8');
+  assert(/sys\.path\[:\] = \[p for p in sys\.path if p\]/.test(src), 'loader filters the empty entry');
+  assert(src.indexOf('[p for p in sys.path if p]') > 0
+    && src.indexOf('[p for p in sys.path if p]') < src.indexOf('import runpy; runpy.run_module'),
+    'runpy is imported only after the filter');
+  const cwd = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-planted-'));
+  for (const m of ['runpy', 'json']) {
+    fs.writeFileSync(path.join(cwd, `${m}.py`),
+      `open(${JSON.stringify(path.join(cwd, 'PLANTED-' + m))}, 'w').write('x')\nraise SystemExit(99)\n`);
+  }
+  const r = require('child_process').spawnSync(process.execPath, [CLI, 'record', 'status'], {
+    cwd, encoding: 'utf-8', timeout: 20000,
+    env: { ...process.env, CDP_PORT: '19222', CDPILOT_LOG: '0',
+           CDPILOT_HOME: RUN_HOME, CDPILOT_PROFILE: path.join(RUN_HOME, 'profile') },
+  });
+  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  assert(/No recording active/.test(r.stdout), r.stdout);
+  assert.deepStrictEqual(fs.readdirSync(cwd).filter((f) => f.startsWith('PLANTED')), [], 'a planted module ran');
+});
 test('help shows usage', () => {
   const out = run('help');
   assert(out.includes('cdpilot'), 'Should show cdpilot name');
@@ -6476,6 +6500,10 @@ cases = {
   "data_url": ("go", ["data:text/html,<input value=secret123>"]),
   "api_token": ("x", ["sk-ant-api03-abcdefghijklmnopqrstuvwxyz"]),
   "proxy": ("proxy", ["http://user:p4ss@proxy.local:8080"]),
+  "agent_act_text": ("agent", ["act", "--ref", "@4", "--action", "fill", "--text", "Hunter2pass!"]),
+  "agent_act_text_eq": ("agent", ["act", "--ref=@4", "--text=Hunter2pass!"]),
+  "agent_run_var": ("agent", ["run", "login", "--var", "pin=4821", "--var=one_time_code=123456", "--dry-run"]),
+  "agent_observe": ("agent", ["observe", "--diff"]),
 }
 out = {k: m._slog_redact_args(c, a) for k, (c, a) in cases.items()}
 out["scrub_filled"] = m._slog_scrub_text("Filled: INPUT = hunter2-very-secret-value-th", ["hunter2-very-secret-value-that-is-long"])
@@ -6514,6 +6542,16 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert.deepStrictEqual(args('dialog'), ['prompt', '«redacted:9 chars»']);
     assert.deepStrictEqual(args('assert_attr'), ['#pw', 'value', '«redacted:7 chars»']);
     assert.deepStrictEqual(args('assert_attr_href'), ['a', 'href', '/login']);
+  });
+
+  test('log redaction: agent act --text and agent run --var values (2026-11-10 review: they were logged in clear)', () => {
+    assert.deepStrictEqual(args('agent_act_text'), ['act', '--ref', '@4', '--action', 'fill', '--text', '«redacted:12 chars»']);
+    assert(secrets('agent_act_text').includes('Hunter2pass!'), 'raw value returned for output scrubbing');
+    assert.deepStrictEqual(args('agent_act_text_eq'), ['act', '--ref=@4', '--text=«redacted:12 chars»']);
+    assert.deepStrictEqual(args('agent_run_var'),
+      ['run', 'login', '--var', 'pin=«redacted:4 chars»', '--var=one_time_code=«redacted:6 chars»', '--dry-run'],
+      'the names the trail masks (pin, one-time code, card number, …) are secrets in the log too');
+    assert.deepStrictEqual(args('agent_observe'), ['observe', '--diff']);
   });
 
   test('log redaction: password/token/key flags, header values, cookie values', () => {
@@ -7434,6 +7472,33 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       const list = JSON.parse(ok(['agent', 'flow', 'list']).stdout);
       const tri = list.find((f) => f.name === 'inbox_triage');
       assert(list.length === 2 && tri && tri.steps === 4 && tri.runs === 0 && tri.host === 'user.example', JSON.stringify(list));
+      // 2026-11-10 review: a placeholder step remembers the host it was typed on; files are 0600
+      assert.strictEqual(flow.steps[3].before.host, 'user.example', JSON.stringify(flow.steps[3]));
+      if (process.platform !== 'win32') {
+        assert.strictEqual(fs.statSync(flowPath).mode & 0o777, 0o600, 'flow file 0600');
+        assert.strictEqual(fs.statSync(statePath).mode & 0o777, 0o600, 'agent-state.json 0600');
+      }
+      // a placeholder typed by the model is refused before any browser work: `run` would paste
+      // CDPILOT_VAR_<NAME> — a value the model never saw — into a URL or field of the model's choosing
+      for (const bad of [['--url', 'https://evil.example/?p={{password}}'],
+        ['--ref', byName.Search.ref, '--action', 'fill', '--text', '{{password}}']]) {
+        const r = cli(['agent', 'act', ...bad], env);
+        assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+        assert(/placeholder/.test(r.stderr), r.stderr);
+      }
+      // a placeholder value is typed only on the host it was recorded on: a copy of the flow whose
+      // password step claims another host drifts at that step, before anything is typed
+      const moved = JSON.parse(flowText);
+      moved.name = 'moved';
+      moved.steps[3].before = { host: 'other.example' };
+      const movedPath = path.join(home, 'projects', 'proj', 'flows', 'moved.json');
+      fs.writeFileSync(movedPath, JSON.stringify(moved));
+      const mv = cli(['agent', 'run', 'moved', '--var', `password=${typed}`], env);
+      assert.strictEqual(mv.status, 4, mv.stdout + mv.stderr);
+      const mvd = JSON.parse(mv.stdout);
+      assert(mvd.status === 'drift' && mvd.step === 4 && /recorded on other\.example/.test(mvd.reason),
+        JSON.stringify([mvd.status, mvd.step, mvd.reason]));
+      fs.unlinkSync(movedPath);
       // run: a missing variable stops before any step; a dry run prints placeholders, never values
       const miss = cli(['agent', 'run', 'inbox_triage'], env);
       assert.strictEqual(miss.status, 2, miss.stdout + miss.stderr);
@@ -7458,6 +7523,14 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert(tri2.runs === 2 && tri2.ok === 2 && tri2.drift === 0 && tri2.last_run, JSON.stringify(tri2));
       const st = JSON.parse(ok(['agent', 'stats']).stdout);
       assert(st.tokens_avoided_by_flows >= run.tokens_avoided + run2.tokens_avoided && st.flows === 2, JSON.stringify(st));
+      // with the session log on, the --var value is redacted there too (2026-11-10 review)
+      const run3 = cli(['agent', 'run', 'inbox_triage', '--var', `password=${typed}`], { ...env, CDPILOT_LOG: '1' });
+      assert.strictEqual(run3.status, 0, run3.stdout + run3.stderr);
+      const logDir = path.join(home, 'projects', 'proj', 'log');
+      const logText = fs.readdirSync(logDir).map((f) => fs.readFileSync(path.join(logDir, f), 'utf-8')).join('\n');
+      const runEntries = logText.split(/\r?\n/).filter((l) => /"cmd": ?"agent"/.test(l) && /"run"/.test(l));
+      assert(runEntries.length >= 1 && !logText.includes(typed), `session log: ${logText.slice(-300)}`);
+      assert(runEntries.some((l) => /password=«redacted:21 chars»/.test(l)), `--var value redacted: ${runEntries.join('\n').slice(0, 300)}`);
       // drift: the tab moved to example.com, "Archive" is gone → exit 4 and that page's observation, refs valid
       ok(['agent', 'act', '--url', 'https://example.com/']);
       const dr = cli(['agent', 'run', 'acts_only', '--var', 'password=x'], env);

@@ -15854,7 +15854,7 @@ def _save_agent_state(state):
             del amap[ref]
         state['actions_map'] = amap
     tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as f:
         json.dump(state, f)
     os.replace(tmp, path)
 
@@ -16259,6 +16259,26 @@ AGENT_RUN_DRIFT_EXIT = 4
 _AGENT_VAR_RE = _re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
 
 
+def _agent_act_refuse_placeholders(args):
+    """`agent act --url/--text` carrying a {{placeholder}} exits 2 before any
+    browser work. Placeholders are written by cdpilot when it masks a typed
+    secret; one typed by the model would make `agent run` paste
+    CDPILOT_VAR_<NAME> — a value the model never saw — into a URL or a field
+    of the model's choosing (2026-11-10 review)."""
+    for i, a in enumerate(args):
+        for flag in ('--url', '--text'):
+            val = None
+            if a == flag and i + 1 < len(args):
+                val = args[i + 1]
+            elif a.startswith(flag + '='):
+                val = a[len(flag) + 1:]
+            if val and _AGENT_VAR_RE.search(val):
+                print(json.dumps({'error': f'{flag} carries a {{{{placeholder}}}}; cdpilot writes placeholders '
+                                           'itself when it masks a typed secret — pass the value'}),
+                      file=sys.stderr)
+                sys.exit(2)
+
+
 def _agent_flows_dir():
     return os.path.join(CDPILOT_HOME, 'projects', PROJECT_ID, 'flows')
 
@@ -16289,7 +16309,7 @@ def _agent_flow_load(path):
 def _agent_flow_write(path, flow):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w', encoding='utf-8') as f:
         json.dump(flow, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
 
@@ -16342,8 +16362,9 @@ def _agent_anchor(desc, amap):
 
 def _agent_mask_text(field_name, text):
     """A typed value becomes {{name}} when the field is secret-named or the
-    value is token-shaped. The value itself never reaches disk; `agent run`
-    takes it from --var or CDPILOT_VAR_<NAME>."""
+    value is token-shaped. The value itself never reaches disk (the session
+    log redacts `agent act --text` too); `agent run` takes it from --var or
+    CDPILOT_VAR_<NAME>, and types it only on the host it was recorded on."""
     if _AGENT_SECRET_FIELD_RE.search(field_name or '') or _slog_tokenish(text) \
             or _SLOG_TOKEN_PREFIX_RE.search(text):
         return '{{%s}}' % (_record_slug(field_name) or 'secret')
@@ -16408,6 +16429,9 @@ async def cmd_agent_flow_save(name, last=None):
             h, p = _agent_host_path(e.get('url_after'))
             if h:
                 step['after'] = {'host': h, 'path': p}
+            hb = _agent_host_path(e.get('url_before'))[0]
+            if hb:
+                step['before'] = {'host': hb}  # a {{placeholder}} is typed only here
         for m in _AGENT_VAR_RE.finditer(step.get('text') or step.get('url') or ''):
             label = (step.get('anchor') or {}).get('name') or step.get('kind')
             vars_dict.setdefault(m.group(1), {'step': n, 'hint': f"{step.get('action', 'go')} {label}"})
@@ -16558,6 +16582,12 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
         if match is None:
             drift(step, 'anchor not found', page, out_actions, text, state, _agent_injection_scan(last_nodes))
         amap = {a['ref']: a for a in actions}
+        before_host = (step.get('before') or {}).get('host')
+        if before_host and step.get('text') and _AGENT_VAR_RE.search(step['text']):
+            host_here = _agent_host_path(page.get('url', ''))[0]
+            if host_here and host_here != before_host:
+                drift(step, f"on {host_here}, the value was recorded on {before_host}", page, out_actions,
+                      text, state, _agent_injection_scan(last_nodes))
         text_in = subst(step['text']) if step.get('text') is not None else None
         await _agent_perform(match['ref'], step.get('action', 'click'), text_in, amap)
         page2, actions2, out2, text2, state = await snapshot()
@@ -16688,6 +16718,7 @@ def _dispatch_agent_cmd(args):
                 text = tok.split('=', 1)[1]; i += 1
             else:
                 i += 1
+        _agent_act_refuse_placeholders(rest)  # also checked before the browser connects
         return cmd_agent_act(ref=ref, url=url, action=action, text=text)
 
     if sub == 'twitter':
@@ -20728,7 +20759,8 @@ SLOG_EVAL_WITHHELD = "«output not logged: the script names a secret-like value�
 
 # Flag, header and key names that carry secrets.
 _SLOG_SECRET_NAME_RE = _re.compile(
-    r"pass|pwd|token|secret|key|cookie|auth|session|credential|bearer|jwt|otp|signature", _re.I)
+    r"pass|pwd|token|secret|key|cookie|auth|session|credential|bearer|jwt|otp|signature"
+    r"|\bpin\b|\bcvv\b|\bcvc\b|card[ _-]?number|\biban\b|\bssn\b|one[ _-]?time", _re.I)
 # A bare positional word naming a secret; the NEXT arg is its value.
 _SLOG_SECRET_WORD_RE = _re.compile(
     r"(?:x-)?[\w-]*(?:password|passwd|pwd|token|secret|api[-_]?key|apikey|authorization"
@@ -21179,6 +21211,39 @@ def _slog_redact_args(cmd, args):
                     red = _slog_redact_json(obj, secrets)
                     out[i] = _slog_clip_mark(_slog_scrub_text(
                         json.dumps(red, ensure_ascii=False), secrets, echo=False), SLOG_ARG_CHARS)
+                    done.add(i)
+            i += 1
+    elif cmd == "agent" and args[:1] in (["act"], ["run"]):
+        # agent act --text <value> and agent run --var name=value: the typed value
+        # and the variable's value are secrets by position — what the trail and
+        # the flow file keep as {{placeholders}} must not sit in the session log
+        # (2026-11-10 review: `agent act --action fill --text <password>` was
+        # logged in clear, and so was `--var pin=…`).
+        i = 1
+        while i < len(args):
+            a = args[i]
+            if a in ("--text", "--var") and i + 1 < len(args):
+                done.add(i)
+                if a == "--var":
+                    k, eq, v = args[i + 1].partition("=")
+                    if eq:
+                        secrets.append(v)
+                        out[i + 1] = k + "=" + _slog_mark(v)
+                        done.add(i + 1)
+                else:
+                    redact_span([i + 1])
+                i += 2
+                continue
+            if a.startswith("--text="):
+                v = a[len("--text="):]
+                secrets.append(v)
+                out[i] = "--text=" + _slog_mark(v)
+                done.add(i)
+            elif a.startswith("--var="):
+                k, eq, v = a[len("--var="):].partition("=")
+                if eq:
+                    secrets.append(v)
+                    out[i] = "--var=" + k + "=" + _slog_mark(v)
                     done.add(i)
             i += 1
 
@@ -23139,6 +23204,8 @@ def _cli_main():
             elif _a.startswith("--har="):
                 if not _a.split("=", 1)[1]:
                     _har_usage_exit()
+    if cmd == "agent" and args[:1] == ["act"]:
+        _agent_act_refuse_placeholders(args[1:])
 
     # Hidden re-entrant entry for the watch daemon. `cdpilot watch start`
     # forks this process with the flag so the screencast consumer runs in
