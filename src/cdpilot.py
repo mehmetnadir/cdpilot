@@ -18768,7 +18768,7 @@ class MCPServer:
     TOOL_TIMEOUT_S = 30
 
     def __init__(self, tools_spec=None):
-        self.tools = self._register_tools()
+        self.tools = self._register_tools() + list(CANVAS_TOOLS)  # canvas: lane D
         spec = (tools_spec or os.environ.get("CDPILOT_MCP_TOOLS") or "all").strip()
         self.profiled = spec != "all"
         self.enabled = set(self.CORE_TOOLS if spec == "core" else spec.split(","))
@@ -18988,6 +18988,8 @@ class MCPServer:
                     t["name"] == name for t in self.tools):
                 return {"jsonrpc": "2.0", "id": req_id, "result": {
                     "content": [{"type": "text", "text": self.NOT_ENABLED}], "isError": True}}
+            if name in _CANVAS_TOOL_NAMES:  # canvas: lane D
+                return _canvas_mcp_call(self, req_id, name, args)
             return self._execute_tool(req_id, name, args)
         elif method == "ping":
             return {"jsonrpc": "2.0", "id": req_id, "result": {}}
@@ -22932,7 +22934,8 @@ DAEMON_SPAWN_CMDS = frozenset({
 # Sub-commands that run fresh while their command is served warm ("cmd sub"):
 # `agent observe/act/reset/stats` are page steps (warm); `agent twitter` logs
 # in and posts (its own session, fresh). Mirrored in bin/cdpilot.js.
-DAEMON_SPAWN_SUBCMDS = frozenset({'agent twitter'})
+DAEMON_SPAWN_SUBCMDS = frozenset({'agent twitter', 'canvas open', 'canvas stream',
+                                  'canvas watch', 'canvas events'})
 
 
 def _daemon_spawn_only(plain):
@@ -23390,6 +23393,127 @@ def _daemon_serve_entry(args):
         # _ws_pool_close_all (atexit) closes the pooled CDP sockets.
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Live canvas (`cdpilot canvas`) — v0. Plan: .claude/docs/plan-canli-tuval-uygulama.md,
+# frozen contract: .claude/docs/canvas-sozlesme-v0.md (day 0, 11.11). Each lane writes
+# only inside its own region; the names below are the contract between regions.
+# ═══════════════════════════════════════════════════════════════════════════
+
+CANVAS_HOST_FLAG = '--_canvas-host'          # hidden: `cdpilot.py --_canvas-host <name> [--allow-net h]...`
+CANVAS_NAME_RE = re.compile(r'^[a-z0-9_-]{1,32}$')
+CANVAS_DEFAULT_NAME = 'main'
+CANVAS_URL_FMT = 'http://cdpilot-canvas.invalid/{name}/'
+CANVAS_BINDING = '__cdpilotCanvasEmit'
+CANVAS_OPS = frozenset({'set', 'patch', 'events', 'close', 'ping'})   # host socket: closed list (jury K3)
+CANVAS_PAGE_EVENT_TYPES = frozenset({'click', 'submit', 'input'})     # the only types a page may emit (K5)
+CANVAS_HTML_MAX = 1 << 20          # CLI and host: 1 MB of HTML
+CANVAS_MCP_HTML_MAX = 256 << 10    # MCP: 256 KB
+CANVAS_EVENT_RING = 1000           # events kept by the host (oldest dropped, `dropped` counts them)
+CANVAS_EVENT_BYTES = 64 << 10      # ring total
+CANVAS_EVENT_ITEM_MAX = 1024       # one event's `data`, serialised
+CANVAS_IDLE_EXIT_S = 1800          # host exits after 30 min without a request
+
+
+class CanvasError(Exception):
+    """A canvas command failed; `code` is the CLI exit code (1 runtime, 2 usage/limit)."""
+    def __init__(self, msg, code=1):
+        super().__init__(msg)
+        self.code = code
+
+
+def _canvas_dir():
+    """<PROFILE_DIR>/canvas, mode 0700 (created on first use). Lane B: a socket path
+    over 100 bytes moves to a short per-user runtime directory, as bin/cdpilot.js
+    daemonSockPath() does for the warm process."""
+    d = os.path.join(PROFILE_DIR, 'canvas')
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+def _canvas_check_name(name):
+    """The canvas name or CanvasError(code 2). Names are path components: [a-z0-9_-]{1,32}."""
+    if not isinstance(name, str) or not CANVAS_NAME_RE.match(name):
+        raise CanvasError(f"canvas name must match [a-z0-9_-]{{1,32}}: {name!r}", 2)
+    return name
+
+
+def _canvas_paths(name):
+    """{'sock': <name>.sock (0600), 'reg': <name>.json, 'ready': <name>.ready} in _canvas_dir()."""
+    d = _canvas_dir()
+    _canvas_check_name(name)
+    return {k: os.path.join(d, f'{name}.{ext}') for k, ext in
+            (('sock', 'sock'), ('reg', 'json'), ('ready', 'ready'))}
+
+
+# ═══ CANVAS-A BEGIN ═══ (lane A: morph + page runtime)
+# Contract: CANVAS_RUNTIME_JS defines window.__cdpilotCanvas = Object.freeze({
+#   v: CANVAS_RUNTIME_V,
+#   patch(html, {final}) -> Promise<{ok, ops: {add, del, move, upd}, ms, t_paint}>
+#       (t_paint = Date.now() after two requestAnimationFrame; scripts run only when final),
+#   reset() -> undefined   (clears the timers the runtime wrapped; host calls it before `set`),
+#   emit(o) -> undefined   (o = {type: click|submit|input, action, id, data}; calls the binding
+#       CANVAS_BINDING with JSON.stringify(o); queued in `q` while the binding is missing),
+#   q: [] })
+# Delegated listeners: [data-action]/[data-emit] clicks, form submit/input -> emit.
+# Strips <meta http-equiv=refresh|content-security-policy> and <base> from incoming HTML.
+CANVAS_RUNTIME_V = 0          # lane A sets 1 with the runtime
+CANVAS_RUNTIME_JS = ''        # lane A
+# ═══ CANVAS-A END ═══
+
+
+
+# ═══ CANVAS-B BEGIN ═══ (lane B: host process, socket client, open/set/patch/close/list, security)
+# Contract (other regions call only these):
+#   _canvas_request(name, msg: dict, timeout: float = 10.0) -> dict
+#       one JSON line to the host socket, one JSON line back; msg['op'] in CANVAS_OPS.
+#       Replies: set -> {ok, ms, t_paint}; patch -> {ok, ops, ms, t_paint};
+#       events {after, max<=100, wait_ms<=25000} -> {ok, events, next, dropped};
+#       close -> {ok}; ping -> {ok, name, targetId, v, pid, uptime_s};
+#       failure -> {ok: false, error, code}. No host / timeout -> CanvasError(code 1).
+#   _canvas_resolve_name(args) -> (name, rest_args)   (--name n | --name=n, default CANVAS_DEFAULT_NAME)
+#   _canvas_read_html(src) -> str   (path or '-' for stdin; > CANVAS_HTML_MAX -> CanvasError(code 2))
+#   event = {seq, t (epoch ms), src: 'page'|'host', type, action, id, data}; host types: blocked|nav|closed.
+def cmd_canvas_dispatch(args):
+    """`cdpilot canvas <open|set|patch|stream|watch|events|close|list> ...` (lane B routes C and D)."""
+    print("cdpilot: canvas is not implemented yet (v0 in progress)", file=sys.stderr)
+    sys.exit(1)
+
+
+def _canvas_host_entry(args):
+    """Hidden `--_canvas-host <name>` process (lane B)."""
+    sys.exit(1)
+# ═══ CANVAS-B END ═══
+
+
+
+# ═══ CANVAS-C BEGIN ═══ (lane C: stream + watch + measurement)
+# Contract: cmd_canvas_stream(name) and cmd_canvas_watch(name, path); both patch through
+# _canvas_request(name, {'op': 'patch', 'html': <whole document so far>, 'final': bool,
+# 't_cli': time.time_ns()}). Lane B's dispatcher calls them.
+# ═══ CANVAS-C END ═══
+
+
+
+# ═══ CANVAS-D BEGIN ═══ (lane D: events CLI + MCP tools + examples)
+# Contract: cmd_canvas_events(name, follow, after, max_n, wait_ms) prints one JSON event per line;
+# CANVAS_TOOLS (MCP tool definitions, never in CORE_TOOLS) and
+# _canvas_mcp_call(server, req_id, name, args) -> JSON-RPC response dict. MCP hands HTML to the
+# canvas through stdin or a 0600 temp file, never argv (jury C2).
+CANVAS_TOOLS = []
+_CANVAS_TOOL_NAMES = frozenset()
+
+
+def _canvas_mcp_call(server, req_id, name, args):
+    return {"jsonrpc": "2.0", "id": req_id, "result": {
+        "content": [{"type": "text", "text": "canvas tools are not implemented yet"}], "isError": True}}
+# ═══ CANVAS-D END ═══
+
+
+
 def _cli_main():
     """The CLI: sys.argv[1:] is the command. A fresh process runs it once
     (the __main__ block below); the warm process (_daemon_serve_entry)
@@ -23475,6 +23599,14 @@ def _cli_main():
     if cmd == BOT_AUTH_SIGNER_FLAG:  # detached bot-auth request signer
         _bot_auth_signer_entry(args)
         sys.exit(0)
+    # ═══ CANVAS-B DISPATCH BEGIN ═══
+    if cmd == CANVAS_HOST_FLAG:  # detached canvas host (one per canvas)
+        _canvas_host_entry(args)
+        sys.exit(0)
+    if cmd == 'canvas':
+        cmd_canvas_dispatch(args)
+        sys.exit(0)
+    # ═══ CANVAS-B DISPATCH END ═══
     if cmd == BOT_AUTH_LABEL_FLAG:  # the `bot-auth:` line of bin/cdpilot.js status
         _bot_auth_warn_if_stale(CDP_PORT)
         print(_bot_auth_status_label(CDP_PORT))
