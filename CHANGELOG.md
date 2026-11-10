@@ -7,7 +7,9 @@ All notable changes to cdpilot will be documented in this file.
 ## [0.9.7] - 2026-11-11
 
 ### Security
-- replay: a CDPILOT_VAR_<NAME> environment value now fills only the value of an input step (fill/type…), never a frame-routed step, on a host named by CDPILOT_VAR_HOSTS, checked live before the step; go/eval and other commands take --var only. Before, a crafted flow file could send an environment secret to any host (since 0.9.5, not reachable over MCP).
+- replay: a CDPILOT_VAR_<NAME> environment value now fills only the value of an input step (fill/type…) on an https page of a host CDPILOT_VAR_HOSTS names (http only on loopback, another port only as `host:port`), checked before the step and again in the browser call that sets it, which refuses an iframe or any non-field target; and only in a flow made of non-script steps: one eval/run/batch/tools step refuses the whole flow. go/eval and other commands take --var only. Before, a crafted flow file could send an environment secret to any host (since 0.9.5, not reachable over MCP).
+- agent run: a placeholder value is set on the recorded field by that same checked call (editable, top-level page, recorded origin), no longer by focus + Input.insertText.
+- Replaying a flow runs its steps with your browser profile: replay only flows you trust (a flow with eval can act on any page you are logged into).
 
 ### Changed
 - **CLI help documents agent mode and `CDPILOT_VAR_HOSTS`.** `cdpilot --help` adds `agent observe`, `agent act`, `agent flow` and `agent run` to the AI AGENT section; environment options list `CDPILOT_VAR_HOSTS`.

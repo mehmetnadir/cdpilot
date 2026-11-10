@@ -22,6 +22,7 @@ would signal this process. Standard library only.
 import base64
 import hashlib
 import json
+import os
 import time
 import socket
 import struct
@@ -36,6 +37,17 @@ LOCK = threading.Lock()
 PAGES = [{"id": "PAGE1", "type": "page", "url": "https://user.example/inbox",
           "title": "The user's own tab"}]
 SEQ = [1]
+# The field check cdpilot runs before it types a flow's placeholder value
+# (_VAR_TARGET_FN; the real logic is unit-tested in test.js): the fake reports
+# a node as an <iframe> when its backend id is in FAKE_CDP_FRAME_NODES, or a
+# `fill` selector starting with "iframe", and otherwise sets the value.
+FRAME_NODES = {x for x in os.environ.get("FAKE_CDP_FRAME_NODES", "").split(",") if x}
+# A message whose text contains FAKE_CDP_WATCH gets "watch": true in the log,
+# so a test can see which CDP calls carried a value.
+WATCH = os.environ.get("FAKE_CDP_WATCH", "")
+# FAKE_CDP_DOM=1: every CSS selector exists (`!!document.querySelector(…)` is true),
+# so a fill resolves its selector and reaches the field check.
+DOM = os.environ.get("FAKE_CDP_DOM") == "1"
 
 
 def log(entry):
@@ -177,6 +189,12 @@ def answer(msg, path):
     result = {}
     if method == "Runtime.evaluate":
         expr = p.get("expression", "")
+        if "cdpilot-var-find" in expr:
+            # the field a strict fill/smart-fill resolves: an object, not a value
+            kind = "IFRAME" if '"iframe' in expr else "INPUT"
+            result = {"result": {"type": "object", "subtype": "node", "className": "HTML" + kind.title(),
+                                 "objectId": f"OFIND-{kind}"}}
+            return {"id": msg.get("id"), "result": result}, events
         if "cdpilot-probe" in expr:
             # cmd_go's combined post-load probe: hostname of the tab this
             # socket is attached to, no friction, no CAPTCHA.
@@ -189,6 +207,8 @@ def answer(msg, path):
             value = json.dumps({"probe": "cdpilot", "host": host,
                                 "friction": json.dumps({"level": "none", "signals": [], "detail": ""}),
                                 "captcha": json.dumps({"detected": False, "types": [], "details": []})})
+        elif DOM and expr.startswith("!!document.querySelector("):
+            value = True
         elif "readyState" in expr:
             value = "complete"
         elif "location.href" in expr:
@@ -245,6 +265,18 @@ def answer(msg, path):
                             "width": 80, "height": 16}}
     elif method == "DOM.resolveNode":
         result = {"object": {"type": "object", "objectId": f"O{p.get('backendNodeId')}"}}
+    elif method == "Runtime.callFunctionOn" and "cdpilot-var-target" in (p.get("functionDeclaration") or ""):
+        pg = page_for(path)
+        oid = str(p.get("objectId", ""))
+        args = p.get("arguments") or [{}, {}]
+        if oid == "OFIND-IFRAME" or oid[1:] in FRAME_NODES:
+            verdict = {"refused": "the target is an IFRAME, not a field"}
+        else:
+            if pg is not None and oid[1:].isdigit():
+                with LOCK:
+                    pg.setdefault("values", {})[oid[1:]] = (args[0] or {}).get("value", "")
+            verdict = {"ok": True, "tag": "INPUT"}
+        result = {"result": {"type": "object", "value": verdict}}
     elif method == "Runtime.callFunctionOn":
         pg = page_for(path)
         if pg is not None and "focus()" in (p.get("functionDeclaration") or ""):
@@ -273,6 +305,7 @@ def handle_ws(conn, path, headers):
                   f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").encode())
     log({"ws_open": path})
     for text in ws_frames(conn):
+        text_raw = text
         try:
             msg = json.loads(text)
         except ValueError:
@@ -297,6 +330,10 @@ def handle_ws(conn, path, headers):
                   if marker in text]
         if probes:
             entry["probes"] = probes
+        if WATCH and WATCH in text_raw:
+            entry["watch"] = True
+        if "cdpilot-var-target" in text_raw:
+            entry["var_target"] = True
         log(entry)
         reply, events = answer(msg, path)
         ws_send(conn, json.dumps(reply))
