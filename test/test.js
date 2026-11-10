@@ -393,6 +393,12 @@ test('no args shows help', () => {
   assert(out.includes('SETUP'), 'Should show SETUP section');
 });
 
+test('bin --help output lists agent run and CDPILOT_VAR_HOSTS', () => {
+  const out = run('--help');
+  assert(out.includes('agent run'), 'Help should list agent run');
+  assert(out.includes('CDPILOT_VAR_HOSTS'), 'Help should list CDPILOT_VAR_HOSTS');
+});
+
 // ── Setup ──
 
 test('setup detects browser', () => {
@@ -6328,6 +6334,15 @@ print("RESULT=" + json.dumps(out))
       assert.deepStrictEqual(s.streams, [true, true, true], 'stdin/stdout/stderr must be DEVNULL');
       assert.strictEqual(s.timeout_env, false, 'the watcher must not inherit CDPILOT_TIMEOUT');
     }
+  });
+
+  test('launch: cmd_launch Popen does not use stderr=subprocess.PIPE', () => {
+    const launch = (PY_CONTENT.match(/def cmd_launch\(auto=False, idle_close=None\):([\s\S]*?)\n\ndef /) || [])[1] || '';
+    assert(launch, 'cmd_launch body must be found');
+    assert(/subprocess\.Popen\(chrome_args,\s*stdout=subprocess\.DEVNULL,\s*stderr=subprocess\.DEVNULL\)/.test(launch),
+      'cmd_launch must use stderr=subprocess.DEVNULL');
+    assert(!/subprocess\.Popen\([^)]*stderr=subprocess\.PIPE/.test(launch),
+      'cmd_launch must not use stderr=subprocess.PIPE');
   });
 
   test('idle close: wired into launch, dispatcher, mcp and serve', () => {
