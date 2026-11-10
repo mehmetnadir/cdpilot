@@ -22,6 +22,9 @@
 //   twoframes two same-origin frames register the same tool name
 //   framesown Chrome 156: the top document's getTools() leaves out the frame's
 //            tool; the frame's own document.modelContext lists and runs it
+//   framehang the frame's own getTools() never settles (Chromium never answers
+//            some registrations); the top document's getTools() works
+//   tophang  the top document's getTools() never settles
 'use strict';
 const vm = require('vm');
 
@@ -81,6 +84,7 @@ function settle(tool, parsed, options) {
 const modelContext = {
   getTools(opts) {
     calls.push({ fn: 'getTools', world, argc: arguments.length });
+    if (scenario === 'tophang') return new Promise(() => {});
     if (scenario === 'refused') {
       return Promise.reject(new DOMException('not origin-keyed', 'SecurityError'));
     }
@@ -105,6 +109,19 @@ if (scenario === 'legacy') {
     }
     return settle(tool, inputObject, options);
   };
+}
+
+if (scenario === 'framehang') {
+  tools.splice(tools.findIndex((t) => t.name === 'frame_echo'), 1);
+  frameWin.document.modelContext = {
+    getTools() {
+      calls.push({ fn: 'getTools', world, argc: arguments.length, ctx: 'frame' });
+      return new Promise(() => {});
+    },
+    executeTool() { return new Promise(() => {}); },
+  };
+  frameWin.frames = [];
+  win.frames = [frameWin];
 }
 
 if (scenario === 'framesown') {
