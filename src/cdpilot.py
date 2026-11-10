@@ -22819,6 +22819,18 @@ def _daemon_send(conn, obj):
         pass  # the client went away; the command still runs to its end
 
 
+def _daemon_hangup(conn):
+    """End the conversation for the peer, whatever else still holds the socket.
+    close() alone only drops this process's reference: on Linux a thread blocked
+    in recv() on it (the client watcher, up to its 10 s timeout) keeps the
+    connection open, the client sees no EOF and every warm call took 10 s there
+    (K-0027, CI 42810141487). shutdown() sends the EOF now and wakes that thread."""
+    try:
+        conn.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass  # already gone
+
+
 def _daemon_recv_line(conn, limit=8 * 1024 * 1024):
     """One newline-terminated JSON object, or None (closed, too long, invalid)."""
     chunks, size = [], 0
@@ -23191,6 +23203,8 @@ def _daemon_serve_entry(args):
                     stop.append(True)
                 except OSError:
                     pass
+                finally:
+                    _daemon_hangup(conn)
     finally:
         asyncio.run = _DAEMON["asyncio_run"]
         try:
