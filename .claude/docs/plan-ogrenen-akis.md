@@ -49,6 +49,13 @@ Sapmada `agent run`:
 - `agent run` değişkeni `--var k=v` ya da `CDPILOT_VAR_<K>` ile alır; eksikse hiçbir adım koşmadan çıkış 2.
 - `--dry-run` değer basmaz. Akış dosyası 0600 değil (sır yok), ama `~/.cdpilot/projects/<id>/flows/` altında.
 - Yanlış eylem sessiz geçmez: son koşul (host) tutmazsa sapma; sonuç JSON her adımı listeler.
+- 10.11 inceleme turu (T1 agy-filo `review` + jüri J1/J2): `agent act --text/--url` içindeki `{{yer tutucu}}` reddedilir
+  (çıkış 2, tarayıcı bağlantısından önce) — yer tutucuyu yalnız cdpilot yazar; aksi hâlde sayfadan yönlendirilen model
+  `CDPILOT_VAR_<AD>` değerini (hiç görmediği sırrı) kendi seçtiği URL'ye ya da alana yapıştırtabilirdi. Yer tutucu adımı
+  yalnız kaydedildiği host'ta yazılır (`before.host`; başka host = sapma, yazmadan önce). Akış dosyası ve agent-state.json
+  0600. Oturum günlüğü `agent act --text` ve `agent run --var` değerlerini maskeler (önceden açık yazıyordu; pin, cvv,
+  kart numarası, iban, ssn, tek kullanımlık kod adları günlükte de sır sayılır). Launcher `-c` yükleyicisi cwd'yi
+  `sys.path`ten çıkarır (planted `json.py` cdpilot'tan önce koşuyordu; 0.9.5'te src/ vardı).
 
 ## 4. Ölçüm ve kapılar
 
