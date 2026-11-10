@@ -6624,7 +6624,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert(/os\.name == "nt" and not os\.environ\.get\("PYTHONIOENCODING"\)/.test(main),
       'the switch is Windows-only and yields to a PYTHONIOENCODING the user set');
     const call = PY_CONTENT.slice(PY_CONTENT.indexOf('env[SLOG_VIA_ENV] = via'));
-    const run = call.slice(0, call.indexOf('output = result.stdout'));
+    const run = call.slice(0, call.indexOf('code, output, errors = ran[0]'));  // the fresh-process branch
     assert(run.includes('env["PYTHONIOENCODING"] = "utf-8"'), 'MCP child must write UTF-8');
     assert(run.includes('encoding="utf-8", errors="replace"') && !run.includes('text=True'),
       'MCP server must read the child as UTF-8');
@@ -7524,6 +7524,74 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert(byId(14).result.isError === true && /unknown flow 'nope'/.test(text(14)), text(14));
       const diff = json(15);
       assert(byId(15).result.isError === false && 'changed' in diff && diff.known_flows === undefined, text(15));
+    } finally { fake.stop(); }
+  });
+
+  test('mcp warm: CDPILOT_DAEMON=1 runs tool calls in the server process — same results, lifecycle commands still spawn, a timeout cancels and the server goes on (fake browser)', () => {
+    // The MCP server started a Python process per tool call (~400 ms before
+    // any CDP work, 10.11). With CDPILOT_DAEMON=1 a call runs in the server
+    // process the way the warm CLI runs a request (_daemon_execute).
+    if (process.platform === 'win32') return;
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj', { CDPILOT_DAEMON: '1', CDPILOT_WEBMCP: '0', CDPILOT_MCP_TOOLS: '' });
+      const script = `
+import asyncio, importlib.util, json, os, subprocess, sys
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+spawned, real_run = [], subprocess.run
+def no_spawn(argv, **kw):  # a tool call as a fresh process is the exception now: record and refuse it
+    if isinstance(argv, (list, tuple)) and len(argv) > 1 and argv[1] == mod.__file__:
+        spawned.append(list(argv[2:]))
+        raise RuntimeError("spawned")
+    return real_run(argv, **kw)
+subprocess.run = no_spawn
+srv = mod.MCPServer(None)
+out = {"is_mcp": mod.IS_MCP_SESSION}
+out["tabs"] = srv._execute_tool(1, "browser_tabs", {})
+out["act"] = srv._execute_tool(2, "browser_agent_act", {"url": "https://user.example/inbox"})
+out["observe"] = srv._execute_tool(3, "browser_agent_observe", {})
+out["launch"] = srv._execute_tool(4, "browser_launch", {})  # spawn-only by rule
+out["spawned"] = spawned
+real = mod.cmd_agent_observe
+async def hang(diff=False):
+    await asyncio.sleep(30)
+mod.cmd_agent_observe = hang
+srv.TOOL_TIMEOUT_S = 1
+out["hung"] = srv._execute_tool(5, "browser_agent_observe", {})
+mod.cmd_agent_observe = real
+srv.TOOL_TIMEOUT_S = 30
+out["after"] = srv._execute_tool(6, "browser_agent_observe", {})
+out["served"] = mod._DAEMON["served"]
+out["streams"] = sys.stdout is sys.__stdout__ and sys.stderr is sys.__stderr__
+out["env_daemon"] = os.environ.get("CDPILOT_DAEMON")
+out["env_mcp"] = os.environ.get("CDPILOT_MCP_SESSION")
+print(json.dumps(out))
+`;
+      // The interpreter the launcher picks for this home (python.json: one with websockets),
+      // i.e. the sys.executable the real server runs under — the shell's python3 may lack it.
+      const probe = cli(['record', 'status'], env);
+      assert.strictEqual(probe.status, 0, probe.stderr);
+      const PYB = JSON.parse(fs.readFileSync(path.join(home, 'python.json'), 'utf-8')).python;
+      const r = spawnSync(PYB, ['-c', script], { encoding: 'utf-8', timeout: 60000, env });
+      assert.strictEqual(r.status, 0, r.stderr);
+      const o = JSON.parse(r.stdout.trim().split('\n').pop());
+      const text = (res) => res.result.content.map((c) => c.text).join('\n');
+      const json = (res) => JSON.parse(res.result.content.find((c) => c.text.trim().startsWith('{')).text);
+      assert.strictEqual(o.is_mcp, true, 'the server process sees itself as the MCP session its child processes were');
+      assert(o.tabs.result.isError === false && text(o.tabs).length > 0, text(o.tabs));
+      assert(o.act.result.isError === false && json(o.act).url === 'https://user.example/inbox', text(o.act));
+      assert(o.observe.result.isError === false && json(o.observe).actions.some((a) => a.name === 'Archive'), text(o.observe));
+      assert.deepStrictEqual(o.spawned, [['launch']], 'only the lifecycle command went to a fresh process');
+      assert(o.launch.result.isError === true && /spawned/.test(text(o.launch)), text(o.launch));
+      assert(o.hung.result.isError === true && /timed out \(1s\)/.test(text(o.hung)), text(o.hung));
+      assert(o.after.result.isError === false && json(o.after).actions.length > 0, 'the server serves on after a cancelled call');
+      assert.strictEqual(o.served, 4, 'tabs, act, observe and the call after the cancelled one ran warm');
+      assert.strictEqual(o.streams, true, 'stdout/stderr restored after every call');
+      assert.strictEqual(o.env_daemon, '1');
+      assert.strictEqual(o.env_mcp, null, 'the request environment did not leak into the server');
     } finally { fake.stop(); }
   });
 

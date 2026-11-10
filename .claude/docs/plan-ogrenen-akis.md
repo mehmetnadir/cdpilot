@@ -102,4 +102,4 @@ Sınır (bilinçli): görünmez-ama-AX'te metin (beyaz üstüne beyaz, ekran dı
 
 `browser_agent_observe` (`diff`), `browser_agent_act` (`ref`/`url`, `action`, `text`), `browser_agent_flow_save` (`name`, `last`),
 `browser_agent_run` (`flow`, `vars` nesnesi, `dry_run`). `core` profili dışında (`browser_tools enable`). Sapma / eksik değişken
-`isError` + komutun JSON'u. Sınır: MCP sunucusu her çağrıda taze Python süreci açar; daemon sıcak yolu MCP'de yok → HIZ adayı.
+`isError` + komutun JSON'u. 10.11: MCP araç çağrısı `CDPILOT_DAEMON=1` ile sunucu sürecinde koşar (~400 → ~10 ms; plan-daemon-insan-hizi.md §7).

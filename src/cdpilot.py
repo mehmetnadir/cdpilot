@@ -43,7 +43,9 @@ Environment:
   CDPILOT_DAEMON=1     Keep one warm Python process per project and send page
                        commands to it over a local socket (fresh process when
                        it is missing or busy; `cdpilot daemon status|stop`;
-                       idle exit after CDPILOT_DAEMON_IDLE s, default 1800)
+                       idle exit after CDPILOT_DAEMON_IDLE s, default 1800).
+                       Set for `cdpilot mcp`, tool calls run in the server
+                       process instead of a fresh one (~400 -> ~10 ms a call)
   CDPILOT_NO_AUTOLAUNCH=1  Do not start the browser when a page command
                        finds it not running (print the error instead)
   CDPILOT_IDLE_CLOSE   Minutes without a cdpilot command or page change before
@@ -18613,12 +18615,64 @@ class MCPServer:
     }
     NOT_ENABLED = "tool not enabled; call browser_tools enable"
 
+    # A tool call that has not returned in this many seconds is stopped: the
+    # fresh process killed, the in-process run cancelled at its next async step.
+    TOOL_TIMEOUT_S = 30
+
     def __init__(self, tools_spec=None):
         self.tools = self._register_tools()
         spec = (tools_spec or os.environ.get("CDPILOT_MCP_TOOLS") or "all").strip()
         self.profiled = spec != "all"
         self.enabled = set(self.CORE_TOOLS if spec == "core" else spec.split(","))
         self.pending_notifications = []
+        # A tool call that runs in this process (CDPILOT_DAEMON=1, _run_warm)
+        # must see what its own process saw with CDPILOT_MCP_SESSION=1 set.
+        global IS_MCP_SESSION
+        IS_MCP_SESSION = True
+
+    def _run_warm(self, cli_args, env):
+        """CDPILOT_DAEMON=1: run the tool call in the server process, the way
+        the warm CLI process runs a request (_daemon_execute: argv, environment,
+        streams and exit hooks swapped in, module state reset, the CDP sockets
+        closed at the end) — no Python start-up and no compile of this module
+        per call (10.11, M1 Max: ~400 → ~10 ms a call before the CDP work;
+        plan-daemon-insan-hizi.md §7).
+        Returns (exit code, stdout, stderr); None when the command runs fresh by
+        rule (lifecycle commands; a project config that moved since this process
+        imported it) and the caller spawns a process. Raises
+        subprocess.TimeoutExpired when the run passed TOOL_TIMEOUT_S and was
+        cancelled at its next async step (a purely synchronous hang is not
+        interrupted: no cdpilot command is one)."""
+        if os.environ.get("CDPILOT_DAEMON") != "1" or sys.platform == "win32":
+            return None
+        if _DAEMON["loop"] is None:  # once: the one long-lived loop of a warm process
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            _DAEMON.update(loop=loop, asyncio_run=asyncio.run, served=0, started=time.time())
+            asyncio.run = _daemon_asyncio_run
+        out, err = io.StringIO(), io.StringIO()
+        refused, expired = [], []
+
+        def _expire():  # what _daemon_watch_client does when the client goes away
+            expired.append(True)
+            _DAEMON["gone"] = True
+            task = _DAEMON.get("task")
+            if task is not None:
+                _DAEMON["loop"].call_soon_threadsafe(task.cancel)
+
+        timer = threading.Timer(self.TOOL_TIMEOUT_S, _expire)
+        timer.daemon = True
+        req = {"argv": list(cli_args), "cwd": os.getcwd(), "env": env, "stdin": ""}
+        try:
+            code = _daemon_execute(req, out, err, refused.append, on_run=timer.start)
+        finally:
+            timer.cancel()
+        if code is None:
+            return None
+        if expired:
+            raise subprocess.TimeoutExpired(cli_args, self.TOOL_TIMEOUT_S)
+        _DAEMON["served"] += 1
+        return code, out.getvalue(), err.getvalue()
 
     def listed_tools(self):
         """tools/list: the profile's tools (all by default), plus the WebMCP ones
@@ -18876,6 +18930,7 @@ class MCPServer:
         # line; the server writes one only when that process never got to.
         via = f"mcp:{tool_name}"
         started, t0 = datetime.datetime.now().astimezone(), time.monotonic()
+        fresh = False  # set when the call runs as a child process
         try:
             env = os.environ.copy()
             env["CDPILOT_MCP_SESSION"] = "1"
@@ -18884,12 +18939,16 @@ class MCPServer:
             # code page and a parent reading another raised here, and the
             # server logged the call a second time.
             env["PYTHONIOENCODING"] = "utf-8"
-            result = subprocess.run(
-                [sys.executable, __file__] + cli_args,
-                capture_output=True, encoding="utf-8", errors="replace", timeout=30, env=env
-            )
-            output = result.stdout.strip()
-            errors = result.stderr.strip()
+            ran = self._run_warm(cli_args, env)  # CDPILOT_DAEMON=1: in this process
+            if ran is None:
+                fresh = True
+                result = subprocess.run(
+                    [sys.executable, __file__] + cli_args,
+                    capture_output=True, encoding="utf-8", errors="replace",
+                    timeout=self.TOOL_TIMEOUT_S, env=env
+                )
+                ran = (result.returncode, result.stdout, result.stderr)
+            code, output, errors = ran[0], ran[1].strip(), ran[2].strip()
             content = []
             # A click pressed but not clicked is no error (a retry could
             # click twice): a machine-readable first line tells the agent.
@@ -18897,7 +18956,7 @@ class MCPServer:
             # start with the same words, and exit 3 means other things there.
             click_tool = tool_name in MCP_CLICK_TOOLS
             status = _pressed_status(output) if click_tool else None
-            if click_tool and result.returncode == CLICK_MISSED_EXIT_CODE and status is None:
+            if click_tool and code == CLICK_MISSED_EXIT_CODE and status is None:
                 status = {"clicked": False, "reason": "moved"}
             if status is not None:
                 content.append({"type": "text", "text": json.dumps(status)})
@@ -18909,11 +18968,12 @@ class MCPServer:
                 content.append({"type": "text", "text": "Command executed successfully"})
             ok_codes = (0, CLICK_MISSED_EXIT_CODE) if click_tool else (0,)
             return {"jsonrpc": "2.0", "id": req_id, "result": {
-                "content": content, "isError": result.returncode not in ok_codes}}
+                "content": content, "isError": code not in ok_codes}}
         except subprocess.TimeoutExpired:
-            _slog_record_external(cli_args, TIMEOUT_EXIT_CODE, started, int((time.monotonic() - t0) * 1000),
-                                  "MCP tool call timed out (30s); the command was killed", via)
-            return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Error: Command timed out (30s)"}], "isError": True}}
+            if fresh:  # a run in this process wrote its own line at its end (exit 130)
+                _slog_record_external(cli_args, TIMEOUT_EXIT_CODE, started, int((time.monotonic() - t0) * 1000),
+                                      f"MCP tool call timed out ({self.TOOL_TIMEOUT_S}s); the command was killed", via)
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Error: Command timed out ({self.TOOL_TIMEOUT_S}s)"}], "isError": True}}
         except Exception as e:
             _slog_record_external(cli_args, 1, started, int((time.monotonic() - t0) * 1000),
                                   f"{type(e).__name__}: {e}", via)
@@ -22732,17 +22792,22 @@ def _daemon_watch_client(conn, done):
         loop.call_soon_threadsafe(task.cancel)
 
 
-def _daemon_run_request(conn, req):
-    """Run one CLI call in this process as if it were its own process.
-    Returns True (ran), False (refused before anything ran) or "stale" (refused:
-    this process was imported for another port/profile/project than a fresh
-    process would resolve now — it exits and the client starts a new one)."""
+def _daemon_execute(req, out, err, refuse, on_run=None):
+    """Run one CLI call in this process as if it were its own process: the
+    request's argv, cwd, environment and stdin; stdout and stderr to the text
+    streams out and err; module state reset first; the exit-time hooks the
+    command registered run at the end; the pooled CDP sockets closed.
+    Returns the exit code, or None when the call was refused before anything
+    ran — refuse(reason) was called with "request" (malformed), "cwd",
+    "command" (runs fresh by rule) or "stale" (this process was imported for
+    another port/profile/project than a fresh process resolves now). on_run()
+    runs right before the command does: the warm CLI starts its client watcher
+    there, the MCP server its timeout. Callers: _daemon_run_request (socket),
+    MCPServer._run_warm (tool calls in the server process)."""
     argv = req.get("argv")
     if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
-        _daemon_send(conn, {"fallback": "request"})
-        return False
-    out, err = _DaemonStream(conn, "o"), _DaemonStream(conn, "e")
-    out._peer, err._peer = err, out
+        refuse("request")
+        return None
     saved = (sys.stdout, sys.stderr, sys.stdin, sys.exit, sys.excepthook, sys.argv)
     env_before, cwd_before = dict(os.environ), os.getcwd()
     real_register = atexit.register
@@ -22752,10 +22817,7 @@ def _daemon_run_request(conn, req):
         at_end.append((fn, a, k))
         return fn
 
-    done = threading.Event()
-    watcher = None
     code = None  # set once the command ran
-    outcome = False
     try:
         env = req.get("env")  # the caller's environment, as a fresh process would see it
         if isinstance(env, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
@@ -22766,25 +22828,24 @@ def _daemon_run_request(conn, req):
             try:
                 os.chdir(cwd)
             except OSError:
-                _daemon_send(conn, {"fallback": "cwd"})
-                return False
+                refuse("cwd")
+                return None
         try:
             timeout_s, plain = _extract_timeout(argv)
         except ValueError:
             timeout_s, plain = None, argv
-        cmd = plain[0] if plain else None
         if timeout_s or _daemon_spawn_only(plain):
             # --timeout ends a process with os._exit (see _arm_timeout_watchdog);
             # lifecycle commands fork, serve or wait — a fresh process for them.
-            _daemon_send(conn, {"fallback": "command"})
-            return False
+            refuse("command")
+            return None
         try:  # port, profile and project id are resolved at import: still what a fresh process gets?
             current = _resolve_project_config()
         except Exception:
             current = None
         if tuple(current or ()) != (CDP_PORT, PROFILE_DIR, PROJECT_ID):
-            _daemon_send(conn, {"fallback": "stale"})
-            return "stale"
+            refuse("stale")
+            return None
         atexit.register = _register
         _daemon_reset_state()
         sys.argv = ["cdpilot"] + list(argv)
@@ -22794,8 +22855,8 @@ def _daemon_run_request(conn, req):
         _DAEMON["gone"] = False
         code = 0
         try:
-            watcher = threading.Thread(target=_daemon_watch_client, args=(conn, done), daemon=True)
-            watcher.start()
+            if on_run is not None:
+                on_run()
             _cli_main()
         except SystemExit as e:
             code = _daemon_exit_code(e, err)
@@ -22807,9 +22868,7 @@ def _daemon_run_request(conn, req):
             except BaseException:
                 pass
             code = 1
-        outcome = True
     finally:
-        done.set()
         if code is not None:
             for fn, a, k in reversed(at_end):  # session log line, record step, idle stamp
                 try:
@@ -22834,12 +22893,40 @@ def _daemon_run_request(conn, req):
                 _DAEMON["loop"].run_until_complete(asyncio.wait_for(_daemon_request_teardown(), 5))
             except BaseException:
                 pass
-    if code is not None:
-        _daemon_send(conn, {"exit": code})
+    return code
+
+
+def _daemon_run_request(conn, req):
+    """Serve one request of the warm CLI process: run it here (_daemon_execute)
+    with stdout and stderr travelling to the client as frames and a watcher
+    thread cancelling the command when the client goes away.
+    Returns True (ran), False (refused before anything ran) or "stale" (refused:
+    this process was imported for another port/profile/project than a fresh
+    process would resolve now — it exits and the client starts a new one)."""
+    out, err = _DaemonStream(conn, "o"), _DaemonStream(conn, "e")
+    out._peer, err._peer = err, out
+    done = threading.Event()
+    reasons = []
+
+    def _refuse(reason):
+        reasons.append(reason)
+        _daemon_send(conn, {"fallback": reason})
+
+    def _watch():
+        watcher = threading.Thread(target=_daemon_watch_client, args=(conn, done), daemon=True)
+        watcher.start()
+
+    try:
+        code = _daemon_execute(req, out, err, _refuse, on_run=_watch)
+    finally:
+        done.set()
+    if code is None:
+        return "stale" if "stale" in reasons else False
+    _daemon_send(conn, {"exit": code})
     # The watcher thread ends by itself when the caller closes the connection
     # (right after this return): never wait for it — a join here cost 200 ms
     # per request on 08.11, the client closes only after the exit frame.
-    return outcome
+    return True
 
 
 def _daemon_ping(sock_path, timeout=0.5):

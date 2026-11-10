@@ -167,3 +167,15 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
   bilinmeyen akış isError, observe --diff). Not: MCP her araç çağrısında taze Python süreci açıyor (`subprocess.run([sys.executable,
   __file__] …)`) → daemon kazancı MCP yoluna henüz yansımıyor; HIZ için sıradaki aday (plan-daemon'a eklenecek).
 - CI 09.11: 0114ac7, b9d7e8c, 03161c6 üçü de yeşil (12 birim + e2e). 0.9.6 npm Nadir onayı bekler.
+
+## 12. Delta 10.11 — MCP araç çağrısı sıcak süreçte (K-0021)
+
+- Nadir "devam et" dedi; 0.9.6 npm onayı yok, yayın bekler. Şef HIZ borcunu kapattı: MCP sunucusu her araç çağrısında taze
+  Python açıyordu (~400 ms). `_daemon_run_request` → `_daemon_execute` (çekirdek) + soket sarmalayıcı; `MCPServer._run_warm`
+  aynı çekirdeği sunucu sürecinde çağırır (`CDPILOT_DAEMON=1`, POSIX). Ölçüm: eval/tabs/content 412/390/416 → 11/7/9 ms.
+  Ayrıntı plan-daemon-insan-hizi.md §7; CHANGELOG, README (Agent mode over MCP + Warm process), yardım metni, CLAUDE.md.
+- Test: `mcp warm: …` (sahte tarayıcı, süreç içi `MCPServer`, `subprocess.run` çocuk reddi, 1 sn aşım iptali). Ders: süreç içi
+  test yorumlayıcıyı launcher gibi seçmeli (`python.json`) — kabuğun `python3`ü websockets'siz, hata "Could not open a tab"
+  diye görünür (gerçek sebep ModuleNotFoundError, `_browser_ws_call` yutuyor).
+- Kalan: SPA settle ölçümü, enjeksiyon 20+20 ölçümü, gerçek site token ölçümü; 0.9.6 Nadir onayı; daemon varsayılan 22.11'den
+  önce değil (MCP yolu da aynı karara bağlı).

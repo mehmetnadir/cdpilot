@@ -223,3 +223,39 @@ bekleyen istek yoksa (`Network.requestWillBeSent` − `loadingFinished/Failed` =
 SPA'da yük sonrası DOM değişimini kaçırma riski ölçülmeden karar verilmez (bekleyen iş: SPA settle ölçümü — 3 SPA
 sayfasında `innerText` uzunluğunun yük sonrası zaman eğrisi). Nadir kararı: pencere sabit kalsın mı, "bekleyen istek yok"
 kısayolu mu?
+
+## 7. MCP araç çağrısı sıcak süreçte (10.11, şef kararı; Kovan K-0021) — UYGULANDI
+
+Sorun: MCP sunucusu (`cdpilot mcp`) her araç çağrısında taze Python süreci açıyordu
+(`subprocess.run([sys.executable, __file__] + args)`): yorumlayıcı açılışı + 23 bin satırın derlenmesi (bytecode önbelleği
+bu yolda yoktu) → CDP işi başlamadan ~400 ms. Daemon kazancı (§2, §5) MCP yoluna hiç yansımıyordu; MCP, modellerin
+cdpilot'a en çok kullandığı yoldur.
+
+```
+eski:  model → MCP sunucusu → taze Python (açılış + derleme ~400 ms) → CDP
+yeni:  model → MCP sunucusu ──_daemon_execute (aynı süreç, ~10 ms)──▶ CDP
+```
+
+Tasarım: `_daemon_run_request` ikiye ayrıldı. Çekirdek `_daemon_execute(req, out, err, refuse, on_run)` bir çağrıyı bu
+süreçte kendi süreciymiş gibi koşturur (argv / ortam / cwd / stdin takası, modül durumu sıfırlama, `atexit` kancaları
+istek sonunda, CDP soketleri istek sonunda kapanır, çıkış kodu döner ya da `refuse(sebep)` ile reddeder). Soket
+sarmalayıcı (`_daemon_run_request`) çerçeveleri ve istemci gözcüsünü ekler; `MCPServer._run_warm` aynı çekirdeği sunucu
+sürecinde çağırır: soket yok, anahtar yok, node yok. Kurallar aynı: yaşam döngüsü komutları (`launch`, `connect`, …) ve
+bayat proje ayarı taze süreçte koşar; 30 sn aşımı görevin ilk async adımında iptal eder (taze süreçte öldürme idi; tamamen
+eşzamanlı takılma kesilmez — cdpilot komutlarının hepsi async CDP işi). `IS_MCP_SESSION` sunucu sürecinde True yapılır
+(çocuk süreçlerin `CDPILOT_MCP_SESSION=1` ile gördüğü şey). POSIX; `CDPILOT_DAEMON=1` sunucunun ortamında.
+
+Ölçüm (10.11, M1 Max, yük 30–50, ortak başsız Chrome 152 `connect 9333`, stdio oturumu, 4 araç × 3 tur; betik
+`.claude/docs/olcum/olc-mcp.js`):
+
+| Araç | Taze süreç (medyan, tur > 0) | Sıcak süreç (medyan) | Fark |
+|---|---|---|---|
+| `browser_eval` | 412 ms | 11 ms | −%97 |
+| `browser_tabs` | 390 ms | 7 ms | −%98 |
+| `browser_content` | 416 ms | 9 ms | −%98 |
+| ilk çağrı (sekme açma dahil) | 773 ms | 382 ms | — |
+
+Parite (aynı 7 çağrı taze ve sıcak, gerçek Chrome): `navigate`, `eval`, `content`, `a11y`, `click`, bilinmeyen araç birebir
+aynı; `tabs` farkı yalnız paylaşılan tarayıcıda önceki koşunun açık sekmesi. Test: sahte tarayıcıya karşı süreç içi oturum,
+`subprocess.run` çocuk süreci reddediyor (yalnız `launch` ona düşer), 1 sn aşımı iptal + sonraki çağrı sağlıklı, akışlar
+geri yüklü, istek ortamı sunucuya sızmıyor. Sınır: Windows'ta taze süreç sürer; tutanak `TT-…` commit mesajında.
