@@ -7299,7 +7299,8 @@ def cmd_launch(auto=False, idle_close=None):
         print(f'  WebMCP: on (--enable-features={WEBMCP_FEATURE})')
 
     try:
-        proc = subprocess.Popen(chrome_args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        # Nothing reads the pipe; a browser outliving a long-lived (warm) process must not block on a full or closed pipe.
+        proc = subprocess.Popen(chrome_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as e:
         # Windows' FileNotFoundError ("[WinError 2] The system cannot find the
         # file specified") does not name the binary; say which one, on every OS,

@@ -1071,7 +1071,9 @@ in its environment it runs each tool call in the server process the same way (th
 same executor, no socket involved) instead of starting a Python process per
 call — ~400 ms → ~10 ms before the CDP work. Lifecycle tools and a project
 configuration that moved since the server started still run fresh; a call past
-30 s is cancelled at its next async step. See "Agent mode over MCP" above.
+30 s is cancelled at its next async step. A tool call stuck in synchronous code
+(not waiting on the browser) is not interrupted by the 30 s cancel, unlike the
+fresh path's kill. See "Agent mode over MCP" above.
 
 ### Session log
 
