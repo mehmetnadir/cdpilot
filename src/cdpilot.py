@@ -1708,9 +1708,39 @@ def _autolaunch_if_down():
     return False
 
 
+def _external_override_message():
+    """If CDP_PORT in the environment overrides an external browser's port in
+    the registry, return the override advice message; otherwise None."""
+    project_id = globals().get("PROJECT_ID")
+    if not project_id:
+        return None
+    registry = _load_registry()
+    entry = registry.get(project_id)
+    if not isinstance(entry, dict) or not entry.get("external"):
+        return None
+    reg_port = _as_port(entry.get("port"))
+    if reg_port is None:
+        return None
+    env_port_str = os.environ.get("CDP_PORT")
+    if not env_port_str or env_port_str == "0":
+        return None
+    env_port = _as_port(env_port_str)
+    if env_port is None:
+        return None
+    cur_port = globals().get("CDP_PORT")
+    if cur_port != env_port or cur_port == reg_port:
+        return None
+    return (f"cdpilot: CDP_PORT={env_port} in the environment overrides the "
+            f"connected browser on port {reg_port}; unset CDP_PORT or set it to {reg_port}")
+
+
 def _external_gone_exit():
     """The connected (external) browser stopped answering: say so, exit 1.
     Never launches a replacement."""
+    override = _external_override_message()
+    if override:
+        print(override, file=sys.stderr)
+        sys.exit(1)
     print(f"cdpilot: {EXTERNAL_GONE}", file=sys.stderr)
     sys.exit(1)
 
@@ -7114,6 +7144,10 @@ def cmd_launch(auto=False, idle_close=None):
             print(f'Connected browser in use on port {CDP_PORT} (external); '
                   'no cdpilot browser launched. `cdpilot disconnect` to use one.')
             return
+        override = _external_override_message()
+        if override:
+            print(override, file=sys.stderr)
+            sys.exit(1)
         print(EXTERNAL_GONE, file=sys.stderr)
         sys.exit(1)
     # This command's own flags (sys.argv minus --timeout); none for auto-launch.
@@ -13913,6 +13947,14 @@ def _do_connect(port, ws_url, version_info, browser_name):
     print(f"  WebSocket: {ws_url}")
     print(f"  Tabs: {tab_count}")
     print("  Commands now run in YOUR browser; cdpilot will never close it.")
+
+    env_port_str = os.environ.get("CDP_PORT")
+    if env_port_str and env_port_str != "0":
+        env_port = _as_port(env_port_str)
+        if env_port is not None and env_port != port:
+            print(f"cdpilot: CDP_PORT={env_port} in the environment overrides the "
+                  f"connected browser on port {port}; unset CDP_PORT or set it to {port}",
+                  file=sys.stderr)
 
 
 def _forget_project_tabs():
