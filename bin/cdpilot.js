@@ -765,6 +765,8 @@ function showHelp() {
                        a fresh process when it is missing or busy; not with
                        --timeout; 'daemon status|stop'; idle exit after
                        CDPILOT_DAEMON_IDLE seconds, default 1800).
+    CDPILOT_VAR_HOSTS  Hosts (comma-separated) an agent flow may type
+                       CDPILOT_VAR_* values on
 
   SETUP
     setup              Auto-detect browser, create isolated profile
@@ -913,6 +915,19 @@ function showHelp() {
     stop-all           Stop all browser instances
 
   AI AGENT
+    agent observe [--diff]
+                       Page state as numbered @refs (+text); --diff = only
+                       changes since last
+    agent act --ref @N [--action click|type|fill|hover|submit] [--text X]
+                       Acts, prints the diff
+    agent act --url URL
+                       Navigates silently, prints the diff
+    agent flow save <name> [--last N] | list | show <name> | delete <name>
+                       Save the acts since the last navigation as a replayable
+                       flow
+    agent run <name> [--var k=v] [--dry-run]
+                       Replay by anchors, no model; exit 4 on drift with the
+                       page, 2 for a missing or refused variable
     mcp                Start MCP server (stdin/stdout JSON-RPC)
                        --tools core|all|a,b (env CDPILOT_MCP_TOOLS): smaller tool list
 
