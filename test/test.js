@@ -12953,6 +12953,133 @@ print(json.dumps(res))
 
 // ── Summary ──
 
+// fill/click: textarea setter + exit 1 on failure (fake cdp_send, no browser)
+(function() {
+  const { execFileSync } = require('child_process');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const PYSRC = `
+import asyncio, contextlib, importlib.util, io, json, sys, types
+fake = types.ModuleType("websockets"); sys.modules["websockets"] = fake
+spec = importlib.util.spec_from_file_location("cdpilot_fillclick", sys.argv[1])
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+mod.get_page_ws = lambda *a, **k: ("ws://fake/devtools/page/1", {})
+async def _res(ws, sel, ladder=None): return sel, [{"hit": True}]
+mod._resolve_selector_ladder = _res
+mod._entropy_enabled = lambda *a, **k: False
+mod._replay_strict_rule = lambda *a, **k: None
+mod.get_auto_wait_ms = lambda *a, **k: 100
+out = {}
+for name, case in json.load(sys.stdin).items():
+    sent = []
+    async def fake_send(ws, msgs, *a, **k):
+        sent.append(msgs[0][2].get("expression", ""))
+        return {1: case["reply"]}
+    async def fake_smart(ws, js, *a, **k):
+        sent.append(js)
+        return json.dumps(case["reply"])
+    mod.cdp_send = fake_send
+    mod._smart_eval = fake_smart
+    o, e = io.StringIO(), io.StringIO()
+    code = 0
+    try:
+        with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+            asyncio.run(getattr(mod, case["fn"])(*case["args"]))
+    except SystemExit as x:
+        code = x.code
+    out[name] = {"code": code, "out": o.getvalue(), "err": e.getvalue(), "js": sent[-1] if sent else ""}
+print(json.dumps(out))
+`;
+  const val = (v) => ({ result: { type: 'string', value: v } });
+  const cases = {
+    fill_ok: { fn: 'cmd_fill', args: ['#t', 'hello'], reply: val('Filled: TEXTAREA = hello') },
+    fill_missing: { fn: 'cmd_fill', args: ['#nope', 'x'], reply: val('Timeout waiting for: "#nope"') },
+    fill_throw: { fn: 'cmd_fill', args: ['#t', 'x'], reply: { result: { type: 'object', subtype: 'error' },
+      exceptionDetails: { text: 'Uncaught', exception: { description: 'TypeError: Illegal invocation\\n    at x' } } } },
+    click_ok: { fn: 'cmd_click', args: ['#b'], reply: val('Clicked: BUTTON go') },
+    click_missing: { fn: 'cmd_click', args: ['#nope'], reply: val('Timeout waiting for: "#nope"') },
+    smart: { fn: 'cmd_smart_fill', args: ['Notes', 'hi'], reply: { found: true, tag: 'textarea', type: '', score: 9, placeholder: '', name: 'n' } },
+  };
+  let res = null;
+  function get(name) {
+    if (!res) {
+      res = JSON.parse(execFileSync(PYB, ['-c', PYSRC, PY_PATH], {
+        input: JSON.stringify(cases), encoding: 'utf-8', timeout: 30000,
+        env: { ...process.env, CDPILOT_LOG: '0', CDPILOT_HOME: fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-fc-')) },
+      }).trim().split('\n').pop());
+    }
+    return res[name];
+  }
+  // Run the shipped __cdpilot_setValue against a fake DOM whose value setters throw
+  // "Illegal invocation" on a foreign element, like the browser does.
+  function setOn(js, tag) {
+    const vm = require('vm');
+    const m = js.match(/function __cdpilot_setValue\(el, v\) \{[\s\S]*?\n\}/);
+    assert(m, 'expression must carry __cdpilot_setValue');
+    const box = {};
+    const mk = (T) => {
+      const C = class { constructor() { this.tagName = T; this._v = ''; } };
+      Object.defineProperty(C.prototype, 'value', {
+        get() { return this._v; },
+        set(x) { if (!(this instanceof C)) throw new TypeError('Illegal invocation'); this._v = x; },
+      });
+      return C;
+    };
+    box.HTMLInputElement = mk('INPUT'); box.HTMLTextAreaElement = mk('TEXTAREA'); box.HTMLSelectElement = mk('SELECT');
+    box.window = box;
+    vm.createContext(box);
+    const C = { INPUT: 'HTMLInputElement', TEXTAREA: 'HTMLTextAreaElement', SELECT: 'HTMLSelectElement' }[tag];
+    box.el = new box[C]();
+    vm.runInContext(m[0] + '\nvar r = (__cdpilot_setValue(el, "hello"), el.value);', box);
+    return box.r;
+  }
+
+  test('fill: textarea gets the value through its own setter (no Illegal invocation)', () => {
+    const r = get('fill_ok');
+    assert.strictEqual(r.code, 0);
+    assert(r.out.includes('Filled: TEXTAREA = hello'), r.out);
+    assert(!r.js.includes('HTMLInputElement.prototype, \'value\''), 'setter must not be fixed to HTMLInputElement');
+    for (const tag of ['TEXTAREA', 'INPUT', 'SELECT']) assert.strictEqual(setOn(r.js, tag), 'hello', tag);
+  });
+
+  test('fill: element not found exits 1 with the message on stderr', () => {
+    const r = get('fill_missing');
+    assert.strictEqual(r.code, 1);
+    assert(r.err.includes('Timeout waiting for'), r.err);
+    assert.strictEqual(r.out, '');
+  });
+
+  test('fill: script error exits 1 with the error on stderr', () => {
+    const r = get('fill_throw');
+    assert.strictEqual(r.code, 1);
+    assert(r.err.includes('Illegal invocation'), r.err);
+    assert.strictEqual(r.out, '');
+  });
+
+  test('click: success exits 0, element not found exits 1 with the message on stderr', () => {
+    const ok = get('click_ok');
+    assert.strictEqual(ok.code, 0);
+    assert(ok.out.includes('Clicked: BUTTON'), ok.out);
+    const miss = get('click_missing');
+    assert.strictEqual(miss.code, 1);
+    assert(miss.err.includes('Timeout waiting for'), miss.err);
+    assert.strictEqual(miss.out, '');
+  });
+
+  test('smart-fill: picks the setter from the element (textarea works)', () => {
+    const r = get('smart');
+    assert.strictEqual(r.code, 0);
+    assert(r.js.includes('__cdpilot_setValue(best.el, value)'), 'smart-fill must use __cdpilot_setValue');
+    assert(!/getOwnPropertyDescriptor\(\s*window\.HTMLInputElement/.test(r.js), 'no fixed input setter');
+    assert.strictEqual(setOn(r.js, 'TEXTAREA'), 'hello');
+  });
+
+  test('captcha amazon fill: setter picked from the element', () => {
+    assert(/async def _fill_amazon_solution[\s\S]*?__cdpilot_setValue\(el, \{safe_val\}\)/.test(PY_CONTENT));
+    assert(!/Object\.getOwnPropertyDescriptor\(\s*window\.HTMLInputElement\.prototype, 'value'\)\.set/.test(PY_CONTENT));
+  });
+})();
+
+
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);
 
