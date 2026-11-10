@@ -23573,15 +23573,320 @@ def _canvas_host_entry(args):
 # ═══ CANVAS-D BEGIN ═══ (lane D: events CLI + MCP tools + examples)
 # Contract: cmd_canvas_events(name, follow, after, max_n, wait_ms) prints one JSON event per line;
 # CANVAS_TOOLS (MCP tool definitions, never in CORE_TOOLS) and
-# _canvas_mcp_call(server, req_id, name, args) -> JSON-RPC response dict. MCP hands HTML to the
-# canvas through stdin or a 0600 temp file, never argv (jury C2).
-CANVAS_TOOLS = []
-_CANVAS_TOOL_NAMES = frozenset()
+# _canvas_mcp_call(server, req_id, name, args) -> JSON-RPC response dict. MCP talks directly to the
+# host socket in-process via _canvas_request, never putting HTML in argv (jury C2).
+CANVAS_TOOLS = [
+    {
+        "name": "browser_canvas_set",
+        "description": (
+            "Replace the document of an open live canvas (`cdpilot canvas open`) with `html` "
+            "(<= 256 KB). Runs inline scripts in a sandboxed, network-off tab; prefer "
+            "browser_canvas_patch for updates that preserve focus, scroll, and form state."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "html": {"type": "string", "description": "Full HTML document (<= 256 KB)"},
+                "name": {"type": "string", "description": "Canvas name (default: main)"},
+            },
+            "required": ["html"],
+        },
+    },
+    {
+        "name": "browser_canvas_patch",
+        "description": (
+            "Morph an open live canvas to `html` (<= 256 KB), preserving focus, selection, "
+            "scroll, form values, and open <details>/<dialog>. Key nodes with `id` or "
+            "`data-key`; add `data-action` to emit user events."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "html": {"type": "string", "description": "Updated HTML document (<= 256 KB)"},
+                "name": {"type": "string", "description": "Canvas name (default: main)"},
+            },
+            "required": ["html"],
+        },
+    },
+    {
+        "name": "browser_canvas_events",
+        "description": (
+            "Poll events from an open live canvas (`click`, `submit`, `input` on "
+            "`[data-action]`/`[data-emit]`/forms, plus `blocked`/`nav`/`closed`). Pass `next` "
+            "as `after` on the next call; returns JSON `{events, next, dropped}`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "after": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Cursor: return events with seq > after (default: 0)",
+                },
+                "max": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "Max events to return, 1..100 (default: 100)",
+                },
+                "wait_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 25000,
+                    "description": "Wait in ms when empty, 0..25000 (default: 0)",
+                },
+                "name": {"type": "string", "description": "Canvas name (default: main)"},
+            },
+        },
+    },
+]
+_CANVAS_TOOL_NAMES = frozenset(t["name"] for t in CANVAS_TOOLS)
+
+
+def _canvas_parse_int_opt(flag, raw, lo, hi=None):
+    """Parse an integer option and enforce [lo, hi]; else CanvasError(code 2)."""
+    if isinstance(raw, bool):
+        raise CanvasError(f"{flag} needs an integer", 2)
+    if isinstance(raw, int):
+        val = raw
+    elif isinstance(raw, str) and _re.fullmatch(r"[+-]?\d+", raw):
+        val = int(raw, 10)
+    else:
+        raise CanvasError(f"{flag} needs an integer: {raw!r}", 2)
+    if val < lo or (hi is not None and val > hi):
+        bounds = f"{lo}..{hi}" if hi is not None else f">= {lo}"
+        raise CanvasError(f"{flag} must be in {bounds}: {val}", 2)
+    return val
+
+
+def _canvas_events_args(rest_args):
+    """Parse `--follow --after N --max N --wait-ms N` -> (follow, after, max_n, wait_ms)."""
+    follow, after, max_n, wait_ms = False, 0, 100, 0
+    args = list(rest_args or ())
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--follow":
+            follow = True
+            i += 1
+            continue
+        opt, eq, val = a.partition("=") if isinstance(a, str) and a.startswith("--") else ("", "", "")
+        if opt in ("--after", "--max", "--wait-ms"):
+            if not eq:
+                if i + 1 >= len(args):
+                    raise CanvasError(f"{opt} needs a value", 2)
+                val, i = args[i + 1], i + 2
+            else:
+                i += 1
+            if opt == "--after":
+                after = _canvas_parse_int_opt("--after", val, 0)
+            elif opt == "--max":
+                max_n = _canvas_parse_int_opt("--max", val, 1, 100)
+            else:
+                wait_ms = _canvas_parse_int_opt("--wait-ms", val, 0, 25000)
+            continue
+        raise CanvasError(f"canvas events: unknown argument {a!r}", 2)
+    return follow, after, max_n, wait_ms
+
+
+def cmd_canvas_events(name, follow, after, max_n, wait_ms):
+    """One-shot poll (JSON lines + stderr `next=<n> dropped=<n>`) or `--follow` until Ctrl+C."""
+    if sys.platform == "win32":
+        raise CanvasError("canvas is not supported on Windows", 1)
+    _canvas_check_name(name)
+    after = _canvas_parse_int_opt("--after", after, 0)
+    max_n = _canvas_parse_int_opt("--max", max_n, 1, 100)
+    wait_ms = _canvas_parse_int_opt("--wait-ms", wait_ms, 0, 25000)
+    if not follow:
+        reply = _canvas_request(
+            name,
+            {"op": "events", "after": after, "max": max_n, "wait_ms": wait_ms},
+            timeout=max(10.0, wait_ms / 1000.0 + 5.0),
+        )
+        if not reply.get("ok"):
+            raise CanvasError(
+                reply.get("error") or "canvas events failed",
+                int(reply.get("code") or 1),
+            )
+        for ev in reply.get("events") or ():
+            print(json.dumps(ev, ensure_ascii=False, separators=(",", ":")), flush=True)
+        nxt = reply.get("next", after)
+        dropped = reply.get("dropped", 0)
+        print(f"next={nxt} dropped={dropped}", file=sys.stderr, flush=True)
+        return
+
+    cursor = after
+    poll_wait = wait_ms if wait_ms > 0 else 1000
+    sock_timeout = max(10.0, poll_wait / 1000.0 + 5.0)
+    prev_sigint = signal.getsignal(signal.SIGINT)
+    if prev_sigint == signal.SIG_IGN:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        while True:
+            t_req = time.monotonic()
+            reply = _canvas_request(
+                name,
+                {"op": "events", "after": cursor, "max": max_n, "wait_ms": poll_wait},
+                timeout=sock_timeout,
+            )
+            if not reply.get("ok"):
+                raise CanvasError(
+                    reply.get("error") or "canvas events failed",
+                    int(reply.get("code") or 1),
+                )
+            events = reply.get("events") or []
+            for ev in events:
+                print(json.dumps(ev, ensure_ascii=False, separators=(",", ":")), flush=True)
+            nxt = reply.get("next")
+            if isinstance(nxt, int) and not isinstance(nxt, bool):
+                cursor = nxt
+            elif events and isinstance(events[-1], dict) and isinstance(events[-1].get("seq"), int):
+                cursor = events[-1]["seq"]
+            if not events and (time.monotonic() - t_req) < 0.015:
+                time.sleep(0.025)
+    except KeyboardInterrupt:
+        return
+    finally:
+        if prev_sigint == signal.SIG_IGN:
+            signal.signal(signal.SIGINT, prev_sigint)
+
+
+def _canvas_format_ms(ms):
+    if isinstance(ms, bool) or not isinstance(ms, (int, float)):
+        return "0"
+    return str(ms) if isinstance(ms, int) else f"{ms:.1f}".rstrip("0").rstrip(".")
+
+
+def _canvas_mcp_log(tool_name, sub, raw_args, code, started, t0, stdout="", error=None):
+    """Write one session-log entry for an in-process canvas MCP call; HTML -> «html:N chars»."""
+    if not _slog_enabled():
+        return
+    try:
+        via = f"mcp:{tool_name}"
+        dur_ms = int((time.monotonic() - t0) * 1000)
+        raw_name = raw_args.get("name")
+        name_tail = ["--name", str(raw_name)] if raw_name not in (None, "") else []
+        if sub in ("set", "patch"):
+            h = raw_args.get("html")
+            h_len = len(h) if isinstance(h, str) else 0
+            html_mark = f"«html:{h_len} chars»"
+            if error and isinstance(h, str) and len(h) >= 8:
+                error = _slog_scrub_values(error, [h])
+            red_tail, _ = _slog_redact_args("canvas", name_tail)
+            entry = _slog_build_entry(
+                "canvas", name_tail, code, dur_ms, started,
+                stdout=stdout, error=error, via=via,
+            )
+            entry["args"] = [sub, html_mark] + red_tail
+        else:
+            ev_args = ["events"]
+            for key, flag in (("after", "--after"), ("max", "--max"), ("wait_ms", "--wait-ms")):
+                if raw_args.get(key) is not None:
+                    ev_args.extend((flag, str(raw_args[key])))
+            ev_args.extend(name_tail)
+            entry = _slog_build_entry(
+                "canvas", ev_args, code, dur_ms, started,
+                stdout=stdout, error=error, via=via,
+            )
+        _slog_append(entry)
+    except Exception as e:
+        _slog_warn(e)
 
 
 def _canvas_mcp_call(server, req_id, name, args):
-    return {"jsonrpc": "2.0", "id": req_id, "result": {
-        "content": [{"type": "text", "text": "canvas tools are not implemented yet"}], "isError": True}}
+    """Handle browser_canvas_set/patch/events in-process via _canvas_request (no argv, C2)."""
+    _idle_write_activity()
+    started, t0 = datetime.datetime.now().astimezone(), time.monotonic()
+    args = args if isinstance(args, dict) else {}
+    sub = ("set" if name == "browser_canvas_set"
+           else "patch" if name == "browser_canvas_patch" else "events")
+    if sys.platform == "win32":
+        err = "canvas is not supported on Windows"
+        _canvas_mcp_log(name, sub, args, 1, started, t0, error=err)
+        return {"jsonrpc": "2.0", "id": req_id, "result": {
+            "content": [{"type": "text", "text": f"Error: {err}"}], "isError": True}}
+    tool_timeout = float(getattr(server, "TOOL_TIMEOUT_S", 30) or 30)
+    work_margin_s = min(5.0, max(0.5, tool_timeout * 0.2))
+    try:
+        raw_cname = args.get("name")
+        cname = _canvas_check_name(
+            CANVAS_DEFAULT_NAME if raw_cname in (None, "") else raw_cname
+        )
+        if sub in ("set", "patch"):
+            html = args.get("html")
+            if not isinstance(html, str):
+                raise CanvasError("html is required and must be a string", 2)
+            if len(html.encode("utf-8")) > CANVAS_MCP_HTML_MAX:
+                raise CanvasError(
+                    f"HTML is over {CANVAS_MCP_HTML_MAX} bytes (256 KB MCP limit)", 2
+                )
+            sock_timeout = max(0.5, min(15.0, tool_timeout - work_margin_s * 0.5))
+            msg = {"op": sub, "html": html, "t_cli": time.time_ns()}
+            if sub == "patch":
+                msg["final"] = True
+            reply = _canvas_request(cname, msg, timeout=sock_timeout)
+            if not reply.get("ok"):
+                raise CanvasError(
+                    reply.get("error") or f"canvas {sub} failed",
+                    int(reply.get("code") or 1),
+                )
+            ms_s = _canvas_format_ms(reply.get("ms", 0))
+            if sub == "set":
+                text = f"ok {ms_s} ms"
+            else:
+                ops = reply.get("ops") if isinstance(reply.get("ops"), dict) else {}
+                text = (
+                    f"ok +{ops.get('add', 0)} -{ops.get('del', 0)} "
+                    f"~{ops.get('upd', 0)} \u2195{ops.get('move', 0)} {ms_s} ms"
+                )
+        elif name == "browser_canvas_events":
+            after = _canvas_parse_int_opt(
+                "after", 0 if args.get("after") is None else args.get("after"), 0
+            )
+            max_n = _canvas_parse_int_opt(
+                "max", 100 if args.get("max") is None else args.get("max"), 1, 100
+            )
+            wait_ms = _canvas_parse_int_opt(
+                "wait_ms", 0 if args.get("wait_ms") is None else args.get("wait_ms"), 0, 25000
+            )
+            cap_ms = max(0, min(25000, int((tool_timeout - work_margin_s) * 1000)))
+            eff_wait = min(wait_ms, cap_ms)
+            sock_timeout = max(
+                0.5,
+                min(tool_timeout - 0.2, max(5.0, eff_wait / 1000.0 + work_margin_s * 0.6)),
+            )
+            reply = _canvas_request(
+                cname,
+                {"op": "events", "after": after, "max": max_n, "wait_ms": eff_wait},
+                timeout=sock_timeout,
+            )
+            if not reply.get("ok"):
+                raise CanvasError(
+                    reply.get("error") or "canvas events failed",
+                    int(reply.get("code") or 1),
+                )
+            out_obj = {
+                "events": reply.get("events") or [],
+                "next": reply.get("next", after),
+                "dropped": reply.get("dropped", 0),
+            }
+            text = json.dumps(out_obj, ensure_ascii=False, separators=(",", ":"))
+        else:
+            return {"jsonrpc": "2.0", "id": req_id, "error": {
+                "code": -32602, "message": f"Unknown tool: {name}"}}
+        _canvas_mcp_log(name, sub, args, 0, started, t0, stdout=text)
+        return {"jsonrpc": "2.0", "id": req_id, "result": {
+            "content": [{"type": "text", "text": text}], "isError": False}}
+    except CanvasError as e:
+        err = str(e)
+        _canvas_mcp_log(name, sub, args, e.code, started, t0, error=err)
+        return {"jsonrpc": "2.0", "id": req_id, "result": {
+            "content": [{"type": "text", "text": f"Error: {err}"}], "isError": True}}
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        _canvas_mcp_log(name, sub, args, 1, started, t0, error=err)
+        return {"jsonrpc": "2.0", "id": req_id, "result": {
+            "content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}}
 # ═══ CANVAS-D END ═══
 
 
