@@ -11,7 +11,6 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.daemon == '1' }}
     strategy:
       matrix:
         include:
@@ -50,9 +49,10 @@ jobs:
             python-version: '3.11'
           # The whole suite through the warm process (CDPILOT_DAEMON=1): the gate for
           # making it the default (jury D-0042, 10.11.2026; .claude/docs/plan-daemon-insan-hizi.md §4).
-          # Informational (continue-on-error) until that decision: the first run (de9e48c)
-          # passed 617/618 but took 3.6x longer, with +10 s stalls on some calls — every
-          # test home starts its own daemon, so the idle exit is short here (K-0027).
+          # A required job since 11.11: the +10 s per warm call on Linux (the request socket
+          # stayed open while the watcher thread sat in recv) is fixed (2c9a401); 4b67663 ran
+          # 209 s here vs 233 s fresh. Every test home starts its own daemon, so the idle
+          # exit stays short on the runner (K-0027).
           - os: ubuntu-latest
             node-version: 22
             python-version: '3.12'
