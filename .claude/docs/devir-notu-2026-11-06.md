@@ -216,6 +216,11 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
 - Çift kip ölçümü: bütün paket `CDPILOT_DAEMON=1` ile (worktree, cbba05e): 617/618 — tek düşen test sahte senaryonun kendi
   `subprocess.run` yaması (sıcak yol onu atlıyor), ürün hatası değil → senaryo `CDPILOT_DAEMON`'u düşürür; CI'a `daemon: '1'` matris
   girdisi eklendi (D2 kapısı 1).
+- Çift kip CI ilk koşu (de9e48c, run 42810141487): 617/618 — düşen `bin: runpy` testi `execSync` 10 sn ETIMEDOUT; iş taze eşinin 3,6 katı
+  sürdü (1.066 sn / 295 sn), 18 test +10 sn katlarıyla yavaş (agent observe/act +255 sn). Tek başına koşulan aynı testler 1 sn; elle
+  ölçülen ilk çağrı 0,4–0,6 sn, sıcak 0,12–0,16 sn → gerçek kullanımda görünmüyor. Hipotez: her test evi kendi daemon'unu başlatıyor,
+  yüzlerce boşta Python süreci CI koşucusunu (7 GB) boğuyor; +10 sn kuantası açıklanmadı. İş K-0027'ye: koşu sırasında daemon sayısı/RSS
+  ölç, kuantanın kaynağını bul. Şimdilik iş `continue-on-error` + `CDPILOT_DAEMON_IDLE=30` (bilgi amaçlı; D2 kararına kadar).
 - J1'in doğrulanmamış notu (daemon içinden otomatik başlatılan Chrome'un stderr borusu): kontrol edildi — `proc` tutulmuyor, `Popen`
   nesnesi dönüşte düşer, boru kapanır, Chrome EPIPE alır; blok yok. Sonraki sürümde `DEVNULL` daha temiz (iş).
 - X: 10.11 startup-cost paylaşımı 14:23 → 17:30'a kaydırıldı (followup 0.9.6 sonrası güncellenir); 11.11 followup metni hazır (278 ağırlıklı).
