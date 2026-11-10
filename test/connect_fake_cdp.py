@@ -260,9 +260,13 @@ def answer(msg, path):
     # every node has a box, a click lands, a focused field takes typed text.
     elif method == "DOM.getBoxModel":
         bid = int(p.get("backendNodeId") or 0)
+        if bid >= 9000:  # a node of another document: no box, like a real stale backendNodeId
+            return {"id": msg.get("id"), "result": {}}, events
         x, y = 100, 20 * bid
         result = {"model": {"content": [x, y, x + 80, y, x + 80, y + 16, x, y + 16],
                             "width": 80, "height": 16}}
+    elif method == "DOM.resolveNode" and int(p.get("backendNodeId") or 0) >= 9000:
+        result = {}
     elif method == "DOM.resolveNode":
         result = {"object": {"type": "object", "objectId": f"O{p.get('backendNodeId')}"}}
     elif method == "Runtime.callFunctionOn" and "cdpilot-var-target" in (p.get("functionDeclaration") or ""):

@@ -15923,7 +15923,12 @@ async def cmd_click_ref(ref_str):
         val = None
 
     if not val or "x" not in val:
-        print(f"Error: Could not get coordinates for @{ref_num}.", file=sys.stderr)
+        # The box model is gone when the ref's node is not in the page any more:
+        # the tab navigated or reloaded since the snapshot (another command, a
+        # second process on the same tab). The ref belongs to the old document.
+        print(f"Error: Could not get coordinates for @{ref_num}. The element is not in the "
+              "current page (stale ref: the page changed since the last snapshot). "
+              "Run 'agent observe' (or 'a11y-snapshot') again and use a fresh @ref.", file=sys.stderr)
         sys.exit(1)
 
     x, y = val["x"], val["y"]
