@@ -7,6 +7,7 @@ All notable changes to cdpilot will be documented in this file.
 ### Changed
 - **CLI help documents agent mode and `CDPILOT_VAR_HOSTS`.** `cdpilot --help` adds `agent observe`, `agent act`, `agent flow` and `agent run` to the AI AGENT section; environment options list `CDPILOT_VAR_HOSTS`.
 - **README clarifies tool-call cancellation in warm MCP mode.** A tool call stuck in synchronous code (not waiting on the browser) is not interrupted by the 30 s cancel, unlike the fresh path's kill.
+- Docs: claims audit after 0.9.6 — zero npm dependencies wording everywhere, MCP tool count in the bundle manifest, origin (not host) for placeholder steps, exit codes 2/4 for agent commands, tokens_avoided is an upper bound, injection patterns are English-only, comparison table aligned with cdpilot.dev/compare.
 
 ### Fixed
 - **`cmd_launch` starts the browser with `stderr=subprocess.DEVNULL`.** Nothing reads the pipe, so a browser outliving a long-lived (warm) process will not block on a full or closed pipe.
