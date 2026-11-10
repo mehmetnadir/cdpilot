@@ -9016,6 +9016,25 @@ print(json.dumps(out))
     assert.strictEqual(exec(r.frame_filter)[0].name, 'frame_echo');
   });
 
+  test('webmcp: a getTools() that never settles is cut off: the list skips that frame, a stuck top document is a named error', () => {
+    const r = fake('getTools_hang');
+    assert(r.seconds < 20, `took ${r.seconds}s: the evaluate timeout (15 s) was hit, not the getTools limit`);
+    const fl = r.frame_list;
+    assert.strictEqual(fl.exit, 0, fl.stderr);
+    assert.deepStrictEqual(JSON.parse(fl.stdout).tools.map((t) => t.name),
+      ['add_to_cart', 'subscribe_newsletter'], 'the tools of the documents that answered');
+    assert.strictEqual(r.frame_call_top.exit, 0, r.frame_call_top.stderr);
+    assert.deepStrictEqual(JSON.parse(r.frame_call_top.stdout),
+      { ok: true, tool: 'add_to_cart', got: { sku: 'A1', qty: 2 } });
+    assert.strictEqual(r.frame_call_stuck.exit, 1);
+    assert(/not found on this page/.test(r.frame_call_stuck.stderr), r.frame_call_stuck.stderr);
+    const tl = JSON.parse(r.top_list.stdout);
+    assert.strictEqual(r.top_list.exit, 0, r.top_list.stderr);
+    assert.deepStrictEqual(tl.tools, []);
+    assert.strictEqual(tl.reason, 'error');
+    assert(/TimeoutError: getTools\(\) did not answer within/.test(tl.hint), tl.hint);
+  });
+
   test('webmcp: tools call aborts the execution signal when its time budget ends (exit 124)', () => {
     const r = fake('call_timeout');
     isolatedOnly(r, 'timeout');
