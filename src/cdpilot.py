@@ -8478,7 +8478,7 @@ async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
         return el;
     }});
 }})()"""
-        out = await _replay_strict_act(ws, find_js, value, strict, 'fill')
+        out = await _replay_strict_act(ws, find_js, _replay_strict_value('fill', value), strict, 'fill')
         if out.get('refused'):
             _replay_strict_refuse('fill', out['refused'])
         if not out.get('ok'):
@@ -15129,7 +15129,7 @@ async def cmd_smart_fill(text, value):
     }})()
     """
     if strict is not None:  # the top-level page only: no frame search
-        out = await _replay_strict_act(ws_url, js, value, strict, 'fill')
+        out = await _replay_strict_act(ws_url, js, _replay_strict_value('smart-fill', value), strict, 'fill')
         if out.get('refused'):
             _replay_strict_refuse('smart-fill', out['refused'])
         if not out.get('ok'):
@@ -15255,7 +15255,8 @@ async def cmd_smart_select(text, option_text):
     }})()
     """
     if strict is not None:  # the top-level page only: no frame search
-        out = await _replay_strict_act(ws_url, js, option_text, strict, 'select')
+        out = await _replay_strict_act(ws_url, js, _replay_strict_value('smart-select', option_text),
+                                       strict, 'select')
         if out.get('refused'):
             _replay_strict_refuse('smart-select', out['refused'])
         if not out.get('ok'):
@@ -15630,7 +15631,8 @@ async def cmd_assert_value(selector, expected_value):
       var res = __cdpilot_resolveSelector(document, {safe_sel}, true);
       return res && res.el ? res.el : 'FAIL: Element not found: ' + {safe_sel};
     }})()"""
-        out = await _replay_strict_act(ws_url, find_js, expected_value, strict, 'assert')
+        out = await _replay_strict_act(ws_url, find_js, _replay_strict_value('assert-value', expected_value),
+                                       strict, 'assert')
         if out.get('refused'):
             _replay_strict_refuse('assert-value', out['refused'])
         if not out.get('ok'):
@@ -16308,7 +16310,8 @@ async def _agent_type_placeholder(ref, value, origin, old_map):
         oid = res_r.get(2, {}).get('object', {}).get('objectId')
         if not oid:
             return 'the field is gone'
-        out = await _var_target_call(ws_url, oid, value, {'kind': 'fill', 'origin': origin, 'hosts': None})
+        out = await _var_target_call(ws_url, oid, value,
+                                     {'kind': 'fill', 'origin': origin, 'hosts': None, 'ce': True})
     finally:
         try:
             await cdp_send(ws_url, [(3, 'Runtime.releaseObjectGroup', {'objectGroup': _VAR_TARGET_GROUP})])
@@ -16567,24 +16570,27 @@ def _agent_host_allowed(host, allowed):
 _VAR_LOOPBACK_HOSTS = frozenset({'localhost', '127.0.0.1', '::1'})
 
 
-def _var_url_allowed(url, entries):
+def _var_url_allowed(url, entries, subject='the active page'):
     """None when an environment value may be typed on the page at `url`, else why
     (names only, never a value). https on a host the entries name; http only on
     a loopback host (localhost, 127.0.0.1, [::1], *.localhost); the scheme's
     default port unless the entry is written `host:port` (2026-11-11 review: a
-    host-only check let http://bank.example and bank.example:8443 through)."""
+    host-only check let http://bank.example and bank.example:8443 through).
+    `subject` names the URL in the reason (the active page, a go URL)."""
     from urllib.parse import urlparse
     try:
         u = urlparse(url or '')
         scheme, host, port = (u.scheme or '').lower(), (u.hostname or '').lower(), u.port
     except ValueError:
-        return 'the active page has an unreadable URL'
+        return f'{subject} has an unreadable URL'
     if not host:
-        return 'the active page could not be read or has no host (about:blank, data:, browser down)'
+        if subject == 'the active page':
+            return 'the active page could not be read or has no host (about:blank, data:, browser down)'
+        return f'{subject} has no host'
     shown = f'[{host}]' if ':' in host else host
     loopback = host in _VAR_LOOPBACK_HOSTS or host.endswith('.localhost')
     if scheme != 'https' and not (scheme == 'http' and loopback):
-        return (f'the active page is {scheme or "?"}://{shown}; an environment value is typed only '
+        return (f'{subject} is {scheme or "?"}://{shown}; an environment value is typed only '
                 'over https (http only on a loopback host)')
     default = 443 if scheme == 'https' else 80
     eff = default if port is None else port
@@ -16592,9 +16598,9 @@ def _var_url_allowed(url, entries):
         if (host == h or host.endswith('.' + h)) and eff == (default if p is None else p):
             return None
     if port is not None and port != default:
-        return (f'the active page is on {shown}:{port}; {AGENT_VAR_HOSTS_ENV} does not name that '
+        return (f'{subject} is on {shown}:{port}; {AGENT_VAR_HOSTS_ENV} does not name that '
                 f'port (write the entry as host:{port})')
-    return f'the active page is on {shown}; {AGENT_VAR_HOSTS_ENV} does not name it'
+    return f'{subject} is on {shown}; {AGENT_VAR_HOSTS_ENV} does not name it'
 
 
 # One Runtime.callFunctionOn on the resolved field, for a step that types a
@@ -16606,7 +16612,9 @@ def _var_url_allowed(url, entries):
 # check runs first and uses only what a page cannot replace (location's own
 # fields, ===, string indexing): until it passes the page may be hostile.
 # rule: {kind: fill|select|assert, origin: exact origin or null,
-#        hosts: [[host, port or null], ...] when origin is null}.
+#        hosts: [[host, port or null], ...] when origin is null,
+#        ce: true to accept a contenteditable element (agent run only: a
+#        replayed flow could read its text back with wait-for-text / text=)}.
 _VAR_TARGET_FN = r"""function (value, rule) {
   'use strict';
   /* cdpilot-var-target */
@@ -16655,7 +16663,8 @@ _VAR_TARGET_FN = r"""function (value, rule) {
     if (!textLike && tag !== 'TEXTAREA' && tag !== 'SELECT')
       return {refused: 'the target is ' + what + ', not a field'};
     return {ok: true, tag: tag, equal: el.value === value};
-  } else if (!textLike && tag !== 'TEXTAREA' && !(tag !== 'INPUT' && tag !== 'SELECT' && el.isContentEditable)) {
+  } else if (!textLike && tag !== 'TEXTAREA' &&
+             !(rule.ce === true && tag !== 'INPUT' && tag !== 'SELECT' && el.isContentEditable)) {
     return {refused: 'the target is ' + what + ', not an editable field'};
   }
   if (typeof el.focus === 'function') el.focus();
@@ -16699,6 +16708,37 @@ async def _var_target_call(ws_url, object_id, value, rule):
 
 REPLAY_STRICT_ENV = 'CDPILOT_REPLAY_STRICT_TARGET'
 REPLAY_ALLOWED_HOSTS_ENV = 'CDPILOT_REPLAY_ALLOWED_HOSTS'
+# An environment value reaches the child in its environment, never in argv
+# (2026-11-11 review: argv is readable by every local user): argv carries
+# @@cdpilot-value-<run token>-<slot>@@, the child reads REPLAY_VALUE_ENV<slot>
+# and REPLAY_TOKEN_ENV once at start (and drops them from its environment, so
+# nothing it starts inherits them) and swaps the value in right before the
+# checked call. The token is random per replay run: a flow file cannot write a
+# sentinel that matches, and a sentinel without its value fails closed.
+REPLAY_VALUE_ENV = 'CDPILOT_REPLAY_VALUE_'
+REPLAY_TOKEN_ENV = 'CDPILOT_REPLAY_TOKEN'
+_REPLAY_SENTINEL_RE = _re.compile(r'@@cdpilot-value-([0-9a-f]+)-(\d+)@@')
+_REPLAY_VALUES = {}  # this process's REPLAY_VALUE_ENV* / REPLAY_TOKEN_ENV, taken at start
+
+
+def _replay_take_values():
+    """Move REPLAY_VALUE_ENV* and REPLAY_TOKEN_ENV out of os.environ (CLI start)."""
+    _REPLAY_VALUES.clear()
+    for k in [k for k in os.environ if k.startswith(REPLAY_VALUE_ENV) or k == REPLAY_TOKEN_ENV]:
+        _REPLAY_VALUES[k] = os.environ.pop(k)
+
+
+def _replay_strict_value(cmd, value):
+    """`value` with each replay sentinel swapped for its environment value;
+    exit 2 for a sentinel whose token or value is missing (no value printed)."""
+    tok = _REPLAY_VALUES.get(REPLAY_TOKEN_ENV, '')
+
+    def put(m):
+        v = _REPLAY_VALUES.get(REPLAY_VALUE_ENV + m.group(2))
+        if not tok or not secrets.compare_digest(m.group(1), tok) or v is None:
+            _replay_strict_refuse(cmd, 'a replay value placeholder has no value (sentinel without its value)')
+        return v
+    return _REPLAY_SENTINEL_RE.sub(put, value)
 
 
 def _replay_strict_rule():
@@ -16710,7 +16750,7 @@ def _replay_strict_rule():
     if os.environ.get(REPLAY_STRICT_ENV) != '1':
         return None
     hosts = _var_host_entries(os.environ.get(REPLAY_ALLOWED_HOSTS_ENV, ''))
-    return {'origin': None, 'hosts': [[h, p] for h, p in hosts]}
+    return {'origin': None, 'hosts': [[h, p] for h, p in hosts], 'ce': False}
 
 
 def _replay_strict_refuse(cmd, why):
@@ -22978,10 +23018,34 @@ def _replay_child_args(args):
     return out
 
 
+# Selector pieces that react to a typed value (2026-11-11 review, H2): an
+# attribute selector on `value` (React copies the property to the attribute),
+# XPath @value, the selector ladder's `value=<text>` form, and pseudo-classes
+# that change with the value. A step that waits on or clicks such a selector,
+# then a navigation, would let a server time the value out character by
+# character. Matched after CSS escapes are decoded (`[v\61 lue` is `[value`).
+_REPLAY_VALUE_PROBE_RE = _re.compile(
+    r"\[\s*(?:[\w*-]*\|)?\s*value\b|@\s*value\b|^\s*value\s*=|"
+    r":(?:-[a-z]+-)?(?:placeholder-shown|valid|invalid|in-range|out-of-range|user-valid|user-invalid|blank)\b",
+    _re.I)
+
+
+def _css_unescape(s):
+    """`s` with CSS escapes decoded (\\76 alue -> value); a bad code point is U+FFFD."""
+    def rep(m):
+        if m.group(1):
+            try:
+                return chr(int(m.group(1), 16))
+            except (ValueError, OverflowError):
+                return '\ufffd'
+        return m.group(2)
+    return _re.sub(r'\\(?:([0-9a-fA-F]{1,6})\s?|(.))', rep, s, flags=_re.S)
+
+
 def _replay_env_flow_refusal(idx, cmd, args, env_steps, fill_cli):
     """Why step `idx` may not run in a flow that types an environment value
     (env_steps: the indexes of the steps that take one), or None. `fill_cli`
-    puts the --var values in (a go URL may carry one)."""
+    puts the --var values in (a go URL or a selector may carry one)."""
     if cmd == 'assert-value' and idx in env_steps:
         return None  # compared inside the page, nothing printed (_replay_strict_rule)
     if cmd not in REPLAY_ENV_FLOW_CMDS:
@@ -22992,15 +23056,21 @@ def _replay_env_flow_refusal(idx, cmd, args, env_steps, fill_cli):
                 + ', '.join(sorted(REPLAY_ENV_FLOW_CMDS)) + ')')
     rest = _replay_child_args(args)
     if cmd in ('go', 'open'):
-        from urllib.parse import urlparse
-        url = fill_cli(rest[0]) if rest else ''
-        try:
-            u = urlparse(url)
-            scheme, host = (u.scheme or '').lower(), u.hostname
-        except ValueError:
-            scheme, host = '', None
-        if scheme not in ('http', 'https') or not host:
-            return f'{cmd} takes only an http(s) URL here, not a {scheme or "scheme-less"} one'
+        # Every page such a flow opens is one an environment value may be typed
+        # on (https, a listed host and port): no step can navigate the tab to a
+        # server that would time or read what the flow does (H2).
+        why = _var_url_allowed(fill_cli(rest[0]) if rest else '', _var_host_entries(), f'the {cmd} URL')
+        if why:
+            return f'{cmd} opens a page an environment value may not be typed on: {why}'
+        return None
+    typed = _replay_value_positions(cmd, args)
+    for j, a in enumerate(args):
+        if j in typed:
+            continue  # typed text, not a selector
+        a = fill_cli(str(a))
+        if _REPLAY_VALUE_PROBE_RE.search(a) or _REPLAY_VALUE_PROBE_RE.search(_css_unescape(a)):
+            return (f'{cmd} names a selector that reacts to a typed value ([value...], @value, value=, '
+                    ':placeholder-shown, :valid, :invalid...); a page could time the value out')
     if cmd == 'keys' and rest:
         if set(rest[0].lower().split('+')) & {'ctrl', 'control', 'alt', 'meta'}:
             return 'keys takes no Ctrl/Alt/Meta combination here (copy and paste carry a typed value)'
@@ -23288,6 +23358,8 @@ def cmd_replay(*args):
         sys.exit(0)
 
     had_failure = False
+    typed_at = 0  # the last step that took an environment value (0: none yet)
+    run_token = secrets.token_hex(16)  # per run: a flow file cannot write a matching sentinel
     for idx, step in enumerate(steps, 1):
         if idx > 1:
             if delay_mode == "real":
@@ -23313,14 +23385,25 @@ def cmd_replay(*args):
             step_label = cmd
 
         env_here = env_by_step.get(idx, {})  # arg index -> names the environment may fill
-        if env_here:
-            # Checked now, for this step only (never cached across steps): the
-            # page the step will act on must be https (http on loopback) on a
-            # host CDPILOT_VAR_HOSTS names, on the port the entry allows. The
-            # child checks again in the call that types (REPLAY_STRICT_ENV).
-            # A refusal always stops the replay, --continue or not, and no
-            # value has reached any child process's argv.
+        if env_here or typed_at:
+            # Checked now (never cached across steps), before a step that types
+            # an environment value and before every step after one: the page
+            # must be https (http on loopback) on a host CDPILOT_VAR_HOSTS
+            # names, on the port the entry allows. The child checks again in
+            # the call that types (REPLAY_STRICT_ENV). A refusal always stops
+            # the replay, --continue or not, and no value is in any argv.
             why = _var_url_allowed(_replay_live_url(), _var_host_entries())
+            if why and not env_here:
+                # A click followed a link off the allowed hosts after the value
+                # was typed (H2): nothing more runs on that page.
+                print(f"[{idx}/{total_steps}] {step_label} ... refused")
+                print(json.dumps({"error": f"step {idx} ({cmd}) not run: the page left the hosts "
+                                           f"{AGENT_VAR_HOSTS_ENV} names after step {typed_at} typed an "
+                                           "environment value",
+                                  "missing": [], "step": idx, "cmd": cmd, "why": why,
+                                  "hint": "list every host the flow reaches after the value is typed, "
+                                          "or pass --var name=value"}), file=sys.stderr)
+                sys.exit(2)
             if why:
                 names = sorted({k for ks in env_here.values() for k in ks})
                 print(f"[{idx}/{total_steps}] {step_label} ... refused")
@@ -23332,11 +23415,15 @@ def cmd_replay(*args):
                       file=sys.stderr)
                 sys.exit(2)
 
+        child_values = {}  # REPLAY_VALUE_ENV<slot> -> environment value, for this child only
+
         def _fill(m, j):
             k = m.group(1)
             v = _lookup(cli_vars, k)
             if v is None and k in env_here.get(j, ()):
-                v = _lookup(env_vars, k)
+                slot = sorted({n for ns in env_here.values() for n in ns}).index(k)
+                child_values[f"{REPLAY_VALUE_ENV}{slot}"] = str(_lookup(env_vars, k))
+                return f"@@cdpilot-value-{run_token}-{slot}@@"  # the value goes in the child's environment
             if v is None:
                 return m.group(0)
             return str(v)
@@ -23349,11 +23436,15 @@ def cmd_replay(*args):
         # The strict-target pair is replay's own, set for a step that takes an
         # environment value and removed for every other (a flow file sets no
         # environment; an inherited pair never reaches an unrelated step).
-        env.pop(REPLAY_STRICT_ENV, None)
-        env.pop(REPLAY_ALLOWED_HOSTS_ENV, None)
+        for k in [k for k in env if k in (REPLAY_STRICT_ENV, REPLAY_ALLOWED_HOSTS_ENV, REPLAY_TOKEN_ENV)
+                  or k.startswith(REPLAY_VALUE_ENV)]:
+            del env[k]
         if env_here:
             env[REPLAY_STRICT_ENV] = "1"
             env[REPLAY_ALLOWED_HOSTS_ENV] = os.environ.get(AGENT_VAR_HOSTS_ENV, "")
+            env[REPLAY_TOKEN_ENV] = run_token
+            env.update(child_values)
+            typed_at = idx
         t0 = time.monotonic()
         child_cmd = [sys.executable, os.path.abspath(__file__), cmd] + sub_args
         res = subprocess.run(
@@ -23911,6 +24002,7 @@ def _cli_main():
     runs it per request with sys.argv, the streams and atexit swapped in.
     Exits by SystemExit like any script; never returns a code."""
     global _FRAME_FLAG
+    _replay_take_values()  # a replayed environment value never stays in os.environ
     # On Windows a pipe (an agent's shell, the MCP server, `> file`) gets the
     # ANSI code page, so a Turkish page title or an emoji crashed the command
     # with UnicodeEncodeError. Write UTF-8 unless the user chose an encoding.
