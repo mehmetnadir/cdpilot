@@ -159,6 +159,16 @@ on MCP works from numbered refs, gets diffs, and replays a learned flow with no 
 outside the `core` profile; `browser_tools enable` adds them. A drift or a missing variable comes back as
 `isError` with the command's JSON (`status:"drift"` carries the page's observation).
 
+Set `CDPILOT_DAEMON=1` in the MCP server's environment and every tool call runs in the server process
+instead of a fresh Python process: ~10 ms before the CDP work instead of ~400 ms (`browser_eval` /
+`browser_tabs` / `browser_content` medians 11 / 7 / 9 ms against 412 / 390 / 416 ms, M1 Max under load).
+Same rules as the warm process below — same output, exit codes and session log; lifecycle tools
+(`browser_launch`, `browser_connect`) still run fresh; a call past 30 s is cancelled.
+
+```json
+{ "mcpServers": { "cdpilot": { "command": "npx", "args": ["cdpilot", "mcp"], "env": { "CDPILOT_DAEMON": "1" } } } }
+```
+
 ### MCP Bundle (.mcpb)
 
 For MCP clients that support one-click local server installation (Claude
@@ -1045,6 +1055,13 @@ temp directory when that path is too long for a Unix socket), 0600, and is used
 only when it and its directory belong to you. `CDPILOT_DAEMON_IDLE=<seconds>`
 sets the idle exit (default 1800). Opt-in in this release; the default may
 change once two weeks of use show no difference in error rates.
+
+The MCP server (`cdpilot mcp`) reads the same variable: with `CDPILOT_DAEMON=1`
+in its environment it runs each tool call in its own process the same way (the
+same executor, no socket involved) instead of starting a Python process per
+call — ~400 ms → ~10 ms before the CDP work. Lifecycle tools and a project
+configuration that moved since the server started still run fresh; a call past
+30 s is cancelled at its next async step. See "Agent mode over MCP" above.
 
 ### Session log
 
