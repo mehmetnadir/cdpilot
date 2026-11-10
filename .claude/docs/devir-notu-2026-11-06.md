@@ -251,3 +251,21 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
 - Makine: yük 400–500, takas dolu; kaynak başka oturumun Rust derlemesi (`cati` %660). agy şeritleri MCP açılışında 5 dk bekliyor.
 - Ders (agy-filo SKILL.md'ye 2 satır): şerit PATH'teki Intel node 20 ile koştu, `.ts` import testini yamadı; kapsam dışı 2 dosyayı
   teste istisna yazdı. Şef geri aldı; spec'e `export PATH=/opt/homebrew/bin:$PATH` ve "var olan teste dokunma" satırı girer.
+
+## 15. Delta 11.11 00:00–01:00 — dalga 1 birleşti, 0.9.7 T1'de durdu, tuval v0 başladı
+
+| İş | Durum | Kanıt |
+|---|---|---|
+| 5 kod şeridi (kucuk, iddia, k0027, replay, cdpport) | ✅ main'de | 02a436a, 986bf83, 4b67663, 332f37d, 36a3715; CI f1b6db6 yeşil (çift kip artık zorunlu) |
+| Site | ✅ | cdpilot-site 21eb3de (smoke rozet yoklaması 5 sn); canlı smoke ALL PASS |
+| enj-desen | ✅ main'de f6ca63e | held-out-2 (ayar dışı) 4 → 8/30, yanlış alarm 1/30; held-out-1 artık ayar verisi (24/24 örneklem içi) |
+| mcp-cikti-2 | ✅ notlu | tablolar geçerli; a11y "yinelenen satır" kırpması reddedildi; observe `indent=2` + `ensure_ascii` o200k ile ölçülüyor (şerit json-bicim) |
+| 0.9.7 | ⏸ T1 YÜKSEK | aynı akışta `eval` adımı ortam değerini okuyup dışarı yollayabiliyor (D-0079). Düzeltme şeridi `lane/replay2` (Claude Opus): akış düzeyi izin listesi, seçenek değeri, https/port, entropy + iframe hedef denetimi, `agent run` callFunctionOn |
+| Tutanak | TT-20261111-002646-15ffd3 632/632 (aday e08346c) | önceki KALDI 630/632 = 9222 portunu eşzamanlı koşan ikinci suite tuttu; tek başına geçti |
+| Tuval v0 | gün 0 ✅ (lane/canvas b8b6409 + 404691b) | sözleşme `canvas-sozlesme-v0.md`; şeritler A/B (Gemini 4 Argon high), C/D (Gemini 4 Carbon high) ayrı worktree'lerde |
+| Ölçüm dalga 3 | koşuyor (worktree cdpilot-olcum3) | json-bicim (o200k), soak-2 (≥500 çağrı, geçersizse INVALID), heldout-3 (40+40, dedektörü görmeden) |
+
+- Ultra Claude 5.5 kotası 17.11 13:25'e dek kapalı: `yargi`/`review` Gemini 3.8'e düşüyor. Güvenlik işi yerel Claude alt
+  ajanlarında (CLAUDE-GEREKÇE güvenlik), kod şeritleri Gemini 4 Argon/Carbon'da (Nadir 10.11: "gerekirse gemini argon").
+- Kural: iki cdpilot test paketi aynı anda koşmaz (9222 port testleri). Şeritlere yalnız hedefli `CDPILOT_TEST_ONLY`.
+- Sıradaki: replay2 bitince şef diff'i okur → T1 2. tur (taze Claude) → tutanak → CI → jüri (J1/J2 yerel Claude, J3 agy `ikinci`) → yayın.
