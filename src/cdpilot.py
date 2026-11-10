@@ -13500,6 +13500,7 @@ def cmd_project_stop(name):
         sys.exit(1)
 
     info = registry[target_id]
+    _canvas_close_all(quiet=True)
     port = info.get("port")
     if _is_external(info) or _is_external(port, registry):
         print(f"{target_id}: {EXTERNAL_LEFT_RUNNING}")
@@ -13520,6 +13521,7 @@ def cmd_project_stop(name):
 
 def cmd_stop_all():
     """Stop all active cdpilot browser instances."""
+    _canvas_close_all(quiet=True)
     registry = _cleanup_registry()
     stopped = 0
     for pid, info in registry.items():
@@ -21362,6 +21364,21 @@ def _slog_redact_args(cmd, args):
                     out[i] = "--var=" + k + "=" + _slog_mark(v)
                     done.add(i)
             i += 1
+    elif cmd == "canvas":
+        for i, a in enumerate(args):
+            if a.lstrip().startswith("<"):
+                secrets.append(a)
+                out[i] = f"\u00abhtml:{len(a)} chars\u00bb"
+                done.add(i)
+            elif a == "--html" and i + 1 < len(args):
+                secrets.append(args[i + 1])
+                out[i + 1] = f"\u00abhtml:{len(args[i + 1])} chars\u00bb"
+                done.update({i, i + 1})
+            elif a.startswith("--html="):
+                v = a[len("--html="):]
+                secrets.append(v)
+                out[i] = f"--html=\u00abhtml:{len(v)} chars\u00bb"
+                done.add(i)
 
     for i, arg in enumerate(args):
         if i in done:
@@ -23549,15 +23566,1126 @@ CANVAS_RUNTIME_JS = ''        # lane A
 #   _canvas_resolve_name(args) -> (name, rest_args)   (--name n | --name=n, default CANVAS_DEFAULT_NAME)
 #   _canvas_read_html(src) -> str   (path or '-' for stdin; > CANVAS_HTML_MAX -> CanvasError(code 2))
 #   event = {seq, t (epoch ms), src: 'page'|'host', type, action, id, data}; host types: blocked|nav|closed.
-def cmd_canvas_dispatch(args):
-    """`cdpilot canvas <open|set|patch|stream|watch|events|close|list> ...` (lane B routes C and D)."""
-    print("cdpilot: canvas is not implemented yet (v0 in progress)", file=sys.stderr)
-    sys.exit(1)
+
+CANVAS_BASE_CSP = (
+    "default-src 'none'; "
+    "script-src 'unsafe-inline' 'unsafe-eval'; "
+    "style-src 'unsafe-inline'; "
+    "img-src data: blob:; "
+    "form-action 'none'; "
+    "base-uri 'none'; "
+    "frame-src 'none'; "
+    "sandbox allow-scripts"
+)
+_CANVAS_HOSTNAME_RE = _re.compile(
+    r'^(?=.{1,253}$)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?'
+    r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$'
+)
+_CANVAS_ACTION_RE = _re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+_canvas_base_paths = _canvas_paths
+
+
+def _canvas_check_allow_net(host):
+    """Validate a plain hostname for --allow-net; raise CanvasError(code 2) otherwise."""
+    if not isinstance(host, str) or not _CANVAS_HOSTNAME_RE.match(host):
+        raise CanvasError(f"invalid --allow-net hostname: {host!r}", 2)
+    labels = host.split('.')
+    if all(lbl.isdigit() for lbl in labels):
+        raise CanvasError(f"--allow-net requires a plain hostname, not an IP: {host!r}", 2)
+    return host.lower()
+
+
+def _canvas_check_dir_safe(d):
+    """Verify directory `d` is owned by this uid with no group/other permission bits."""
+    try:
+        st = os.lstat(d)
+    except OSError as e:
+        raise CanvasError(f"cannot stat canvas directory {d}: {e}", 2)
+    is_dir = (st.st_mode & 0o170000) == 0o040000
+    uid_ok = (not hasattr(os, 'getuid')) or (st.st_uid == os.getuid())
+    if not is_dir or not uid_ok or (st.st_mode & 0o077):
+        raise CanvasError(f"canvas directory {d} has unsafe ownership or permissions", 2)
+
+
+def _canvas_runtime_sock_dir():
+    """Short per-user runtime directory when <PROFILE_DIR>/canvas/<name>.sock > 100 bytes."""
+    uid = os.getuid() if hasattr(os, 'getuid') else 0
+    xdg = os.environ.get('XDG_RUNTIME_DIR')
+    cand = (os.path.join(xdg, 'cdpilot-canvas') if xdg
+            else os.path.join(tempfile.gettempdir(), f'cdpilot-{uid}-canvas'))
+    if len(cand.encode('utf-8')) > 48 and os.path.isdir('/tmp'):
+        cand = f'/tmp/cdpilot-{uid}-canvas'
+    if os.path.lexists(cand):
+        _canvas_check_dir_safe(cand)
+    else:
+        os.makedirs(cand, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(cand, 0o700)
+        except OSError:
+            pass
+        _canvas_check_dir_safe(cand)
+    return cand
+
+
+def _canvas_paths(name):
+    """{'sock', 'reg', 'ready'}: moves 'sock' to a short runtime dir if > 100 bytes."""
+    raw_dir = os.path.join(PROFILE_DIR, 'canvas')
+    if os.path.lexists(raw_dir):
+        _canvas_check_dir_safe(raw_dir)
+    paths = _canvas_base_paths(name)
+    _canvas_check_dir_safe(os.path.dirname(paths['reg']))
+    if len(paths['sock'].encode('utf-8')) > 100:
+        key = hashlib.sha1(os.path.abspath(PROFILE_DIR).encode('utf-8')).hexdigest()[:10]
+        rt_dir = _canvas_runtime_sock_dir()
+        paths['sock'] = os.path.join(rt_dir, f'{key}-{name}.sock')
+    return paths
+
+
+def _canvas_csp_header(allow_net=()):
+    """Full CSP header string from plan §3 (+ connect-src https://<host> when allow_net set)."""
+    if not allow_net:
+        return CANVAS_BASE_CSP
+    srcs = ' '.join(f'https://{h}' for h in allow_net)
+    return CANVAS_BASE_CSP.replace(
+        '; sandbox allow-scripts',
+        f'; connect-src {srcs}; sandbox allow-scripts',
+    )
+
+
+def _canvas_skeleton_html(allow_net=()):
+    """Initial canvas document with host-inserted <meta data-cdpilot-csp> and inline runtime."""
+    csp_full = _canvas_csp_header(allow_net)
+    meta_csp = csp_full.replace('; sandbox allow-scripts', '')
+    esc_csp = meta_csp.replace('&', '&amp;').replace('"', '&quot;')
+    rt = f'<script>{CANVAS_RUNTIME_JS}</script>' if CANVAS_RUNTIME_JS else ''
+    return (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        f'<meta data-cdpilot-csp http-equiv="Content-Security-Policy" content="{esc_csp}">'
+        f'{rt}</head><body></body></html>'
+    )
+
+
+class _CanvasHost:
+    """Single-canvas CDP guard and Unix-socket server (plan §2.0-2.3, §3, §7)."""
+
+    def __init__(self, ws, name, allow_net=(), idle_exit_s=None):
+        self.ws = ws
+        self.name = _canvas_check_name(name)
+        self.allow_net = tuple(_canvas_check_allow_net(h) for h in (allow_net or ()))
+        self.canvas_url = CANVAS_URL_FMT.format(name=self.name)
+        self.idle_exit_s = CANVAS_IDLE_EXIT_S if idle_exit_s is None else float(idle_exit_s)
+        self.started = time.time()
+        self.last_activity = time.monotonic()
+        self.next_id = 0
+        self.pending = {}
+        self.browser_context_id = None
+        self.target_id = None
+        self.session_id = None
+        self.frame_id = None
+        self.frame_url = None
+        self.events = []
+        self.event_bytes = 0
+        self.seq = 0
+        self.dropped = 0
+        self.rate_window = int(time.monotonic())
+        self.rate_count = 0
+        self.event_wakeup = asyncio.Event()
+        self.stop_event = asyncio.Event()
+        self.req_lock = asyncio.Lock()
+        self.closed_by_op = False
+        self._error_on_paused = False
+        self._init_nav_task = None
+
+    async def send(self, method, params=None, session=None):
+        self.next_id += 1
+        cid = self.next_id
+        msg = {'id': cid, 'method': method, 'params': params or {}}
+        if session:
+            msg['sessionId'] = session
+        await self.ws.send(json.dumps(msg))
+        return cid
+
+    async def call(self, method, params=None, session=None, timeout=10.0):
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        cid = await self.send(method, params, session=session)
+        self.pending[cid] = fut
+        try:
+            msg = await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self.pending.pop(cid, None)
+        if 'error' in msg and msg['error']:
+            err = msg['error']
+            raise CanvasError(err.get('message') if isinstance(err, dict) else str(err), 1)
+        return msg.get('result') or {}
+
+    def _append_event(self, src, ev_type, action='', elem_id='', data=None):
+        if data is not None:
+            try:
+                ser = json.dumps(data, ensure_ascii=False)
+            except (TypeError, ValueError):
+                ser = json.dumps(str(data), ensure_ascii=False)
+                data = str(data)
+            if len(ser.encode('utf-8')) > CANVAS_EVENT_ITEM_MAX:
+                raw_str = data if isinstance(data, str) else ser
+                limit = max(0, CANVAS_EVENT_ITEM_MAX - 2)
+                clipped = raw_str.encode('utf-8')[:limit].decode('utf-8', errors='ignore')
+                while clipped and len(json.dumps(clipped, ensure_ascii=False).encode('utf-8')) > CANVAS_EVENT_ITEM_MAX:
+                    limit = max(0, limit - 16)
+                    clipped = raw_str.encode('utf-8')[:limit].decode('utf-8', errors='ignore')
+                data = clipped
+        self.seq += 1
+        ev = {
+            'seq': self.seq,
+            't': int(time.time() * 1000),
+            'src': src,
+            'type': ev_type,
+            'action': str(action or ''),
+            'id': str(elem_id or '')[:128],
+            'data': data,
+        }
+        ev_len = len(json.dumps(ev, ensure_ascii=False).encode('utf-8'))
+        self.events.append((ev, ev_len))
+        self.event_bytes += ev_len
+        while (len(self.events) > CANVAS_EVENT_RING or self.event_bytes > CANVAS_EVENT_BYTES) and len(self.events) > 1:
+            _, old_len = self.events.pop(0)
+            self.event_bytes -= old_len
+            self.dropped += 1
+        self.event_wakeup.set()
+        self.event_wakeup.clear()
+
+    def _emit_host_event(self, ev_type, data=None):
+        self._append_event('host', ev_type, '', '', data)
+
+    def on_binding_called(self, params, session_id=None):
+        if session_id and self.session_id and session_id != self.session_id:
+            return
+        if (params or {}).get('name') != CANVAS_BINDING:
+            return
+        payload = (params or {}).get('payload')
+        if not isinstance(payload, str) or len(payload.encode('utf-8')) > 65536:
+            return
+        try:
+            obj = json.loads(payload)
+        except ValueError:
+            return
+        if not isinstance(obj, dict):
+            return
+        ev_type = obj.get('type')
+        if ev_type not in CANVAS_PAGE_EVENT_TYPES:
+            return
+        action = obj.get('action') or ''
+        if action and (not isinstance(action, str) or not _CANVAS_ACTION_RE.match(action)):
+            return
+        now_s = int(time.monotonic())
+        if now_s != self.rate_window:
+            self.rate_window = now_s
+            self.rate_count = 0
+        self.rate_count += 1
+        if self.rate_count > 100:
+            self.dropped += 1
+            return
+        self._append_event(
+            'page',
+            ev_type,
+            action=action,
+            elem_id=obj.get('id') or '',
+            data=obj.get('data'),
+        )
+
+    def on_frame_navigated(self, params, session_id=None):
+        if session_id and self.session_id and session_id != self.session_id:
+            return
+        frame = (params or {}).get('frame') or {}
+        if not frame.get('parentId'):
+            if frame.get('id'):
+                self.frame_id = frame['id']
+            if 'url' in frame:
+                self.frame_url = frame.get('url') or ''
+
+    async def on_request_paused(self, params, session_id=None):
+        sid = session_id or self.session_id
+        request_id = (params or {}).get('requestId')
+        if not request_id:
+            return
+        resource_type = (params or {}).get('resourceType') or ''
+        is_doc = (resource_type == 'Document')
+        try:
+            if self._error_on_paused:
+                raise RuntimeError('simulated requestPaused handler failure')
+            req = (params or {}).get('request')
+            if not isinstance(req, dict):
+                raise TypeError('missing request dict')
+            url = req.get('url')
+            if not isinstance(url, str) or not url:
+                raise ValueError('missing request url')
+            if is_doc:
+                if url == self.canvas_url:
+                    html_bytes = _canvas_skeleton_html(self.allow_net).encode('utf-8')
+                    await self.send('Fetch.fulfillRequest', {
+                        'requestId': request_id,
+                        'responseCode': 200,
+                        'responseHeaders': [
+                            {'name': 'Content-Type', 'value': 'text/html; charset=utf-8'},
+                            {'name': 'Content-Security-Policy', 'value': _canvas_csp_header(self.allow_net)},
+                        ],
+                        'body': base64.b64encode(html_bytes).decode('ascii'),
+                    }, session=sid)
+                    return
+                self._emit_host_event('blocked', {'url': url[:256], 'resourceType': 'Document'})
+                await self.send('Fetch.fulfillRequest', {
+                    'requestId': request_id,
+                    'responseCode': 204,
+                    'responseHeaders': [],
+                    'body': '',
+                }, session=sid)
+                return
+            import urllib.parse as _urlparse
+            sp = _urlparse.urlsplit(url)
+            scheme = (sp.scheme or '').lower()
+            host = (sp.hostname or '').lower()
+            if scheme == 'https' and host and host in self.allow_net:
+                await self.send('Fetch.continueRequest', {'requestId': request_id}, session=sid)
+                return
+            self._emit_host_event('blocked', {'url': url[:256], 'resourceType': resource_type or 'Other'})
+            await self.send('Fetch.failRequest', {
+                'requestId': request_id,
+                'errorReason': 'BlockedByClient',
+            }, session=sid)
+        except Exception:
+            # Jury K8: closed failure — 204 for documents, failRequest for everything else;
+            # never continueRequest on an error path.
+            try:
+                if is_doc:
+                    await self.send('Fetch.fulfillRequest', {
+                        'requestId': request_id,
+                        'responseCode': 204,
+                        'responseHeaders': [],
+                        'body': '',
+                    }, session=sid)
+                else:
+                    await self.send('Fetch.failRequest', {
+                        'requestId': request_id,
+                        'errorReason': 'BlockedByClient',
+                    }, session=sid)
+            except Exception:
+                pass
+
+    async def ws_reader_loop(self):
+        try:
+            while True:
+                raw = await self.ws.recv()
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                if 'id' in msg and msg['id'] in self.pending:
+                    fut = self.pending.pop(msg['id'], None)
+                    if fut and not fut.done():
+                        fut.set_result(msg)
+                    continue
+                method = msg.get('method')
+                params = msg.get('params') or {}
+                sid = msg.get('sessionId')
+                if method == 'Fetch.requestPaused':
+                    await self.on_request_paused(params, sid)
+                elif method == 'Runtime.bindingCalled':
+                    self.on_binding_called(params, sid)
+                elif method == 'Page.frameNavigated':
+                    self.on_frame_navigated(params, sid)
+                elif method == 'Page.frameRequestedNavigation':
+                    if not sid or not self.session_id or sid == self.session_id:
+                        nav_url = params.get('url') or ''
+                        if nav_url and nav_url != self.canvas_url and nav_url != 'about:blank':
+                            self._emit_host_event('blocked', {
+                                'url': nav_url[:256],
+                                'resourceType': 'Document',
+                                'reason': params.get('reason') or 'navigation',
+                            })
+                elif method == 'Page.windowOpen':
+                    if not sid or not self.session_id or sid == self.session_id:
+                        open_url = params.get('url') or ''
+                        if open_url:
+                            self._emit_host_event('blocked', {
+                                'url': open_url[:256],
+                                'resourceType': 'Document',
+                                'reason': 'windowOpen',
+                            })
+                elif method == 'Target.targetDestroyed':
+                    if params.get('targetId') == self.target_id:
+                        self._emit_host_event('closed', {'reason': 'targetDestroyed'})
+                        self.stop_event.set()
+                        return
+                elif method == 'Target.detachedFromTarget':
+                    if params.get('sessionId') == self.session_id or params.get('targetId') == self.target_id:
+                        self._emit_host_event('closed', {'reason': 'detachedFromTarget'})
+                        self.stop_event.set()
+                        return
+                elif method == 'Inspector.detached':
+                    self._emit_host_event('closed', {'reason': 'inspectorDetached'})
+                    self.stop_event.set()
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._emit_host_event('closed', {'reason': 'wsClosed'})
+            self.stop_event.set()
+        finally:
+            for fut in list(self.pending.values()):
+                if not fut.done():
+                    fut.set_exception(CanvasError('browser connection closed', 1))
+            self.pending.clear()
+
+    async def setup(self):
+        """C1 + K8 setup order: createBrowserContext -> createTarget -> attachToTarget -> session setup."""
+        ctx_res = await self.call('Target.createBrowserContext', {'disposeOnDetach': True})
+        self.browser_context_id = ctx_res.get('browserContextId')
+        if not self.browser_context_id:
+            raise CanvasError('Target.createBrowserContext returned no browserContextId', 1)
+        tgt_res = await self.call('Target.createTarget', {
+            'url': 'about:blank',
+            'browserContextId': self.browser_context_id,
+        })
+        self.target_id = tgt_res.get('targetId')
+        if not self.target_id:
+            raise CanvasError('Target.createTarget returned no targetId', 1)
+        att_res = await self.call('Target.attachToTarget', {
+            'targetId': self.target_id,
+            'flatten': True,
+        })
+        self.session_id = att_res.get('sessionId')
+        if not self.session_id:
+            raise CanvasError('Target.attachToTarget returned no sessionId', 1)
+        sid = self.session_id
+        await self.call('Page.enable', {}, session=sid)
+        await self.call('Runtime.enable', {}, session=sid)
+        await self.call('Runtime.addBinding', {'name': CANVAS_BINDING}, session=sid)
+        await self.call('Fetch.enable', {
+            'patterns': [{'urlPattern': '*', 'requestStage': 'Request'}],
+        }, session=sid)
+        await self.call('Emulation.setFocusEmulationEnabled', {'enabled': True}, session=sid)
+        self._init_nav_task = asyncio.create_task(
+            self.call('Page.navigate', {'url': self.canvas_url}, session=sid, timeout=45.0)
+        )
+        try:
+            nav_res = await asyncio.wait_for(asyncio.shield(self._init_nav_task), timeout=1.2)
+            if isinstance(nav_res, dict) and nav_res.get('frameId'):
+                self.frame_id = nav_res['frameId']
+            self._init_nav_task = None
+        except asyncio.TimeoutError:
+            pass
+        self.frame_url = self.canvas_url
+
+    async def _ensure_canvas_document(self, need_frame_id=False):
+        """K4: check main-frame URL via Page.frameNavigated / Page.getFrameTree; re-navigate if lost."""
+        sid = self.session_id
+        if self._init_nav_task is not None:
+            try:
+                nav_res = await self._init_nav_task
+                if isinstance(nav_res, dict) and nav_res.get('frameId'):
+                    self.frame_id = nav_res['frameId']
+            finally:
+                self._init_nav_task = None
+        if self.frame_id is None:
+            ft_res = await self.call('Page.getFrameTree', {}, session=sid)
+            frame = ((ft_res or {}).get('frameTree') or {}).get('frame') or {}
+            if frame.get('id'):
+                self.frame_id = frame['id']
+            if frame.get('url') and self.frame_url == self.canvas_url:
+                self.frame_url = frame['url']
+        if self.frame_url != self.canvas_url:
+            lost_url = self.frame_url or ''
+            self._emit_host_event('nav', {'url': lost_url[:256]})
+            nav_res = await self.call('Page.navigate', {'url': self.canvas_url}, session=sid, timeout=20.0)
+            if isinstance(nav_res, dict) and nav_res.get('frameId'):
+                self.frame_id = nav_res['frameId']
+            self.frame_url = self.canvas_url
+
+    async def handle_op(self, req):
+        if not isinstance(req, dict):
+            return {'ok': False, 'error': 'invalid request', 'code': 2}
+        op = req.get('op')
+        if op not in CANVAS_OPS:
+            return {'ok': False, 'error': f'unknown canvas op: {op!r}', 'code': 2}
+        self.last_activity = time.monotonic()
+        if op == 'ping':
+            return {
+                'ok': True,
+                'name': self.name,
+                'targetId': self.target_id,
+                'v': CANVAS_RUNTIME_V,
+                'pid': os.getpid(),
+                'uptime_s': round(time.time() - self.started, 1),
+            }
+        if op == 'events':
+            try:
+                after = max(0, int(req.get('after') or 0))
+                max_n = min(100, max(1, int(req.get('max') if req.get('max') is not None else 100)))
+                wait_ms = min(25000, max(0, int(req.get('wait_ms') or 0)))
+            except (TypeError, ValueError):
+                return {'ok': False, 'error': 'invalid events parameters', 'code': 2}
+            avail = [ev for ev, _ in self.events if ev['seq'] > after]
+            if not avail and wait_ms > 0:
+                try:
+                    await asyncio.wait_for(self.event_wakeup.wait(), timeout=wait_ms / 1000.0)
+                except asyncio.TimeoutError:
+                    pass
+                avail = [ev for ev, _ in self.events if ev['seq'] > after]
+            batch = avail[:max_n]
+            next_seq = batch[-1]['seq'] if batch else max(after, self.seq)
+            return {'ok': True, 'events': batch, 'next': next_seq, 'dropped': self.dropped}
+        async with self.req_lock:
+            if op == 'close':
+                self.closed_by_op = True
+                await self.close_cdp()
+                self.stop_event.set()
+                return {'ok': True}
+            if op in ('set', 'patch'):
+                html = req.get('html')
+                if not isinstance(html, str):
+                    return {'ok': False, 'error': 'html must be a string', 'code': 2}
+                if len(html.encode('utf-8')) > CANVAS_HTML_MAX:
+                    return {'ok': False, 'error': f'HTML is over {CANVAS_HTML_MAX} bytes', 'code': 2}
+                t0 = time.monotonic()
+                sid = self.session_id
+                try:
+                    if op == 'set':
+                        await self._ensure_canvas_document(need_frame_id=(self.frame_id is None))
+                        with contextlib.suppress(CanvasError):
+                            await self.call('Runtime.evaluate', {
+                                'expression': (
+                                    'if (window.__cdpilotCanvas && typeof window.__cdpilotCanvas.reset === "function") '
+                                    'window.__cdpilotCanvas.reset();'
+                                ),
+                            }, session=sid)
+                        await self.call('Page.setDocumentContent', {
+                            'frameId': self.frame_id or 'F1',
+                            'html': html,
+                        }, session=sid)
+                        val = None
+                        with contextlib.suppress(CanvasError):
+                            raf_res = await self.call('Runtime.evaluate', {
+                                'expression': (
+                                    'new Promise(r => { const t = setTimeout(() => r(Date.now()), 50); '
+                                    'requestAnimationFrame(() => requestAnimationFrame(() => '
+                                    '{ clearTimeout(t); r(Date.now()); })); })'
+                                ),
+                                'awaitPromise': True,
+                                'returnByValue': True,
+                            }, session=sid, timeout=2.0)
+                            val = ((raf_res or {}).get('result') or {}).get('value')
+                        t_paint = int(val) if isinstance(val, (int, float)) else int(time.time() * 1000)
+                        ms = round((time.monotonic() - t0) * 1000.0, 1)
+                        return {'ok': True, 'ms': ms, 't_paint': t_paint}
+                    # op == 'patch' (K4: HTML enters only through json.dumps)
+                    final = bool(req.get('final', True))
+                    await self._ensure_canvas_document(need_frame_id=False)
+                    expr = (
+                        '__cdpilotCanvas.patch('
+                        + json.dumps(html)
+                        + ', {final: '
+                        + ('true' if final else 'false')
+                        + '})'
+                    )
+                    ev_res = await self.call('Runtime.evaluate', {
+                        'expression': expr,
+                        'awaitPromise': True,
+                        'returnByValue': True,
+                    }, session=sid)
+                    res_obj = (ev_res or {}).get('result') or {}
+                    val = res_obj.get('value') if res_obj.get('type') == 'object' else None
+                    if not isinstance(val, dict) and CANVAS_RUNTIME_JS:
+                        await self.call('Runtime.evaluate', {
+                            'expression': CANVAS_RUNTIME_JS,
+                        }, session=sid)
+                        ev_res = await self.call('Runtime.evaluate', {
+                            'expression': expr,
+                            'awaitPromise': True,
+                            'returnByValue': True,
+                        }, session=sid)
+                        res_obj = (ev_res or {}).get('result') or {}
+                        val = res_obj.get('value') if res_obj.get('type') == 'object' else None
+                    if not isinstance(val, dict):
+                        return {'ok': False, 'error': 'runtime missing', 'code': 1}
+                    if not val.get('ok', True):
+                        return {
+                            'ok': False,
+                            'error': str(val.get('error') or 'patch failed'),
+                            'code': int(val.get('code') or 1),
+                        }
+                    ops = val.get('ops') if isinstance(val.get('ops'), dict) else {}
+                    return {
+                        'ok': True,
+                        'ops': {
+                            'add': int(ops.get('add', 0)),
+                            'del': int(ops.get('del', 0)),
+                            'move': int(ops.get('move', 0)),
+                            'upd': int(ops.get('upd', 0)),
+                        },
+                        'ms': val.get('ms', round((time.monotonic() - t0) * 1000.0, 1)),
+                        't_paint': int(val.get('t_paint') or int(time.time() * 1000)),
+                    }
+                except CanvasError as e:
+                    return {'ok': False, 'error': str(e), 'code': e.code}
+                except Exception as e:
+                    return {'ok': False, 'error': str(e) or type(e).__name__, 'code': 1}
+
+    async def close_cdp(self):
+        if self._init_nav_task is not None and not self._init_nav_task.done():
+            self._init_nav_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self._init_nav_task
+        self._init_nav_task = None
+        if self.target_id:
+            try:
+                await self.call('Target.closeTarget', {'targetId': self.target_id}, timeout=2.0)
+            except Exception:
+                pass
+        if self.browser_context_id:
+            try:
+                await self.call('Target.disposeBrowserContext', {
+                    'browserContextId': self.browser_context_id,
+                }, timeout=2.0)
+            except Exception:
+                pass
+
+
+def _canvas_cleanup_files(paths):
+    for k in ('sock', 'reg', 'ready'):
+        p = paths.get(k)
+        if p:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def _canvas_parse_host_args(args):
+    """Parse `<name> [--allow-net <host>]...` for _canvas_host_entry."""
+    if not args:
+        raise CanvasError('missing canvas name', 2)
+    name = _canvas_check_name(args[0])
+    allow_net = []
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a == '--allow-net':
+            if i + 1 >= len(args):
+                raise CanvasError('--allow-net needs a hostname', 2)
+            allow_net.append(_canvas_check_allow_net(args[i + 1]))
+            i += 2
+        elif a.startswith('--allow-net='):
+            allow_net.append(_canvas_check_allow_net(a.split('=', 1)[1]))
+            i += 1
+        else:
+            raise CanvasError(f'unknown option for canvas host: {a}', 2)
+    return name, tuple(dict.fromkeys(allow_net))
 
 
 def _canvas_host_entry(args):
-    """Hidden `--_canvas-host <name>` process (lane B)."""
-    sys.exit(1)
+    """Hidden `--_canvas-host <name> [--allow-net <host>]...` process (lane B)."""
+    if not hasattr(socket, 'AF_UNIX'):
+        print('canvas is not supported on Windows', file=sys.stderr)
+        sys.exit(1)
+    try:
+        name, allow_net = _canvas_parse_host_args(list(args or []))
+        os.umask(0o077)
+        paths = _canvas_paths(name)
+    except CanvasError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(e.code)
+    sock_path = paths['sock']
+    sock_dir = os.path.dirname(sock_path) or '.'
+    os.makedirs(sock_dir, mode=0o700, exist_ok=True)
+    try:
+        _canvas_check_dir_safe(sock_dir)
+    except CanvasError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(e.code)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(sock_path)
+    except OSError:
+        try:
+            pong = _canvas_request(name, {'op': 'ping'}, timeout=0.8)
+            if isinstance(pong, dict) and pong.get('ok'):
+                sys.exit(0)
+        except CanvasError:
+            pass
+        try:
+            os.unlink(sock_path)
+        except OSError:
+            pass
+        try:
+            srv.bind(sock_path)
+        except OSError:
+            sys.exit(1)
+    try:
+        os.chmod(sock_path, 0o600)
+    except OSError:
+        pass
+    srv.listen(16)
+    srv.setblocking(False)
+
+    ver = cdp_get('/json/version', no_cache=True) or {}
+    ws_url = ver.get('webSocketDebuggerUrl')
+    if not ws_url:
+        try:
+            srv.close()
+        except OSError:
+            pass
+        _canvas_cleanup_files(paths)
+        sys.exit(1)
+
+    try:
+        idle_s = float(os.environ.get('CDPILOT_CANVAS_IDLE_S') or CANVAS_IDLE_EXIT_S)
+    except ValueError:
+        idle_s = float(CANVAS_IDLE_EXIT_S)
+
+    async def _serve():
+        import websockets
+        loop = asyncio.get_running_loop()
+        async with websockets.connect(ws_url, max_size=64 * 1024 * 1024, ping_interval=None) as ws:
+            host = _CanvasHost(ws, name, allow_net=allow_net, idle_exit_s=idle_s)
+            for sig in (signal.SIGTERM, getattr(signal, 'SIGHUP', signal.SIGTERM)):
+                try:
+                    loop.add_signal_handler(sig, host.stop_event.set)
+                except (NotImplementedError, RuntimeError, ValueError, OSError):
+                    pass
+            reader_task = asyncio.create_task(host.ws_reader_loop())
+            unix_srv = None
+            try:
+                await host.setup()
+
+                async def _on_client(reader, writer):
+                    try:
+                        limit = CANVAS_HTML_MAX + (64 << 10)
+                        buf = bytearray()
+                        while True:
+                            chunk = await asyncio.wait_for(reader.read(65536), timeout=10.0)
+                            if not chunk:
+                                break
+                            buf.extend(chunk)
+                            if b'\n' in chunk:
+                                break
+                            if len(buf) > limit:
+                                break
+                        if len(buf) > limit or (buf and b'\n' not in buf):
+                            resp = {'ok': False, 'error': 'request line exceeds limit', 'code': 2}
+                        elif not buf:
+                            return
+                        else:
+                            line = bytes(buf).split(b'\n', 1)[0]
+                            try:
+                                req = json.loads(line.decode('utf-8'))
+                            except (ValueError, UnicodeDecodeError):
+                                req = None
+                            resp = await host.handle_op(req)
+                        if host.closed_by_op:
+                            _canvas_cleanup_files(paths)
+                        writer.write((json.dumps(resp, ensure_ascii=False) + '\n').encode('utf-8'))
+                        await writer.drain()
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+
+                unix_srv = await asyncio.start_unix_server(_on_client, sock=srv)
+                reg_data = {
+                    'name': name,
+                    'targetId': host.target_id,
+                    'browserContextId': host.browser_context_id,
+                    'pid': os.getpid(),
+                    'sock': sock_path,
+                    'started': host.started,
+                    'allow_net': list(allow_net),
+                    'v': CANVAS_RUNTIME_V,
+                }
+                _atomic_write_json(paths['reg'], reg_data)
+                try:
+                    os.chmod(paths['reg'], 0o600)
+                except OSError:
+                    pass
+                _atomic_write_json(paths['ready'], {'pid': os.getpid(), 'targetId': host.target_id})
+                try:
+                    os.chmod(paths['ready'], 0o600)
+                except OSError:
+                    pass
+                while not host.stop_event.is_set():
+                    rem = host.idle_exit_s - (time.monotonic() - host.last_activity)
+                    if rem <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(host.stop_event.wait(), timeout=min(1.0, max(0.05, rem)))
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                if not host.closed_by_op:
+                    await host.close_cdp()
+                if unix_srv is not None:
+                    unix_srv.close()
+                    try:
+                        await unix_srv.wait_closed()
+                    except Exception:
+                        pass
+                reader_task.cancel()
+                try:
+                    await reader_task
+                except BaseException:
+                    pass
+
+    try:
+        asyncio.run(_serve())
+    except Exception:
+        sys.exit(1)
+    finally:
+        try:
+            srv.close()
+        except OSError:
+            pass
+        _canvas_cleanup_files(paths)
+
+
+def cmd_canvas_open(args):
+    """`cdpilot canvas open [--name n] [--allow-net host]...`."""
+    name, rest = _canvas_resolve_name(args)
+    allow_net = []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == '--allow-net':
+            if i + 1 >= len(rest):
+                raise CanvasError('--allow-net needs a hostname', 2)
+            allow_net.append(_canvas_check_allow_net(rest[i + 1]))
+            i += 2
+        elif a.startswith('--allow-net='):
+            allow_net.append(_canvas_check_allow_net(a.split('=', 1)[1]))
+            i += 1
+        else:
+            raise CanvasError(f'unknown canvas open argument: {a}', 2)
+    paths = _canvas_paths(name)
+    try:
+        pong = _canvas_request(name, {'op': 'ping'}, timeout=1.5)
+    except CanvasError as e:
+        if e.code == 2:
+            raise
+        pong = None
+    if isinstance(pong, dict) and pong.get('ok') and pong.get('targetId'):
+        print(f"canvas: {name} {pong['targetId']}")
+        return
+    if not cdp_get('/json/version', no_cache=True):
+        _AUTOLAUNCH['cmd'] = 'canvas'
+        _autolaunch_if_down()
+    if not cdp_get('/json/version', no_cache=True):
+        raise CanvasError('cannot reach browser on CDP port', 1)
+    try:
+        os.unlink(paths['ready'])
+    except OSError:
+        pass
+    _src_dir = os.path.dirname(os.path.abspath(__file__))
+    _mod_name = os.path.splitext(os.path.basename(__file__))[0]
+    _loader = (
+        'import sys, runpy; '
+        'sys.path[:] = [p for p in sys.path if p]; '
+        'sys.path.insert(0, sys.argv[1]); del sys.argv[1]; '
+        f'runpy.run_module({_mod_name!r}, run_name="__main__", alter_sys=True)'
+    )
+    cmd = [sys.executable, '-c', _loader, _src_dir, CANVAS_HOST_FLAG, name]
+    for h in dict.fromkeys(allow_net):
+        cmd.extend(['--allow-net', h])
+    env = os.environ.copy()
+    env.update(
+        CDP_PORT=str(CDP_PORT),
+        CDPILOT_HOME=CDPILOT_HOME,
+        CDPILOT_PROFILE=PROFILE_DIR,
+        CDPILOT_LOG='0',
+    )
+    if PROJECT_ID:
+        env['CDPILOT_PROJECT_ID'] = PROJECT_ID
+    env.pop('CDPILOT_TIMEOUT', None)
+    os.makedirs(CDPILOT_HOME, mode=0o700, exist_ok=True)
+    kwargs = {
+        'stdin': subprocess.DEVNULL,
+        'stdout': subprocess.DEVNULL,
+        'stderr': subprocess.DEVNULL,
+        'env': env,
+        'close_fds': True,
+        'cwd': CDPILOT_HOME,
+    }
+    if os.name == 'nt':
+        kwargs['creationflags'] = (getattr(subprocess, 'DETACHED_PROCESS', 0x00000008)
+                                   | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200))
+    else:
+        kwargs['start_new_session'] = True
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+    except OSError as e:
+        raise CanvasError(f'cannot spawn canvas host: {e.strerror or e}', 1)
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if os.path.exists(paths['ready']):
+            break
+        if proc.poll() is not None and not os.path.exists(paths['ready']):
+            break
+        time.sleep(0.03)
+    if os.path.exists(paths['ready']):
+        target_id = None
+        try:
+            with open(paths['reg'], 'r', encoding='utf-8') as f:
+                target_id = (json.load(f) or {}).get('targetId')
+        except (OSError, ValueError):
+            pass
+        if not target_id:
+            try:
+                pong = _canvas_request(name, {'op': 'ping'}, timeout=2.0)
+                target_id = (pong or {}).get('targetId')
+            except CanvasError:
+                pass
+        if target_id:
+            print(f'canvas: {name} {target_id}')
+            return
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    _canvas_cleanup_files(paths)
+    raise CanvasError(f'canvas {name!r} host did not become ready within 5 s', 1)
+
+
+def cmd_canvas_set(args):
+    """`cdpilot canvas set <file|-> [--name n]`."""
+    name, rest = _canvas_resolve_name(args)
+    if len(rest) != 1:
+        raise CanvasError('usage: cdpilot canvas set <file|-> [--name <name>]', 2)
+    html = _canvas_read_html(rest[0])
+    reply = _canvas_request(name, {'op': 'set', 'html': html, 't_cli': time.time_ns()}, timeout=45.0)
+    if not reply.get('ok'):
+        raise CanvasError(reply.get('error') or 'canvas set failed', int(reply.get('code') or 1))
+    print(f"ok {reply.get('ms', 0)} ms")
+
+
+def cmd_canvas_patch(args):
+    """`cdpilot canvas patch <file|-> [--name n]` (CLI patch sends final:true)."""
+    name, rest = _canvas_resolve_name(args)
+    if len(rest) != 1:
+        raise CanvasError('usage: cdpilot canvas patch <file|-> [--name <name>]', 2)
+    html = _canvas_read_html(rest[0])
+    reply = _canvas_request(name, {
+        'op': 'patch',
+        'html': html,
+        'final': True,
+        't_cli': time.time_ns(),
+    }, timeout=45.0)
+    if not reply.get('ok'):
+        raise CanvasError(reply.get('error') or 'canvas patch failed', int(reply.get('code') or 1))
+    ops = reply.get('ops') or {}
+    add = int(ops.get('add', 0))
+    dl = int(ops.get('del', 0))
+    upd = int(ops.get('upd', 0))
+    move = int(ops.get('move', 0))
+    print(f"ok +{add} -{dl} ~{upd} \u2195{move} {reply.get('ms', 0)} ms")
+
+
+def _canvas_close_one(name, require_open=False):
+    paths = _canvas_paths(name)
+    had_any = any(os.path.exists(paths[k]) for k in ('sock', 'reg', 'ready'))
+    closed_ok = False
+    try:
+        reply = _canvas_request(name, {'op': 'close'}, timeout=3.0)
+        closed_ok = bool(isinstance(reply, dict) and reply.get('ok'))
+    except CanvasError as e:
+        if e.code == 2:
+            raise
+    if not closed_ok and os.path.exists(paths['reg']):
+        try:
+            with open(paths['reg'], 'r', encoding='utf-8') as f:
+                reg = json.load(f) or {}
+            pid = int(reg.get('pid') or 0)
+            if pid > 0 and _pid_alive(pid):
+                os.kill(pid, signal.SIGTERM)
+                deadline = time.time() + 1.5
+                while _pid_alive(pid) and time.time() < deadline:
+                    time.sleep(0.05)
+                closed_ok = True
+        except (OSError, ValueError):
+            pass
+    _canvas_cleanup_files(paths)
+    if require_open and not (closed_ok or had_any):
+        raise CanvasError(f"no canvas named {name!r} is open (cdpilot canvas open --name {name})", 1)
+    return closed_ok or had_any
+
+
+def _canvas_close_all(quiet=False):
+    cdir = os.path.join(PROFILE_DIR, 'canvas')
+    if not os.path.isdir(cdir):
+        return []
+    names = set()
+    try:
+        for fn in os.listdir(cdir):
+            for ext in ('.json', '.sock', '.ready'):
+                if fn.endswith(ext):
+                    cand = fn[:-len(ext)]
+                    if CANVAS_NAME_RE.match(cand):
+                        names.add(cand)
+    except OSError:
+        return []
+    closed = []
+    for n in sorted(names):
+        try:
+            if _canvas_close_one(n, require_open=False):
+                closed.append(n)
+                if not quiet:
+                    print(f'closed {n}')
+        except CanvasError:
+            pass
+    return closed
+
+
+def cmd_canvas_close(args):
+    """`cdpilot canvas close [--name n | --all]`."""
+    if '--all' in args:
+        rest = [a for a in args if a != '--all']
+        if rest:
+            raise CanvasError('usage: cdpilot canvas close [--name <name> | --all]', 2)
+        _canvas_close_all(quiet=False)
+        return
+    name, rest = _canvas_resolve_name(args)
+    if rest:
+        raise CanvasError('usage: cdpilot canvas close [--name <name> | --all]', 2)
+    _canvas_close_one(name, require_open=True)
+    print(f'closed {name}')
+
+
+def cmd_canvas_list(args):
+    """`cdpilot canvas list`."""
+    if args:
+        raise CanvasError('usage: cdpilot canvas list', 2)
+    cdir = _canvas_dir()
+    names = set()
+    try:
+        for fn in os.listdir(cdir):
+            if fn.endswith('.json'):
+                cand = fn[:-5]
+                if CANVAS_NAME_RE.match(cand):
+                    names.add(cand)
+    except OSError:
+        pass
+    rows = []
+    for n in sorted(names):
+        paths = _canvas_paths(n)
+        try:
+            pong = _canvas_request(n, {'op': 'ping'}, timeout=1.0)
+        except CanvasError:
+            pong = None
+        if isinstance(pong, dict) and pong.get('ok'):
+            tid = pong.get('targetId') or '?'
+            pid = pong.get('pid') or '?'
+            age = int(round(float(pong.get('uptime_s') or 0)))
+            rows.append(f'{n}\t{tid}\tpid {pid}\t{age}s')
+        else:
+            _canvas_cleanup_files(paths)
+    for r in rows:
+        print(r)
+
+
+def _canvas_call_lane(fn_name, sub, call_args):
+    fn = globals().get(fn_name)
+    if not callable(fn):
+        raise CanvasError(f'canvas {sub} is not available in this build', 1)
+    import inspect as _inspect
+    try:
+        params = list(_inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        params = []
+    if len(params) == 1 and len(call_args) > 1:
+        return fn(call_args)
+    return fn(*call_args)
+
+
+def cmd_canvas_dispatch(args):
+    """`cdpilot canvas <open|set|patch|stream|watch|events|close|list> ...` (lane B routes C and D)."""
+    try:
+        if not hasattr(socket, 'AF_UNIX'):
+            raise CanvasError('canvas is not supported on Windows', 1)
+        args = list(args or [])
+        if not args:
+            raise CanvasError(
+                'usage: cdpilot canvas <open|set|patch|stream|watch|events|close|list> ...', 2
+            )
+        sub, sub_args = args[0], args[1:]
+        if sub == 'open':
+            cmd_canvas_open(sub_args)
+        elif sub == 'set':
+            cmd_canvas_set(sub_args)
+        elif sub == 'patch':
+            cmd_canvas_patch(sub_args)
+        elif sub == 'close':
+            cmd_canvas_close(sub_args)
+        elif sub == 'list':
+            cmd_canvas_list(sub_args)
+        elif sub == 'stream':
+            name, rest = _canvas_resolve_name(sub_args)
+            if rest:
+                raise CanvasError('usage: cdpilot canvas stream [--name <name>]', 2)
+            _canvas_call_lane('cmd_canvas_stream', 'stream', (name,))
+        elif sub == 'watch':
+            name, rest = _canvas_resolve_name(sub_args)
+            if len(rest) != 1 or rest[0].startswith('-'):
+                raise CanvasError('usage: cdpilot canvas watch <file> [--name <name>]', 2)
+            _canvas_call_lane('cmd_canvas_watch', 'watch', (name, rest[0]))
+        elif sub == 'events':
+            name, rest = _canvas_resolve_name(sub_args)
+            follow, after, max_n, wait_ms = False, 0, 100, 0
+            i = 0
+            while i < len(rest):
+                a = rest[i]
+                if a == '--follow':
+                    follow = True
+                    i += 1
+                elif a in ('--after', '--max', '--wait-ms'):
+                    if i + 1 >= len(rest):
+                        raise CanvasError(f'{a} needs a value', 2)
+                    val_s = rest[i + 1]
+                    i += 2
+                    try:
+                        val_i = int(val_s)
+                    except ValueError:
+                        raise CanvasError(f'{a} requires an integer: {val_s!r}', 2)
+                    if a == '--after':
+                        after = val_i
+                    elif a == '--max':
+                        max_n = val_i
+                    else:
+                        wait_ms = val_i
+                elif a.startswith(('--after=', '--max=', '--wait-ms=')):
+                    k, val_s = a.split('=', 1)
+                    try:
+                        val_i = int(val_s)
+                    except ValueError:
+                        raise CanvasError(f'{k} requires an integer: {val_s!r}', 2)
+                    if k == '--after':
+                        after = val_i
+                    elif k == '--max':
+                        max_n = val_i
+                    else:
+                        wait_ms = val_i
+                    i += 1
+                else:
+                    raise CanvasError(f'unknown canvas events option: {a}', 2)
+            _canvas_call_lane('cmd_canvas_events', 'events', (name, follow, after, max_n, wait_ms))
+        else:
+            raise CanvasError(
+                f'unknown canvas subcommand: {sub!r} '
+                '(expected open, set, patch, stream, watch, events, close, list)',
+                2,
+            )
+    except CanvasError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(e.code)
 # ═══ CANVAS-B END ═══
 
 
