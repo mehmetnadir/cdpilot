@@ -140,3 +140,19 @@ Bu turun hedefi olan sahte sistem mesajı (0/3) ve sahte sohbet turu (1/3) ailel
 "ayar verisi" diye geçer; dışarıya söylenen sayı kör kümenin sayısıdır (11/40, yanlış alarm 2/40).
 Maliyet: olağan sayfa (2.000 düğüm) 28,6 → 42,4 ms işlemci; 100 KB en kötü girdi 118 ms (bütçe 330 ms).
 Sonraki tur için kör küme yok: heldout-3 artık ölçüldü; 4. tur yeni bir kör küme (desenleri görmeden) ister.
+
+## Şef kör ölçümü 2 — held-out-4 (11.11 03:3x, ikinci bağımsız doğrulama)
+
+Küme bu ölçüm için yazıldı: 50+50, 8 dil (en, es, de, fr, ru, zh, ar, tr), yazar (Claude Sonnet) dedektörü ve önceki kümeleri
+görmedi (yasak yollar istemde; yazar teyit etti). Sahte sistem mesajı 8 ve sahte sohbet turu 8 satırla ağırlıklı.
+Dosya depoda DEĞİL: `~/01dev/cdpilot-olcum-ham/kor-kume/injection-heldout-4.json` (sha256 önek `40310967ae9e165b`) — 4. tur ayar
+şeridi onu görmesin diye. 4. tur ölçüldükten sonra `test/fixtures/`'e girer.
+
+| Kod | Yakalama | Yanlış alarm |
+|---|---|---|
+| main eea73f6 | 13/50 | 2/50 |
+| lane/098 (3. tur) | **19/50** | **3/50** (ek alarm: bir güvenlik haberi saldırı dizesini alıntılıyor) |
+
+Aileler (önce → sonra): sahte sistem 4 → 5/8, sahte sohbet turu 0 → 0/8, çok dilli 2 → 5/7, kodlanmış 1 → 2/4,
+sızdırma 3 → 4/5; ötekiler aynı. Sonuç heldout-3 ile tutarlı: kazanç çok dilli ve kodlanmış satırlarda; `fake_turn`
+deseni kör veride hiç tutmuyor (iki kümede 0/11). 4. turun ilk işi sahte sohbet turu ailesi.
