@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'">
+  <title>Canvas State Fixture</title>
+</head>
+<body>
+  <div id="inputs-wrap">
+    <input id="inp-a" value="alpha">
+    <input id="inp-b" value="hello world">
+    <input id="inp-c" value="gamma">
+  </div>
+  <div id="scroll-box" style="height:60px;width:100px;overflow:auto;">
+    <div id="scroll-inner" style="height:400px;width:400px;">scroll-v1</div>
+  </div>
+  <p id="range-p">range target text here</p>
+  <form id="live-form" data-action="save-form">
+    <input id="chk-1" name="chk" type="checkbox">
+    <textarea id="ta-1" name="ta">initial</textarea>
+    <select id="sel-1" name="sel">
+      <option id="opt-1" value="1" selected>One</option>
+      <option id="opt-2" value="2">Two</option>
+    </select>
+  </form>
+  <details id="det-1">
+    <summary>More</summary>
+    <p id="det-p">Hidden1</p>
+  </details>
+  <dialog id="dlg-1">
+    <p id="dlg-p">Dialog1</p>
+  </dialog>
+  <button id="act-btn" data-action="ping-btn" data-val="7">Ping</button>
+</body>
+</html>
