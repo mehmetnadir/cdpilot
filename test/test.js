@@ -270,6 +270,80 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
     cli(['daemon', 'stop']);
   });
 
+  // K-0027 (CI 42810141487): every warm call took ~10 s on Linux. The daemon closed the
+  // request socket while its client-watcher thread sat in recv() on it (10 s socket timeout);
+  // on Linux that thread keeps the connection open, so the client never saw EOF, and the
+  // client waited for EOF after the exit frame. Two defences, one test each.
+  test('daemon: the client is done at the exit frame — it never waits for the daemon to close the socket', () => {
+    cli(['daemon', 'stop']);
+    const m = status().match(/socket: (\S+\.sock)/);
+    assert(m, status());
+    const sock = m[1];
+    const script = path.join(home, 'fake-daemon-hold.js');
+    fs.writeFileSync(script, [
+      "const net = require('net');",
+      'const srv = net.createServer((c) => {',
+      `  c.write(JSON.stringify({ hello: 1, version: ${JSON.stringify(VERSION)}, pid: process.pid }) + '\\n');`,
+      "  c.on('data', () => { c.write(JSON.stringify({ o: 'warm output\\n' }) + '\\n');",
+      "    c.write(JSON.stringify({ exit: 3 }) + '\\n'); /* and keep the socket open */ });",
+      "  c.on('error', () => {});",
+      '});',
+      `srv.listen(${JSON.stringify(sock)});`,
+      'setTimeout(() => process.exit(0), 25000).unref();',
+    ].join('\n'));
+    const fake = spawn(process.execPath, [script], { stdio: 'ignore' });
+    try {
+      assert(waitFor(() => fs.existsSync(sock)), 'fake daemon socket');
+      const t0 = Date.now();
+      const r = cli(['version']);
+      const took = Date.now() - t0;
+      assert.strictEqual(r.stdout, 'warm output\n', `served by the fake daemon: ${r.stdout}${r.stderr}`);
+      assert.strictEqual(r.status, 3, 'the exit code of the exit frame');
+      assert(took < 8000, `the client waited ${took} ms for the daemon to close the socket`);
+    } finally {
+      fake.kill();
+    }
+  });
+
+  test('daemon: the server hangs up with shutdown() — a thread blocked in recv() cannot keep a closed request open', () => {
+    // Static: the serve loop ends every request with the helper.
+    const serve = (PY_SRC.match(/def _daemon_serve_entry\([\s\S]*?\ndef _cli_main/) || [''])[0];
+    assert(/finally:\s*\n\s*_daemon_hangup\(conn\)/.test(serve), 'every request ends with _daemon_hangup(conn)');
+    // Behaviour, on any OS: a descriptor copy stands in for the reference a blocked recv()/poll()
+    // holds on Linux — close() alone leaves the peer without EOF, _daemon_hangup gives it at once.
+    // Then a real daemon: a raw client reads one request to its exit frame and must see EOF at once.
+    const PYB = (typeof PY_BIN !== 'undefined' && PY_BIN) || 'python3';
+    cli(['daemon', 'start']);
+    const sockLine = status().match(/(\S+\.sock)/);
+    assert(sockLine, status());
+    const script = [
+      'import sys, os, json, socket, time',
+      `sys.path.insert(0, ${JSON.stringify(path.join(__dirname, '..', 'src'))})`,
+      'import cdpilot as c',
+      'a, b = socket.socketpair(); held = os.dup(a.fileno())',
+      'c._daemon_hangup(a); a.close(); b.settimeout(3)',
+      'assert b.recv(1) == b"", "no EOF after _daemon_hangup while a copy of the descriptor is held"',
+      'os.close(held)',
+      's = socket.socket(socket.AF_UNIX); s.settimeout(10); s.connect(sys.argv[1])',
+      'f = s.makefile("rb"); hello = json.loads(f.readline()); assert hello["hello"] == 1',
+      'req = {"argv": ["version"], "cwd": os.getcwd(), "env": json.loads(sys.argv[2])}',
+      's.sendall((json.dumps(req) + "\\n").encode())',
+      'frames = []',
+      'while True:',
+      '    fr = json.loads(f.readline()); frames.append(fr)',
+      '    if "exit" in fr or "fallback" in fr: break',
+      'assert frames[-1] == {"exit": 0}, frames',
+      't0 = time.time(); rest = f.read(); took = time.time() - t0',
+      'assert rest == b"" and took < 2, "no EOF after the exit frame (%.1fs)" % took',
+      'print("ok")',
+    ].join('\n');
+    const r = spawnSync(PYB, ['-c', script, sockLine[1], JSON.stringify(baseEnv)],
+      { encoding: 'utf-8', timeout: 30000 });
+    cli(['daemon', 'stop']);
+    assert.strictEqual(r.status, 0, r.stderr + r.stdout);
+    assert(/ok/.test(r.stdout), r.stdout);
+  });
+
   test('daemon: the request executor restores env, streams and sys hooks, maps exits, forwards stdin, refuses spawn-only calls', () => {
     // In-process: _cli_main is replaced by small mains, _daemon_run_request is
     // driven with a fake connection. What a fresh process would have done at
