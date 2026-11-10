@@ -18673,6 +18673,7 @@ WEBMCP_CONFIG_FILE = os.path.join(PROFILE_DIR, 'webmcp.json')
 WEBMCP_FEATURE = 'WebMCP'
 WEBMCP_MIN_CHROMIUM = 146
 WEBMCP_CALL_TIMEOUT = 20.0  # seconds for `tools call` without --timeout
+WEBMCP_GETTOOLS_MS = 5000  # one document's getTools() may stay pending this long
 WEBMCP_REPORT_GRACE = 3.0   # seconds after --timeout to report the aborted call
 _WEBMCP_LAUNCH_FLAG = [None]  # this process's `launch --webmcp` (True) / `--no-webmcp` (False)
 _WEBMCP_TRUE = ('1', 'true', 'yes', 'on')
@@ -18830,6 +18831,16 @@ WEBMCP_LIST_JS = r"""(async () => {
     url: location.href
   };
   if (!facts.api) return { facts };
+  // getTools() of one document can stay pending for good (Chromium never
+  // answers some registrations; seen on CI 11.11 as 15 s "no reply" on every
+  // poll). One such document must not block the list: each call gets a time
+  // limit; a frame that misses it is left out (facts.stuck), the top
+  // document missing it is an error with a name.
+  const bounded = (p) => new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new DOMException(
+      'getTools() did not answer within __GT_MS__ ms', 'TimeoutError')), __GT_MS__);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
   // Every readable document in the frame tree is asked for its own tools. The
   // top document's getTools() is meant to include its same-origin frames' tools,
   // but Chromium 156 leaves out a frame that registered after the parent first
@@ -18858,11 +18869,12 @@ WEBMCP_LIST_JS = r"""(async () => {
     if (!mc || typeof mc.getTools !== 'function') continue;
     let tools;
     try {
-      tools = await mc.getTools();
+      tools = await bounded(mc.getTools());
     } catch (e) {
       if (w === window) {
         return { facts, error: { name: String(e && e.name), message: String(e && e.message) } };
       }
+      if (e && e.name === 'TimeoutError') facts.stuck = (facts.stuck || 0) + 1;
       continue;
     }
     for (const t of tools) {
@@ -18916,13 +18928,19 @@ WEBMCP_CALL_JS = r"""(async () => {
     }
   };
   walk(window);
+  // A getTools() that never settles must not hang the call (see WEBMCP_LIST_JS).
+  const bounded = (p) => new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new DOMException(
+      'getTools() did not answer', 'TimeoutError')), __GT_MS__);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
   let mc = null, tool = null;
   for (const w of docs) {
     let c = null;
     try { c = w.document.modelContext; } catch (e) { continue; }
     if (!c || typeof c.getTools !== 'function' || typeof c.executeTool !== 'function') continue;
     let tools;
-    try { tools = await c.getTools(); } catch (e) { continue; }
+    try { tools = await bounded(c.getTools()); } catch (e) { continue; }
     const hit = tools.find((t) => {
       if (t.name !== name) return false;
       let owner = w;
@@ -19056,11 +19074,12 @@ async def _webmcp_list(ws):
     document.modelContext and the main world can, the main world is used
     (one stderr note); isolated=False then tells the call step to follow.
     """
-    val, exc = await _webmcp_eval(ws, WEBMCP_LIST_JS)
+    list_js = WEBMCP_LIST_JS.replace("__GT_MS__", str(WEBMCP_GETTOOLS_MS))
+    val, exc = await _webmcp_eval(ws, list_js)
     iso = None if exc else (val or {})
     if iso is not None and (iso.get("facts") or {}).get("api"):
         return iso.get("tools"), iso.get("facts") or {}, iso.get("error"), True
-    val, exc = await _webmcp_eval(ws, WEBMCP_LIST_JS, isolated=False)
+    val, exc = await _webmcp_eval(ws, list_js, isolated=False)
     main = None if exc else (val or {})
     if main is not None and (main.get("facts") or {}).get("api"):
         print(WEBMCP_MAIN_WORLD_NOTE, file=sys.stderr)
@@ -19237,7 +19256,8 @@ async def cmd_tools_call(name, call_args, frame=None):
     js = (WEBMCP_CALL_JS.replace("__NAME__", json.dumps(name))
           .replace("__FRAME__", json.dumps(tool.get("frame")))
           .replace("__INPUT__", json.dumps(call_args, ensure_ascii=False))
-          .replace("__MS__", str(int(budget * 1000))))
+          .replace("__MS__", str(int(budget * 1000)))
+          .replace("__GT_MS__", str(WEBMCP_GETTOOLS_MS)))
     val, exc = await _webmcp_eval(ws, js, timeout=budget + 5, isolated=isolated)
     val = val or {}
     status = val.get("status")
