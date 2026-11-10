@@ -204,7 +204,14 @@ function daemonRequest(sockPath, payload, onFrame) {
           sock.destroy();
           return;
         }
-        if (msg.exit !== undefined) { exitCode = msg.exit; continue; }
+        if (msg.exit !== undefined) {
+          // The last frame: the command ran and every output frame is through. Do not wait
+          // for the daemon to close the socket (K-0027: on Linux it held it open for 10 s).
+          exitCode = msg.exit;
+          done({ handled: true, code: exitCode });
+          sock.destroy();
+          return;
+        }
         onFrame(msg);
       }
       scanFrom = buf.length;  // a frame longer than one chunk: do not rescan it
