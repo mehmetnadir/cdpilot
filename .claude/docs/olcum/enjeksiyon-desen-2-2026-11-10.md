@@ -88,3 +88,12 @@ otorite/aciliyet. İşaret ipucudur, süzgeç değil. Bundan sonraki her ayar tu
 
 Kötü niyetli giriş süresi (şef, 100 KB tek ad, `scratchpad/redos.py`): en kötü `<invoke x ` ×10.000 → 164 ms (main 24 ms);
 öteki durumlar 9–35 ms. Felaket geri izleme yok (bütün nicelleyiciler sınırlı).
+
+## Şef ölçümü — held-out-3 (11.11 00:4x, üçüncü bağımsız küme, 40+40, 12 dil)
+
+Küme agy `heldout-3` şeridinden (Gemini 3.8 Flash), dedektörü ve önceki kümeleri görmeden yazıldı; ayar için KULLANILMAZ.
+
+| Desenler | Yakalama | Yanlış alarm |
+|---|---|---|
+| önce (65e8b45) | 2/40 | 2/40 |
+| sonra (main f6ca63e) | 7/40 | 2/40 (bir güvenlik haberi alıntısı, bir tarif satırı) |
