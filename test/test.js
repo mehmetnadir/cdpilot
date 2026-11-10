@@ -7473,7 +7473,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       const tri = list.find((f) => f.name === 'inbox_triage');
       assert(list.length === 2 && tri && tri.steps === 4 && tri.runs === 0 && tri.host === 'user.example', JSON.stringify(list));
       // 2026-11-10 review: a placeholder step remembers the host it was typed on; files are 0600
-      assert.strictEqual(flow.steps[3].before.host, 'user.example', JSON.stringify(flow.steps[3]));
+      assert.deepStrictEqual(flow.steps[3].before, { host: 'user.example', origin: 'https://user.example' }, JSON.stringify(flow.steps[3]));
       if (process.platform !== 'win32') {
         assert.strictEqual(fs.statSync(flowPath).mode & 0o777, 0o600, 'flow file 0600');
         assert.strictEqual(fs.statSync(statePath).mode & 0o777, 0o600, 'agent-state.json 0600');
@@ -7496,8 +7496,14 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       const mv = cli(['agent', 'run', 'moved', '--var', `password=${typed}`], env);
       assert.strictEqual(mv.status, 4, mv.stdout + mv.stderr);
       const mvd = JSON.parse(mv.stdout);
-      assert(mvd.status === 'drift' && mvd.step === 4 && /recorded on other\.example/.test(mvd.reason),
+      assert(mvd.status === 'drift' && mvd.step === 4 && /recorded \(other\.example\); this page is user\.example/.test(mvd.reason),
         JSON.stringify([mvd.status, mvd.step, mvd.reason]));
+      // … and a step with no recorded host at all fails closed, it is never a pass
+      delete moved.steps[3].before;
+      fs.writeFileSync(movedPath, JSON.stringify(moved));
+      const nb = cli(['agent', 'run', 'moved', '--var', `password=${typed}`], env);
+      assert.strictEqual(nb.status, 4, nb.stdout + nb.stderr);
+      assert(/no recorded host/.test(JSON.parse(nb.stdout).reason), nb.stdout);
       fs.unlinkSync(movedPath);
       // run: a missing variable stops before any step; a dry run prints placeholders, never values
       const miss = cli(['agent', 'run', 'inbox_triage'], env);
@@ -7514,8 +7520,16 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert(run.tokens_avoided > 0 && run.token_estimate < run.tokens_avoided,
         `the model reads less than it would have: ${JSON.stringify({ t: run.token_estimate, a: run.tokens_avoided })}`);
       assert(typeof run.ms === 'number');
-      // the variable may come from the environment too; stats count runs and tokens kept away
-      const run2 = JSON.parse(ok(['agent', 'run', 'inbox_triage'], { CDPILOT_VAR_PASSWORD: typed }).stdout);
+      // the variable may come from the environment too — only for the host the value was recorded on,
+      // named in CDPILOT_VAR_HOSTS (2026-11-10 review: a flow a prompt-injected model records on another
+      // site must not draw on the environment's secrets); refused before any step runs
+      for (const hosts of [undefined, 'other.example']) {
+        const r = cli(['agent', 'run', 'inbox_triage'], { ...env, CDPILOT_VAR_PASSWORD: typed, ...(hosts ? { CDPILOT_VAR_HOSTS: hosts } : {}) });
+        assert.strictEqual(r.status, 2, `hosts=${hosts}: ${r.stdout}${r.stderr}`);
+        const e = JSON.parse(r.stderr);
+        assert(e.refused && e.refused[0].var === 'password' && /CDPILOT_VAR_HOSTS does not name user\.example/.test(e.refused[0].why), r.stderr);
+      }
+      const run2 = JSON.parse(ok(['agent', 'run', 'inbox_triage'], { CDPILOT_VAR_PASSWORD: typed, CDPILOT_VAR_HOSTS: 'example' }).stdout);
       assert.strictEqual(run2.status, 'ok');
       assert(!fs.readFileSync(statePath, 'utf-8').includes(typed) && !fs.readFileSync(flowPath, 'utf-8').includes(typed),
         'two runs later the typed value is still not on disk');

@@ -38,7 +38,8 @@ Environment:
   CHROME_BIN           Browser binary path (auto-detected if not set)
   CDPILOT_PROFILE      Isolated browser profile directory
   CDPILOT_LOG=0        Do not write the session log
-  CDPILOT_VAR_<NAME>   Value for flow placeholder {{name}} in replay
+  CDPILOT_VAR_<NAME>   Value for flow placeholder {{name}} in replay / agent run
+  CDPILOT_VAR_HOSTS    Hosts (comma-separated) an agent flow may type CDPILOT_VAR_* values on
   CDPILOT_TIMEOUT      Default for --timeout (the flag wins)
   CDPILOT_DAEMON=1     Keep one warm Python process per project and send page
                        commands to it over a local socket (fresh process when
@@ -15816,8 +15817,8 @@ AGENT_SKIP_ROLES = {
 # is saved in a flow as a {{placeholder}}. Deliberately narrower than the
 # session log's name regex ("Keyword", "Compass" are not secrets).
 _AGENT_SECRET_FIELD_RE = _re.compile(
-    r"passw|passcode|\bpwd\b|\bpin\b|\botp\b|one[ -]?time|token|secret|api[ _-]?key|access[ _-]?key"
-    r"|secret[ _-]?key|private[ _-]?key|\bcvv\b|\bcvc\b|card ?number|\biban\b|\bssn\b|credential",
+    r"passw|passcode|(?<![a-z0-9])(?:pwd|pin|otp|cvv|cvc|iban|ssn)(?![a-z0-9])|one[ -]?time|token|secret"
+    r"|api[ _-]?key|access[ _-]?key|secret[ _-]?key|private[ _-]?key|card ?number|credential",
     _re.I)
 
 
@@ -16343,6 +16344,35 @@ def _agent_host_path(url):
         return '', '/'
 
 
+def _agent_origin(url):
+    """scheme://host[:port] of a URL ('file' for file://, '' for an opaque page
+    such as about:blank or data:) — what a placeholder step is pinned to."""
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(url or '')
+        if not u.hostname:
+            return 'file' if u.scheme == 'file' else ''
+        return f"{u.scheme}://{u.hostname.lower()}" + (f":{u.port}" if u.port else '')
+    except Exception:
+        return ''
+
+
+AGENT_VAR_HOSTS_ENV = 'CDPILOT_VAR_HOSTS'
+
+
+def _agent_env_var_hosts():
+    """Hosts on which CDPILOT_VAR_<NAME> values may be typed (CDPILOT_VAR_HOSTS,
+    comma-separated; a listed host covers its subdomains). Empty = never: a
+    flow a prompt-injected model records on another site must not be able to
+    draw on the environment's secrets (2026-11-10 review)."""
+    return [h.strip().lower() for h in os.environ.get(AGENT_VAR_HOSTS_ENV, '').split(',') if h.strip()]
+
+
+def _agent_host_allowed(host, allowed):
+    host = (host or '').lower()
+    return bool(host) and any(host == a or host.endswith('.' + a.lstrip('.')) for a in allowed)
+
+
 def _agent_trail_push(state, entry):
     trail = state.setdefault('trail', [])
     trail.append(entry)
@@ -16430,8 +16460,8 @@ async def cmd_agent_flow_save(name, last=None):
             if h:
                 step['after'] = {'host': h, 'path': p}
             hb = _agent_host_path(e.get('url_before'))[0]
-            if hb:
-                step['before'] = {'host': hb}  # a {{placeholder}} is typed only here
+            if hb:  # a {{placeholder}} is typed only here
+                step['before'] = {'host': hb, 'origin': _agent_origin(e.get('url_before'))}
         for m in _AGENT_VAR_RE.finditer(step.get('text') or step.get('url') or ''):
             label = (step.get('anchor') or {}).get('name') or step.get('kind')
             vars_dict.setdefault(m.group(1), {'step': n, 'hint': f"{step.get('action', 'go')} {label}"})
@@ -16507,23 +16537,51 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
     except ValueError as e:
         print(json.dumps({'error': f'{path}: {e}'}), file=sys.stderr)
         sys.exit(1)
-    values = dict(var_values or {})
+    # Values: --var (the caller holds them) always; CDPILOT_VAR_<NAME> only for an
+    # act step whose recorded host is named in CDPILOT_VAR_HOSTS, never for a URL.
+    # Everything is settled here, before any step runs (exit 2 otherwise).
+    cli_values = dict(var_values or {})
+    env_hosts = _agent_env_var_hosts()
+    env_values, missing, refused = {}, [], []
     needed = set(flow.get('vars') or {})
     for step in flow['steps']:
-        needed.update(_AGENT_VAR_RE.findall(step.get('text') or step.get('url') or ''))
-    missing = []
-    for k in sorted(needed):
-        if k not in values:
+        names = _AGENT_VAR_RE.findall(step.get('text') or step.get('url') or '')
+        needed.update(names)
+        host_rec = (step.get('before') or {}).get('host')
+        for k in names:
+            if k in cli_values or k in env_values:
+                continue
             env_v = os.environ.get(f'CDPILOT_VAR_{k.upper()}')
             if env_v is None:
                 missing.append(k)
+            elif step.get('kind') == 'go':
+                refused.append({'var': k, 'step': step['n'], 'why': 'an environment value never fills a URL; pass --var'})
+            elif not host_rec:
+                refused.append({'var': k, 'step': step['n'], 'why': 'the step has no recorded host; re-record the flow or pass --var'})
+            elif not _agent_host_allowed(host_rec, env_hosts):
+                refused.append({'var': k, 'step': step['n'], 'why': f'{AGENT_VAR_HOSTS_ENV} does not name {host_rec}'})
             else:
-                values[k] = env_v
-    if missing:
-        print(json.dumps({'error': 'missing variables', 'missing': missing,
-                          'hint': '--var name=value or CDPILOT_VAR_<NAME>'}), file=sys.stderr)
+                env_values[k] = env_v
+    for k in sorted(needed):  # catalogued but typed in no step: a value must still exist
+        if k not in cli_values and k not in env_values and k not in missing \
+                and not any(r['var'] == k for r in refused) and os.environ.get(f'CDPILOT_VAR_{k.upper()}') is None:
+            missing.append(k)
+    if missing or refused:
+        err = {'error': 'missing variables', 'missing': sorted(set(missing)),
+               'hint': f'--var name=value, or CDPILOT_VAR_<NAME> with {AGENT_VAR_HOSTS_ENV}=<host,...> '
+                       'naming the host the value was recorded on'}
+        if refused:
+            err['refused'] = refused
+        print(json.dumps(err), file=sys.stderr)
         sys.exit(2)
-    subst = lambda s: _AGENT_VAR_RE.sub(lambda m: values.get(m.group(1), m.group(0)), s or '')
+
+    def subst(s, env_ok=True):
+        def pick(m):
+            k = m.group(1)
+            if k in cli_values:
+                return cli_values[k]
+            return env_values.get(k, m.group(0)) if env_ok else m.group(0)
+        return _AGENT_VAR_RE.sub(pick, s or '')
     if dry_run:
         # Placeholders stay placeholders: a dry run never prints a value.
         print(json.dumps({'flow': slug, 'dry_run': True, 'host': flow.get('host', ''),
@@ -16568,7 +16626,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
     for step in flow['steps']:
         if step.get('kind') == 'go':
             url_before = (state or {}).get('last_url') if state else None
-            await _agent_go_silent(subst(step.get('url', '')))
+            await _agent_go_silent(subst(step.get('url', ''), env_ok=False))
             page, actions, out_actions, text, state = await snapshot()
             tokens_avoided += _estimate_tokens({'actions': out_actions, 'text': text})
             _agent_trail_push(state, {'kind': 'go', 'url': step.get('url', ''), 'url_after': page.get('url', ''),
@@ -16582,12 +16640,19 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
         if match is None:
             drift(step, 'anchor not found', page, out_actions, text, state, _agent_injection_scan(last_nodes))
         amap = {a['ref']: a for a in actions}
-        before_host = (step.get('before') or {}).get('host')
-        if before_host and step.get('text') and _AGENT_VAR_RE.search(step['text']):
-            host_here = _agent_host_path(page.get('url', ''))[0]
-            if host_here and host_here != before_host:
-                drift(step, f"on {host_here}, the value was recorded on {before_host}", page, out_actions,
-                      text, state, _agent_injection_scan(last_nodes))
+        if step.get('text') and _AGENT_VAR_RE.search(step['text']):
+            # A placeholder value is typed only where it was recorded: same origin
+            # (host-only for a flow saved without one); no record, or an opaque page
+            # (about:blank, data:), is a drift, never a pass (2026-11-10 review).
+            before = step.get('before') or {}
+            if before.get('origin'):
+                recorded, here = before['origin'], _agent_origin(page.get('url', ''))
+            else:
+                recorded, here = before.get('host') or '', _agent_host_path(page.get('url', ''))[0]
+            if not recorded or not here or here != recorded:
+                drift(step, f"a placeholder value is typed only where it was recorded "
+                            f"({recorded or 'no recorded host'}); this page is {here or 'an opaque origin'}",
+                      page, out_actions, text, state, _agent_injection_scan(last_nodes))
         text_in = subst(step['text']) if step.get('text') is not None else None
         await _agent_perform(match['ref'], step.get('action', 'click'), text_in, amap)
         page2, actions2, out2, text2, state = await snapshot()
@@ -16651,14 +16716,14 @@ def _dispatch_agent_run(rest):
         if tok == '--var' and i + 1 < len(rest):
             k, sep, v = rest[i + 1].partition('=')
             if not sep or not k:
-                print(json.dumps({'error': f'--var expects name=value, got {rest[i + 1]!r}'}), file=sys.stderr)
+                print(json.dumps({'error': '--var expects name=value'}), file=sys.stderr)
                 sys.exit(2)
             var_values[k] = v
             i += 2
         elif tok.startswith('--var='):
             k, sep, v = tok[6:].partition('=')
             if not sep or not k:
-                print(json.dumps({'error': f'--var expects name=value, got {tok[6:]!r}'}), file=sys.stderr)
+                print(json.dumps({'error': '--var expects name=value'}), file=sys.stderr)
                 sys.exit(2)
             var_values[k] = v
             i += 1
@@ -20760,7 +20825,7 @@ SLOG_EVAL_WITHHELD = "«output not logged: the script names a secret-like value�
 # Flag, header and key names that carry secrets.
 _SLOG_SECRET_NAME_RE = _re.compile(
     r"pass|pwd|token|secret|key|cookie|auth|session|credential|bearer|jwt|otp|signature"
-    r"|\bpin\b|\bcvv\b|\bcvc\b|card[ _-]?number|\biban\b|\bssn\b|one[ _-]?time", _re.I)
+    r"|(?<![a-z0-9])(?:pin|cvv|cvc|iban|ssn)(?![a-z0-9])|card[ _-]?number|one[ _-]?time", _re.I)
 # A bare positional word naming a secret; the NEXT arg is its value.
 _SLOG_SECRET_WORD_RE = _re.compile(
     r"(?:x-)?[\w-]*(?:password|passwd|pwd|token|secret|api[-_]?key|apikey|authorization"
@@ -21222,6 +21287,9 @@ def _slog_redact_args(cmd, args):
         i = 1
         while i < len(args):
             a = args[i]
+            if a in ("--ref", "--url", "--action") and i + 1 < len(args):
+                i += 2  # their values are not secrets; the generic pass below still masks a URL
+                continue
             if a in ("--text", "--var") and i + 1 < len(args):
                 done.add(i)
                 if a == "--var":

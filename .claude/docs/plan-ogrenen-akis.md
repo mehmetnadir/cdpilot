@@ -56,6 +56,11 @@ Sapmada `agent run`:
   0600. Oturum günlüğü `agent act --text` ve `agent run --var` değerlerini maskeler (önceden açık yazıyordu; pin, cvv,
   kart numarası, iban, ssn, tek kullanımlık kod adları günlükte de sır sayılır). Launcher `-c` yükleyicisi cwd'yi
   `sys.path`ten çıkarır (planted `json.py` cdpilot'tan önce koşuyordu; 0.9.5'te src/ vardı).
+- T1 2. tur (F1/F2): yer tutucu adı sayfanın verdiği alan adından türediği için kötü sayfa "Password" alanıyla `CDPILOT_VAR_PASSWORD`'ü
+  kendi host'unda yazdırabiliyordu; host sabitlemesi boş host'ta (about:blank, data:) ve kayıtsız adımda açık kalıyordu. Düzeltme:
+  ortam değeri yalnız `CDPILOT_VAR_HOSTS`ta adı geçen host'ta kaydedilmiş act adımına verilir (URL'ye asla; liste boşsa hiç),
+  her şey ilk adımdan önce çözülür (çıkış 2, `refused` sebepli); yer tutucu adımı yalnız kaydedildiği origin'de yazılır, kayıt yok
+  ya da opak sayfa = sapma. `--var` değerleri çağıranın elindedir, kapı yok.
 
 ## 4. Ölçüm ve kapılar
 
