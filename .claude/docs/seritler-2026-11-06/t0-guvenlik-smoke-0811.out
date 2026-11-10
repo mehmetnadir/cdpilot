@@ -2,7 +2,7 @@
 | Denetim | Sonuç | Not |
 |---|---|---|
 | git-sir-dosya | OK |  |
-| sir-deseni | İHLAL | test/test.js:5868:  "api_token": ("x", ["sk-ant-api03-abcdefghijklmnopqrstuvwxyz"]),; |
+| sir-deseni | İHLAL | test/test.js:5868:  "api_token": ("x", ["sk-ant-api03-<uydurma, 08.11 T0 çıktısında kırpıldı 10.11>"]),; |
 | bagimlilik | OK |  |
 | sessiz-catch | OK |  |
 Sonuç: İHLAL (ihlal 1, uyarı 0)
