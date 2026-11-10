@@ -238,6 +238,16 @@ function classifyError(exitCode, isError, text) {
     'file://' + linksHtmlPath,
   ];
 
+  // Each mode gets its own working directory. cdpilot keys the project (session tab,
+  // agent-state.json, @refs) on the caller's cwd. Sharing one cwd made the three modes
+  // drive ONE tab: a warm mode's `go` between cli_fresh's observe and act left cli_fresh
+  // with refs of another document ("Could not get coordinates", 2026-11-11 diagnosis).
+  const modeCwd = {};
+  for (const m of ['cli_warm', 'cli_fresh', 'mcp_warm']) {
+    modeCwd[m] = path.join(tmpBase, 'cwd-' + m);
+    fs.mkdirSync(modeCwd[m], { recursive: true });
+  }
+
   // 4. Base environment for isolation
   const baseEnv = {
     ...process.env,
@@ -251,14 +261,16 @@ function classifyError(exitCode, isError, text) {
 
   // 5. Connect 9333 in temporary CDPILOT_HOME
   console.log(`[soak] connect 9333 çalıştırılıyor (CDPILOT_HOME=${cdpilotHome})...`);
-  const conn = spawnSync(process.execPath, [CLI, 'connect', '9333'], {
-    env: baseEnv,
-    cwd: REPO_ROOT,
-    encoding: 'utf8'
-  });
-  if (conn.status !== 0) {
-    console.error(`[soak] connect 9333 başarısız:`, conn.stderr);
-    process.exit(1);
+  for (const m of Object.keys(modeCwd)) {
+    const conn = spawnSync(process.execPath, [CLI, 'connect', '9333'], {
+      env: baseEnv,
+      cwd: modeCwd[m],
+      encoding: 'utf8'
+    });
+    if (conn.status !== 0) {
+      console.error(`[soak] connect 9333 başarısız (${m}):`, conn.stderr);
+      process.exit(1);
+    }
   }
   console.log(`[soak] Chrome 9333'e bağlandı.`);
 
@@ -266,7 +278,7 @@ function classifyError(exitCode, isError, text) {
   console.log(`[soak] CLI warm daemon başlatılıyor...`);
   const dStart = spawnSync(process.execPath, [CLI, 'daemon', 'start'], {
     env: { ...baseEnv, CDPILOT_DAEMON: '1' },
-    cwd: REPO_ROOT,
+    cwd: modeCwd.cli_warm,
     encoding: 'utf8'
   });
   console.log(`[soak] ${dStart.stdout.trim()}`);
@@ -282,7 +294,7 @@ function classifyError(exitCode, isError, text) {
   const mcpEnv = { ...baseEnv, CDPILOT_DAEMON: '1' };
   const mcpSrv = spawn(process.execPath, [CLI, 'mcp'], {
     env: mcpEnv,
-    cwd: REPO_ROOT,
+    cwd: modeCwd.mcp_warm,
     stdio: ['pipe', 'pipe', 'pipe']
   });
 
@@ -389,11 +401,12 @@ function classifyError(exitCode, isError, text) {
   ];
 
   function runCli(args, isWarm) {
+    const cwd = isWarm ? modeCwd.cli_warm : modeCwd.cli_fresh;
     const env = { ...baseEnv, CDPILOT_DAEMON: isWarm ? '1' : '0' };
     const t0 = process.hrtime.bigint();
     const res = spawnSync(process.execPath, [CLI, ...args], {
       env,
-      cwd: REPO_ROOT,
+      cwd,
       encoding: 'utf8'
     });
     const ms = Number(process.hrtime.bigint() - t0) / 1e6;
