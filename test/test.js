@@ -12314,6 +12314,316 @@ print(json.dumps(res))
 
 
 // ═══ CANVAS-B TESTS BEGIN ═══ (lane B: "canvas host:" tests)
+(() => {
+  const { spawnSync } = require('child_process');
+  const pyCanvasPath = path.join(__dirname, '..', 'src', 'cdpilot.py');
+  const cliJsPath = path.join(__dirname, '..', 'bin', 'cdpilot.js');
+  const fakeCdpScript = path.join(__dirname, 'canvas_fake_cdp.py');
+  const pySrcText = fs.readFileSync(pyCanvasPath, 'utf8');
+  const cliJsText = fs.readFileSync(cliJsPath, 'utf8');
+
+  let cachedPyBin = null;
+  function findPython() {
+    if (cachedPyBin) return cachedPyBin;
+    const candidates = [
+      process.env.CDPILOT_PYTHON,
+      'python3.13',
+      'python3.12',
+      'python3.11',
+      'python3',
+      'python',
+    ].filter(Boolean);
+    for (const c of candidates) {
+      const r = spawnSync(c, ['-I', '-c', 'import websockets; print("ok")'], {
+        encoding: 'utf8',
+        timeout: 5000,
+      });
+      if (r.status === 0 && (r.stdout || '').includes('ok')) {
+        cachedPyBin = c;
+        return c;
+      }
+    }
+    return null;
+  }
+
+  let cachedSuite = null;
+  function getFakeCdpSuite() {
+    if (cachedSuite) return cachedSuite;
+    const pyBin = findPython();
+    assert(pyBin, 'python3 with websockets is required for canvas host fake CDP tests');
+    const r = spawnSync(pyBin, ['-I', fakeCdpScript, pyCanvasPath], {
+      encoding: 'utf8',
+      timeout: 60000,
+    });
+    assert.strictEqual(r.status, 0, `canvas_fake_cdp.py failed: ${r.stderr || r.stdout}`);
+    cachedSuite = JSON.parse(r.stdout.trim());
+    for (const [k, v] of Object.entries(cachedSuite)) {
+      assert(!v.error, `scenario ${k} failed:\n${v.error}`);
+    }
+    return cachedSuite;
+  }
+
+  test('canvas host: DAEMON_SPAWN_SUBCMDS equal in src/cdpilot.py and bin/cdpilot.js', () => {
+    const pyMatch = pySrcText.match(/DAEMON_SPAWN_SUBCMDS\s*=\s*frozenset\(\{([^}]+)\}\)/);
+    const jsMatch = cliJsText.match(/DAEMON_SPAWN_SUBCMDS\s*=\s*new Set\(\[([^\]]+)\]\)/);
+    assert(pyMatch, 'DAEMON_SPAWN_SUBCMDS must exist in src/cdpilot.py');
+    assert(jsMatch, 'DAEMON_SPAWN_SUBCMDS must exist in bin/cdpilot.js');
+    const parseItems = (raw) =>
+      raw
+        .split(',')
+        .map((s) => s.trim().replace(/^['"]|['"]$/g, ''))
+        .filter(Boolean)
+        .sort();
+    const pyItems = parseItems(pyMatch[1]);
+    const jsItems = parseItems(jsMatch[1]);
+    assert.deepStrictEqual(pyItems, jsItems);
+    assert(pyItems.includes('canvas open'), 'canvas open must be in DAEMON_SPAWN_SUBCMDS');
+  });
+
+  test('canvas host: fake CDP exact setup method order and K8 session-only Fetch', () => {
+    const s = getFakeCdpSuite().setup_and_guards;
+    assert.deepStrictEqual(
+      s.setup_methods.slice(0, 9).map(([m, sid]) => [m, sid]),
+      [
+        ['Target.createBrowserContext', null],
+        ['Target.createTarget', null],
+        ['Target.attachToTarget', null],
+        ['Page.enable', 'SES-1'],
+        ['Runtime.enable', 'SES-1'],
+        ['Runtime.addBinding', 'SES-1'],
+        ['Fetch.enable', 'SES-1'],
+        ['Emulation.setFocusEmulationEnabled', 'SES-1'],
+        ['Page.navigate', 'SES-1'],
+      ]
+    );
+    assert.deepStrictEqual(s.setup_methods[0][2], { disposeOnDetach: true });
+    assert.deepStrictEqual(s.setup_methods[1][2], { url: 'about:blank', browserContextId: 'CTX-1' });
+    assert.deepStrictEqual(s.setup_methods[2][2], { targetId: 'TGT-1', flatten: true });
+    assert.deepStrictEqual(s.setup_methods[5][2], { name: '__cdpilotCanvasEmit' });
+    assert.deepStrictEqual(s.setup_methods[6][2], {
+      patterns: [{ urlPattern: '*', requestStage: 'Request' }],
+    });
+    assert.deepStrictEqual(s.setup_methods[7][2], { enabled: true });
+    assert.deepStrictEqual(s.setup_methods[8][2], { url: 'http://cdpilot-canvas.invalid/main/' });
+    assert(
+      !s.setup_methods.some(([m]) => m === 'Target.setAutoAttach'),
+      'K8: Target.setAutoAttach must never be called'
+    );
+    assert(
+      !s.setup_methods.some(([m, sid]) => m === 'Fetch.enable' && !sid),
+      'K8: browser-level Fetch.enable forbidden'
+    );
+  });
+
+  test('canvas host: requestPaused for canvas URL fulfills 200 with full CSP header and skeleton', () => {
+    const s = getFakeCdpSuite().setup_and_guards;
+    const fulfill = s.setup_methods[9];
+    assert(fulfill && fulfill[0] === 'Fetch.fulfillRequest', 'canvas URL must be fulfilled via Fetch.fulfillRequest');
+    const fp = fulfill[2];
+    assert.strictEqual(fp.responseCode, 200);
+    const hdrs = {};
+    for (const h of fp.responseHeaders || []) {
+      hdrs[h.name.toLowerCase()] = h.value;
+    }
+    const expectedCsp =
+      "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline'; " +
+      "img-src data: blob:; form-action 'none'; base-uri 'none'; frame-src 'none'; " +
+      'connect-src https://api.example.com; sandbox allow-scripts';
+    assert.strictEqual(hdrs['content-security-policy'], expectedCsp);
+    assert(hdrs['content-type'].includes('text/html'));
+    const body = Buffer.from(fp.body, 'base64').toString('utf8');
+    assert(body.includes('<meta data-cdpilot-csp http-equiv="Content-Security-Policy"'));
+    assert(!body.includes('sandbox allow-scripts'), 'meta CSP must omit sandbox directive');
+  });
+
+  test('canvas host: requestPaused for other document fulfills 204 and emits host blocked', () => {
+    const s = getFakeCdpSuite().setup_and_guards;
+    assert.strictEqual(s.other_doc_replies.length, 5);
+    for (const r of s.other_doc_replies) {
+      assert.strictEqual(r.method, 'Fetch.fulfillRequest');
+      assert.strictEqual(r.params.responseCode, 204);
+      assert.strictEqual(r.params.body, '');
+    }
+    const evs = (s.events && s.events.events) || [];
+    assert(
+      evs.some(
+        (e) => e.src === 'host' && e.type === 'blocked' && e.data.url === 'http://cdpilot-canvas.invalid/other/'
+      ),
+      'other document must emit host blocked event'
+    );
+  });
+
+  test('canvas host: requestPaused subresource fails BlockedByClient and allow-net https only continues', () => {
+    const s = getFakeCdpSuite().setup_and_guards;
+    assert.strictEqual(s.sub_replies.length, 4);
+    assert.strictEqual(s.sub_replies[0].method, 'Fetch.failRequest');
+    assert.strictEqual(s.sub_replies[0].params.errorReason, 'BlockedByClient');
+    assert.strictEqual(s.sub_replies[1].method, 'Fetch.continueRequest');
+    assert.strictEqual(s.sub_replies[2].method, 'Fetch.failRequest');
+    assert.strictEqual(s.sub_replies[2].params.errorReason, 'BlockedByClient');
+    assert.strictEqual(s.sub_replies[3].method, 'Fetch.failRequest');
+    assert.strictEqual(s.sub_replies[3].params.errorReason, 'BlockedByClient');
+  });
+
+  test('canvas host: requestPaused handler error never calls continueRequest', () => {
+    const s = getFakeCdpSuite().setup_and_guards;
+    assert.strictEqual(s.err_replies.length, 4);
+    assert(!s.err_replies.some((r) => r.method === 'Fetch.continueRequest'), 'never continueRequest on error');
+    assert.strictEqual(s.err_replies[0].method, 'Fetch.fulfillRequest');
+    assert.strictEqual(s.err_replies[0].params.responseCode, 204);
+    assert.strictEqual(s.err_replies[1].method, 'Fetch.failRequest');
+    assert.strictEqual(s.err_replies[1].params.errorReason, 'BlockedByClient');
+    assert.strictEqual(s.err_replies[2].method, 'Fetch.fulfillRequest');
+    assert.strictEqual(s.err_replies[2].params.responseCode, 204);
+    assert.strictEqual(s.err_replies[3].method, 'Fetch.failRequest');
+    assert.strictEqual(s.err_replies[3].params.errorReason, 'BlockedByClient');
+  });
+
+  test('canvas host: set calls Page.setDocumentContent and frameNavigated away re-navigates before patch', () => {
+    const s = getFakeCdpSuite().set_patch_and_doc_loss;
+    assert.strictEqual(s.set_res.ok, true);
+    assert(typeof s.set_res.ms === 'number');
+    assert(typeof s.set_res.t_paint === 'number');
+    const setDoc = s.set_calls.find((c) => c.method === 'Page.setDocumentContent');
+    assert(setDoc, 'set must call Page.setDocumentContent');
+    assert.strictEqual(setDoc.params.frameId, 'FRM-1');
+    assert.strictEqual(setDoc.params.html, '<h1>Hello</h1>');
+
+    // Empty runtime reports {ok:false, error:'runtime missing', code:1}
+    assert.strictEqual(s.missing_res.ok, false);
+    assert.strictEqual(s.missing_res.error, 'runtime missing');
+    assert.strictEqual(s.missing_res.code, 1);
+
+    // After Page.frameNavigated to about:blank, next patch re-navigates to canvas URL first
+    assert.strictEqual(s.patch_res.ok, true);
+    assert.strictEqual(s.patch_calls[0].method, 'Page.navigate');
+    assert.strictEqual(s.patch_calls[0].params.url, 'http://cdpilot-canvas.invalid/main/');
+    assert(
+      s.patch_calls.some(
+        (c) => c.method === 'Runtime.evaluate' && (c.params.expression || '').startsWith('__cdpilotCanvas.patch(')
+      ),
+      'patch must call Runtime.evaluate with __cdpilotCanvas.patch'
+    );
+    const navEvs = (s.events_after_nav && s.events_after_nav.events) || [];
+    assert(
+      navEvs.some((e) => e.src === 'host' && e.type === 'nav' && e.data.url === 'about:blank'),
+      'document loss must emit host nav event'
+    );
+  });
+
+  test('canvas host: bindingCalled filters types, caps rate at 100/s, and truncates >1KB data', () => {
+    const s = getFakeCdpSuite().bindings_and_limits;
+    const evs = (s.ev1 && s.ev1.events) || [];
+    assert.deepStrictEqual(
+      evs.map((e) => e.type),
+      ['click', 'submit', 'input'],
+      'spoofed blocked/paint/nav/closed and bad action names must be dropped'
+    );
+    assert.strictEqual(evs[0].src, 'page');
+    assert.strictEqual(evs[0].action, 'save_item');
+    assert.strictEqual(evs[0].id, 'btn-1');
+    assert(
+      Buffer.byteLength(JSON.stringify(evs[2].data), 'utf8') <= 1024,
+      'event data must be truncated to <= 1024 bytes'
+    );
+    assert(s.burst_count <= 100, `burst should cap total page events at 100/s (got ${s.burst_count})`);
+    assert(s.burst_dropped >= 10, `excess burst events must increment dropped (got ${s.burst_dropped})`);
+    assert.strictEqual(s.bad_op.ok, false);
+    assert.strictEqual(s.bad_op.code, 2);
+    assert.strictEqual(s.non_dict_op.ok, false);
+    assert.strictEqual(s.non_dict_op.code, 2);
+    assert.strictEqual(s.over_set.ok, false);
+    assert.strictEqual(s.over_set.code, 2);
+    assert.strictEqual(s.over_patch.ok, false);
+    assert.strictEqual(s.over_patch.code, 2);
+  });
+
+  test('canvas host: bad name, non-hostname allow-net, unsafe dir mode, and socket permissions', () => {
+    const s = getFakeCdpSuite().cli_and_socket;
+    for (const item of s.bad_names) {
+      assert.strictEqual(item.code, 2, `bad canvas name ${JSON.stringify(item.name)} must exit 2`);
+    }
+    for (const item of s.bad_allow_net) {
+      assert.strictEqual(item.code, 2, `bad --allow-net ${JSON.stringify(item.host)} must exit 2`);
+    }
+    assert.strictEqual(s.baddir_code, 2, '0755 canvas dir must be refused with exit 2');
+    assert.strictEqual(s.dir_mode, 0o700, 'canvas dir must be 0700');
+    assert.strictEqual(s.sock_mode, 0o600, 'canvas socket must be 0600');
+    assert.strictEqual(s.long_open.code, 0, 'canvas open with >100B profile path must succeed');
+    assert(s.long_open.sock_len <= 100, `fallback socket path must be <= 100 bytes (got ${s.long_open.sock_len})`);
+    assert.strictEqual(s.long_open.close_code, 0);
+  });
+
+  test('canvas host: CLI open, set, patch, list, close, unknown op, slog redaction, and Windows exit 1', () => {
+    const s = getFakeCdpSuite().cli_and_socket;
+    assert.strictEqual(s.open1.code, 0);
+    assert(/^canvas: main TARGET-\d+$/.test(s.open1.out), `unexpected open1 output: ${s.open1.out}`);
+    assert.strictEqual(s.open2.code, 0);
+    assert.strictEqual(s.open2.out, s.open1.out);
+    assert.strictEqual(s.raw_unknown.ok, false);
+    assert.strictEqual(s.raw_unknown.code, 2);
+    assert.strictEqual(s.set.code, 0);
+    assert(/^ok \d+(\.\d+)? ms$/.test(s.set.out), `unexpected set output: ${s.set.out}`);
+    assert.strictEqual(s.patch.code, 0);
+    assert(
+      /^ok \+\d+ -\d+ ~\d+ ↕\d+ \d+(\.\d+)? ms$/.test(s.patch.out),
+      `unexpected patch output: ${s.patch.out}`
+    );
+    assert.strictEqual(s.list.code, 0);
+    assert(s.list.out.includes('main\tTARGET-'), `unexpected list output: ${s.list.out}`);
+    assert.strictEqual(s.close.code, 0);
+    assert.strictEqual(s.close.out, 'closed main');
+    assert.deepStrictEqual(s.files_after_close, []);
+    assert.strictEqual(s.stop_all.cleaned, true, 'stop-all must close project canvas hosts');
+
+    assert(
+      s.slog.pos.some((a) => /^«html:\d+ chars»$/.test(a)),
+      'slog must redact positional HTML argument'
+    );
+    assert(
+      s.slog.flag.some((a) => /«html:\d+ chars»/.test(a)),
+      'slog must redact --html argument'
+    );
+    assert(s.slog.file.includes('page.html'), 'slog must keep file path unredacted');
+
+    for (const sub of ['open', 'set', 'patch', 'close', 'list', 'stream', 'watch', 'events']) {
+      assert.strictEqual(s.windows[sub].code, 1, `Windows ${sub} must exit 1`);
+      assert.strictEqual(s.windows[sub].stderr, 'canvas is not supported on Windows');
+    }
+  });
+
+  if (process.env.CDPILOT_E2E === '1') {
+    test('canvas host: e2e exfil leak vectors (0 hits), counter-experiment (>0 hits), and SIGKILL cleanup', () => {
+      const pyBin = findPython();
+      assert(pyBin, 'python3 is required for canvas host e2e test');
+      const r = spawnSync(pyBin, ['-I', fakeCdpScript, '--e2e', pyCanvasPath, cliJsPath], {
+        encoding: 'utf8',
+        timeout: 90000,
+      });
+      assert.strictEqual(r.status, 0, `canvas_fake_cdp --e2e failed: ${r.stderr || r.stdout}`);
+      const res = JSON.parse(r.stdout.trim());
+      assert(!res.error, `e2e error:\n${res.error}`);
+      assert.strictEqual(
+        res.guarded.total_hits,
+        0,
+        `K9: guarded canvas must have 0 loopback hits, got ${JSON.stringify(res.guarded)}`
+      );
+      assert(
+        res.guarded.host_blocked_count > 0,
+        `K9: guarded canvas must record host blocked events, got ${JSON.stringify(res.guarded)}`
+      );
+      assert.strictEqual(res.guarded.blob_nav_set_ok, true, 'K2: blob/about:blank nav phase must run');
+      assert(
+        res.counter.total_hits > 0,
+        `K9: counter-experiment without guard must produce >0 hits, got ${JSON.stringify(res.counter)}`
+      );
+      assert.strictEqual(res.sigkill.tid_present_before, true);
+      assert.strictEqual(res.sigkill.ctx_present_before, true);
+      assert.strictEqual(res.sigkill.tid_gone, true, 'C1: SIGKILL must dispose canvas target within 5 s');
+      assert.strictEqual(res.sigkill.ctx_gone, true, 'C1: SIGKILL must dispose browserContext within 5 s');
+    });
+  }
+})();
 // ═══ CANVAS-B TESTS END ═══
 
 

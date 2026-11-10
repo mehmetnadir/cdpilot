@@ -1,0 +1,184 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Canvas Exfil Fixture</title>
+  <link rel="prefetch" href="http://127.0.0.1:__HTTP_PORT__/prefetch">
+  <link rel="preconnect" href="http://127.0.0.1:__HTTP_PORT__/preconnect">
+  <link rel="dns-prefetch" href="//127.0.0.1:__HTTP_PORT__">
+</head>
+<body>
+  <div id="status">running</div>
+  <script>
+    (function () {
+      var hp = '__HTTP_PORT__';
+      var up = '__UDP_PORT__';
+      var base = 'http://127.0.0.1:' + hp;
+      var r = (window.__r = {});
+
+      // 1. fetch
+      try {
+        fetch(base + '/fetch', { mode: 'no-cors' }).then(
+          function () { r.fetch = 'ok'; },
+          function (e) { r.fetch = 'blocked:' + e; }
+        );
+      } catch (e) {
+        r.fetch = 'err:' + e;
+      }
+
+      // 2. img beacon
+      try {
+        var img = new Image();
+        img.onload = function () { r.img = 'ok'; };
+        img.onerror = function () { r.img = 'blocked'; };
+        img.src = base + '/img';
+      } catch (e) {
+        r.img = 'err:' + e;
+      }
+
+      // 3. external script
+      try {
+        var sc = document.createElement('script');
+        sc.onload = function () { r.script = 'ok'; };
+        sc.onerror = function () { r.script = 'blocked'; };
+        sc.src = base + '/script';
+        document.head.appendChild(sc);
+      } catch (e) {
+        r.script = 'err:' + e;
+      }
+
+      // 4. dynamic link prefetch / preconnect / dns-prefetch
+      ['prefetch', 'preconnect', 'dns-prefetch'].forEach(function (rel) {
+        try {
+          var lk = document.createElement('link');
+          lk.rel = rel;
+          lk.href = rel === 'dns-prefetch' ? '//127.0.0.1:' + hp : base + '/' + rel;
+          document.head.appendChild(lk);
+          r[rel] = 'appended';
+        } catch (e) {
+          r[rel] = 'err:' + e;
+        }
+      });
+
+      // 5. <a ping>
+      try {
+        var a = document.createElement('a');
+        a.href = '#ping-anchor';
+        a.ping = base + '/ping';
+        a.textContent = 'ping';
+        document.body.appendChild(a);
+        a.click();
+        r.ping = 'clicked';
+      } catch (e) {
+        r.ping = 'err:' + e;
+      }
+
+      // 6. iframe
+      try {
+        var ifr = document.createElement('iframe');
+        ifr.src = base + '/iframe';
+        document.body.appendChild(ifr);
+        r.iframe = 'appended';
+      } catch (e) {
+        r.iframe = 'err:' + e;
+      }
+
+      // 7. WebSocket
+      try {
+        var ws = new WebSocket('ws://127.0.0.1:' + hp + '/ws');
+        ws.onopen = function () { r.ws = 'open'; ws.close(); };
+        ws.onerror = function () { r.ws = 'blocked'; };
+      } catch (e) {
+        r.ws = 'err:' + e;
+      }
+
+      // 8. WebRTC STUN/TURN UDP
+      try {
+        var pc = new RTCPeerConnection({
+          iceServers: [
+            { urls: 'stun:127.0.0.1:' + up },
+            { urls: 'turn:127.0.0.1:' + up + '?transport=udp', username: 'u', credential: 'p' }
+          ]
+        });
+        pc.createDataChannel('exfil');
+        pc.createOffer().then(function (offer) {
+          return pc.setLocalDescription(offer);
+        }).then(function () {
+          r.webrtc = 'gathering';
+        }).catch(function (e) {
+          r.webrtc = 'err:' + e;
+        });
+      } catch (e) {
+        r.webrtc = 'err:' + e;
+      }
+
+      // 9. window.open
+      try {
+        var w = window.open(base + '/window_open');
+        r.window_open = w === null ? 'null' : 'opened';
+      } catch (e) {
+        r.window_open = 'err:' + e;
+      }
+
+      // 10. form submit (40ms), location= (120ms), meta refresh (240ms)
+      setTimeout(function () {
+        try {
+          var f = document.createElement('form');
+          f.method = 'GET';
+          f.action = base + '/form';
+          document.body.appendChild(f);
+          f.submit();
+          r.form = 'submitted';
+        } catch (e) {
+          r.form = 'err:' + e;
+        }
+      }, 40);
+
+      setTimeout(function () {
+        try {
+          location.href = base + '/location';
+          r.location = 'assigned';
+        } catch (e) {
+          r.location = 'err:' + e;
+        }
+      }, 120);
+
+      setTimeout(function () {
+        try {
+          var m = document.createElement('meta');
+          m.httpEquiv = 'refresh';
+          m.content = '0;url=' + base + '/meta_refresh';
+          document.head.appendChild(m);
+          r.meta_refresh = 'appended';
+        } catch (e) {
+          r.meta_refresh = 'err:' + e;
+        }
+      }, 240);
+
+      // 11. data:, blob:, and about:blank top-level navigation
+      var blobDelay = typeof window.__EXFIL_BLOB_DELAY__ === 'number' ? window.__EXFIL_BLOB_DELAY__ : 1800;
+      setTimeout(function () {
+        try {
+          location.href = 'data:text/html,<script>fetch("' + base + '/data_nav",{mode:"no-cors"})<\/script>';
+          r.data_nav = 'attempted';
+        } catch (e) {
+          r.data_nav = 'err:' + e;
+        }
+        setTimeout(function () {
+          try {
+            var blobHtml = '<!doctype html><html><body><script>' +
+              'try{fetch("' + base + '/blob_nav",{mode:"no-cors"});}catch(e){}' +
+              'setTimeout(function(){try{location.href="about:blank";}catch(e){}},60);' +
+              '<\/script></body></html>';
+            var blob = new Blob([blobHtml], { type: 'text/html' });
+            location.href = URL.createObjectURL(blob);
+            r.blob_nav = 'assigned';
+          } catch (e) {
+            r.blob_nav = 'err:' + e;
+          }
+        }, 20);
+      }, blobDelay);
+    })();
+  </script>
+</body>
+</html>
