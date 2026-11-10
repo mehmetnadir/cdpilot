@@ -1,0 +1,208 @@
+{
+  "date": "2026-11-11",
+  "timestamp": "2026-11-10T21:51:02.050110+00:00",
+  "mode": "cdp",
+  "browser": "HeadlessChrome/152.0.7977.30",
+  "canvas_name": "main",
+  "attempt": 1,
+  "doc_bytes": 20818,
+  "stream_summary": "ok 12 patches (114 coalesced) 3.5 ms 20818 bytes",
+  "uptime": {
+    "before": "0:50  up 6 days, 13:51, 2 users, load averages: 68.51 85.26 99.07",
+    "after": "0:51  up 6 days, 13:51, 2 users, load averages: 68.47 84.97 98.89",
+    "load_before": [
+      68.51,
+      85.26,
+      99.07
+    ],
+    "load_after": [
+      68.47,
+      84.97,
+      98.89
+    ],
+    "cpu_cores": 10,
+    "load_threshold_1m": 40,
+    "load_valid": false
+  },
+  "gate": {
+    "target_p50_ms": 100.0,
+    "target_p95_ms": 200.0,
+    "enforced": false,
+    "status": "load-invalid (report-only)"
+  },
+  "summary": {
+    "patches": 12,
+    "paint_minus_cli_ms": {
+      "p50": 432.305,
+      "p95": 1495.007,
+      "min": 199.199,
+      "max": 1658.015,
+      "mean": 565.24
+    },
+    "host_reply_ms": {
+      "p50": 434.149,
+      "p95": 1496.475,
+      "min": 199.857,
+      "max": 1659.347,
+      "mean": 566.519
+    }
+  },
+  "patches": [
+    {
+      "seq": 1,
+      "bytes": 524,
+      "final": false,
+      "t_cli_ns": 1794347456388487000,
+      "t_cli_ms": 1794347456388.487,
+      "t_host_recv_ms": 1794347456388.844,
+      "t_host_reply_ms": 1794347456906.583,
+      "host_reply_ms": 518.096,
+      "host_ms": 1.1,
+      "t_paint_ms": 1794347456905.0,
+      "paint_minus_cli_ms": 516.513
+    },
+    {
+      "seq": 2,
+      "bytes": 3006,
+      "final": false,
+      "t_cli_ns": 1794347456870956000,
+      "t_cli_ms": 1794347456870.956,
+      "t_host_recv_ms": 1794347456907.019,
+      "t_host_reply_ms": 1794347457075.244,
+      "host_reply_ms": 204.288,
+      "host_ms": 0.6,
+      "t_paint_ms": 1794347457074.0,
+      "paint_minus_cli_ms": 203.044
+    },
+    {
+      "seq": 3,
+      "bytes": 3748,
+      "final": false,
+      "t_cli_ns": 1794347457065448000,
+      "t_cli_ms": 1794347457065.448,
+      "t_host_recv_ms": 1794347457075.551,
+      "t_host_reply_ms": 1794347457586.869,
+      "host_reply_ms": 521.421,
+      "host_ms": 0.3,
+      "t_paint_ms": 1794347457585.0,
+      "paint_minus_cli_ms": 519.552
+    },
+    {
+      "seq": 4,
+      "bytes": 6278,
+      "final": false,
+      "t_cli_ns": 1794347457543449000,
+      "t_cli_ms": 1794347457543.449,
+      "t_host_recv_ms": 1794347457587.134,
+      "t_host_reply_ms": 1794347457756.664,
+      "host_reply_ms": 213.215,
+      "host_ms": 1.9,
+      "t_paint_ms": 1794347457756.0,
+      "paint_minus_cli_ms": 212.551
+    },
+    {
+      "seq": 5,
+      "bytes": 7026,
+      "final": false,
+      "t_cli_ns": 1794347457744676000,
+      "t_cli_ms": 1794347457744.676,
+      "t_host_recv_ms": 1794347457756.978,
+      "t_host_reply_ms": 1794347458324.684,
+      "host_reply_ms": 580.008,
+      "host_ms": 0.4,
+      "t_paint_ms": 1794347458324.0,
+      "paint_minus_cli_ms": 579.324
+    },
+    {
+      "seq": 6,
+      "bytes": 9884,
+      "final": false,
+      "t_cli_ns": 1794347458291557000,
+      "t_cli_ms": 1794347458291.557,
+      "t_host_recv_ms": 1794347458325.002,
+      "t_host_reply_ms": 1794347458761.075,
+      "host_reply_ms": 469.518,
+      "host_ms": 1.7,
+      "t_paint_ms": 1794347458759.0,
+      "paint_minus_cli_ms": 467.443
+    },
+    {
+      "seq": 7,
+      "bytes": 11943,
+      "final": false,
+      "t_cli_ns": 1794347458755801000,
+      "t_cli_ms": 1794347458755.801,
+      "t_host_recv_ms": 1794347458761.841,
+      "t_host_reply_ms": 1794347458955.658,
+      "host_reply_ms": 199.857,
+      "host_ms": 2.5,
+      "t_paint_ms": 1794347458955.0,
+      "paint_minus_cli_ms": 199.199
+    },
+    {
+      "seq": 8,
+      "bytes": 12834,
+      "final": false,
+      "t_cli_ns": 1794347458896831000,
+      "t_cli_ms": 1794347458896.831,
+      "t_host_recv_ms": 1794347458956.046,
+      "t_host_reply_ms": 1794347459257.091,
+      "host_reply_ms": 360.26,
+      "host_ms": 0.5,
+      "t_paint_ms": 1794347459256.0,
+      "paint_minus_cli_ms": 359.169
+    },
+    {
+      "seq": 9,
+      "bytes": 14472,
+      "final": false,
+      "t_cli_ns": 1794347459237739000,
+      "t_cli_ms": 1794347459237.739,
+      "t_host_recv_ms": 1794347459257.462,
+      "t_host_reply_ms": 1794347459547.963,
+      "host_reply_ms": 310.224,
+      "host_ms": 1.6,
+      "t_paint_ms": 1794347459547.0,
+      "paint_minus_cli_ms": 309.261
+    },
+    {
+      "seq": 10,
+      "bytes": 15783,
+      "final": false,
+      "t_cli_ns": 1794347459503833000,
+      "t_cli_ms": 1794347459503.833,
+      "t_host_recv_ms": 1794347459548.337,
+      "t_host_reply_ms": 1794347459902.613,
+      "host_reply_ms": 398.78,
+      "host_ms": 1.3,
+      "t_paint_ms": 1794347459901.0,
+      "paint_minus_cli_ms": 397.167
+    },
+    {
+      "seq": 11,
+      "bytes": 17515,
+      "final": false,
+      "t_cli_ns": 1794347459900985000,
+      "t_cli_ms": 1794347459900.985,
+      "t_host_recv_ms": 1794347459902.951,
+      "t_host_reply_ms": 1794347461560.332,
+      "host_reply_ms": 1659.347,
+      "host_ms": 1.6,
+      "t_paint_ms": 1794347461559.0,
+      "paint_minus_cli_ms": 1658.015
+    },
+    {
+      "seq": 12,
+      "bytes": 20818,
+      "final": true,
+      "t_cli_ns": 1794347460576363000,
+      "t_cli_ms": 1794347460576.363,
+      "t_host_recv_ms": 1794347461560.751,
+      "t_host_reply_ms": 1794347461939.58,
+      "host_reply_ms": 1363.217,
+      "host_ms": 3.5,
+      "t_paint_ms": 1794347461938.0,
+      "paint_minus_cli_ms": 1361.637
+    }
+  ]
+}
