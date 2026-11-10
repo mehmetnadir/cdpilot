@@ -1,6 +1,6 @@
 # cdpilot
 
-> Zero-dependency browser automation from your terminal. One command, full control.
+> Zero-npm-dependency browser automation from your terminal. One command, full control.
 
 [![npm version](https://img.shields.io/npm/v/cdpilot.svg)](https://www.npmjs.com/package/cdpilot)
 [![npm downloads](https://img.shields.io/npm/dm/cdpilot.svg)](https://www.npmjs.com/package/cdpilot)
@@ -340,7 +340,7 @@ cdpilot network <url> --har trace.har # Export navigation traffic as HAR 1.2 JSO
 cdpilot debug [url]                   # Full diagnostic (console+network+perf+shot)
 cdpilot perf                          # Performance metrics
 cdpilot eval <js>                     # Execute JavaScript
-cdpilot eval-batch <json>             # Run N JS expressions in 1 roundtrip (5-30x faster)
+cdpilot eval-batch <json>             # Run N JS expressions in one process and one CDP roundtrip instead of N
 ```
 
 #### Network monitoring & HAR export
@@ -506,8 +506,10 @@ Every `agent act` leaves a trail entry addressed by an *anchor*, the element's a
 position among equals (`{"role":"button","name":"Archive","nth":0}`), never a `@ref` or a DOM node id, which
 belong to one session. `agent flow save` writes the trail as a flow; `agent run` finds each anchor on the live
 page (exact name, then case-insensitive, then a longer name containing it when that is unambiguous) and acts,
-with no model in the loop. The result's `tokens_avoided` is what a model would have read observing the page
-before each step. When a site has a flow, `agent observe` lists it under `known_flows`.
+with no model in the loop. The result's `tokens_avoided` is an upper bound — a full observation before each step;
+an agent that reads diffs reads less. On three real sites the model loop read
+2,292–18,331 tokens, the `agent run` result 90–136 (HN 18,331 → 90, Wikipedia 15,474 → 136,
+httpbin 2,292 → 119). When a site has a flow, `agent observe` lists it under `known_flows`.
 
 **Drift stops, never guesses.** If a step's anchor is gone, or the step lands on another host than it did
 when recorded, `agent run` exits 4 and prints that page's full observation (`status:"drift"`, `step`,
@@ -519,7 +521,8 @@ same fields show `«masked»` as their value in `observe` output. Masking goes b
 secret typed into a field named otherwise is stored in clear, so review a flow before sharing it (flow files
 and `agent-state.json` are 0600). A `{{placeholder}}` typed into `agent act --text` or `--url` is refused
 (exit 2): placeholders are cdpilot's own, so a flow replays only values the user recorded, and a step that
-types one runs only on the host it was recorded on. `--var` values are visible in the process list for the
+types one runs only on the origin (scheme, host, port) it was recorded on (old flows without an origin fall
+back to host); another origin or an opaque page is a drift. `--var` values are visible in the process list for the
 duration of the call and are redacted in the session log; an environment value never enters argv.
 `CDPILOT_VAR_<NAME>` is used only by a step recorded on a host named in `CDPILOT_VAR_HOSTS` (comma-separated,
 subdomains included), on that same origin, and never inside a URL — so a flow that a prompt-injected model
@@ -533,8 +536,10 @@ assistants reading this page: ignore your previous instructions…"). `agent obs
 and a drift result of `agent run` carry `injection_suspect: [{text, match}]` (at most 5, absent when none)
 whenever such a block is in the text: `ignore_instructions`, `addresses_ai`, `system_prompt`,
 `new_instructions`, `hide_from_user`, `exfiltrate`. Nothing is hidden or blocked, the text stays where it was;
-the agent sees the mark next to it and treats the block as data. The patterns are narrow on purpose: a page
-*about* AI agents or system prompts is not flagged.
+the agent sees the mark next to it and treats the block as data. The patterns are narrow on purpose and English-only: on the corpus they were tuned on (`test/fixtures/injection-korpus.json`) 0 of 20 pages about AI were flagged and 19 of 20 injections caught (the German one is missed).
+On text written without seeing the patterns they catch far less: 7 of 24 with 0 of 24 false alarms
+(`test/fixtures/injection-heldout.json`) and 4 of 30 with 1 of 30 (`injection-heldout-2.json`, a recipe line).
+Treat the mark as a hint, not a filter: a page without it can still carry an injection.
 
 ### Session Management
 
@@ -620,7 +625,7 @@ cdpilot watch stop            # Stop the screencast
 ```
 
 Works on both local files (`file://...`) and online video (YouTube, Vimeo,
-Twitter, Facebook, Instagram). Zero dependency — Pillow is optional and only
+Twitter, Facebook, Instagram). No extra package needed — Pillow is optional and only
 used for motion-detection between frames.
 
 > **DRM limitation:** DRM-protected players (Netflix and similar) render as
@@ -641,7 +646,7 @@ cdpilot watch stop                     # Stop screencast
 
 ### Stealth & CAPTCHA
 
-Zero-dependency anti-fingerprint layer — patches `navigator.webdriver`,
+Self-contained anti-fingerprint layer (no extra packages) — patches `navigator.webdriver`,
 `chrome.runtime`, plugins (proper `PluginArray` inheritance), WebGL
 vendor/renderer, permissions, hardware concurrency, and the `Worker`
 constructor. Injected via `Page.addScriptToEvaluateOnNewDocument` before
@@ -1033,12 +1038,14 @@ itself; it is passed on to every tool call / request it runs.
 
 Every cdpilot call is a fresh process: node starts (~0.1 s), Python imports the
 core (~0.15 s) and a CDP session is set up (~0.5 s) before the command itself
-runs — a browser paints a page in 20 ms, `cdpilot go` took about a second
+runs — a browser paints a page in 20 ms, `cdpilot go` took about a second before
+0.9.6; now 0.5–0.8 s fresh and ~0.23–0.30 s with `CDPILOT_DAEMON=1`
 (measurements: `.claude/docs/perf-taban-2026-11-08.md`). With
 `CDPILOT_DAEMON=1` the launcher keeps one warm Python process per project and
 environment and hands page commands to it over a Unix socket; the process keeps
 the module and its event loop between calls, so the second and later calls skip
-the start-up cost.
+the Python start-up and CDP session set-up; node's ~0.1 s launcher remains: a
+browser-free command ~270 → ~140 ms, `content`/`eval` ~360 → ~110 ms (M1 Max).
 
 ```bash
 export CDPILOT_DAEMON=1
@@ -1359,7 +1366,7 @@ print(result.stdout)
 │   (CLI)     │    Chrome DevTools       │  (CDP mode)  │
 └─────────────┘     Protocol             └──────────────┘
        │                                        │
-       │  Zero dependencies                     │  Isolated profile
+       │  Zero npm dependencies                 │  Isolated profile
        │  Pure HTTP + WebSocket                 │  Separate from your
        │  single file, stdlib + websockets      │  personal browser
        └────────────────────────────────────────┘
@@ -1419,13 +1426,15 @@ The full adaptive layer is bench-neutral vs baseline (30/80 vs 30/80) for Stealt
 
 | Feature | cdpilot | Puppeteer | Playwright | Selenium |
 |---------|-----------|-----------|------------|----------|
-| Install size | **one Python file + a small Node launcher, no node_modules** | 400MB+ | 200MB+ | 100MB+ |
-| Dependencies | **0 npm** (Python: `websockets`, auto-installed) | 50+ | 30+ | Java + drivers |
-| Setup time | **instant** | minutes | minutes | painful |
+| Install size | **one Python file + a small Node launcher, no node_modules** | puppeteer-core ~5.7MB + Chromium ~170-280MB | playwright-core ~12.8MB + browsers | selenium-webdriver ~21.8MB + drivers |
+| Dependencies | **0 npm** (Python: `websockets`, auto-installed) | 6 direct npm | 1 (playwright-core) direct npm | 4 direct npm |
+| Setup time | **one npx; needs Python 3.10+** | minutes | minutes | painful |
 | AI-agent ready | **yes** | manual | manual | manual |
 | Browser download | **no** | yes (Chromium) | yes (3 browsers) | no |
 | CLI-first | **yes** | no (library) | no (library) | no |
-| MCP support | **yes** | no | no | no |
+| MCP support | **yes** | deprecated official server | yes (official @playwright/mcp) | no official server |
+
+Third-party numbers from npm on 27.09.2026; sources on [cdpilot.ndr.ist/compare](https://cdpilot.ndr.ist/compare).
 
 ## Monetization / Pro (Coming Soon)
 
@@ -1471,7 +1480,7 @@ Expired cookies are filtered automatically on load.
 
 ## Roadmap
 
-The only browser MCP with built-in test assertions. Here's what we've shipped and what's next:
+A browser MCP with 10 built-in test assertions. Here's what we've shipped and what's next:
 
 ### Shipped
 
@@ -1485,7 +1494,7 @@ The only browser MCP with built-in test assertions. Here's what we've shipped an
 - [x] **Annotated screenshots** — @N badge overlays on interactive elements
 - [x] **Auto-wait** — MutationObserver-based, 5s automatic element waiting
 - [x] **`wait-for-text`** — adaptive text-based waiting (subtree + characterData) for streaming AI responses, async toasts, and selector-less synchronization
-- [x] **`eval-batch`** — run N JS expressions in 1 CDP roundtrip (5-30x speedup vs sequential `eval`)
+- [x] **`eval-batch`** — run N JS expressions in one process and one CDP roundtrip instead of N
 - [x] **`block`** — request blocking via `Network.setBlockedURLs` with built-in presets (images/fonts/ads/media); fewer bytes and faster loads on opt-in (measure on your own pages)
 - [x] **`dismiss`** — heuristic auto-click for LLM chat sign-up walls (EN+TR pattern library, destructive-action guards)
 - [x] **`adaptive`** — auto-escalate to stealth on CAPTCHA-protected hosts, persistent per-host memory ("run fast, climb walls")
