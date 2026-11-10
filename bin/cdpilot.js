@@ -90,7 +90,8 @@ const DAEMON_SPAWN_CMDS = new Set([
   'tls-proxy', 'captcha-wait', 'help', '--help', '-h']);
 // "cmd sub" pairs that run fresh while the command itself is served warm
 // (agent observe/act are page steps; agent twitter logs in and posts).
-const DAEMON_SPAWN_SUBCMDS = new Set(['agent twitter']);
+const DAEMON_SPAWN_SUBCMDS = new Set(['agent twitter', 'canvas open', 'canvas stream',
+  'canvas watch', 'canvas events']);
 
 function daemonEnabled() {
   return process.env.CDPILOT_DAEMON === '1' && process.platform !== 'win32';

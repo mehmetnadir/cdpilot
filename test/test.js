@@ -12187,6 +12187,26 @@ print(json.dumps(res))
 
 
 
+// ═══ CANVAS-A TESTS BEGIN ═══ (lane A: "canvas morph:" tests)
+// ═══ CANVAS-A TESTS END ═══
+
+
+
+// ═══ CANVAS-B TESTS BEGIN ═══ (lane B: "canvas host:" tests)
+// ═══ CANVAS-B TESTS END ═══
+
+
+
+// ═══ CANVAS-C TESTS BEGIN ═══ (lane C: "canvas stream:" tests)
+// ═══ CANVAS-C TESTS END ═══
+
+
+
+// ═══ CANVAS-D TESTS BEGIN ═══ (lane D: "canvas events:" tests)
+// ═══ CANVAS-D TESTS END ═══
+
+
+
 // ── Summary ──
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
