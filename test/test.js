@@ -12188,6 +12188,127 @@ print(json.dumps(res))
 
 
 // ═══ CANVAS-A TESTS BEGIN ═══ (lane A: "canvas morph:" tests)
+(() => {
+  const { execFileSync } = require('child_process');
+  let _morphReport = null;
+  function getMorphReport() {
+    if (_morphReport) return _morphReport;
+    const out = execFileSync(process.execPath, [path.join(__dirname, 'canvas_morph.js')], {
+      encoding: 'utf8',
+      timeout: 30000,
+    });
+    const parsed = JSON.parse(out.trim());
+    assert.strictEqual(parsed.ok, true);
+    _morphReport = parsed.results;
+    return _morphReport;
+  }
+
+  test('canvas morph: size budget (morph core <= 300 lines / <= 10 KB, runtime <= 14 KB, fake DOM <= 250 lines)', () => {
+    const b = getMorphReport().budget;
+    assert.strictEqual(b.v, 1);
+    assert(b.coreLines <= 300, `morph core lines ${b.coreLines} > 300`);
+    assert(b.coreBytes <= 10240, `morph core bytes ${b.coreBytes} > 10240`);
+    assert(b.totalBytes <= 14336, `CANVAS_RUNTIME_JS bytes ${b.totalBytes} > 14336`);
+    assert(b.fakeDomLines <= 250, `canvas_fake_dom.js lines ${b.fakeDomLines} > 250`);
+  });
+
+  test('canvas morph: frozen surface, v=1, idempotent double load, and empty HTML no-op', () => {
+    const s = getMorphReport().surface;
+    assert.strictEqual(s.frozen, true);
+    assert.strictEqual(s.v, 1);
+    assert.strictEqual(s.sameInstance, true);
+    assert.deepStrictEqual(s.nopOps, { add: 0, del: 0, move: 0, upd: 0 });
+  });
+
+  test('canvas morph: keyed reorder (id and data-key) with minimum op count and different tag replaceWith', () => {
+    const k = getMorphReport().keyed;
+    assert.strictEqual(k.moveOps, 1);
+    assert.strictEqual(k.dataKeyMoveOps, 1);
+    assert.strictEqual(k.replaceWithCount, 1);
+  });
+
+  test('canvas morph: attribute diff (add, update, remove, unchanged)', () => {
+    const a = getMorphReport().attrDiff;
+    assert.strictEqual(a.upd1, 1);
+    assert.strictEqual(a.upd2, 0);
+  });
+
+  test('canvas morph: focus kept on keyed input while siblings reorder (neighbours move instead)', () => {
+    const f = getMorphReport().focus;
+    assert.strictEqual(f.activeId, 'b');
+    assert.strictEqual(f.blurCount, 0);
+    assert.strictEqual(f.moveCount, 2);
+  });
+
+  test('canvas morph: Range selection offsets restored after nodeValue writes and element scroll kept', () => {
+    const ss = getMorphReport().selectionAndScroll;
+    assert.strictEqual(ss.startOffset, 2);
+    assert.strictEqual(ss.endOffset, 2);
+    assert.strictEqual(ss.scrollTop, 125);
+    assert.strictEqual(ss.scrollLeft, 40);
+  });
+
+  test('canvas morph: live form values, <details open>, and modal <dialog> kept unless template attr changes', () => {
+    const st = getMorphReport().stateRules;
+    assert.strictEqual(st.keptUserValue, true);
+    assert.strictEqual(st.updatedOnAttrChange, true);
+    assert.strictEqual(st.modalKept, true);
+  });
+
+  test('canvas morph: scripts run only on final:true and equal matched script never runs again', () => {
+    const sc = getMorphReport().scripts;
+    assert.strictEqual(sc.runCount, 2);
+    assert.deepStrictEqual(sc.texts, ['window.a=1;', 'window.a=2;']);
+  });
+
+  test('canvas morph: strip <meta http-equiv=refresh|content-security-policy> and <base>, keep host CSP meta', () => {
+    const sec = getMorphReport().security;
+    assert.strictEqual(sec.hostCspKept, true);
+    assert.strictEqual(sec.baseCount, 0);
+  });
+
+  test('canvas morph: delegated events (click/submit/input), emit queue (cap 100), binding, and 1 KB cut', () => {
+    const em = getMorphReport().emit;
+    assert.strictEqual(em.flushedCount, 101);
+    assert(em.cutDataLen <= 1024, `cutDataLen ${em.cutDataLen} > 1024`);
+  });
+
+  test('canvas morph: timer wrapper (setTimeout/setInterval/requestAnimationFrame) and reset()', () => {
+    const tm = getMorphReport().timers;
+    assert.strictEqual(tm.cleared, true);
+  });
+
+  test('canvas morph: idempotence on 200 seeded random trees (after morph(a->b) serialised DOM equals b)', () => {
+    const rnd = getMorphReport().random200;
+    assert.strictEqual(rnd.passed, 200);
+  });
+
+  test('canvas morph: malformed HTML does not throw', () => {
+    const m = getMorphReport().malformed;
+    assert.strictEqual(m.ok, true);
+    assert(m.count >= 5);
+  });
+
+  test('canvas morph: e2e real focus, selection, scroll, <details>, modal <dialog>, and 1,000-patch heap <= 2x (gated by CDPILOT_E2E=1)', () => {
+    if (process.env.CDPILOT_E2E !== '1') {
+      console.log('  - skipped: canvas morph e2e (set CDPILOT_E2E=1 to run against Chrome 127.0.0.1:9333)');
+      return;
+    }
+    const out = execFileSync(process.execPath, [path.join(__dirname, 'canvas_e2e.js')], {
+      encoding: 'utf8',
+      timeout: 60000,
+    });
+    const res = JSON.parse(out.trim());
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.focusKept, true);
+    assert.strictEqual(res.selectionKept, true);
+    assert.strictEqual(res.rangeKept, true);
+    assert.strictEqual(res.scrollKept, true);
+    assert.strictEqual(res.detailsKept, true);
+    assert.strictEqual(res.modalDialogKept, true);
+    assert(res.heapEnd <= res.heapStart * 2, `heap grew > 2x: ${res.heapStart} -> ${res.heapEnd}`);
+  });
+})();
 // ═══ CANVAS-A TESTS END ═══
 
 

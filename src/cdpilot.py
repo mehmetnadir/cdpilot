@@ -23532,8 +23532,303 @@ def _canvas_request(name, msg, timeout=10.0):
 #   q: [] })
 # Delegated listeners: [data-action]/[data-emit] clicks, form submit/input -> emit.
 # Strips <meta http-equiv=refresh|content-security-policy> and <base> from incoming HTML.
-CANVAS_RUNTIME_V = 0          # lane A sets 1 with the runtime
-CANVAS_RUNTIME_JS = ''        # lane A
+CANVAS_RUNTIME_V = 1
+CANVAS_RUNTIME_JS = r"""(() => {
+const V=1,W=window,D=document,J=JSON.stringify,isFn=(f)=>typeof f==='function';
+if(W.__cdpilotCanvas&&W.__cdpilotCanvas.v===V)return W.__cdpilotCanvas;
+const BIND='__cdpilotCanvasEmit',ACT_RE=/^[a-z0-9_-]{1,64}$/,EV_T={click:1,submit:1,input:1};
+const DA='data-action',DE='data-emit',CSP_A='data-cdpilot-csp',INERT_A='data-ci',MAX_D=1024,MAX_Q=100,q=[];
+const oST=W.setTimeout,oRAF=W.requestAnimationFrame,tIds=new Set(),iIds=new Set(),rIds=new Set();
+const ga=(e,k)=>e.getAttribute(k),sa=(e,k,v)=>e.setAttribute(k,v),ra=(e,k)=>e.removeAttribute(k),ha=(e,k)=>e.hasAttribute(k);
+const arr=(x)=>Array.from(x||[]),ch=(n)=>arr(n&&n.childNodes),at=(n)=>arr(n&&n.attributes),lc=(s)=>String(s||'').toLowerCase();
+const wrapT=(sK,cK,set,once)=>{
+const oS=W[sK],oC=W[cK];if(!isFn(oS))return null;
+W[sK]=function(fn,...a){const id=oS.call(W,function(...x){if(once)set.delete(id);return isFn(fn)?fn.apply(this,x):undefined;},...a);set.add(id);return id;};
+W[cK]=(id)=>{set.delete(id);if(oC)oC.call(W,id);};return oC;
+};
+const oCT=wrapT('setTimeout','clearTimeout',tIds,1),oCI=wrapT('setInterval','clearInterval',iIds,0),oCRAF=wrapT('requestAnimationFrame','cancelAnimationFrame',rIds,1);
+function reset(){
+if(oCT)for(const id of tIds)oCT.call(W,id);
+if(oCI)for(const id of iIds)oCI.call(W,id);
+if(oCRAF)for(const id of rIds)oCRAF.call(W,id);
+tIds.clear();iIds.clear();rIds.clear();
+}
+function cutD(d){
+if(d===undefined)return null;
+if(typeof d==='string')return d.slice(0,MAX_D);
+let s='';try{s=J(d)||'';}catch(_){s=String(d);}
+if(!s||s.length<=MAX_D)return s?d:null;
+if(d&&typeof d==='object'&&!Array.isArray(d)){
+const out={};let u=2;
+for(const[k,v]of Object.entries(d)){
+const ks=J(k)+':',rm=MAX_D-u-ks.length-3,vs=typeof v==='string'?(rm>0?J(v.slice(0,rm)):''):J(v);
+if(vs&&u+ks.length+vs.length+1<=MAX_D){out[k]=JSON.parse(vs);u+=ks.length+vs.length+1;}
+}
+if(J(out).length<=MAX_D)return out;
+}
+return s.slice(0,MAX_D);
+}
+function emit(o){
+if(!o||typeof o!=='object'||!EV_T[o.type])return;
+const action=o.action!=null?String(o.action):'';
+if(action!==''&&!ACT_RE.test(action))return;
+const ev={type:o.type,action,id:o.id!=null?String(o.id):'',data:cutD(o.data)},fn=W[BIND];
+if(isFn(fn)){
+while(q.length){try{fn(J(q.shift()));}catch(_){}}
+try{fn(J(ev));}catch(_){}
+}else{if(q.length>=MAX_Q)q.shift();q.push(ev);}
+}
+const fAct=(t)=>{for(let c=t;c&&c.nodeType===1;c=c.parentNode)if(ha(c,DA)||ha(c,DE))return c;return null;};
+const rAct=(el)=>{if(!el)return[false,''];const h=ha(el,DA),a=(h?ga(el,DA):ga(el,DE))||'';return[(h||a)&&!ACT_RE.test(a),a];};
+if(D&&isFn(D.addEventListener)){
+const on=(t,fn)=>D.addEventListener(t,fn,true);
+on('click',(e)=>{
+const el=fAct(e&&e.target);if(!el)return;
+const[bad,action]=rAct(el);if(bad)return;
+const data={};
+for(const a of at(el))if(a.name.startsWith('data-')&&![DA,DE,'data-key',CSP_A].includes(a.name))data[a.name.slice(5)]=a.value;
+emit({type:'click',action,id:ga(el,'id')||'',data});
+});
+on('submit',(e)=>{
+if(e&&isFn(e.preventDefault))e.preventDefault();
+const f=e&&e.target;if(!f||f.nodeName!=='FORM')return;
+const[bad,action]=rAct(f);if(bad)return;
+const data={};
+for(const c of arr(f.querySelectorAll&&f.querySelectorAll('input,textarea,select'))){
+if(c.disabled||(c.hasAttribute&&ha(c,'disabled')))continue;
+const k=ga(c,'name')||ga(c,'id');if(!k)continue;
+const tp=lc(ga(c,'type'));
+if(tp==='checkbox')data[k]=!!c.checked;
+else if(tp==='radio'){if(c.checked)data[k]=c.value||'';}
+else data[k]=c.value!=null?String(c.value):'';
+}
+emit({type:'submit',action,id:ga(f,'id')||'',data});
+});
+const onIn=(e)=>{
+const el=e&&e.target;if(!el||!['INPUT','TEXTAREA','SELECT'].includes(el.nodeName))return;
+const actEl=fAct(el);let[bad,action]=rAct(actEl);if(bad)return;
+if(!actEl){const nm=ga(el,'name')||'';if(ACT_RE.test(nm))action=nm;}
+const tp=lc(ga(el,'type')),val=(tp==='checkbox'||tp==='radio')?!!el.checked:(el.value!=null?String(el.value):'');
+emit({type:'input',action,id:ga(el,'id')||ga(el,'name')||'',data:{value:val}});
+};
+on('input',onIn);on('change',onIn);
+}
+// --- morph core begin ---
+const app=new WeakMap(),rSg=new WeakMap(),SKIP={INPUT:/^(value|checked)$/,TEXTAREA:/^value$/,OPTION:/^selected$/,DETAILS:/^open$/,DIALOG:/^open$/};
+let hCsp=null;
+const sSig=(el)=>at(el).filter((a)=>a.name!==INERT_A).map((a)=>a.name+'='+a.value).sort().join('&')+'::'+(el.textContent||'');
+const rSp=(el)=>{
+const t=el.nodeName;
+return t==='INPUT'?[ga(el,'value'),ha(el,'checked')]:t==='TEXTAREA'?[ga(el,'value')??(el.textContent||'')]:t==='OPTION'?[ha(el,'selected')]:(t==='DETAILS'||t==='DIALOG')?[ha(el,'open')]:null;
+};
+function seed(r,mark){
+if(!r||r.nodeType!==1)return;
+const s=rSp(r);if(s&&!app.has(r))app.set(r,s);
+if(mark&&r.nodeName==='SCRIPT')rSg.set(r,sSig(r));
+for(const c of ch(r))seed(c,mark);
+}
+function ensCsp(){
+const h=D.head;if(!h)return;
+for(const c of ch(h))if(c.nodeType===1&&c.nodeName==='META'){
+if(ha(c,CSP_A)||lc(ga(c,'http-equiv')).trim()==='content-security-policy'){sa(c,CSP_A,'');hCsp=c;break;}
+}
+if(hCsp&&hCsp.parentNode!==h)h.insertBefore(hCsp,h.firstChild);
+}
+const isModal=(el)=>{
+if(!el||el.nodeType!==1||el.nodeName!=='DIALOG')return false;
+if(el._isModal)return true;
+try{return!!(el.matches&&el.matches(':modal'));}catch(_){return false;}
+};
+const hasPin=(el)=>{
+if(!el||el.nodeType!==1)return false;
+const ae=D.activeElement;
+if(ae&&ae!==D.body&&ae!==D.documentElement&&(el===ae||(el.contains&&el.contains(ae))))return true;
+if(isModal(el))return true;
+try{return!!(el.querySelector&&el.querySelector('dialog:modal'));}catch(_){return false;}
+};
+const getKey=(n)=>(n&&n.nodeType===1?(ga(n,'id')||ga(n,'data-key')||null):null);
+function lis(arr){
+const n=arr.length,tails=[],p=new Int32Array(n),out=new Set();if(!n)return out;
+for(let i=0;i<n;i++){
+let lo=0,hi=tails.length;
+while(lo<hi){const m=(lo+hi)>>1;if(arr[tails[m]]<arr[i])lo=m+1;else hi=m;}
+tails[lo]=i;p[i]=lo>0?tails[lo-1]:-1;
+}
+for(let k=tails[tails.length-1];k>=0;k=p[k])out.add(k);
+return out;
+}
+function statS(oldIdx,pin){
+if(pin<0)return lis(oldIdx);
+const pv=oldIdx[pin],li=[],lv=[],ri=[],rv=[],keep=new Set([pin]);
+for(let i=0;i<pin;i++)if(oldIdx[i]<pv){li.push(i);lv.push(oldIdx[i]);}
+for(let i=pin+1;i<oldIdx.length;i++)if(oldIdx[i]>pv){ri.push(i);rv.push(oldIdx[i]);}
+for(const k of lis(lv))keep.add(li[k]);
+for(const k of lis(rv))keep.add(ri[k]);
+return keep;
+}
+function san(p){
+for(const c of ch(p)){
+if(c.nodeType!==1)continue;
+if(ha(c,CSP_A))ra(c,CSP_A);
+const he=c.nodeName==='META'?lc(ga(c,'http-equiv')).trim():'';
+if(c.nodeName==='BASE'||he==='refresh'||he==='content-security-policy'){p.removeChild(c);continue;}
+san(c);
+}
+}
+function mat(n){
+if(n.nodeType===3)return D.createTextNode(n.nodeValue||'');
+if(n.nodeType===8)return D.createComment?D.createComment(n.nodeValue||''):D.createTextNode('');
+const t=n.nodeName,el=D.createElement(lc(t));
+for(const a of at(n))sa(el,a.name,a.value);
+if(t==='SCRIPT'){sa(el,INERT_A,ga(el,'type')??'');sa(el,'type','text/ci');el.textContent=n.textContent||'';return el;}
+for(const c of ch(n))el.appendChild(mat(c));
+const s=rSp(el);
+if(s){
+if(t==='INPUT'){el.value=s[0]??'';el.checked=s[1];}
+else if(t==='TEXTAREA')el.value=s[0];
+else if(t==='OPTION')el.selected=s[0];
+else el.open=s[0];
+app.set(el,s);
+}
+return el;
+}
+function rIn(n){
+if(!n||n.nodeType!==1)return;
+if(n.nodeName==='SCRIPT'&&ha(n,INERT_A)){const o=ga(n,INERT_A);ra(n,INERT_A);if(o==='')ra(n,'type');else sa(n,'type',o);}
+for(const c of ch(n))rIn(c);
+}
+function mTx(oldT,newT,ops){
+const nv=newT.nodeValue||'';if((oldT.nodeValue||'')===nv)return;
+const sel=isFn(W.getSelection)?W.getSelection():null;
+let r=null,sc=null,so=0,ec=null,eo=0;
+if(sel&&sel.rangeCount>0)try{r=sel.getRangeAt(0);sc=r.startContainer;so=r.startOffset;ec=r.endContainer;eo=r.endOffset;}catch(_){r=null;}
+oldT.nodeValue=nv;ops.upd++;
+if(r&&(sc===oldT||ec===oldT)){
+const l=nv.length;let ns=sc===oldT?Math.min(so,l):so,ne=ec===oldT?Math.min(eo,l):eo;
+if(sc===ec&&ns>ne)ns=ne;
+try{r.setStart(sc,ns);r.setEnd(ec,ne);if(sel.rangeCount===0&&sel.addRange)sel.addRange(r);}catch(_){}
+}
+}
+const sRm=(el,k,on,val)=>{if(on)sa(el,k,val);else ra(el,k);};
+function mEl(oldEl,newEl,final,ops){
+const t=oldEl.nodeName;
+if(t==='SCRIPT'){
+if(sSig(oldEl)!==sSig(newEl)){
+for(const a of at(oldEl))if(!ha(newEl,a.name))ra(oldEl,a.name);
+for(const a of at(newEl))if(ga(oldEl,a.name)!==a.value)sa(oldEl,a.name,a.value);
+oldEl.textContent=newEl.textContent||'';rSg.delete(oldEl);ops.upd++;
+}
+return;
+}
+let chg=false;
+const modal=isModal(oldEl),prev=app.get(oldEl)||rSp(oldEl),cur=rSp(newEl);
+const isFoc=D.activeElement===oldEl&&(t==='INPUT'||t==='TEXTAREA');
+const ss=isFoc?oldEl.selectionStart:null,se=isFoc?oldEl.selectionEnd:null,sd=isFoc?oldEl.selectionDirection:null;
+if(t==='INPUT'){
+if(cur[0]!==prev[0]){sRm(oldEl,'value',cur[0]!==null,cur[0]);oldEl.value=cur[0]??'';chg=true;}
+if(cur[1]!==prev[1]){sRm(oldEl,'checked',cur[1],'');oldEl.checked=cur[1];chg=true;}
+}else if(t==='TEXTAREA'){
+if(cur[0]!==prev[0]){const va=ga(newEl,'value');sRm(oldEl,'value',va!==null,va);oldEl.textContent=oldEl.value=cur[0];chg=true;}
+}else if(t==='OPTION'){
+if(cur[0]!==prev[0]){sRm(oldEl,'selected',cur[0],'');oldEl.selected=cur[0];chg=true;}
+}else if(t==='DETAILS'||(t==='DIALOG'&&!modal)){
+if(cur[0]!==prev[0]){sRm(oldEl,'open',cur[0],'');oldEl.open=cur[0];chg=true;}
+}
+if(cur&&!modal)app.set(oldEl,cur);
+if(isFoc&&typeof ss==='number'&&typeof se==='number'){
+const l=(oldEl.value||'').length;
+try{oldEl.setSelectionRange(Math.min(ss,l),Math.min(se,l),sd||'none');}catch(_){}
+}
+const skip=(nm)=>nm===CSP_A||!!(SKIP[t]&&SKIP[t].test(nm));
+for(const a of at(oldEl))if(!skip(a.name)&&!ha(newEl,a.name)){ra(oldEl,a.name);chg=true;}
+for(const a of at(newEl))if(!skip(a.name)&&ga(oldEl,a.name)!==a.value){sa(oldEl,a.name,a.value);chg=true;}
+if(chg)ops.upd++;
+if(t==='TEXTAREA')return;
+const st=oldEl.scrollTop||0,sl=oldEl.scrollLeft||0;
+mCh(oldEl,newEl,final,ops);
+if(st&&oldEl.scrollTop!==st)oldEl.scrollTop=st;
+if(sl&&oldEl.scrollLeft!==sl)oldEl.scrollLeft=sl;
+}
+function mCh(oldP,newP,final,ops){
+const isCsp=(n)=>n.nodeType===1&&ha(n,CSP_A),nch=ch(newP),nks=new Set();
+for(const nc of nch){const k=getKey(nc);if(k)nks.add(k);}
+for(const oc of ch(oldP))if(!isCsp(oc)&&!isModal(oc)&&getKey(oc)&&!nks.has(getKey(oc))){oldP.removeChild(oc);ops.del++;}
+const ro=ch(oldP).filter((c)=>!isCsp(c)),okm=new Map(),used=new Uint8Array(ro.length),ntg=new Map();
+for(let i=0;i<ro.length;i++){const k=getKey(ro[i]);if(k&&!okm.has(k))okm.set(k,i);}
+for(const nc of nch)if(!getKey(nc)&&nc.nodeType===1)ntg.set(nc.nodeName,(ntg.get(nc.nodeName)||0)+1);
+const findU=(from,fn)=>{for(let i=from;i<ro.length;i++)if(!used[i]&&!getKey(ro[i])&&fn(ro[i]))return i;return -1;};
+let cur=0;const plan=[];
+for(const nc of nch){
+const k=getKey(nc);
+if(k){
+if(okm.has(k)){
+const oi=okm.get(k);okm.delete(k);used[oi]=1;const on=ro[oi];
+plan.push({kind:(on.nodeName===nc.nodeName||isModal(on))?'match':'replace',oi,on,nn:nc});
+}else plan.push({kind:'add',nn:nc});
+continue;
+}
+if(nc.nodeType===1)ntg.set(nc.nodeName,ntg.get(nc.nodeName)-1);
+while(cur<ro.length&&(used[cur]||getKey(ro[cur])))cur++;
+const mFn=(n)=>nc.nodeType===1?(n.nodeType===1&&n.nodeName===nc.nodeName):(n.nodeType===nc.nodeType);
+let oi=nc.nodeType===3?findU(cur,(n)=>n.nodeType===3&&n.nodeValue===nc.nodeValue):findU(cur,mFn);
+if(oi<0)oi=findU(0,mFn);
+if(oi>=0){used[oi]=1;if(oi>=cur)cur=oi+1;plan.push({kind:'match',oi,on:ro[oi],nn:nc});}
+else if(nc.nodeType===1){
+const ri=findU(cur,(n)=>n.nodeType===1&&!isModal(n)&&!(ntg.get(n.nodeName)>0));
+if(ri>=0){used[ri]=1;plan.push({kind:'replace',oi:ri,on:ro[ri],nn:nc});}
+else plan.push({kind:'add',nn:nc});
+}else plan.push({kind:'add',nn:nc});
+}
+for(let i=0;i<ro.length;i++)if(!used[i]&&!isModal(ro[i])){oldP.removeChild(ro[i]);ops.del++;}
+const kept=[];
+for(const it of plan){
+if(it.kind==='replace'){const live=mat(it.nn);it.on.replaceWith(live);rIn(live);ops.add++;ops.del++;it.node=live;kept.push(it);}
+else if(it.kind==='match'){it.node=it.on;kept.push(it);}
+}
+const pin=kept.findIndex((x)=>x.kind==='match'&&hasPin(x.node)),stat=statS(kept.map((x)=>x.oi),pin);
+for(let i=0;i<kept.length;i++)kept[i].stat=stat.has(i);
+let nx=null;
+for(let j=plan.length-1;j>=0;j--){
+const it=plan[j];
+if(it.kind==='add'){const live=mat(it.nn);oldP.insertBefore(live,nx);rIn(live);ops.add++;nx=live;}
+else{if(!it.stat&&it.node!==nx&&it.node.nextSibling!==nx){oldP.insertBefore(it.node,nx);if(it.kind==='match')ops.move++;}nx=it.node;}
+}
+for(const it of kept){
+if(it.kind!=='match')continue;
+if(it.node.nodeType===1)mEl(it.node,it.nn,final,ops);
+else if(it.node.nodeType===3)mTx(it.node,it.nn,ops);
+else if(it.node.nodeValue!==it.nn.nodeValue){it.node.nodeValue=it.nn.nodeValue;ops.upd++;}
+}
+}
+function rMph(rawHtml,final,ops){
+ensCsp();let html=rawHtml;const low=lc(html),lo=low.lastIndexOf('<script');
+if(lo!==-1&&low.lastIndexOf('</script')<lo)html=html.slice(0,lo);
+if(/<(?:html|head|body)\b/i.test(html)&&isFn(DOMParser)){
+const p=new DOMParser().parseFromString(html,'text/html');
+if(/<head\b/i.test(html)&&p.head&&D.head){san(p.head);mCh(D.head,p.head,final,ops);}
+if(p.body&&D.body){san(p.body);mCh(D.body,p.body,final,ops);}
+}else{
+const tpl=D.createElement('template');tpl.innerHTML=html;const f=tpl.content||tpl;san(f);if(D.body)mCh(D.body,f,final,ops);
+}
+ensCsp();
+if(final&&D.querySelectorAll)for(const s of arr(D.querySelectorAll('script'))){
+const sig=sSig(s);if(rSg.get(s)===sig)continue;
+const fr=D.createElement('script');for(const a of at(s))sa(fr,a.name,a.value);
+fr.textContent=s.textContent||'';rSg.set(fr,sig);s.replaceWith(fr);
+}
+}
+// --- morph core end ---
+seed(D.documentElement||D.body,true);ensCsp();
+const now=()=>(typeof performance==='object'&&performance&&isFn(performance.now))?performance.now():Date.now();
+const raf=isFn(oRAF)?(cb)=>oRAF.call(W,cb):(cb)=>(oST?oST.call(W,cb,0):cb());
+function patch(html,opts){
+const final=!!(opts&&opts.final),t0=now(),ops={add:0,del:0,move:0,upd:0};
+if(typeof html==='string'&&html.trim())try{rMph(html,final,ops);}catch(_){}
+const ms=Math.round((now()-t0)*100)/100;
+return new Promise((res)=>raf(()=>raf(()=>res({ok:true,ops,ms,t_paint:Date.now()}))));
+}
+return(W.__cdpilotCanvas=Object.freeze({v:V,patch,reset,emit,q}));
+})()"""
 # ═══ CANVAS-A END ═══
 
 
