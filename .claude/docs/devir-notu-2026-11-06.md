@@ -188,3 +188,36 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
   İsraf: gercek-site şeridi 9,3 M girdi token (ham JSON'ları bağlama okudu) — sonraki spec'e "ham dosyayı okuma, alan çek" satırı.
 - e049878 CI yeşil (10.11 11:57, 42786717450). Enjeksiyon korpusu + ölçüm belgeleri: tutanak TT-20261110-121959-027e63 GEÇERLİ.
 - Düzeltme (10.11 12:40): f52acc3 ve e833c60 commit mesajlarında "617/617" yazıldı; tutanak 616/616 (korpus denetimi var olan testi genişletti). CI e833c60 yeşil (42789932451).
+
+## 13. Delta 10.11 14:00–16:00 — Nadir onayı jüriye devredildi, 0.9.6 jüri kapısından geçti
+
+- 14:01 Nadir: *"benden onay almana gerek yok. bağımsız jürimiz vardı sanırım, o onaylıyorsa hiç bekleme ve hep devam et."* → Kovan D-0040;
+  anı `surum-onayi-bagimsiz-juri-1011`; jüri kapısı belgesi `.claude/docs/juri-surum.md` (a8579c7): üç üye (`yargi` Opus 5.5, `review`
+  Sonnet 5.5, `ikinci` gpt-oss), 5 ölçüt, JSON, karar kuralı; Nadir'e yalnız credential/destructive. Tasarım kararları da aynı jüriye (§8).
+- T0 smoke İHLAL: `guvenlik-smoke.sh` izin dosyasını kendisi tarıyordu (08.11'den beri strict'te kırmızı) → conductor f51c261 (izin dosyası
+  tarama dışı) + 08.11 çıktısındaki uydurma anahtar kırpıldı → OK (izin 1).
+- T1 (agy-filo `review`, 0.9.5..HEAD diff'i): 3 bulgu, üçü şef tarafından doğrulandı. HIGH: `-c` yükleyicisi `sys.path[0]=''` (cwd) —
+  planted `json.py` cdpilot'tan önce koştu (kontrol: eski yükleyici rc 99 + işaret dosyası). MEDIUM: modelin yazdığı `{{x}}` → `agent run`
+  `CDPILOT_VAR_X`'i saldırgan URL'ye yazıyor. MEDIUM: `agent act --text` / `--var` oturum günlüğünde açık.
+- Jüri 1. tur (canavar/agy-filo/20261110-141021, 7,5 M girdi token, çoğu önbellek): J1 DÜZELT (günlük maskesi), J2 DÜZELT (CHANGELOG
+  "270→110" ölçüme uymuyor: doğrusu 138/149; help "~0.4 s"), J3 YAYINLA 5/5. Düzeltme accdb54 (+6 test), sürüm cbba05e; tutanak
+  TT-20261110-143453-95c5de 618/618.
+- Jüri 2. tur (20261110-143014): J1 YAYINLA (güvenlik 4), J2 YAYINLA (doğruluk 4, belge 4). T1 2. tur: #1 ve #3 KAPALI, #2 AÇIK — F1: yer
+  tutucu adı sayfanın alan adından türüyor, kötü sayfa "Password" alanıyla ortam sırrını kendi host'una yazdırır; F2: host sabitlemesi
+  about:blank/data:, kayıtsız adım ve go adımında açık. Düzeltme 17db115: `CDPILOT_VAR_HOSTS` (ortam değeri yalnız listedeki host'ta
+  kaydedilmiş act adımına, URL'ye asla, liste boşsa hiç; ilk adımdan önce `refused` sebepli çıkış 2), origin sabitleme (kayıt yok /
+  opak sayfa = sapma). J1 notları da işlendi (redaksiyon ayrıştırıcıyı taklit eder, `--var` hatası değeri yankılamaz, `pin_code`).
+- T1 3. tur: F2 KAPALI; F1 için N1 — izin listesi ad başına bir kez bakılıyordu, ikinci host'taki aynı adlı adım önbellekten değer alıyordu
+  → adım başına kontrol (`env_by_step`), iki host'lu akış testi (bu commit).
+- Tasarım jürisi (20261110-143050, 3/3 hepsinde): D-0041 `go` penceresi 100 ms sabit (şefin 30 ms kısayolu reddedildi: örnekleyici ilk
+  150 ms'yi görmüyordu; yeniden açma şartı plan-daemon §6.1) · D-0042 daemon/MCP sıcak varsayılan en erken 24.11, kapılar K-0027
+  (çift kip CI, ≥500 çağrılık soak, günlük hata sınıfı, `CDPILOT_DAEMON=0` belgeli) · D-0043 canlı tuval: Q1 B, Q2 A+CSP sıkılaştırma,
+  Q3 C, Q4 A (set/patch/events, sınırlı yoklama). Plan belgeleri güncellendi (bu commit).
+- Çift kip ölçümü: bütün paket `CDPILOT_DAEMON=1` ile (worktree, cbba05e): 617/618 — tek düşen test sahte senaryonun kendi
+  `subprocess.run` yaması (sıcak yol onu atlıyor), ürün hatası değil → senaryo `CDPILOT_DAEMON`'u düşürür; CI'a `daemon: '1'` matris
+  girdisi eklendi (D2 kapısı 1).
+- J1'in doğrulanmamış notu (daemon içinden otomatik başlatılan Chrome'un stderr borusu): kontrol edildi — `proc` tutulmuyor, `Popen`
+  nesnesi dönüşte düşer, boru kapanır, Chrome EPIPE alır; blok yok. Sonraki sürümde `DEVNULL` daha temiz (iş).
+- X: 10.11 startup-cost paylaşımı 14:23 → 17:30'a kaydırıldı (followup 0.9.6 sonrası güncellenir); 11.11 followup metni hazır (278 ağırlıklı).
+- Ölçüm notu: `agy-filo` jüri koşuları Ultra kotasından 7,5 M (tur 1) + 0,6 M (karar) girdi; tur 2 ve T1-3 ayrıca. Spec'e "ham dosyayı
+  bağlama okuma" satırı girmeli (önceki ISRAF notuyla aynı ders).

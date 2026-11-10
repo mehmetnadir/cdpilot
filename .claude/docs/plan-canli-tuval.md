@@ -1,6 +1,7 @@
 # Canlı tuval — `cdpilot canvas` (PRD taslağı, Nadir kararına)
 
-Durum: TASLAK, 08.11.2026. Nadir'in sözü (08.11): "LLM'lerin bir tarayıcı sekmesinde canlı canlı yaptıkları kodlamalarının
+Durum: KARARLI — 4 soru jüride cevaplandı (10.11, D-0043, 3/3; §8). Başlama tetiği: çift kip CI yeşil + 0.9.6 belgeleri (site) bitti.
+İlk durum: TASLAK, 08.11.2026. Nadir'in sözü (08.11): "LLM'lerin bir tarayıcı sekmesinde canlı canlı yaptıkları kodlamalarının
 anında canlı uygulamalara dönüşmesi … insanların Google'da yaptıkları aramaları görsel arayüzlere dönüştürmek isteyenlere
 altyapı … biz de kullanırız." Kod yazılmadı; bu belge karar içindir (TURN_KEY_LIFECYCLE: araştırma → PRD → onay → kod).
 
@@ -68,7 +69,14 @@ LLM'in yazdığı JS tuval sekmesinde çalışır. Varsayılan öneri:
 | Dış kaynak | `img-src data: https:`; `script-src` yalnız satır içi | CDN'e izin (`--allow-cdn`) |
 | Tuval → CLI | `events` yalnız `data-action`/form olaylarını taşır, serbest metin 1 KB kesilir | tüm DOM olayları |
 
-Günlük: `canvas` komutları oturum günlüğüne girer; stdin'den gelen HTML günlüğe YAZILMAZ (boyut + sır riski), yalnız uzunluk.
+Günlük: `canvas` komutları oturum günlüğüne girer; stdin'den gelen HTML günlüğe YAZILMAZ (boyut + sır riski), yalnız uzunluk —
+MCP argümanları için de aynı kural ve aynı boyut sınırı.
+
+Jüri sıkılaştırması (10.11, D-0043 Q2): taban `default-src 'none'`; `img-src data: blob:` (https görsel yalnız `--allow-net`/`--allow-img`
+ile); `form-action 'none'`, `base-uri 'none'`, `frame-src 'none'`; tuval sekmesinden dışa gezinme ve `window.open` cdpilot tarafından
+engellenir (sekmedeki gezinme istekleri kesilir); CSP her `set`/`patch`te yeniden uygulanır; `fetch`, görsel işaretçisi (img beacon),
+`location` değişimi, form gönderimi, WebSocket ve `window.open` deneyen fixture sayfasında her deneme engelli görünmeden v0 çıkmaz
+(§7 güvenlik incelemesi bunu denetler).
 
 ## 6. Var olan çözüm sorusu (hesaplamadan-önce §0)
 
@@ -91,7 +99,16 @@ Günlük: `canvas` komutları oturum günlüğüne girer; stdin'den gelen HTML g
 | `events` (addBinding) + örnek LLM döngüsü (`examples/canvas/`) | 0,5 gün | şef |
 | Güvenlik gözden geçirme (CSP, köken) | 0,5 gün | reviewer |
 
-## 8. Nadir'e sorular
+## 8. Sorular ve jüri cevapları (10.11, D-0043; Nadir onayı jüriye devredildi, D-0040)
+
+| Soru | Cevap | Koşul |
+|---|---|---|
+| 1 | **B** — önce 0.9.6 takibi (belgeler, site, çift kip CI), sonra v0 | başlama tetiği sabit: çift kip CI yeşil + 0.9.6 belgeleri; D1 ölçümü beklenmez |
+| 2 | **A**, §5'teki sıkılaştırmayla | sızıntı fixture'ı güvenlik incelemesinde |
+| 3 | **C** — boyama kapı (p50 ≤ 100 ms, p95 ≤ 200 ms); döngü model süresi hariç, yük ortalamasıyla raporlanır | belgede "model süresi hariç" açık yazılır |
+| 4 | **A** — yalnız `browser_canvas_set` / `patch` / `events`, `core` dışı; `events` imleçli sınırlı yoklama (izleme yok); `stream`/`watch` CLI'da kalır | CLI e2e + güvenlik incelemesi geçince; 3 aracın şema token maliyeti ölçülüp değişiklik notuna |
+
+İlk soru metinleri:
 
 1. v0'a başlayalım mı, yoksa önce Faz 3 (gözlem çıktısında token azaltma) mı?
 2. Güvenlik varsayılanı: ağ kapalı + satır içi betik serbest (öneri) kabul mü?

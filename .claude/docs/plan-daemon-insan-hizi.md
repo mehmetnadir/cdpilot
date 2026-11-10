@@ -113,7 +113,7 @@ komutu iptal eder ama tarayıcıda yarım kalmış navigasyon kalabilir (taze s�
 | Adım | Ne | Kapı |
 |---|---|---|
 | v1 (bu) | opt-in `CDPILOT_DAEMON=1`, POSIX | 9 tarayıcısız test + tam paket; sıcak `go` ölçümü (§5) |
-| v2 | 2 hafta ölçüm sonrası varsayılan açık; `CDPILOT_DAEMON=0` kapatır | ajan oturumlarında hata oranı taze ile aynı |
+| v2 | varsayılan açık, en erken 24.11 (0.9.6 npm'den 2 hafta; jüri D-0042, 10.11, 3/3); `CDPILOT_DAEMON=0` kapatır; MCP sıcak yol CLI ile birlikte | (1) CI çift kip işi (taze + `CDPILOT_DAEMON=1`) pencere boyunca her koşuda yeşil · (2) ≥500 karışık çağrılık soak (daemon + MCP sıcak): RSS/fd düz, hata oranı taze ile aynı · (3) kendi kullanım günlüklerinde daemon'a özgü hata sınıfı 0 (oturum sayısı yazılı), daemon'la ilgili issue 0 · (4) `CDPILOT_DAEMON=0` + otomatik taze düşüş değişiklik notunda |
 | v3 | Windows (127.0.0.1 + jeton dosyası), Ctrl+C iletimi | — |
 | canlı tuval | `cdpilot canvas`: sıcak oturumda `Page.setDocumentContent` + DOM yaması, son token → ilk boyama ≤ 100 ms | ayrı plan |
 
@@ -224,7 +224,12 @@ SPA'da yük sonrası DOM değişimini kaçırma riski ölçülmeden karar verilm
 sayfasında `innerText` uzunluğunun yük sonrası zaman eğrisi). Nadir kararı: pencere sabit kalsın mı, "bekleyen istek yok"
 kısayolu mu? **Ölçüm 10.11** (`.claude/docs/olcum/spa-settle-2026-11-10.md`, react/angular/vue/example × 3): `go` dönüşünden
 ~150 ms sonrasından 2,2 sn'ye kadar `innerText` 12/12 koşuda değişmedi; kaynak sayısı angular'da +402 ms, vue ısınmada +204 ms
-arttı (geç yazı tipi/ölçüm betiği). 100 ms pencere metni kaçırmadı; 30 ms kısayolu da metin açısından kaçırmazdı. Karar Nadir'de.
+arttı (geç yazı tipi/ölçüm betiği). 100 ms pencere metni kaçırmadı; 30 ms kısayolu da metin açısından kaçırmazdı. **Karar (jüri D-0041, 10.11, 3/3: Opus, Sonnet,
+gpt-oss): pencere 100 ms sabit kalır; kısayol reddedildi.** Gerekçe: örnekleyici `go` dönüşünden ~150 ms sonra başlıyor, kısayolun
+keseceği 30–100 ms aralığını görmüyor; "bekleyen istek yok" tetiği ölçülmedi; 4 site × 3 küçük örneklem. Yeniden açma şartı: ölçüm
+derlemesi yükten t=0 itibaren MutationObserver ile kaydeder, ≥10–20 site × 5 koşu (SPA hidrasyonu, iskelet yükleyici, service worker
+sayfası dahil), 30–100 ms arasında metin değişimi 0 ve kısayol tetik oranı kayıtlı; `go --wait <ms>` kaçış yolu kalır. Eksik ölçüm
+listesi: `canavar/agy-filo/20261110-143050/karar-j1.d1.out`.
 
 ## 7. MCP araç çağrısı sıcak süreçte (10.11, şef kararı; Kovan K-0021) — UYGULANDI
 
