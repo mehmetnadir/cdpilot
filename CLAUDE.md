@@ -55,8 +55,9 @@
 | ⏳ | v0.9 tls-proxy | Optional local TLS-MITM (curl-impersonate semantics) |
 
 ## Son Oturum
-→ 2026-11-08 (CEO kipi, gece + gündüz): 5 şerit birleşti, T1 güvenlik (2 düşük bulgu kapandı), 0.9.5 yayınlandı. CI'da Chrome 156 WebMCP iframe arızası çıktı, aynı gün düzeltildi (ae4a857, e2e yeşil). X: bricks paylaşımı 14:09'da ikinci kez ConnectTimeout → 17:30'a yeniden kuyruklandı; poster artık bağlantı hatasında öğeyi kuyrukta tutar (286aec0). Devir notu: `.claude/docs/devir-notu-2026-11-06.md` §5–§7.
-→ İlk iş: hız hedefi A→D (perf tabanına karşı ölç); Nadir kararı: canlı tuval hedefi; srv21 claude-oauth-token şimdilik bu Mac'ten (Nadir 08.11).
+→ 2026-11-10 (şef kararlarıyla, Nadir "devam et"): MCP araç çağrısı sıcak süreçte (e049878, ~400 → ~10 ms); enjeksiyon korpusu 20+20 ve desen genişletmesi (f52acc3, 13 → 19/20, 0 alarm); SPA settle + gerçek site token ölçümleri agy-filo şeritleriyle (e833c60). CI üçü de yeşil. Devir notu: `.claude/docs/devir-notu-2026-11-06.md` §11–§12.
+→ 2026-11-09: öğrenen akış v0 + injection_suspect + MCP agent araçları (0114ac7, b9d7e8c, 03161c6). 2026-11-08: 5 şerit birleşti, 0.9.5 yayınlandı (§5–§7).
+→ Bekleyen Nadir kararları: 0.9.6 npm onayı · `go` sessizlik penceresi (SPA ölçümü hazır, plan-daemon §6) · daemon varsayılan (22.11'den önce değil) · canlı tuval PRD 4 soru · srv21 claude-oauth-token.
 
 Son Güncelleme: 2026-11-10
 

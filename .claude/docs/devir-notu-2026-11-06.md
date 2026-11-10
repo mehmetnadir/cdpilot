@@ -187,3 +187,4 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
   `olcum/gercek-site-token-2026-11-10.md` (HN 18.331 → 90, Wikipedia 15.474 → 136, httpbin 2.292 → 119; sapma 0/9; PRD §6).
   İsraf: gercek-site şeridi 9,3 M girdi token (ham JSON'ları bağlama okudu) — sonraki spec'e "ham dosyayı okuma, alan çek" satırı.
 - e049878 CI yeşil (10.11 11:57, 42786717450). Enjeksiyon korpusu + ölçüm belgeleri: tutanak TT-20261110-121959-027e63 GEÇERLİ.
+- Düzeltme (10.11 12:40): f52acc3 ve e833c60 commit mesajlarında "617/617" yazıldı; tutanak 616/616 (korpus denetimi var olan testi genişletti). CI e833c60 yeşil (42789932451).
