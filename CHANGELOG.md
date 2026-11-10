@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Docs: claims audit after 0.9.6 — zero npm dependencies wording everywhere, MCP tool count in the bundle manifest, origin (not host) for placeholder steps, exit codes 2/4 for agent commands, tokens_avoided is an upper bound, injection patterns are English-only, comparison table aligned with cdpilot.dev/compare.
+
 ## [0.9.6] - 2026-11-10
 
 ### Added

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * cdpilot — Zero-dependency browser automation CLI
+ * cdpilot — Browser automation CLI, zero npm dependencies
  * Entry point: detects Python, finds browser, delegates to cdpilot.py
  */
 
@@ -745,7 +745,7 @@ function resolveProjectConfig() {
 
 function showHelp() {
   console.log(`
-  cdpilot v${VERSION} — Zero-dependency browser automation
+  cdpilot v${VERSION} — browser automation, zero npm dependencies
 
   USAGE
     cdpilot [--timeout <s>] <command> [args]

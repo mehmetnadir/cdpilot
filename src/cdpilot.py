@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cdpilot — Zero-dependency browser automation from your terminal.
+cdpilot — Zero-npm-dependency browser automation from your terminal.
 
 Controls any Chromium-based browser (Brave, Chrome, Chromium) via the
 Chrome DevTools Protocol (CDP). No Puppeteer, no Playwright, no Selenium.
@@ -94,11 +94,13 @@ Record & replay:
                        Replay a recorded flow with variable substitution
 
 Exit codes: 0 ok, 1 error (batch / run: a step failed), 124 --timeout;
+  2 agent: unknown flow, missing or refused variable, {{placeholder}} in --text/--url;
   exit 3 from click / smart-click (batch / run: one, and no failed step):
   pressed, release missed the target, not clicked (a real mouse click whose
   target moved or got covered under the press; see the stderr note). A target
   the page replaced or navigated away from on mousedown prints
-  "Pressed (the page replaced or left it ...)" and exits 0.
+  "Pressed (the page replaced or left it ...)" and exits 0;
+  4 agent run: drift (page observation on stdout).
 """
 
 __version__ = "0.9.6"
@@ -7755,7 +7757,7 @@ async def cmd_eval_batch(exprs_json):
       observations (e.g. read 12 DOM values to fill a report), N sequential
       `eval` commands cost N × roundtrip. This packs them into one IIFE that
       runs all N expressions and returns the result array — one roundtrip
-      total. Typical speedup: 5-30x for batches of 5+ expressions.
+      total. Run N JS expressions in one process and one CDP roundtrip instead of N.
     """
     try:
         exprs = json.loads(exprs_json) if isinstance(exprs_json, str) else exprs_json
@@ -18815,7 +18817,7 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "browser_eval", "description": "Execute arbitrary JavaScript code in the browser page context and return the result. Use for custom DOM queries, data extraction, or page manipulation that other tools don't cover. Expression is evaluated via Runtime.evaluate.",
              "inputSchema": {"type": "object", "properties": {"expression": {"type": "string", "description": "JavaScript expression to evaluate (e.g. 'document.title', 'document.querySelectorAll(\"a\").length')"}}, "required": ["expression"]}},
-            {"name": "browser_eval_batch", "description": "Evaluate N JavaScript expressions in a SINGLE round-trip. Returns an array of {ok, value} or {ok:false, error} objects, one per expression — a failure in one does not abort the batch. Use this when you need many small observations (read 10 DOM values, query multiple selectors, build a report) — collapses N×roundtrip into 1×roundtrip, typically 5-30x faster than calling browser_eval repeatedly.",
+            {"name": "browser_eval_batch", "description": "Evaluate N JavaScript expressions in a SINGLE round-trip. Returns an array of {ok, value} or {ok:false, error} objects, one per expression — a failure in one does not abort the batch. Use this when you need many small observations (read 10 DOM values, query multiple selectors, build a report) — run N JS expressions in one process and one CDP roundtrip instead of N.",
              "inputSchema": {"type": "object", "properties": {"expressions": {"type": "array", "items": {"type": "string"}, "description": "Array of JavaScript expression strings. Each runs in its own try/catch."}}, "required": ["expressions"]}},
             {"name": "browser_tabs", "description": "List all open browser tabs with their IDs, URLs, and titles. Use this to see what pages are open and get tab IDs for switching between them with other navigation commands.",
              "inputSchema": {"type": "object", "properties": {}}},
