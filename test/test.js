@@ -12319,6 +12319,461 @@ print(json.dumps(res))
 
 
 // ═══ CANVAS-C TESTS BEGIN ═══ (lane C: "canvas stream:" tests)
+(() => {
+  if (process.platform === 'win32') return;
+  const { execFileSync } = require('child_process');
+  const osmod = require('os');
+  const PYB = process.env.CDPILOT_PYTHON || 'python3';
+  const PY_PATH = path.join(__dirname, '..', 'src', 'cdpilot.py');
+  const BENCH_PATH = path.join(__dirname, 'canvas_bench.py');
+
+  const HARNESS_PY = `
+import contextlib, importlib.util, io, json, os, signal, socket, sys, tempfile, threading, time
+
+src_path = sys.argv[1]
+tmp_root = tempfile.mkdtemp(prefix="cc-", dir="/tmp")
+profile_dir = os.path.join(tmp_root, "p")
+os.environ["CDPILOT_HOME"] = tmp_root
+os.environ["CDPILOT_PROFILE"] = profile_dir
+os.environ["CDP_PORT"] = "19339"
+os.environ["CDPILOT_LOG"] = "0"
+
+spec = importlib.util.spec_from_file_location("cdpilot_canvas_c_test", src_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+
+class FakeCanvasHost:
+    def __init__(self, name, delay_s=0.0):
+        self.name = name
+        self.delay_s = delay_s
+        self.sock_path = mod._canvas_paths(name)["sock"]
+        self.reqs = []
+        self.lock = threading.Lock()
+        self.first_in = threading.Event()
+        self.patch_event = threading.Event()
+        self._stop = threading.Event()
+        self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if os.path.exists(self.sock_path):
+            os.unlink(self.sock_path)
+        self._srv.bind(self.sock_path)
+        os.chmod(self.sock_path, 0o600)
+        self._srv.listen(16)
+        self._srv.settimeout(0.05)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with conn:
+                conn.settimeout(5.0)
+                buf = b""
+                while not buf.endswith(b"\\n"):
+                    c = conn.recv(65536)
+                    if not c:
+                        break
+                    buf += c
+                if not buf:
+                    continue
+                recv_mono = time.monotonic()
+                msg = json.loads(buf.decode("utf-8"))
+                self.first_in.set()
+                if msg.get("op") not in mod.CANVAS_OPS:
+                    rep = {"ok": False, "error": "bad op", "code": 2}
+                else:
+                    if self.delay_s > 0:
+                        time.sleep(self.delay_s)
+                    rep = {
+                        "ok": True,
+                        "ops": {"add": 0, "del": 0, "upd": 1, "move": 0},
+                        "ms": round(self.delay_s * 1000.0, 1) if self.delay_s else 1.5,
+                        "t_paint": round(time.time() * 1000),
+                    }
+                with self.lock:
+                    self.reqs.append({
+                        "op": msg.get("op"),
+                        "html": msg.get("html"),
+                        "final": msg.get("final"),
+                        "t_cli": msg.get("t_cli"),
+                        "recv_mono": recv_mono,
+                    })
+                    self.patch_event.set()
+                conn.sendall((json.dumps(rep) + "\\n").encode("utf-8"))
+
+    def wait_count(self, n, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.lock:
+                if len(self.reqs) >= n:
+                    return True
+            time.sleep(0.005)
+        return False
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._srv.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=2.0)
+        try:
+            os.unlink(self.sock_path)
+        except OSError:
+            pass
+
+
+def run_stream_with_feeder(name, feeder_fn):
+    r_fd, w_fd = os.pipe()
+    saved_stdin = os.dup(0)
+    os.dup2(r_fd, 0)
+    os.close(r_fd)
+    out_buf, err_buf = io.StringIO(), io.StringIO()
+    exit_code = 0
+
+    def _feed():
+        try:
+            feeder_fn(w_fd)
+        finally:
+            try:
+                os.close(w_fd)
+            except OSError:
+                pass
+
+    t = threading.Thread(target=_feed, daemon=True)
+    t.start()
+    try:
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+            try:
+                mod.cmd_canvas_stream(name)
+            except SystemExit as se:
+                exit_code = int(se.code or 0)
+    finally:
+        os.dup2(saved_stdin, 0)
+        os.close(saved_stdin)
+        t.join(timeout=3.0)
+    return exit_code, out_buf.getvalue().strip(), err_buf.getvalue().strip()
+
+
+out = {}
+
+# 1. 50 ms silence trigger + cut at last complete '>'
+h1 = FakeCanvasHost("sil")
+m1 = {}
+def feed_sil(w):
+    time.sleep(0.01)
+    m1["w0"] = time.monotonic()
+    os.write(w, b"<article><h1>News</h1><p>partial")
+    assert h1.wait_count(1, 2.0), "silence patch did not fire"
+    m1["w1"] = time.monotonic()
+    os.write(w, b" text</p></article>")
+rc1, out1, err1 = run_stream_with_feeder("sil", feed_sil)
+h1.close()
+out["silence"] = {
+    "rc": rc1, "stdout": out1, "stderr": err1,
+    "wait_ms": round((h1.reqs[0]["recv_mono"] - m1["w0"]) * 1000.0, 2),
+    "fired_before_w1": h1.reqs[0]["recv_mono"] <= m1["w1"],
+    "reqs": [{k: v for k, v in r.items() if k != "recv_mono"} for r in h1.reqs],
+}
+
+# 2. Closing-tag trigger + 16 ms throttle
+h2 = FakeCanvasHost("ctag")
+def feed_ctag(w):
+    time.sleep(0.01)
+    os.write(w, b"<div><h1>Fast</h1>")
+    assert h2.wait_count(1, 2.0), "closing-tag patch 1 did not fire"
+    os.write(w, b"<h2>Next</h2>")
+    assert h2.wait_count(2, 2.0), "closing-tag patch 2 did not fire"
+rc2, out2, err2 = run_stream_with_feeder("ctag", feed_ctag)
+h2.close()
+out["closing_tag"] = {
+    "rc": rc2, "stdout": out2,
+    "gap_ms": round((h2.reqs[1]["recv_mono"] - h2.reqs[0]["recv_mono"]) * 1000.0, 2),
+    "reqs": [{k: v for k, v in r.items() if k != "recv_mono"} for r in h2.reqs],
+}
+
+# 3. Open <script> and <style> held out of non-final patches until closed or EOF
+h3a = FakeCanvasHost("scr")
+def feed_scr(w):
+    time.sleep(0.01)
+    os.write(w, b"<div>visible</div><script>if (a > b) { window.x = 1;")
+    assert h3a.wait_count(1, 2.0), "prefix before <script> did not patch on silence"
+    time.sleep(0.02)
+rc3a, out3a, _ = run_stream_with_feeder("scr", feed_scr)
+h3a.close()
+
+h3b = FakeCanvasHost("sty")
+def feed_sty(w):
+    time.sleep(0.01)
+    os.write(w, b"<div>styled</div><style>.box > span { color: red;")
+    assert h3b.wait_count(1, 2.0), "prefix before <style> did not patch on silence"
+    os.write(w, b" }</style>")
+    assert h3b.wait_count(2, 2.0), "closed </style> did not patch"
+rc3b, out3b, _ = run_stream_with_feeder("sty", feed_sty)
+h3b.close()
+out["rawtext"] = {
+    "script_rc": rc3a,
+    "script_reqs": [{k: v for k, v in r.items() if k != "recv_mono"} for r in h3a.reqs],
+    "style_rc": rc3b,
+    "style_reqs": [{k: v for k, v in r.items() if k != "recv_mono"} for r in h3b.reqs],
+}
+
+# 4. final:true on EOF even when no new bytes arrived since last non-final patch
+h4 = FakeCanvasHost("eof")
+def feed_eof(w):
+    time.sleep(0.01)
+    os.write(w, b"<p>done</p>")
+    assert h4.wait_count(1, 2.0), "non-final patch did not fire"
+    time.sleep(0.03)
+rc4, out4, _ = run_stream_with_feeder("eof", feed_eof)
+h4.close()
+out["eof_final"] = {
+    "rc": rc4, "stdout": out4,
+    "reqs": [{k: v for k, v in r.items() if k != "recv_mono"} for r in h4.reqs],
+}
+
+# 5. Whole-document patches + summary line
+h5 = FakeCanvasHost("whole")
+def feed_whole(w):
+    time.sleep(0.01)
+    os.write(w, b"<main><h1>One</h1>")
+    assert h5.wait_count(1, 2.0)
+    time.sleep(0.02)
+    os.write(w, b"<p>Two</p>")
+    assert h5.wait_count(2, 2.0)
+    time.sleep(0.02)
+    os.write(w, b"<footer>Three</footer></main>")
+    assert h5.wait_count(3, 2.0)
+rc5, out5, _ = run_stream_with_feeder("whole", feed_whole)
+h5.close()
+out["whole"] = {
+    "rc": rc5, "stdout": out5,
+    "reqs": [{k: v for k, v in r.items() if k != "recv_mono"} for r in h5.reqs],
+}
+
+# 6. Coalescing under a slow fake host
+h6 = FakeCanvasHost("slow", delay_s=0.180)
+def feed_slow(w):
+    time.sleep(0.01)
+    os.write(w, b"<div>1</div>")
+    assert h6.first_in.wait(2.0), "patch 1 never entered host"
+    for k in (2, 3, 4, 5):
+        time.sleep(0.025)
+        os.write(w, f"<div>{k}</div>".encode("utf-8"))
+rc6, out6, _ = run_stream_with_feeder("slow", feed_slow)
+h6.close()
+out["coalesce"] = {
+    "rc": rc6, "stdout": out6,
+    "reqs": [{k: v for k, v in r.items() if k != "recv_mono"} for r in h6.reqs],
+}
+
+# 7. 1 MB limit -> exit 2, last state stays
+h7 = FakeCanvasHost("lim")
+def feed_lim(w):
+    time.sleep(0.01)
+    os.write(w, b"<div>keep-me</div>")
+    assert h7.wait_count(1, 2.0), "initial state patch missing"
+    blk = b"x" * 65536
+    os.write(w, b"<p>")
+    for _ in range(17):
+        try:
+            os.write(w, blk)
+        except BrokenPipeError:
+            break
+rc7, out7, err7 = run_stream_with_feeder("lim", feed_lim)
+h7.close()
+out["limit"] = {
+    "rc": rc7, "stdout": out7, "stderr": err7,
+    "reqs": [{k: v for k, v in r.items() if k != "recv_mono"} for r in h7.reqs],
+}
+
+# 8. Watch picks up rewrite within 300 ms and exits 0 cleanly on SIGINT
+h8 = FakeCanvasHost("wtc")
+watch_file = os.path.join(tmp_root, "watched.html")
+with open(watch_file, "w", encoding="utf-8") as wf:
+    wf.write("<h1>v1</h1>")
+orig_sig = signal.getsignal(signal.SIGINT)
+w_meta = {}
+
+def drive_watch():
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and signal.getsignal(signal.SIGINT) == orig_sig:
+        time.sleep(0.002)
+    w_meta["t_write"] = time.monotonic()
+    with open(watch_file, "w", encoding="utf-8") as wf:
+        wf.write("<h1>v2</h1>")
+    h8.wait_count(1, 2.0)
+    time.sleep(0.02)
+    os.kill(os.getpid(), signal.SIGINT)
+
+wt = threading.Thread(target=drive_watch, daemon=True)
+w_out, w_err = io.StringIO(), io.StringIO()
+w_rc = 0
+wt.start()
+with contextlib.redirect_stdout(w_out), contextlib.redirect_stderr(w_err):
+    try:
+        mod.cmd_canvas_watch("wtc", watch_file)
+    except SystemExit as se:
+        w_rc = int(se.code or 0)
+wt.join(timeout=2.0)
+h8.close()
+w_lat_ms = round((h8.reqs[0]["recv_mono"] - w_meta["t_write"]) * 1000.0, 2) if h8.reqs else 9999.0
+out["watch"] = {
+    "rc": w_rc,
+    "stdout": w_out.getvalue().strip(),
+    "stderr": w_err.getvalue().strip(),
+    "latency_ms": w_lat_ms,
+    "sigint_restored": signal.getsignal(signal.SIGINT) == orig_sig,
+    "reqs": [{k: v for k, v in r.items() if k != "recv_mono"} for r in h8.reqs],
+}
+
+import shutil as _sh
+_sh.rmtree(tmp_root, ignore_errors=True)
+print(json.dumps(out))
+`;
+
+  let cached = null;
+  function suite() {
+    if (!cached) {
+      const raw = execFileSync(PYB, ['-I', '-c', HARNESS_PY, PY_PATH], {
+        encoding: 'utf-8',
+        timeout: 60000,
+      });
+      cached = JSON.parse(raw.trim().split('\n').pop());
+    }
+    return cached;
+  }
+
+  test('canvas stream: 50 ms silence trigger cuts at last complete >', () => {
+    const r = suite().silence;
+    assert.strictEqual(r.rc, 0, r.stderr);
+    assert(r.fired_before_w1, 'silence patch must fire before next chunk');
+    assert(r.wait_ms >= 40, `expected ~50 ms silence wait, got ${r.wait_ms} ms`);
+    assert.strictEqual(r.reqs[0].op, 'patch');
+    assert.strictEqual(r.reqs[0].final, false);
+    assert.strictEqual(r.reqs[0].html, '<article><h1>News</h1><p>');
+    assert.strictEqual(typeof r.reqs[0].t_cli, 'number');
+    const last = r.reqs[r.reqs.length - 1];
+    assert.strictEqual(last.final, true);
+    assert.strictEqual(last.html, '<article><h1>News</h1><p>partial text</p></article>');
+  });
+
+  test('canvas stream: closing-tag trigger and 16 ms spacing', () => {
+    const r = suite().closing_tag;
+    assert.strictEqual(r.rc, 0);
+    assert(r.reqs.length >= 3, `expected >= 3 patches, got ${r.reqs.length}`);
+    assert.strictEqual(r.reqs[0].html, '<div><h1>Fast</h1>');
+    assert.strictEqual(r.reqs[0].final, false);
+    assert.strictEqual(r.reqs[1].html, '<div><h1>Fast</h1><h2>Next</h2>');
+    assert.strictEqual(r.reqs[1].final, false);
+    assert(r.gap_ms >= 14, `expected >= 16 ms throttle between closing tags, got ${r.gap_ms} ms`);
+    assert.strictEqual(r.reqs[r.reqs.length - 1].final, true);
+  });
+
+  test('canvas stream: open <script> and <style> held out of non-final patches until EOF or close', () => {
+    const r = suite().rawtext;
+    assert.strictEqual(r.script_rc, 0);
+    assert.strictEqual(r.script_reqs.length, 2);
+    assert.strictEqual(r.script_reqs[0].final, false);
+    assert.strictEqual(r.script_reqs[0].html, '<div>visible</div>');
+    assert.strictEqual(r.script_reqs[1].final, true);
+    assert.strictEqual(r.script_reqs[1].html, '<div>visible</div><script>if (a > b) { window.x = 1;');
+
+    assert.strictEqual(r.style_rc, 0);
+    assert.strictEqual(r.style_reqs[0].final, false);
+    assert.strictEqual(r.style_reqs[0].html, '<div>styled</div>');
+    assert.strictEqual(r.style_reqs[1].final, false);
+    assert.strictEqual(r.style_reqs[1].html, '<div>styled</div><style>.box > span { color: red; }</style>');
+    assert.strictEqual(r.style_reqs[r.style_reqs.length - 1].final, true);
+  });
+
+  test('canvas stream: final:true on EOF', () => {
+    const r = suite().eof_final;
+    assert.strictEqual(r.rc, 0);
+    assert.strictEqual(r.reqs.length, 2);
+    assert.strictEqual(r.reqs[0].final, false);
+    assert.strictEqual(r.reqs[0].html, '<p>done</p>');
+    assert.strictEqual(r.reqs[1].final, true);
+    assert.strictEqual(r.reqs[1].html, '<p>done</p>');
+  });
+
+  test('canvas stream: whole-document patches and summary line', () => {
+    const r = suite().whole;
+    assert.strictEqual(r.rc, 0);
+    assert.strictEqual(r.reqs[0].html, '<main><h1>One</h1>');
+    assert.strictEqual(r.reqs[1].html, '<main><h1>One</h1><p>Two</p>');
+    assert.strictEqual(r.reqs[2].html, '<main><h1>One</h1><p>Two</p><footer>Three</footer></main>');
+    assert.strictEqual(r.reqs[r.reqs.length - 1].final, true);
+    assert.match(r.stdout, /^ok \d+ patches \(\d+ coalesced\) [\d.]+ ms 57 bytes$/);
+  });
+
+  test('canvas stream: coalescing under a slow fake host', () => {
+    const r = suite().coalesce;
+    assert.strictEqual(r.rc, 0);
+    assert.strictEqual(r.reqs.length, 2, `expected 2 patches after coalescing, got ${r.reqs.length}`);
+    assert.strictEqual(r.reqs[0].html, '<div>1</div>');
+    assert.strictEqual(r.reqs[0].final, false);
+    assert.strictEqual(r.reqs[1].html, '<div>1</div><div>2</div><div>3</div><div>4</div><div>5</div>');
+    assert.strictEqual(r.reqs[1].final, true);
+    const m = r.stdout.match(/^ok (\d+) patches \((\d+) coalesced\)/);
+    assert(m, `unexpected summary: ${r.stdout}`);
+    assert.strictEqual(Number(m[1]), 2);
+    assert(Number(m[2]) >= 2, `expected >= 2 coalesced, got ${m[2]}`);
+  });
+
+  test('canvas stream: 1 MB limit exits 2 and keeps last state', () => {
+    const r = suite().limit;
+    assert.strictEqual(r.rc, 2, `expected exit 2, got ${r.rc}`);
+    assert.match(r.stderr, /1048576/);
+    assert.strictEqual(r.reqs.length, 1);
+    assert.strictEqual(r.reqs[0].html, '<div>keep-me</div>');
+    assert.strictEqual(r.reqs[0].final, false);
+  });
+
+  test('canvas stream: watch picks up rewrite within 300 ms and exits cleanly on SIGINT', () => {
+    const r = suite().watch;
+    assert.strictEqual(r.rc, 0, `watch exit ${r.rc}: ${r.stderr}`);
+    assert.strictEqual(r.sigint_restored, true);
+    assert.strictEqual(r.reqs.length, 1);
+    assert.strictEqual(r.reqs[0].op, 'patch');
+    assert.strictEqual(r.reqs[0].html, '<h1>v2</h1>');
+    assert.strictEqual(r.reqs[0].final, true);
+    assert.strictEqual(typeof r.reqs[0].t_cli, 'number');
+    assert(r.latency_ms < 300, `watch took ${r.latency_ms} ms (limit 300 ms)`);
+    assert.match(r.stdout, /^ok \+0 -0 ~1 ↕0 [\d.]+ ms$/);
+  });
+
+  test('canvas stream: canvas_bench.py --fake records t_cli, host reply, t_paint and load', () => {
+    const tmp = fs.mkdtempSync(path.join(osmod.tmpdir(), 'cdpilot-cbench-'));
+    const outJson = path.join(tmp, 'bench.json');
+    try {
+      const benchPy = fs.existsSync('/opt/homebrew/bin/python3.13')
+        ? '/opt/homebrew/bin/python3.13'
+        : PYB;
+      execFileSync(benchPy, ['-I', BENCH_PATH, '--fake', '--blocks', '8', '--pause-ms', '20', '--out', outJson], {
+        encoding: 'utf-8',
+        timeout: 30000,
+      });
+      const doc = JSON.parse(fs.readFileSync(outJson, 'utf-8'));
+      assert.strictEqual(doc.mode, 'fake');
+      assert(doc.summary.patches >= 2, `expected >= 2 patches, got ${doc.summary.patches}`);
+      assert.strictEqual(typeof doc.summary.paint_minus_cli_ms.p50, 'number');
+      assert.strictEqual(typeof doc.summary.paint_minus_cli_ms.p95, 'number');
+      assert.strictEqual(typeof doc.summary.host_reply_ms.p50, 'number');
+      assert(Array.isArray(doc.uptime.load_before) && doc.uptime.load_before.length === 3);
+      assert.strictEqual(doc.patches[doc.patches.length - 1].final, true);
+      assert.strictEqual(typeof doc.patches[0].t_cli_ns, 'number');
+      assert.strictEqual(typeof doc.patches[0].t_paint_ms, 'number');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+})();
 // ═══ CANVAS-C TESTS END ═══
 
 
