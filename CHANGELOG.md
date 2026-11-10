@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Clearer error when `CDP_PORT` in the environment overrides a connected browser.** With both `CDP_PORT` and `CDPILOT_PROFILE` set, environment variables take precedence over project registry settings; probing the environment port while the registry pointed to a connected browser on a different port caused misleading "your connected browser is gone" errors. When `CDP_PORT` in the environment overrides the connected browser's port, `cdpilot` now reports that `CDP_PORT=<env> in the environment overrides the connected browser on port <registry>` and suggests unsetting `CDP_PORT` or setting it to `<registry>`, and `cdpilot connect <port>` prints a warning to stderr when `CDP_PORT` is set to a different port.
+
 ## [0.9.6] - 2026-11-10
 
 ### Added

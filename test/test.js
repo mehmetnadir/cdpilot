@@ -7986,6 +7986,42 @@ print(json.dumps(out))
     } finally { fake.stop(); }
   });
 
+  test('connect: CDP_PORT in environment overriding connected browser warns on connect and explains probe failure', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      const otherPort = freePort();
+      const expectedMsg = `cdpilot: CDP_PORT=${otherPort} in the environment overrides the connected browser on port ${fake.port}; unset CDP_PORT or set it to ${fake.port}`;
+
+      // 1. Connect with CDP_PORT pointing elsewhere -> stderr has the warning, connect succeeds
+      const envOverride = isoEnv(home, otherPort, 'ext-override');
+      const c = cli(['connect', String(fake.port)], envOverride);
+      assert.strictEqual(c.status, 0, `connect exit ${c.status}: ${c.stdout}${c.stderr}`);
+      assert(c.stderr.includes(expectedMsg), `stderr must have warning: ${c.stderr}`);
+      assert(new RegExp(`Connected to .* on port ${fake.port}`).test(c.stdout), `stdout: ${c.stdout}`);
+
+      // 2. Following commands print the override message, not EXTERNAL_GONE
+      const g = cli(['go', 'https://example.com/'], envOverride);
+      assert.strictEqual(g.status, 1, `go exit ${g.status}: ${g.stdout}${g.stderr}`);
+      assert(g.stderr.includes(expectedMsg), `go stderr must have override message: ${g.stderr}`);
+      assert(!g.stderr.includes(GONE), `go stderr must not have EXTERNAL_GONE: ${g.stderr}`);
+
+      const l = cli(['launch'], envOverride);
+      assert.strictEqual(l.status, 1, `launch exit ${l.status}: ${l.stdout}${l.stderr}`);
+      assert((l.stdout + l.stderr).includes(expectedMsg), `launch must have override message: ${l.stdout}${l.stderr}`);
+      assert(!(l.stdout + l.stderr).includes(GONE), `launch must not have EXTERNAL_GONE: ${l.stdout}${l.stderr}`);
+
+      // 3. With CDP_PORT equal to the connected port nothing changes
+      const envEqual = isoEnv(home, fake.port, 'ext-equal');
+      const c2 = cli(['connect', String(fake.port)], envEqual);
+      assert.strictEqual(c2.status, 0, `connect exit ${c2.status}: ${c2.stdout}${c2.stderr}`);
+      assert(!c2.stderr.includes('in the environment overrides'), `stderr must not have warning: ${c2.stderr}`);
+
+      const g2 = cli(['go', 'https://example.com/'], envEqual);
+      assert.strictEqual(g2.status, 0, `go exit ${g2.status}: ${g2.stdout}${g2.stderr}`);
+    } finally { fake.stop(); }
+  });
+
   test('connect: close / session-close / idle cleanup close only the tabs cdpilot opened (inactive window), never a user tab', () => {
     const fake = startFake();
     try {
