@@ -10,9 +10,10 @@ All notable changes to cdpilot will be documented in this file.
 - replay: a CDPILOT_VAR_<NAME> environment value now fills only the value of an input step (fill/type…), never a frame-routed step, on a host named by CDPILOT_VAR_HOSTS, checked live before the step; go/eval and other commands take --var only. Before, a crafted flow file could send an environment secret to any host (since 0.9.5, not reachable over MCP).
 
 ### Changed
+- **`injection_suspect` second pass.** Page text is matched on a normalised copy (zero-width characters, NFKC, case, spaced-out letters); new marks `fake_system`, `tool_call`, `navigate_order`; the "ignore previous instructions" family covers six more languages. On a held-out set never used for tuning: 8 of 30 caught (was 4), 1 of 30 false alarms (unchanged). Still a hint, not a filter.
 - **CLI help documents agent mode and `CDPILOT_VAR_HOSTS`.** `cdpilot --help` adds `agent observe`, `agent act`, `agent flow` and `agent run` to the AI AGENT section; environment options list `CDPILOT_VAR_HOSTS`.
 - **README clarifies tool-call cancellation in warm MCP mode.** A tool call stuck in synchronous code (not waiting on the browser) is not interrupted by the 30 s cancel, unlike the fresh path's kill.
-- Docs: claims audit after 0.9.6 — zero npm dependencies wording everywhere, MCP tool count in the bundle manifest, origin (not host) for placeholder steps, exit codes 2/4 for agent commands, tokens_avoided is an upper bound, injection patterns are English-only, comparison table aligned with cdpilot.dev/compare.
+- Docs: claims audit after 0.9.6 — zero npm dependencies wording everywhere, MCP tool count in the bundle manifest, origin (not host) for placeholder steps, exit codes 2/4 for agent commands, tokens_avoided is an upper bound, comparison table aligned with cdpilot.dev/compare.
 
 ### Fixed
 - **Warm process (`CDPILOT_DAEMON=1`) no longer adds ~10 s per call on Linux.** The daemon ends every request with `shutdown()` and the launcher finishes at the exit frame; before, a watcher thread held the socket open until its 10 s timeout (Linux only; macOS was unaffected). Dual-mode CI: warm 209 s vs fresh 233 s (before 1,072 s vs 303 s).
