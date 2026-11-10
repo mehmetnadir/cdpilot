@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Session log marks warm calls (`warm: true`).
+
 ## [0.9.7] - 2026-11-11
 
 ### Security
