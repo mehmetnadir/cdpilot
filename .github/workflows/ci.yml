@@ -47,6 +47,12 @@ jobs:
           - os: windows-latest
             node-version: 20
             python-version: '3.11'
+          # The whole suite through the warm process (CDPILOT_DAEMON=1): the gate for
+          # making it the default (jury D-0042, 10.11.2026; .claude/docs/plan-daemon-insan-hizi.md §4).
+          - os: ubuntu-latest
+            node-version: 22
+            python-version: '3.12'
+            daemon: '1'
 
     steps:
       - uses: actions/checkout@v4
@@ -64,6 +70,7 @@ jobs:
         run: npm test
         env:
           CDPILOT_PYTHON: python
+          CDPILOT_DAEMON: ${{ matrix.daemon || '' }}  # '1' on the warm-process matrix entry
       - name: Compile Python
         run: python -m py_compile src/cdpilot.py
       - name: Python version check

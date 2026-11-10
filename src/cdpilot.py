@@ -16542,18 +16542,19 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
     # Everything is settled here, before any step runs (exit 2 otherwise).
     cli_values = dict(var_values or {})
     env_hosts = _agent_env_var_hosts()
-    env_values, missing, refused = {}, [], []
+    env_by_step, missing, refused = {}, [], []  # step n → {name: value} the environment may fill there
     needed = set(flow.get('vars') or {})
     for step in flow['steps']:
         names = _AGENT_VAR_RE.findall(step.get('text') or step.get('url') or '')
         needed.update(names)
         host_rec = (step.get('before') or {}).get('host')
-        for k in names:
-            if k in cli_values or k in env_values:
+        for k in names:  # checked on every step that types the name, never cached across steps
+            if k in cli_values:
                 continue
             env_v = os.environ.get(f'CDPILOT_VAR_{k.upper()}')
             if env_v is None:
-                missing.append(k)
+                if k not in missing:
+                    missing.append(k)
             elif step.get('kind') == 'go':
                 refused.append({'var': k, 'step': step['n'], 'why': 'an environment value never fills a URL; pass --var'})
             elif not host_rec:
@@ -16561,10 +16562,10 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
             elif not _agent_host_allowed(host_rec, env_hosts):
                 refused.append({'var': k, 'step': step['n'], 'why': f'{AGENT_VAR_HOSTS_ENV} does not name {host_rec}'})
             else:
-                env_values[k] = env_v
+                env_by_step.setdefault(step['n'], {})[k] = env_v
     for k in sorted(needed):  # catalogued but typed in no step: a value must still exist
-        if k not in cli_values and k not in env_values and k not in missing \
-                and not any(r['var'] == k for r in refused) and os.environ.get(f'CDPILOT_VAR_{k.upper()}') is None:
+        if k not in cli_values and k not in missing and not any(r['var'] == k for r in refused) \
+                and os.environ.get(f'CDPILOT_VAR_{k.upper()}') is None:
             missing.append(k)
     if missing or refused:
         err = {'error': 'missing variables', 'missing': sorted(set(missing)),
@@ -16575,13 +16576,9 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
         print(json.dumps(err), file=sys.stderr)
         sys.exit(2)
 
-    def subst(s, env_ok=True):
-        def pick(m):
-            k = m.group(1)
-            if k in cli_values:
-                return cli_values[k]
-            return env_values.get(k, m.group(0)) if env_ok else m.group(0)
-        return _AGENT_VAR_RE.sub(pick, s or '')
+    def subst(s, step_n=None):
+        env_here = env_by_step.get(step_n, {})  # a go step (None) never gets an environment value
+        return _AGENT_VAR_RE.sub(lambda m: cli_values.get(m.group(1), env_here.get(m.group(1), m.group(0))), s or '')
     if dry_run:
         # Placeholders stay placeholders: a dry run never prints a value.
         print(json.dumps({'flow': slug, 'dry_run': True, 'host': flow.get('host', ''),
@@ -16626,7 +16623,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
     for step in flow['steps']:
         if step.get('kind') == 'go':
             url_before = (state or {}).get('last_url') if state else None
-            await _agent_go_silent(subst(step.get('url', ''), env_ok=False))
+            await _agent_go_silent(subst(step.get('url', '')))
             page, actions, out_actions, text, state = await snapshot()
             tokens_avoided += _estimate_tokens({'actions': out_actions, 'text': text})
             _agent_trail_push(state, {'kind': 'go', 'url': step.get('url', ''), 'url_after': page.get('url', ''),
@@ -16653,7 +16650,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
                 drift(step, f"a placeholder value is typed only where it was recorded "
                             f"({recorded or 'no recorded host'}); this page is {here or 'an opaque origin'}",
                       page, out_actions, text, state, _agent_injection_scan(last_nodes))
-        text_in = subst(step['text']) if step.get('text') is not None else None
+        text_in = subst(step['text'], step['n']) if step.get('text') is not None else None
         await _agent_perform(match['ref'], step.get('action', 'click'), text_in, amap)
         page2, actions2, out2, text2, state = await snapshot()
         _agent_trail_push(state, {'kind': 'act', 'action': step.get('action', 'click'), 'anchor': anchor,

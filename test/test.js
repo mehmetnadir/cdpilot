@@ -7529,6 +7529,18 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
         const e = JSON.parse(r.stderr);
         assert(e.refused && e.refused[0].var === 'password' && /CDPILOT_VAR_HOSTS does not name user\.example/.test(e.refused[0].why), r.stderr);
       }
+      // … and per step, never cached by name: a second step typing {{password}} that was recorded on
+      // another host is refused even though the first step's host is allowed (T1 round 3)
+      const twoHosts = JSON.parse(flowText);
+      twoHosts.name = 'two_hosts';
+      twoHosts.steps.push({ ...twoHosts.steps[3], n: 5, before: { host: 'evil.test', origin: 'https://evil.test' } });
+      const twoPath = path.join(home, 'projects', 'proj', 'flows', 'two_hosts.json');
+      fs.writeFileSync(twoPath, JSON.stringify(twoHosts));
+      const th = cli(['agent', 'run', 'two_hosts'], { ...env, CDPILOT_VAR_PASSWORD: typed, CDPILOT_VAR_HOSTS: 'user.example' });
+      assert.strictEqual(th.status, 2, th.stdout + th.stderr);
+      const the = JSON.parse(th.stderr);
+      assert(the.refused.length === 1 && the.refused[0].step === 5 && /does not name evil\.test/.test(the.refused[0].why), th.stderr);
+      fs.unlinkSync(twoPath);
       const run2 = JSON.parse(ok(['agent', 'run', 'inbox_triage'], { CDPILOT_VAR_PASSWORD: typed, CDPILOT_VAR_HOSTS: 'example' }).stdout);
       assert.strictEqual(run2.status, 'ok');
       assert(!fs.readFileSync(statePath, 'utf-8').includes(typed) && !fs.readFileSync(flowPath, 'utf-8').includes(typed),

@@ -1202,7 +1202,10 @@ def scenario_click_outcome(mod):
             mod.subprocess.run = real_run
         out["run"][key] = {"res": res, "result": stdout.strip().splitlines()[-1]}
 
-    # MCP: the CLI's exit code and stdout, as the server sees them.
+    # MCP: the CLI's exit code and stdout, as the server sees them. The stubbed
+    # subprocess.run is the fresh path; the warm in-process path (CDPILOT_DAEMON=1
+    # in the suite's environment) would run the real click against the fake page.
+    mod.os.environ.pop("CDPILOT_DAEMON", None)
     real_run = mod.subprocess.run
     server = mod.MCPServer()
     mcp = {}
