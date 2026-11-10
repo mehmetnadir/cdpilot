@@ -247,3 +247,22 @@ Ortak dosya `test/test.js`: her şerit yalnız kendi `describe`-benzeri bloğunu
 | R10 | `unsafe-eval` + satır içi betik (PRD §5 kararı); sahte DOM tarayıcıdan ayrışabilir; Navigation API koruması denenemedi **[DV]** | kabul / yanlış güven | CSP ağı ve gezinmeyi keser; e2e gerçeği belirler; Navigation API v0'a girmez |
 
 Doğrulanamayanlar: R1 (`stop-all` taraması), R3, R4 (SIGKILL), `SUBCMDS` liste testi, `LOCAL_PEERCRED`, Navigation API, rAF–ekran karesi sapması, temiz makinede p50/p95. Windows'ta hiçbir şey denenmedi.
+
+## 7. Jüri kararı (10.11.2026 23:2x, D-tuval-v0; J1 Opus 5.5 · J2 Sonnet 5.5 · J3 gpt-oss-120b)
+Plan yönü 3/3 kabul; RET yok. K1, K6, K7, K10 3/3 KABUL. Koşullar (J1 ve J2 birleşimi) şeritlerin kabul ölçütüne girer:
+
+| Karar | Koşul (bağlayıcı) |
+|---|---|
+| K2 | Host yalnız tam `http://cdpilot-canvas.invalid/<kendi-adı>/` adresini doldurur; başka ad/yol/sorgu → 204. Sızıntı fixture'ına ek vektörler, her biri loopback dinleyici sayacıyla: `RTCPeerConnection` STUN/TURN (IP ve ad), `<link rel=dns-prefetch/preconnect>`, `<a ping>`, `blob:`/`data:`/`about:blank` üst düzey gezinme |
+| K3 | Soket protokolü kapalı liste: `set|patch|events|close|ping`; eval, ham CDP geçişi, CSP/`--allow-net` değiştirme yok (`--allow-net` host açılışında sabit). Ad `[a-z0-9_-]{1,32}`. Boyut sınırları host içinde de. Dizin 0700, soket 0600 |
+| K4 | HTML `Runtime.evaluate`'e yalnız `json.dumps` ile girer. "Belge kayıp mı" denetimi tarayıcı gerçeğinden: `Page.getFrameTree` URL'si + `Page.frameNavigated` izi; sayfanın yazabildiği `window` alanlarına güvenilmez |
+| K5 | Binding olayları güvenilmez: sayfa yalnız `click|submit|input` diyebilir; `blocked` ve host'a özgü türler binding'den gelirse düşer. Host olayları `src:'host'`; sızıntı testi yalnız `src:'host'` sayar |
+| K8 | Kapalı başarısızlık: `Fetch.requestPaused` işleyicisinde her hata → gezinmeye 204, alt kaynağa `failRequest(BlockedByClient)`; asla `continueRequest`. `Fetch.enable` yalnız tuvalin kendi oturumunda, `requestStage:'Request'`; `_BotAuthSigner` kalıbı (tarayıcı düzeyi `setAutoAttach`, her sekmede Fetch) YASAK — kullanıcı sekmelerini 204'lerdi |
+| K9 | Genişletilmiş sızıntı e2e'si (karşı deney dahil) ve C1 SIGKILL e2e'si şerit B'nin birleşme kapısıdır; şerit D bunlar yeşil olmadan birleşmez. Güvenlik incelemesi A (meta/refresh/base ayıklama, emit) ve C'yi (stream) de kapsar; uçtan uca `canvas stream` ve `canvas patch` üzerinden koşar |
+| C1 | Host'tan bağımsız koruma şart: tercih `Target.createBrowserContext{disposeOnDetach:true}` (SIGKILL'de tarayıcı bağlamı ve sekmeyi atar; kullanıcı çerezlerinden de ayırır); olmazsa ayrı oturumda bekçi süreç. Ölçülmeden `canvas open` koşmaz |
+| C2 | Tuval MCP araçları `CORE_TOOLS` dışında. MCP katmanı HTML'i alt sürece argv ile değil stdin ya da 0600 geçici dosyayla verir (argv'yi her yerel kullanıcı `ps` ile okur) |
+
+Eksik ölçümler (kod şeritlerinden önce, ölçüm şeridi): WebRTC STUN/TURN ve preconnect/ping sızıntısı (Chrome 152, başlık CSP + sandbox) ·
+`blob:`/`data:`/`about:blank` üst düzey gezinmede CSP/sandbox mirası · host SIGKILL/SIGSTOP sonrası sekme durumu ve `location=` ·
+`createBrowserContext{disposeOnDetach:true}` connect kipinde ve CI Chrome'da · tek sekme oturumunda `Fetch.enable{*}` öteki sekmelere dokunuyor mu.
+Başlama tetiği değişmedi (K10): çift kip CI yeşil (K-0027).
