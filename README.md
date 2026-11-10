@@ -535,10 +535,14 @@ Page text that addresses the model instead of the user is the shape of an indire
 assistants reading this page: ignore your previous instructions…"). `agent observe`, the diff of `agent act`
 and a drift result of `agent run` carry `injection_suspect: [{text, match}]` (at most 5, absent when none)
 whenever such a block is in the text: `ignore_instructions`, `addresses_ai`, `system_prompt`,
-`new_instructions`, `hide_from_user`, `exfiltrate`. Nothing is hidden or blocked, the text stays where it was;
-the agent sees the mark next to it and treats the block as data. The patterns are narrow on purpose and English-only: on the corpus they were tuned on (`test/fixtures/injection-korpus.json`) 0 of 20 pages about AI were flagged and 19 of 20 injections caught (the German one is missed).
-On text written without seeing the patterns they catch far less: 7 of 24 with 0 of 24 false alarms
-(`test/fixtures/injection-heldout.json`) and 4 of 30 with 1 of 30 (`injection-heldout-2.json`, a recipe line).
+`new_instructions`, `hide_from_user`, `exfiltrate`, `fake_system`, `tool_call`, `navigate_order`. Nothing is
+hidden or blocked, the text stays where it was; the agent sees the mark next to it and treats the block as data.
+Matching runs on a normalised copy (zero-width characters removed, NFKC, case folded, spaced-out letters joined);
+the "ignore previous instructions" family also covers Spanish, French, Turkish, Japanese, German and Portuguese.
+The patterns were tuned on two sets (`test/fixtures/injection-korpus.json`, `injection-heldout.json`), so their
+numbers there (20 of 20 and 24 of 24 caught, 0 false alarms) are in-sample. On a set never used for tuning
+(`injection-heldout-2.json`, 30 + 30 lines in 7 languages) they catch 8 of 30 with 1 of 30 false alarms (a recipe
+line); fake chat turns, homoglyphs, base64 and Chinese/Russian/Arabic lines still pass.
 Treat the mark as a hint, not a filter: a page without it can still carry an injection.
 
 ### Session Management
