@@ -772,8 +772,8 @@ function showHelp() {
                        a fresh process when it is missing or busy; not with
                        --timeout; 'daemon status|stop'; idle exit after
                        CDPILOT_DAEMON_IDLE seconds, default 1800).
-    CDPILOT_VAR_HOSTS  Hosts (comma-separated) an agent flow may type
-                       CDPILOT_VAR_* values on
+    CDPILOT_VAR_HOSTS  Hosts (comma-separated, host:port for another port)
+                       an agent flow or replay step may type CDPILOT_VAR_* on
 
   SETUP
     setup              Auto-detect browser, create isolated profile
