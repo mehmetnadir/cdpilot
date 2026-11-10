@@ -23566,6 +23566,390 @@ def _canvas_host_entry(args):
 # Contract: cmd_canvas_stream(name) and cmd_canvas_watch(name, path); both patch through
 # _canvas_request(name, {'op': 'patch', 'html': <whole document so far>, 'final': bool,
 # 't_cli': time.time_ns()}). Lane B's dispatcher calls them.
+try:
+    import select as _canvas_select
+except ImportError:
+    _canvas_select = None
+
+_CANVAS_STREAM_SILENCE_S = 0.050
+_CANVAS_STREAM_MIN_GAP_S = 0.016
+_CANVAS_STREAM_CHUNK = 4096
+_CANVAS_WATCH_POLL_S = 0.100
+_CANVAS_WATCH_DEBOUNCE_S = 0.030
+_CANVAS_CLOSING_TAG_END_RE = _re.compile(r'</[A-Za-z][A-Za-z0-9:-]*[ \t\r\n]*>\Z')
+_CANVAS_RAWTEXT_OPEN_RE = _re.compile(r'<(script|style)(?:[\t\n\f\r />]|\Z)', _re.IGNORECASE)
+_CANVAS_SCRIPT_CLOSE_RE = _re.compile(r'</script(?:>|[\t\n\f\r /][^>]*>)', _re.IGNORECASE)
+_CANVAS_STYLE_CLOSE_RE = _re.compile(r'</style(?:>|[\t\n\f\r /][^>]*>)', _re.IGNORECASE)
+
+
+def _canvas_fmt_ms(ms):
+    """Compact millisecond number for CLI output."""
+    try:
+        v = round(float(ms), 1)
+        return str(int(v)) if v == int(v) else f"{v:.1f}"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _canvas_stream_cut(text):
+    """Return (cut_html, ends_with_closing_tag) for a non-final stream buffer.
+
+    Cuts at the last complete `>` outside comments and unclosed tags, and holds
+    any open <script> or <style> block out of non-final patches.
+    """
+    n = len(text)
+    safe_cut = 0
+    i = 0
+    while i < n:
+        lt = text.find('<', i)
+        if lt < 0 or lt + 1 >= n:
+            break
+        nxt = text[lt + 1]
+        if not (('a' <= nxt <= 'z') or ('A' <= nxt <= 'Z') or nxt in '/!?'):
+            i = lt + 1
+            continue
+        if text.startswith('<!--', lt):
+            end_comment = text.find('-->', lt + 4)
+            if end_comment < 0:
+                break
+            i = end_comment + 3
+            safe_cut = i
+            continue
+        j = lt + 1
+        quote = ''
+        tag_gt = -1
+        while j < n:
+            ch = text[j]
+            if quote:
+                if ch == quote:
+                    quote = ''
+            elif ch == '"' or ch == "'":
+                quote = ch
+            elif ch == '>':
+                tag_gt = j
+                break
+            j += 1
+        if tag_gt < 0:
+            break
+        m = _CANVAS_RAWTEXT_OPEN_RE.match(text, lt, tag_gt + 1)
+        if m is not None:
+            raw_tag = m.group(1).lower()
+            close_re = _CANVAS_SCRIPT_CLOSE_RE if raw_tag == 'script' else _CANVAS_STYLE_CLOSE_RE
+            cm = close_re.search(text, tag_gt + 1)
+            if cm is None:
+                break
+            i = cm.end()
+            safe_cut = i
+            continue
+        i = tag_gt + 1
+        safe_cut = i
+    cut = text[:safe_cut]
+    ends_closing = bool(safe_cut and safe_cut == n and _CANVAS_CLOSING_TAG_END_RE.search(cut))
+    return cut, ends_closing
+
+
+def cmd_canvas_stream(name):
+    """Stream HTML from fd 0 into canvas `name` via whole-document patches (plan §2.4)."""
+    if os.name == 'nt' or not hasattr(socket, 'AF_UNIX') or _canvas_select is None:
+        print("cdpilot: canvas is not supported on Windows", file=sys.stderr)
+        sys.exit(1)
+    try:
+        _canvas_check_name(name)
+    except CanvasError as e:
+        print(f"cdpilot: {e}", file=sys.stderr)
+        sys.exit(e.code)
+
+    stdin_fd = 0
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_r, False)
+    os.set_blocking(wake_w, False)
+
+    cond = threading.Condition()
+    pending = None
+    stop_worker = False
+    worker_err = None
+    patches_sent = 0
+    coalesced = 0
+    last_ms = 0.0
+
+    raw = bytearray()
+    parsed_len = -1
+    cut_html = ''
+    ends_closing = False
+    last_dispatched_html = ''
+    last_byte_ns = None
+    last_byte_mono = None
+    last_patch_mono = None
+    eof = False
+    over_limit = False
+
+    def _sender():
+        nonlocal pending, worker_err, patches_sent, last_ms
+        while True:
+            with cond:
+                while pending is None and not stop_worker:
+                    cond.wait()
+                if pending is None and stop_worker:
+                    return
+                html, is_final, t_cli = pending
+                pending = None
+            t0 = time.monotonic()
+            err = None
+            reply = None
+            try:
+                reply = _canvas_request(name, {
+                    'op': 'patch',
+                    'html': html,
+                    'final': is_final,
+                    't_cli': t_cli,
+                })
+                if not reply.get('ok'):
+                    err = CanvasError(
+                        reply.get('error') or 'canvas patch failed',
+                        int(reply.get('code') or 1),
+                    )
+            except CanvasError as e:
+                err = e
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            with cond:
+                if err is not None:
+                    worker_err = err
+                    pending = None
+                    try:
+                        os.write(wake_w, b'\x00')
+                    except OSError:
+                        pass
+                    return
+                patches_sent += 1
+                ms_val = reply.get('ms') if isinstance(reply, dict) else None
+                last_ms = float(ms_val) if isinstance(ms_val, (int, float)) else elapsed_ms
+                try:
+                    os.write(wake_w, b'\x00')
+                except OSError:
+                    pass
+
+    def _stage_patch(html, is_final, t_cli, now_mono):
+        nonlocal pending, coalesced, last_dispatched_html, last_patch_mono
+        with cond:
+            if pending is not None:
+                coalesced += 1
+            pending = (html, is_final, t_cli)
+            cond.notify()
+        last_dispatched_html = html
+        last_patch_mono = now_mono
+
+    worker = threading.Thread(target=_sender, name='cdpilot-canvas-stream', daemon=True)
+    worker.start()
+    try:
+        while True:
+            with cond:
+                err = worker_err
+            if err is not None:
+                break
+            now_mono = time.monotonic()
+            timeout = None
+            if raw:
+                if len(raw) != parsed_len:
+                    parsed_len = len(raw)
+                    cut_html, ends_closing = _canvas_stream_cut(
+                        raw.decode('utf-8', errors='replace')
+                    )
+                if cut_html and cut_html != last_dispatched_html and last_byte_mono is not None:
+                    silence_at = last_byte_mono + _CANVAS_STREAM_SILENCE_S
+                    if ends_closing:
+                        gap_at = (now_mono if last_patch_mono is None
+                                  else last_patch_mono + _CANVAS_STREAM_MIN_GAP_S)
+                        fire_at = gap_at if gap_at < silence_at else silence_at
+                    else:
+                        fire_at = silence_at
+                    if now_mono >= fire_at:
+                        _stage_patch(cut_html, False, last_byte_ns, now_mono)
+                    else:
+                        timeout = fire_at - now_mono
+            try:
+                rlist, _, _ = _canvas_select.select([stdin_fd, wake_r], [], [], timeout)
+            except InterruptedError:
+                continue
+            if wake_r in rlist:
+                try:
+                    while os.read(wake_r, 64):
+                        pass
+                except BlockingIOError:
+                    pass
+            with cond:
+                err = worker_err
+            if err is not None:
+                break
+            if stdin_fd in rlist:
+                while True:
+                    try:
+                        chunk = os.read(stdin_fd, _CANVAS_STREAM_CHUNK)
+                    except InterruptedError:
+                        continue
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        eof = True
+                        break
+                    if len(raw) + len(chunk) > CANVAS_HTML_MAX:
+                        over_limit = True
+                        break
+                    raw.extend(chunk)
+                    last_byte_ns = time.time_ns()
+                    last_byte_mono = time.monotonic()
+                    try:
+                        more, _, _ = _canvas_select.select([stdin_fd], [], [], 0)
+                    except InterruptedError:
+                        more = []
+                    if not more:
+                        break
+                if over_limit or eof:
+                    break
+
+        if over_limit:
+            with cond:
+                pending = None
+                stop_worker = True
+                cond.notify()
+            worker.join()
+            print(f"cdpilot: HTML is over {CANVAS_HTML_MAX} bytes", file=sys.stderr)
+            sys.exit(2)
+
+        with cond:
+            err = worker_err
+        if err is not None:
+            with cond:
+                pending = None
+                stop_worker = True
+                cond.notify()
+            worker.join()
+            print(f"cdpilot: {err}", file=sys.stderr)
+            sys.exit(err.code)
+
+        if eof:
+            full_html = raw.decode('utf-8', errors='replace')
+            eof_t_cli = (last_byte_ns
+                         if (full_html != last_dispatched_html and last_byte_ns is not None)
+                         else time.time_ns())
+            _stage_patch(full_html, True, eof_t_cli, time.monotonic())
+            with cond:
+                stop_worker = True
+                cond.notify()
+            worker.join()
+            with cond:
+                err = worker_err
+            if err is not None:
+                print(f"cdpilot: {err}", file=sys.stderr)
+                sys.exit(err.code)
+            print(
+                f"ok {patches_sent} patches ({coalesced} coalesced) "
+                f"{_canvas_fmt_ms(last_ms)} ms {len(raw)} bytes",
+                flush=True,
+            )
+    except KeyboardInterrupt:
+        with cond:
+            pending = None
+            stop_worker = True
+            cond.notify()
+        worker.join(timeout=2.0)
+        sys.stdout.flush()
+    finally:
+        with cond:
+            stop_worker = True
+            cond.notify()
+        worker.join(timeout=12.0)
+        for _fd in (wake_r, wake_w):
+            try:
+                os.close(_fd)
+            except OSError:
+                pass
+
+
+def cmd_canvas_watch(name, path):
+    """Poll `path` every 100 ms; on change wait 30 ms, read and send final patch (plan §2.5)."""
+    if os.name == 'nt' or not hasattr(socket, 'AF_UNIX'):
+        print("cdpilot: canvas is not supported on Windows", file=sys.stderr)
+        sys.exit(1)
+    try:
+        _canvas_check_name(name)
+    except CanvasError as e:
+        print(f"cdpilot: {e}", file=sys.stderr)
+        sys.exit(e.code)
+    if not path:
+        print("cdpilot: canvas watch requires a file path", file=sys.stderr)
+        sys.exit(2)
+    try:
+        st0 = os.stat(path)
+    except OSError as e:
+        print(f"cdpilot: cannot stat {path}: {e.strerror or e}", file=sys.stderr)
+        sys.exit(2)
+    last_sig = (st0.st_mtime_ns, st0.st_size)
+
+    prev_sigint = signal.getsignal(signal.SIGINT)
+
+    def _on_sigint(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _on_sigint)
+    try:
+        while True:
+            time.sleep(_CANVAS_WATCH_POLL_S)
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                print(f"cdpilot: cannot stat {path}: {e.strerror or e}", file=sys.stderr)
+                sys.exit(2)
+            sig = (st.st_mtime_ns, st.st_size)
+            if sig == last_sig:
+                continue
+            time.sleep(_CANVAS_WATCH_DEBOUNCE_S)
+            try:
+                st2 = os.stat(path)
+                last_sig = (st2.st_mtime_ns, st2.st_size)
+                html = _canvas_read_html(path)
+            except FileNotFoundError:
+                continue
+            except CanvasError as e:
+                print(f"cdpilot: {e}", file=sys.stderr)
+                sys.exit(e.code)
+            except OSError as e:
+                print(f"cdpilot: cannot read {path}: {e.strerror or e}", file=sys.stderr)
+                sys.exit(2)
+            t_cli = time.time_ns()
+            t0 = time.monotonic()
+            try:
+                reply = _canvas_request(name, {
+                    'op': 'patch',
+                    'html': html,
+                    'final': True,
+                    't_cli': t_cli,
+                })
+            except CanvasError as e:
+                print(f"cdpilot: {e}", file=sys.stderr)
+                sys.exit(e.code)
+            if not reply.get('ok'):
+                err_msg = reply.get('error') or 'canvas patch failed'
+                print(f"cdpilot: {err_msg}", file=sys.stderr)
+                sys.exit(int(reply.get('code') or 1))
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            ms_val = reply.get('ms')
+            ms_num = float(ms_val) if isinstance(ms_val, (int, float)) else elapsed_ms
+            ops = reply.get('ops')
+            if isinstance(ops, dict):
+                print(
+                    f"ok +{ops.get('add', 0)} -{ops.get('del', 0)} "
+                    f"~{ops.get('upd', 0)} \u2195{ops.get('move', 0)} "
+                    f"{_canvas_fmt_ms(ms_num)} ms",
+                    flush=True,
+                )
+            else:
+                print(f"ok {_canvas_fmt_ms(ms_num)} ms", flush=True)
+    except KeyboardInterrupt:
+        sys.stdout.flush()
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint)
 # ═══ CANVAS-C END ═══
 
 
