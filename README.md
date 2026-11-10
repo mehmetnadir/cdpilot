@@ -497,7 +497,8 @@ with a full observe of the same page. State lives in `~/.cdpilot/projects/<id>/a
 cdpilot agent observe && cdpilot agent act --ref @3 --action click && cdpilot agent act --ref @4 --action fill --text "cdpilot"
 cdpilot agent flow save inbox-triage        # the acts since the last navigation → ~/.cdpilot/projects/<id>/flows/inbox_triage.json
 cdpilot agent run inbox-triage              # replays by anchors; prints one JSON: {status:"ok", steps, url, title, ms, tokens_avoided}
-cdpilot agent run login --var password=…    # a typed secret was saved as {{password}}; --var or CDPILOT_VAR_PASSWORD supplies it
+cdpilot agent run login --var password=…    # a typed secret was saved as {{password}}; --var supplies it, or CDPILOT_VAR_PASSWORD
+                                            # with CDPILOT_VAR_HOSTS=example.com (the host the value was recorded on)
 cdpilot agent flow list | show <name> | delete <name>
 ```
 
@@ -519,7 +520,11 @@ secret typed into a field named otherwise is stored in clear, so review a flow b
 and `agent-state.json` are 0600). A `{{placeholder}}` typed into `agent act --text` or `--url` is refused
 (exit 2): placeholders are cdpilot's own, so a flow replays only values the user recorded, and a step that
 types one runs only on the host it was recorded on. `--var` values are visible in the process list for the
-duration of the call; `CDPILOT_VAR_<NAME>` is not; the session log redacts both.
+duration of the call and are redacted in the session log; an environment value never enters argv.
+`CDPILOT_VAR_<NAME>` is used only by a step recorded on a host named in `CDPILOT_VAR_HOSTS` (comma-separated,
+subdomains included), on that same origin, and never inside a URL — so a flow that a prompt-injected model
+records on another site cannot draw on the environment's secrets; anything else is refused before the first
+step (exit 2, `refused` says why) or is a drift.
 
 #### Text that talks to the agent: `injection_suspect`
 
