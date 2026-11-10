@@ -4197,6 +4197,53 @@ test('launcher: a python killed by a signal is not reported as success', () => {
     'the close handler must turn a signal into 128 + signal number');
 });
 
+test('launcher: SIGTERM or SIGINT sent to the launcher alone ends the Python child too (no orphan)', () => {
+  // Before: the launcher died and the child ran on (canvas events --follow kept
+  // polling). The MCP server child waits on stdin, which the driver keeps open:
+  // stdout reaches EOF only when the child has exited.
+  if (process.platform === 'win32') return;
+  const os = require('os');
+  const { spawnSync } = require('child_process');
+  const PYB = process.env.CDPILOT_PYTHON || 'python3';
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-sigfwd-'));
+  const driver = `
+import json, os, select, signal, subprocess, sys, time
+out = {}
+for sig in (signal.SIGTERM, signal.SIGINT):
+    p = subprocess.Popen(["node", sys.argv[1], "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL)
+    p.stdin.write(b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\\n'); p.stdin.flush()
+    r, _, _ = select.select([p.stdout], [], [], 15)
+    first = p.stdout.readline() if r else b""
+    p.send_signal(sig)
+    try:
+        rc = p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        rc = "hang"; p.kill(); p.wait()
+    t0 = time.time(); eof = False
+    while time.time() - t0 < 5:
+        r, _, _ = select.select([p.stdout], [], [], 0.2)
+        if r and not os.read(p.stdout.fileno(), 65536):
+            eof = True
+            break
+    p.stdin.close()
+    out[sig.name] = {"up": b'"result"' in first, "rc": rc, "child_gone": eof}
+print(json.dumps(out))
+`;
+  const r = spawnSync(PYB, ['-I', '-c', driver, path.join(__dirname, '..', 'bin', 'cdpilot.js')], {
+    encoding: 'utf8', timeout: 60000,
+    env: { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'p'), CDPILOT_LOG: '0',
+      CDPILOT_NO_AUTOLAUNCH: '1', CDPILOT_DAEMON: '0', CDPILOT_PYTHON: PYB },
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout.trim());
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    assert(out[sig].up, `${sig}: the MCP child answered initialize: ${r.stdout}`);
+    assert(out[sig].child_gone, `${sig}: the Python child must exit with the launcher: ${r.stdout}`);
+    assert.notStrictEqual(out[sig].rc, 'hang', `${sig}: the launcher must exit: ${r.stdout}`);
+  }
+});
+
 test('metadata: publish workflow can be re-run after npm succeeded', () => {
   // 0.9.1: npm accepted the package but it stayed invisible past the wait, so
   // the release failed before the MCP Registry steps. A re-run must skip the
