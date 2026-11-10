@@ -9076,18 +9076,18 @@ print(json.dumps(out))
     return { names: res.find((x) => x.id === 1).result.tools.map((t) => t.name), call: res.find((x) => x.id === 2) };
   }
 
-  test('webmcp: MCP tools/list is 49 tools with WebMCP off (43 + browser_connect/browser_disconnect + 4 browser_agent_*), 51 with it on', () => {
+  test('webmcp: MCP tools/list is 52 tools with WebMCP off (43 + browser_connect/browser_disconnect + 4 browser_agent_* + 3 browser_canvas_*), 54 with it on', () => {
     const off = mcpTools({});
-    assert.strictEqual(off.names.length, 49, `off: ${off.names.length}`);
+    assert.strictEqual(off.names.length, 52, `off: ${off.names.length}`);
     assert(!off.names.some((n) => n.startsWith('browser_site_')), 'off: no browser_site_* tools');
     assert(off.names.includes('browser_connect') && off.names.includes('browser_disconnect'), 'connect tools');
     assert(/Unknown tool: browser_site_tools/.test(JSON.stringify(off.call)), 'off: not callable');
     const offByFile = mcpTools({}, false);
-    assert.strictEqual(offByFile.names.length, 49);
+    assert.strictEqual(offByFile.names.length, 52);
     for (const on of [mcpTools({ CDPILOT_WEBMCP: '1' }), mcpTools({}, true)]) {
-      assert.strictEqual(on.names.length, 51, `on: ${on.names.length}`);
-      assert.deepStrictEqual(on.names.slice(0, 49), off.names, 'the 49 base tools are unchanged');
-      assert.deepStrictEqual(on.names.slice(49), ['browser_site_tools', 'browser_site_tool_call']);
+      assert.strictEqual(on.names.length, 54, `on: ${on.names.length}`);
+      assert.deepStrictEqual(on.names.slice(0, 52), off.names, 'the 52 base tools are unchanged');
+      assert.deepStrictEqual(on.names.slice(52), ['browser_site_tools', 'browser_site_tool_call']);
       assert(!/Unknown tool/.test(JSON.stringify(on.call)), 'on: browser_site_tools routes to the CLI');
     }
   });
@@ -10537,13 +10537,13 @@ test('mcp profile: CDPILOT_MCP_TOOLS=core lists the 10 core tools plus browser_t
 
 test('mcp profile: --tools flag beats the env var', () => {
   const msgs = mcpSession(['--tools', 'all'], { CDPILOT_MCP_TOOLS: 'core' }, []);
-  assert.strictEqual(names(byId(msgs, 2)).length, 49);
+  assert.strictEqual(names(byId(msgs, 2)).length, 52);
 });
 
-test('mcp profile: default stays all 49 tools, no browser_tools, no listChanged', () => {
+test('mcp profile: default stays all 52 tools, no browser_tools, no listChanged', () => {
   const msgs = mcpSession([], {}, []);
   const list = names(byId(msgs, 2));
-  assert.strictEqual(list.length, 49);
+  assert.strictEqual(list.length, 52);
   assert(!list.includes('browser_tools'));
   assert.deepStrictEqual(byId(msgs, 1).result.capabilities, { tools: {} });
 });
