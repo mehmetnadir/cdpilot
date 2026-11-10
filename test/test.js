@@ -3140,7 +3140,8 @@ test('cmd_click: ws obtained before entropy check (host-aware ordering)', () => 
 });
 
 test('cmd_fill: ws obtained before entropy check (host-aware ordering)', () => {
-  const m = PY_CONTENT.match(/async def cmd_fill[\s\S]{0,200}?ws,\s*_\s*=\s*get_page_ws\(\)[\s\S]{0,400}?_entropy_enabled\(_get_project_id\(\)/);
+  // The strict replay guard (0.9.7) sits between the def and get_page_ws(); the order is what matters.
+  const m = PY_CONTENT.match(/async def cmd_fill[\s\S]{0,900}?ws,\s*_\s*=\s*get_page_ws\(\)[\s\S]{0,400}?_entropy_enabled\(_get_project_id\(\)/);
   assert(m, 'cmd_fill must get_page_ws() before calling _entropy_enabled with host');
 });
 
