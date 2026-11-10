@@ -7835,6 +7835,99 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     } finally { fake.stop(); }
   });
 
+  test('agent JSON format (fake browser): compact UTF-8 when piped, CDPILOT_JSON=pretty indents, =compact forces one line, a bogus value notes on stderr and follows the TTY rule', () => {
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_BUTTON: 'Arşivle ✓' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const piped = cli(['agent', 'observe'], env);
+      assert.strictEqual(piped.status, 0, piped.stderr);
+      const line = piped.stdout.trim();
+      assert(!line.includes('\n') && !/\n {2}"/.test(piped.stdout), 'one line, no indent');
+      assert(line.includes('"Arşivle ✓"') && !/\\u[0-9a-f]{4}/i.test(line), `raw UTF-8: ${line.slice(0, 300)}`);
+      assert(!line.includes('": ') && !line.includes('", "'), 'compact separators');
+      const pretty = cli(['agent', 'observe'], { ...env, CDPILOT_JSON: 'pretty' });
+      assert(/\n {2}"url": /.test(pretty.stdout) && pretty.stdout.includes('"Arşivle ✓"'), pretty.stdout.slice(0, 200));
+      assert.deepStrictEqual(JSON.parse(pretty.stdout).actions, JSON.parse(line).actions);
+      const compact = cli(['agent', 'observe'], { ...env, CDPILOT_JSON: 'compact' });
+      assert.strictEqual(compact.stdout.trim().split('\n').length, 1);
+      const bogus = cli(['agent', 'observe'], { ...env, CDPILOT_JSON: 'fancy' });
+      assert.strictEqual(bogus.status, 0, bogus.stderr);
+      assert(/CDPILOT_JSON/.test(bogus.stderr) && /fancy/.test(bogus.stderr), bogus.stderr);
+      assert.strictEqual(bogus.stdout.trim().split('\n').length, 1, 'piped: the TTY rule gives compact');
+      assert(!/CDPILOT_JSON/.test(piped.stderr), 'no note without the variable');
+    } finally { fake.stop(); }
+  });
+
+  test('agent JSON format (unit): the warm path uses the launcher TTY flag for that request only; MCP calls carry none (compact)', () => {
+    const { spawnSync } = require('child_process');
+    const home = mkHome();
+    const script = `
+import io, json, sys, importlib.util
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+async def fake_list():
+    mod._agent_json({"a": [1, 2], "n": "ş"})
+mod.cmd_agent_flow_list = fake_list
+def run(req):
+    out, err = io.StringIO(), io.StringIO()
+    code = mod._daemon_execute(dict(req, argv=["agent", "flow", "list"]), out, err, lambda r: None)
+    assert code == 0, (code, out.getvalue(), err.getvalue())
+    return out.getvalue()
+t = run({"tty": True})
+f = run({"tty": False})
+n = run({})
+assert t.startswith("{\\n  \\"a\\": [") and '"n": "ş"' in t, repr(t)
+assert f == '{"a":[1,2],"n":"ş"}\\n', repr(f)
+assert n == f, repr(n)
+assert mod._OUT_TTY is None, "no TTY flag left behind"
+env = dict(mod.os.environ); 
+mod.os.environ["CDPILOT_JSON"] = "pretty"
+assert run({"tty": False}).startswith("{\\n"), "env wins over the flag"
+del mod.os.environ["CDPILOT_JSON"]
+# a console that cannot encode UTF-8: escape, never lose the output
+class Latin(io.StringIO):
+    encoding = "ascii"
+sys.stdout = Latin()
+mod._agent_json({"n": "ş"})
+got = sys.stdout.getvalue(); sys.stdout = sys.__stdout__
+assert got == '{"n":"\\\\u015f"}\\n', repr(got)
+print("ok")
+`;
+    const r = spawnSync(PY_BIN, ['-I', '-c', script],
+      { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0', CDPILOT_JSON: '' } });
+    assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert(/^ok/m.test(r.stdout), r.stdout);
+  });
+
+  test('agent JSON format (mcp, fake browser): browser_agent_observe result text is compact UTF-8', () => {
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_BUTTON: 'Arşivle ✓' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const lines = [
+        { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+        { jsonrpc: '2.0', method: 'notifications/initialized' },
+        { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'browser_agent_act', arguments: { url: 'https://user.example/inbox' } } },
+        { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'browser_agent_observe', arguments: {} } },
+      ].map((m) => JSON.stringify(m)).join('\n') + '\n';
+      for (const warm of ['', '1']) {
+        const r = spawnSync(process.execPath, [CLI, 'mcp'], {
+          input: lines, encoding: 'utf-8', timeout: 60000,
+          env: { ...process.env, ...env, CDPILOT_WEBMCP: '0', CDPILOT_MCP_TOOLS: '', CDPILOT_DAEMON: warm || '0' },
+        });
+        assert.strictEqual(r.status, 0, r.stderr);
+        const m = r.stdout.trim().split('\n').map((l) => JSON.parse(l)).find((x) => x.id === 11);
+        const txt = m.result.content.map((c) => c.text).join('\n').trim();
+        assert(!txt.includes('\n') && txt.includes('"Arşivle ✓"'), `warm=${warm || 0}: ${txt.slice(0, 200)}`);
+        assert.strictEqual(JSON.parse(txt).actions.some((a) => a.name === 'Arşivle ✓'), true);
+      }
+    } finally { fake.stop(); }
+  });
+
   for (const act of ['hover', 'submit', 'fill', 'type']) {
     test(`agent act --action ${act} on a stale ref (fake browser): exit 1 and the stale-ref wording, never a silent success`, () => {
       // The ref's node is not in the page (no box, no resolveNode result).

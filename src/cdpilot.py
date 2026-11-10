@@ -42,6 +42,8 @@ Environment:
   CDPILOT_VAR_HOSTS    Hosts (comma-separated; host:port for a non-default port) an agent
                        flow or a replayed input step may type CDPILOT_VAR_* values on (https)
   CDPILOT_TIMEOUT      Default for --timeout (the flag wins)
+  CDPILOT_JSON         pretty|compact: agent command JSON (default: indented on a
+                       terminal, compact UTF-8 when stdout is not a terminal)
   CDPILOT_DAEMON=1     Keep one warm Python process per project and send page
                        commands to it over a local socket (fresh process when
                        it is missing or busy; `cdpilot daemon status|stop`;
@@ -16026,6 +16028,40 @@ def _estimate_tokens(obj):
     return max(1, len(json.dumps(obj)) // 4)
 
 
+# Agent commands print JSON through one helper: compact when stdout is not a
+# terminal (an agent, a pipe, an MCP tool call), indented for a person.
+# CDPILOT_JSON=pretty|compact overrides. In the warm process stdout is a socket,
+# so the launcher sends its own TTY flag; _OUT_TTY holds it for that request only.
+_OUT_TTY = None
+
+
+def _agent_json_pretty():
+    mode = os.environ.get('CDPILOT_JSON', '').strip().lower()
+    if mode == 'pretty':
+        return True
+    if mode == 'compact':
+        return False
+    if mode:
+        print(f"cdpilot: ignoring CDPILOT_JSON={mode!r} (use pretty or compact)", file=sys.stderr)
+    if _OUT_TTY is not None:
+        return _OUT_TTY
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _agent_json(obj):
+    """Print obj as agent-command JSON (see _agent_json_pretty)."""
+    kw = {'indent': 2} if _agent_json_pretty() else {'separators': (',', ':')}
+    try:
+        text = json.dumps(obj, ensure_ascii=False, **kw)
+        text.encode(getattr(sys.stdout, 'encoding', None) or 'utf-8')
+    except UnicodeEncodeError:  # a non-UTF-8 console: escape instead of failing
+        text = json.dumps(obj, ensure_ascii=True, **kw)
+    print(text)
+
+
 # Page text that addresses the agent instead of the user: the classic shape of
 # an indirect prompt injection ("AI assistants reading this: ignore your
 # previous instructions…"). The scan marks, it never blocks or hides: the
@@ -16345,7 +16381,7 @@ async def cmd_agent_observe(diff=False):
     state['last_text_hash'] = text_hash
     state['step'] = state.get('step', 0) + 1
     _save_agent_state(state)
-    print(json.dumps(snap, indent=2))
+    _agent_json(snap)
 
 
 async def _agent_go_silent(url):
@@ -16518,7 +16554,7 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None):
     new_state['last_text_hash'] = text_hash
     new_state['step'] = new_state.get('step', 0) + 1
     _save_agent_state(new_state)
-    print(json.dumps(result, indent=2))
+    _agent_json(result)
 
 
 async def cmd_agent_reset():
@@ -17071,7 +17107,7 @@ async def cmd_agent_flow_list():
                     'steps': len(flow.get('steps') or []), 'vars': sorted(flow.get('vars') or {}),
                     'runs': st.get('runs', 0), 'ok': st.get('ok', 0), 'drift': st.get('drift', 0),
                     'last_run': st.get('last_run')})
-    print(json.dumps(out, indent=2))
+    _agent_json(out)
 
 
 async def cmd_agent_flow_show(name):
@@ -17084,7 +17120,7 @@ async def cmd_agent_flow_show(name):
     except ValueError as e:
         print(json.dumps({'error': f'{path}: {e}'}), file=sys.stderr)
         sys.exit(1)
-    print(json.dumps(flow, indent=2, ensure_ascii=False))
+    _agent_json(flow)
 
 
 async def cmd_agent_flow_delete(name):
@@ -17195,7 +17231,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
         if suspects:
             res['injection_suspect'] = suspects
         res['token_estimate'] = _estimate_tokens(res)
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        _agent_json(res)
         sys.exit(AGENT_RUN_DRIFT_EXIT)
 
     for step in flow['steps']:
@@ -17275,7 +17311,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False):
            'url': page.get('url', ''), 'title': page.get('title', ''),
            'ms': ms, 'tokens_avoided': tokens_avoided}
     res['token_estimate'] = _estimate_tokens(res)
-    print(json.dumps(res, indent=2, ensure_ascii=False))
+    _agent_json(res)
 
 
 def _dispatch_agent_flow(rest):
@@ -23988,6 +24024,7 @@ def _daemon_execute(req, out, err, refuse, on_run=None):
         at_end.append((fn, a, k))
         return fn
 
+    global _OUT_TTY
     code = None  # set once the command ran
     try:
         env = req.get("env")  # the caller's environment, as a fresh process would see it
@@ -24024,6 +24061,7 @@ def _daemon_execute(req, out, err, refuse, on_run=None):
         sys.stdin = io.StringIO(stdin_text if isinstance(stdin_text, str) else "")
         sys.stdout, sys.stderr = out, err
         _DAEMON["gone"] = False
+        _OUT_TTY = req.get("tty") is True  # the caller's terminal, this request only
         code = 0
         try:
             if on_run is not None:
@@ -24040,6 +24078,7 @@ def _daemon_execute(req, out, err, refuse, on_run=None):
                 pass
             code = 1
     finally:
+        _OUT_TTY = None
         if code is not None:
             for fn, a, k in reversed(at_end):  # session log line, record step, idle stamp
                 try:

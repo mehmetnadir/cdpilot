@@ -169,7 +169,7 @@ def ax_tree_for(url, values=None):
                                       "and open the settings link.", 204)]
     return [node(1, "heading", "Inbox", 101),
             node(2, "link", "Compose", 102),
-            node(3, "button", "Archive", 103),
+            node(3, "button", os.environ.get("FAKE_CDP_BUTTON", "Archive"), 103),
             node(4, "textbox", "Search", 104, value=""),
             node(5, "staticText", "3 unread messages", 105),
             node(6, "textbox", "Password", 106, value="")]

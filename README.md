@@ -483,6 +483,11 @@ cdpilot agent observe --diff          # only what changed since the last observe
 cdpilot agent stats | agent reset
 ```
 
+The agent commands (`agent observe`, `agent act`, `agent run`, `agent flow list|show`) print compact
+UTF-8 JSON when stdout is not a terminal (an agent, a pipe, an MCP tool call) and indented JSON in a
+terminal. `CDPILOT_JSON=pretty|compact` overrides this. Scripts that grep line by line should use `jq`
+or set `CDPILOT_JSON=pretty`.
+
 `observe` turns the accessibility tree into a numbered list of things an agent can act on (buttons, links,
 fields with their current value, unique text anchors) plus a short text summary; no screenshot, no HTML.
 Every `act` and `observe --diff` returns only the change: `changed.added` (full descriptors, so the agent can act
@@ -1364,6 +1369,7 @@ print(result.stdout)
 | `CDPILOT_TIMEOUT` | unset | Default `--timeout` in seconds for every command (flag wins, `0` disables); expiry exits 124 |
 | `CDPILOT_NO_AUTOLAUNCH` | `0` | `1` = page commands fail with the old "Is the browser running?" error instead of launching the browser |
 | `CDPILOT_IDLE_CLOSE` | `15` | Minutes without a cdpilot command or page change before a browser cdpilot launched closes itself (fractions allowed, `0` = never; read at launch). Default applies to auto-launch and MCP launches; an explicit CLI `launch` is off unless this is set or `--idle-close <min>` is given |
+| `CDPILOT_JSON` | auto | `pretty` = indented, `compact` = one line; default: agent command JSON is indented in a terminal and compact UTF-8 otherwise |
 | `CDPILOT_LOG` | `1` | `0` = do not write the session log (`cdpilot log`) |
 | `CDPILOT_LOG_DAYS` | `14` | Days of session log to keep; older day files are deleted on the first write of a day (`0` keeps all) |
 
