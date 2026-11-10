@@ -39,7 +39,8 @@ Environment:
   CDPILOT_PROFILE      Isolated browser profile directory
   CDPILOT_LOG=0        Do not write the session log
   CDPILOT_VAR_<NAME>   Value for flow placeholder {{name}} in replay / agent run
-  CDPILOT_VAR_HOSTS    Hosts (comma-separated) an agent flow may type CDPILOT_VAR_* values on
+  CDPILOT_VAR_HOSTS    Hosts (comma-separated) an agent flow or a replayed input step may
+                       type CDPILOT_VAR_* values on
   CDPILOT_TIMEOUT      Default for --timeout (the flag wins)
   CDPILOT_DAEMON=1     Keep one warm Python process per project and send page
                        commands to it over a local socket (fresh process when
@@ -91,7 +92,10 @@ Record & replay:
   cdpilot record cancel                    Cancel and discard active recording
   cdpilot record stop [--save <file.json>] Stop recording and emit flow JSON
   cdpilot replay <file.json> [--var k=v] [--delay real|none|<ms>] [--dry-run] [--continue]
-                       Replay a recorded flow with variable substitution
+                       Replay a recorded flow with variable substitution. --var fills any
+                       {{name}}; CDPILOT_VAR_<NAME> fills only the value of an input step
+                       (fill/type/smart-fill/…) on a host named by CDPILOT_VAR_HOSTS, checked
+                       live before the step; go/eval and other commands take --var only (exit 2)
 
 Exit codes: 0 ok, 1 error (batch / run: a step failed), 124 --timeout;
   2 agent: unknown flow, missing or refused variable, {{placeholder}} in --text/--url;
@@ -22464,6 +22468,84 @@ def cmd_record_dispatch(args):
         sys.exit(1)
 
 
+_REPLAY_VAR_RE = _re.compile(r"\{\{([A-Za-z0-9_-]+)\}\}")
+
+
+def _replay_value_positions(cmd, args):
+    """Indexes of `args` that carry the typed value of an input step, by the
+    layout the recorder writes (_record_redact_args) and the dispatcher reads:
+      fill / type            <selector> <value...>, flags (--x, --x=y, one token)
+                             anywhere: the first non-flag token is the selector,
+                             the other non-flag tokens are the value;
+      smart-fill / smart-select / select
+                             <label> <value...>: args[0] is the label, args[1:]
+                             the value;
+      assert-value           <selector> <value>: args[1] only (the rest is unread).
+    A token starting with -- is never a value position, even where the command
+    would read it as text. Every other command (go, eval, run, network…): none,
+    so a CDPILOT_VAR_<NAME> environment value never fills it."""
+    if cmd not in RECORD_INPUT_CMDS:
+        return frozenset()
+    if cmd in ('fill', 'type'):
+        non_flags = [i for i, a in enumerate(args) if not str(a).startswith("--")]
+        return frozenset(non_flags[1:])
+    if cmd == 'assert-value':
+        cand = [1] if len(args) > 1 else []
+    else:
+        cand = range(1, len(args))
+    return frozenset(i for i in cand if not str(args[i]).startswith("--"))
+
+
+def _replay_env_refusal(cmd, j, value_idxs, args, env_hosts):
+    """Why a CDPILOT_VAR_<NAME> value may not fill a placeholder in args[j] of a
+    `cmd` step, or None when it may (subject to the live host check before the
+    step). Names only: the value itself is never part of the reason."""
+    if cmd in ('go', 'open', 'new-tab'):
+        return 'an environment value never fills a URL; pass --var'
+    if cmd in SLOG_JS_CMDS or cmd == 'eval-batch':
+        return 'an environment value never fills a script; pass --var'
+    if cmd not in RECORD_INPUT_CMDS:
+        return ('an environment value fills only the value of an input step ('
+                + ', '.join(sorted(RECORD_INPUT_CMDS)) + '); pass --var')
+    if str(args[j]).startswith('--'):
+        return 'an environment value never fills a flag; pass --var'
+    # A frame-routed step (`sel >>> inner`, --frame) types into an iframe whose
+    # origin the live-host check (top-level page) does not see.
+    if any(FRAME_SEP in str(a) for a in args) or any(
+            str(a) == '--frame' or str(a).startswith('--frame=') for a in args):
+        return 'an environment value never fills a step routed into a frame; pass --var'
+    if j not in value_idxs:
+        return 'an environment value never fills a selector or label; pass --var'
+    if not env_hosts:
+        return (f'{AGENT_VAR_HOSTS_ENV} is empty; name the host(s) the value may be '
+                'typed on, or pass --var')
+    return None
+
+
+def _replay_live_host():
+    """Host of the page the next replay step acts on, read now from the CDP
+    target list (no cache): the target get_page_ws() picks for a child command
+    (CDPILOT_TARGET pin, then the session tab). '' when the browser does not
+    answer or the page has no host (about:blank, data:). A navigation between
+    this read and the child's own attach is not covered (the window is one
+    process start)."""
+    cdp_cache_invalidate()
+    if cdp_get("/json", no_cache=True) is None:
+        return ''
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            _ws, page = get_page_ws()
+    except SystemExit:
+        return ''
+    cdp_cache_invalidate()
+    url = (page or {}).get("url", "")
+    for t in cdp_get("/json", no_cache=True) or []:
+        if t.get("id") and t.get("id") == (page or {}).get("id"):
+            url = t.get("url", "")
+            break
+    return _agent_host_path(url)[0] if url else ''
+
+
 def cmd_replay(*args):
     """Replay a recorded flow JSON file."""
     if not args:
@@ -22588,38 +22670,64 @@ def cmd_replay(*args):
             print(f"cdpilot: invalid flow file: step {idx} malformed", file=sys.stderr)
             sys.exit(2)
 
-    collected_vars = {}
+    # Values: --var (the caller holds them) fills any placeholder, as before.
+    # CDPILOT_VAR_<NAME> fills only the value of an input step, and only on a
+    # host named in CDPILOT_VAR_HOSTS, checked live right before that step
+    # (2026-11-10 review: a crafted flow file could send an environment secret
+    # to any host through go / eval / a fill after `go https://evil`).
+    # The two sources stay in separate dicts; nothing here prints a value.
+    env_vars = {}
     for env_k, env_v in os.environ.items():
-        if env_k.startswith("CDPILOT_VAR_"):
-            var_name = env_k[len("CDPILOT_VAR_"):].lower()
-            collected_vars[var_name] = env_v
-            collected_vars[env_k[len("CDPILOT_VAR_"):]] = env_v
+        if env_k.startswith("CDPILOT_VAR_") and env_k != AGENT_VAR_HOSTS_ENV:
+            env_vars[env_k[len("CDPILOT_VAR_"):]] = env_v
+            env_vars.setdefault(env_k[len("CDPILOT_VAR_"):].lower(), env_v)
 
-    collected_vars.update(cli_vars)
-
-    needed_vars = set(data.get("vars", {}).keys())
-    for s in steps:
-        if isinstance(s, dict):
-            for a in s.get("args", []):
-                for m in _re.finditer(r"\{\{([A-Za-z0-9_-]+)\}\}", str(a)):
-                    needed_vars.add(m.group(1))
-
-    def get_var_value(name):
-        if name in collected_vars:
-            return collected_vars[name]
-        if name.lower() in collected_vars:
-            return collected_vars[name.lower()]
-        if name.upper() in collected_vars:
-            return collected_vars[name.upper()]
+    def _lookup(src, name):
+        for k in (name, name.lower(), name.upper()):
+            if k in src:
+                return src[k]
         return None
 
-    missing = []
-    for var_name in sorted(needed_vars):
-        if get_var_value(var_name) is None:
-            missing.append(var_name)
+    env_hosts = _agent_env_var_hosts()
+    # Settled statically, before any step runs (exit 2 otherwise):
+    # env_by_step: step index -> {arg index -> names the environment may fill there}
+    env_by_step, missing, refused = {}, [], []
+    needed_vars = set((data.get("vars") or {}).keys())
+    for idx, s in enumerate(steps, 1):
+        cmd = s.get("cmd", "")
+        value_idxs = _replay_value_positions(cmd, s.get("args", []))
+        for j, a in enumerate(s.get("args", [])):
+            for m in _REPLAY_VAR_RE.finditer(str(a)):
+                k = m.group(1)
+                needed_vars.add(k)
+                if _lookup(cli_vars, k) is not None:
+                    continue
+                if _lookup(env_vars, k) is None:
+                    if k not in missing:
+                        missing.append(k)
+                    continue
+                why = _replay_env_refusal(cmd, j, value_idxs, s.get("args", []), env_hosts)
+                if why:
+                    refused.append({"var": k, "step": idx, "cmd": cmd, "why": why})
+                else:
+                    env_by_step.setdefault(idx, {}).setdefault(j, set()).add(k)
+    for k in sorted(needed_vars):  # catalogued but used in no step: a value must still exist
+        if k not in missing and _lookup(cli_vars, k) is None and _lookup(env_vars, k) is None:
+            missing.append(k)
 
-    if missing:
-        print(f"cdpilot: missing required variable(s): {', '.join(missing)}", file=sys.stderr)
+    if missing or refused:
+        parts = []
+        if missing:
+            parts.append(f"missing required variable(s): {', '.join(sorted(set(missing)))}")
+        if refused:
+            parts.append("environment value(s) refused: "
+                         + ", ".join(sorted({r['var'] for r in refused})))
+        err = {"error": "; ".join(parts), "missing": sorted(set(missing)),
+               "hint": f"--var name=value, or CDPILOT_VAR_<NAME> with {AGENT_VAR_HOSTS_ENV}=<host,...> "
+                       "for the value of an input step (" + ", ".join(sorted(RECORD_INPUT_CMDS)) + ")"}
+        if refused:
+            err["refused"] = refused
+        print(json.dumps(err), file=sys.stderr)
         sys.exit(2)
 
     total_steps = len(steps)
@@ -22648,22 +22756,49 @@ def cmd_replay(*args):
 
         cmd = step.get("cmd", "")
         raw_args = step.get("args", [])
-        sub_args = []
-        for a in raw_args:
-            s_val = str(a)
-            sub = _re.sub(r"\{\{([A-Za-z0-9_-]+)\}\}",
-                          lambda m: str(get_var_value(m.group(1)) if get_var_value(m.group(1)) is not None else m.group(0)),
-                          s_val)
-            sub_args.append(sub)
 
-        # Collect substituted variable values for placeholders in this step
-        step_subs = {}
-        for a in raw_args:
-            for m in _re.finditer(r"\{\{([A-Za-z0-9_-]+)\}\}", str(a)):
-                vname = m.group(1)
-                vval = get_var_value(vname)
-                if vval is not None and str(vval) != "":
-                    step_subs[vname] = str(vval)
+        if cmd in RECORD_INPUT_CMDS and raw_args:
+            target = next((a for a in raw_args if not a.startswith("--")), raw_args[0])
+            step_label = f"{cmd} {target}"
+        elif raw_args:
+            step_label = f"{cmd} {' '.join(str(a) for a in raw_args)}"
+        else:
+            step_label = cmd
+
+        env_here = env_by_step.get(idx, {})  # arg index -> names the environment may fill
+        if env_here:
+            # Checked now, for this step only (never cached across steps): the
+            # page the step will act on must be on a host CDPILOT_VAR_HOSTS names.
+            # A refusal always stops the replay, --continue or not, and no
+            # value has reached any child process's argv.
+            host_now = _replay_live_host()
+            if not _agent_host_allowed(host_now, _agent_env_var_hosts()):
+                names = sorted({k for ks in env_here.values() for k in ks})
+                why = (f"the active page is on {host_now}; {AGENT_VAR_HOSTS_ENV} does not name it"
+                       if host_now else "the active page could not be read or has no host "
+                                        "(about:blank, data:, browser down)")
+                print(f"[{idx}/{total_steps}] {step_label} ... refused")
+                print(json.dumps({"error": "environment value(s) refused: " + ", ".join(names),
+                                  "missing": [],
+                                  "refused": [{"var": k, "step": idx, "cmd": cmd, "why": why} for k in names],
+                                  "hint": f"open the page on a host named in {AGENT_VAR_HOSTS_ENV} first, "
+                                          "or pass --var name=value"}), file=sys.stderr)
+                sys.exit(2)
+
+        step_subs = {}  # name -> value substituted in this step (for output scrubbing)
+
+        def _fill(m, j):
+            k = m.group(1)
+            v = _lookup(cli_vars, k)
+            if v is None and k in env_here.get(j, ()):
+                v = _lookup(env_vars, k)
+            if v is None:
+                return m.group(0)
+            if str(v) != "":
+                step_subs[k] = str(v)
+            return str(v)
+
+        sub_args = [_REPLAY_VAR_RE.sub(lambda m, j=j: _fill(m, j), str(a)) for j, a in enumerate(raw_args)]
 
         def sanitize_output(text):
             if not text:
@@ -22674,15 +22809,6 @@ def cmd_replay(*args):
                 if vval:
                     text = text.replace(vval, f"{{{{{vname}}}}}")
             return text
-
-        if cmd in RECORD_INPUT_CMDS and raw_args:
-            target = next((a for a in raw_args if not a.startswith("--")), raw_args[0])
-            step_label = f"{cmd} {target}"
-        elif raw_args:
-            step_label = f"{cmd} {' '.join(str(a) for a in raw_args)}"
-        else:
-            step_label = cmd
-
         env = os.environ.copy()
         env["CDPILOT_REPLAY_ACTIVE"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
@@ -22716,7 +22842,10 @@ def cmd_replay(*args):
 def cmd_replay_dispatch(args):
     """Dispatch cdpilot replay command."""
     if not args or args[0] in ('--help', '-h', 'help'):
-        print("Usage: cdpilot replay <flow.json> [--var k=v ...] [--delay real|none|<ms>] [--dry-run] [--continue]\n",
+        print("Usage: cdpilot replay <flow.json> [--var k=v ...] [--delay real|none|<ms>] [--dry-run] [--continue]\n"
+              "  --var k=v fills any {{k}}. CDPILOT_VAR_<NAME> fills only the value of an input step\n"
+              "  (" + ", ".join(sorted(RECORD_INPUT_CMDS)) + ") on a host named by CDPILOT_VAR_HOSTS,\n"
+              "  checked live before the step; go/eval and every other command take --var only.\n",
               file=sys.stderr)
         sys.exit(0 if (args and args[0] in ('--help', '-h', 'help')) else 2)
     cmd_replay(*args)

