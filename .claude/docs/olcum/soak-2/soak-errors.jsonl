@@ -1,0 +1,6 @@
+{"timestamp":"2026-11-10T21:47:22.712Z","mode":"cli_fresh","call":6,"op":"agent_act","exitCode":1,"isError":false,"errorClass":"CliError (Exit 1)","snippet":"Error: Could not get coordinates for @6."}
+{"timestamp":"2026-11-10T21:48:00.762Z","mode":"cli_fresh","call":33,"op":"agent_act","exitCode":1,"isError":false,"errorClass":"CliError (Exit 1)","snippet":"Error: Could not get coordinates for @165."}
+{"timestamp":"2026-11-10T21:48:35.984Z","mode":"cli_fresh","call":60,"op":"agent_act","exitCode":1,"isError":false,"errorClass":"CliError (Exit 1)","snippet":"Error: Could not get coordinates for @298."}
+{"timestamp":"2026-11-10T21:49:06.480Z","mode":"cli_fresh","call":87,"op":"agent_act","exitCode":1,"isError":false,"errorClass":"CliError (Exit 1)","snippet":"Error: Could not get coordinates for @464."}
+{"timestamp":"2026-11-10T21:49:49.491Z","mode":"cli_fresh","call":114,"op":"agent_act","exitCode":1,"isError":false,"errorClass":"CliError (Exit 1)","snippet":"Error: Could not get coordinates for @623."}
+{"timestamp":"2026-11-10T21:50:31.365Z","mode":"cli_fresh","call":141,"op":"agent_act","exitCode":1,"isError":false,"errorClass":"CliError (Exit 1)","snippet":"Error: Could not get coordinates for @756."}

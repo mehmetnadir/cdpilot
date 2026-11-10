@@ -1,0 +1,61 @@
+{
+  "verdictStatus": "KAPI 2 GEÇİLDİ (DÜZ / FLAT)",
+  "verdictText": "DÜZ (FLAT) — GEÇTİ ✅",
+  "countValid": true,
+  "startTime": "2026-11-10T21:47:13.133Z",
+  "endTime": "2026-11-10T21:50:48.827Z",
+  "startLoad": "56.29 109.00 109.97",
+  "endLoad": "67.28 85.61 99.36",
+  "summary": {
+    "cli_warm": {
+      "name": "CLI warm",
+      "completedCalls": 500,
+      "errorCount": 0,
+      "errorRate": 0,
+      "errorClasses": {},
+      "p50": 143,
+      "p95": 471,
+      "firstRssMb": "42.7",
+      "lastRssMb": "40.4",
+      "firstFd": 43,
+      "lastFd": 43,
+      "rssSlopePer100": "0.17",
+      "fdSlopePer100": "0.00",
+      "sampleCount": 10
+    },
+    "cli_fresh": {
+      "name": "CLI fresh",
+      "completedCalls": 150,
+      "errorCount": 6,
+      "errorRate": 0.04,
+      "errorClasses": {
+        "CliError (Exit 1)": 6
+      },
+      "p50": 288,
+      "p95": 551,
+      "firstRssMb": "0.0",
+      "lastRssMb": "0.0",
+      "firstFd": 0,
+      "lastFd": 0,
+      "rssSlopePer100": "0.00",
+      "fdSlopePer100": "0.00",
+      "sampleCount": 3
+    },
+    "mcp_warm": {
+      "name": "MCP warm",
+      "completedCalls": 500,
+      "errorCount": 0,
+      "errorRate": 0,
+      "errorClasses": {},
+      "p50": 12,
+      "p95": 300,
+      "firstRssMb": "42.3",
+      "lastRssMb": "38.7",
+      "firstFd": 42,
+      "lastFd": 42,
+      "rssSlopePer100": "-0.11",
+      "fdSlopePer100": "0.00",
+      "sampleCount": 10
+    }
+  }
+}
