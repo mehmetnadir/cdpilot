@@ -234,3 +234,20 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
 - **Sonraki sürüm işleri (K-0027 + notlar):** çift kip CI yavaşlığının kaynağı · ≥500 çağrılık soak · bin --help AI AGENT bölümü agent
   flow/run · daemon içi Chrome stderr → DEVNULL · README sıcak MCP yolunda senkron takılma notu · `replay` komutunun `CDPILOT_VAR_*`
   okuması host'a bağlı değil (T1-4 notu; 0.9.5'ten beri, ayrı değerlendirme).
+
+## 14. Delta 10.11 21:50– — dalga 1 (Nadir: "olabildiğince çok ajan", model Opus 5.5)
+
+| Şerit | Rol | Durum | Kanıt |
+|---|---|---|---|
+| windows-sicak-plan | review | ✅ | `plan-windows-sicak-surec.md` (seçenek C: 127.0.0.1 TCP + karşılıklı HMAC), 6a6b493 |
+| iddia-096 | yargi | ✅ | `iddia-denetimi-2026-11-10.md` 53 iddia, 27 düzeltme, 99d9609 |
+| iddia-site | kod | ✅ şef düzeltmesiyle | cdpilot-site 4cf1af3 + ea7980c (vitest blog testi kapıya girdi), TT-20261110-225628-d87386 15/15 |
+| iddia-repo | kod | koşuyor | worktree `cdpilot-iddia`, dal `lane/iddia` |
+| enj-heldout | buyuk → review | agy'de 2 kez düştü (açılış takılması, sonra boş koşu) → Claude alt ajanı (Sonnet, gerekçe araç) | — |
+| k0027, soak, settle-t0, kucuk, node-acilis, mcp-cikti-token | — | koşuyor (6'sı 22:41'de yeniden denendi) | — |
+| tuval-plan | Argon | 43 dk sonra hata (Argon 2. takılma) → `tuval-plan-2` yargi | — |
+| replay-var | yargi | 2.527 sn zaman aşımı → `replay-var-2` review, dar kapsam | — |
+
+- Makine: yük 400–500, takas dolu; kaynak başka oturumun Rust derlemesi (`cati` %660). agy şeritleri MCP açılışında 5 dk bekliyor.
+- Ders (agy-filo SKILL.md'ye 2 satır): şerit PATH'teki Intel node 20 ile koştu, `.ts` import testini yamadı; kapsam dışı 2 dosyayı
+  teste istisna yazdı. Şef geri aldı; spec'e `export PATH=/opt/homebrew/bin:$PATH` ve "var olan teste dokunma" satırı girer.
