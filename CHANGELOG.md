@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- replay: a CDPILOT_VAR_<NAME> environment value now fills only the value of an input step (fill/type…) on a host named by CDPILOT_VAR_HOSTS, checked live before the step; go/eval and other commands take --var only. Before, a crafted flow file could send an environment secret to any host (since 0.9.5, not reachable over MCP).
+
 ## [0.9.6] - 2026-11-10
 
 ### Added
