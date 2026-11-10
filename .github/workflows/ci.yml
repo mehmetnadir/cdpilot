@@ -11,6 +11,7 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.daemon == '1' }}
     strategy:
       matrix:
         include:
@@ -49,10 +50,14 @@ jobs:
             python-version: '3.11'
           # The whole suite through the warm process (CDPILOT_DAEMON=1): the gate for
           # making it the default (jury D-0042, 10.11.2026; .claude/docs/plan-daemon-insan-hizi.md §4).
+          # Informational (continue-on-error) until that decision: the first run (de9e48c)
+          # passed 617/618 but took 3.6x longer, with +10 s stalls on some calls — every
+          # test home starts its own daemon, so the idle exit is short here (K-0027).
           - os: ubuntu-latest
             node-version: 22
             python-version: '3.12'
             daemon: '1'
+            daemon_idle: '30'
 
     steps:
       - uses: actions/checkout@v4
@@ -71,6 +76,7 @@ jobs:
         env:
           CDPILOT_PYTHON: python
           CDPILOT_DAEMON: ${{ matrix.daemon || '' }}  # '1' on the warm-process matrix entry
+          CDPILOT_DAEMON_IDLE: ${{ matrix.daemon_idle || '' }}  # empty = default
       - name: Compile Python
         run: python -m py_compile src/cdpilot.py
       - name: Python version check
