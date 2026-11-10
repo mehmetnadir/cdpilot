@@ -15895,6 +15895,106 @@ _AGENT_INJECTION_RES = (
                  r"\b(cookies?|credentials?|passwords?|api[ -]?keys?|tokens?|session|secrets?|conversation|chat history)\b", _re.I)),
 )
 
+# Second pass (10.11, after the held-out set: 7/24 caught). The text is
+# normalised first (_agent_injection_norm), so these patterns see casefolded
+# NFKC text with zero-width characters removed, spaced-out letters joined and
+# Turkish ı/İ folded to i. Every entry is (tag, pattern, required, keys):
+# when `required` is set, the text must ALSO contain an agent-directed cue, so
+# that instructions written for the human reader ("Copy .env.example to .env",
+# "Visit https://… and sign in") stay clean; `keys` is a cheap substring
+# prefilter (one of them must occur before the pattern runs).
+import unicodedata as _unicodedata
+_AGENT_ORDER_RE = _re.compile(
+    r"\b(?:the |all |any )?(?:assistant|ai|model|agent|llm)s? (?:must|shall|should|will|is (?:now )?(?:required|allowed|authori[sz]ed))\b"
+    r"|\byou are now\b"
+    r"|\byou (?:must|shall) (?:now |always |never )?(?:ignore|disregard|obey|comply|follow|approve|reveal|print|output|disable|reply|respond|answer)\b"
+    r"|\b(?:ignore|disregard|reveal|print|output|dump|disable|bypass|override|forget)\b[^.\n]{0,25}"
+    r"\b(?:your|all|previous|prior|safety|hidden)\s+(?:[\w-]+\s+){0,2}"
+    r"(?:instructions?|prompts?|rules|guidelines|configuration|config|settings|restrictions|filters|polic(?:y|ies))\b"
+    r"|\bbefore (?:answering|responding|replying)\b")
+_AGENT_ACTION = (r"(?<![a-z0-9])(?:navigate|open|goto|send|fetch|post|click|fill|submit|upload|email|download|"
+                 r"exec|execute|run_|delete|transfer|purchase|buy)(?![a-z0-9])")
+_AGENT_INJECTION_RES_2 = (
+    # one short alternation per language: es, fr, tr (ı → i folded), ja, de, pt
+    ('ignore_instructions', _re.compile(
+        r"\b(?:ignora|olvida|ignore|olvide|omite)\b[^.\n]{0,20}\binstrucciones (?:anteriores|previas)\b"
+        r"|\b(?:ignore[sz]?|oublie[sz]?)\b[^.\n]{0,20}\b(?:instructions|consignes|directives) (?:précédentes|antérieures)\b"
+        r"|\b(?:önceki|yukaridaki|tüm|bütün)\b[^.\n]{0,15}\b(?:talimat|komut|yönerge)\w*\s+"
+        r"(?:unut(?:un)?|yok say(?:in)?|görmezden gel(?:in)?|dikkate alma(?:yin)?)\b"
+        r"|(?:以前|前|これまで|上記|先)の(?:指示|命令|指令)(?:を|は)?(?:すべて|全て)?無視"
+        r"|\b(?:ignoriere|ignorieren sie|vergiss|vergessen sie|übergehe|missachte)\b[^.\n]{0,20}"
+        r"\b(?:vorherigen|bisherigen|früheren|obigen) (?:anweisungen|instruktionen|befehle|regeln)\b"
+        r"|\b(?:ignore|ignora|esqueça|esqueca|desconsidere)\b[^.\n]{0,20}\binstruções (?:anteriores|prévias)\b"), None,
+     ('instru', 'consign', 'directiv', 'talimat', 'komut', 'yönerge', '指示', '命令', '指令', 'anweis', 'befehl', 'regeln')),
+    ('addresses_ai', _re.compile(
+        r"\b(?:ignore|disregard|forget)\b (?:everything|anything|all|whatever)(?: (?:that|else))? "
+        r"you(?:'ve| have| were| had)? (?:been )?(?:told|taught|instructed|given|programmed)\b"
+        r"|\b(?:ai|llm) (?:assistants?|agents?|models?|systems?)\b[^.\n]{0,20}\b(?:reading|visiting|processing|browsing|parsing) this\b"
+        r"|\b(?:llms|large language models|language models|autonomous (?:ai )?agents?)\b[^.\n]{0,20}"
+        r"\b(?:reading|visiting|processing|browsing|parsing) this\b"
+        r"|\b(?:message|note|notice|attention|instructions?) (?:for|to) (?:all |any |the )?autonomous (?:ai )?agents?\b"
+        r"|\bautonomous (?:ai )?agents?\s*:"
+        r"|\b(?:the|your) (?:user|human|owner|operator)\b[^.\n]{0,10}\b(?:would|will|'d)(?: really| definitely| surely)? "
+        r"(?:want|like|prefer) (?:you|the (?:assistant|agent|ai|model)) to\b"
+        r"|\b(?:the|your) (?:user|human) (?:really )?wants (?:you|the (?:assistant|agent|ai|model)) to\b"), None,
+     ('you', 'this', 'autonomous')),
+    ('exfiltrate', _re.compile(
+        r"\b(?:include|append|copy|read|paste|post|send|upload|attach|insert|output|print|dump|leak)\b[^.\n]{0,60}"
+        r"(?:document\.cookie|\blocalstorage\b|\bsessionstorage\b|\bform (?:fields?|contents|data|values)\b"
+        r"|\b(?:every|each|all) (?:form )?fields?\b|~/\.ssh|\.ssh/|\bid_(?:rsa|ed25519|ecdsa)\b|(?<![\w.])\.env\b"
+        r"|\b(?:session|bearer|auth|access) tokens?\b|\bsaved (?:passwords|addresses|cards|credit cards|payment)\b"
+        r"|\bprivate keys?\b)"),
+     _re.compile(r"\byour (?:next )?(?:reply|replies|answer|response|output|summary)\b(?! headers?| body| object)"
+                 r"|\binto (?:the|this) (?:comment|search|chat|text|message|input|feedback) (?:box|field|form)\b"
+                 r"|\bthe user (?:has )?(?:filled|entered|typed|saved|provided)\b"
+                 r"|\bfrom (?:the|this) (?:local|user's|host) (?:machine|computer|disk)\b"
+                 r"|\byou (?:have access to|can access|can see|can read)\b"
+                 r"|\bbefore (?:answering|responding|replying)\b"),
+     ('cookie', 'storage', 'field', 'form ', 'ssh', 'id_', '.env', 'token', 'saved ', 'private key')),
+    # a line starting with SYSTEM: / [SYSTEM] / <system> / "developer message:", or "debug mode enabled",
+    # followed by an order to the agent ("System requirements: …", "Developer mode lets you …" stay clean)
+    ('fake_system', _re.compile(
+        r"(?m)^[ \t>*#-]*(?:\[(?:system|sys|admin)\]|<\|?system\|?>|<\|im_start\|>system"
+        r"|(?:system|developer message|admin(?:istrator)? message)\s*:)"
+        r"|\b(?:developer|debug|admin|god|jailbreak|maintenance) mode\b[^.\n]{0,15}"
+        r"\b(?:enabled|activated|engaged|unlocked|is on|turned on)\b"), _AGENT_ORDER_RE,
+     ('system', 'developer message', 'admin', ' mode')),
+    # JSON / XML imitating a tool call that names an action (a docs example calling "search" stays clean)
+    ('tool_call', _re.compile(
+        r"\"(?:tool|tool_name|function|name|action)\"\s*:\s*\"[^\"\n]{0,40}?" + _AGENT_ACTION + r"[^\"\n]{0,40}\""
+        r"[\s\S]{0,200}?\"(?:arguments|parameters|params|args|input)\"\s*:"
+        r"|<(?:tool_call|function_calls?|invoke|tool_use)\b[\s\S]{0,300}?" + _AGENT_ACTION), None, ('"', '<')),
+    # open/visit a URL + an agent-directed cue; plain "Visit https://… and sign in" for the reader stays clean
+    ('navigate_order', _re.compile(
+        r"\b(?:open|navigate to|go to|visit|browse to|load)\s+(?:the (?:url|link|page|site)\s+)?(?:https?://|www\.)\S"),
+     _re.compile(r"\b(?:ai|llm|browsing|autonomous|web) (?:agents?|assistants?|models?)\b"
+                 r"|\b(?:chatgpt|claude|gemini|copilot|assistant|agent|ai|llm)\s*[,:]"
+                 r"|\b(?:the |you,? )assistant (?:must|should|will|needs)\b"
+                 r"|\bbefore (?:answering|responding|replying)\b"
+                 r"|\binstead of (?:on |using |at )?(?:this|the current|the original) (?:site|page|website|domain)\b"
+                 r"|\bwithout (?:telling|asking|informing|notifying) the user\b|\byour (?:task|instructions)\b"),
+     ('http', 'www.')),
+)
+_AGENT_ZW_RE = _re.compile('[\u200b-\u200d\u2060\ufeff\u00ad]')
+# one substring test for the whole second pass (skips it for most nodes)
+_AGENT_KEYS_RE = _re.compile('|'.join(_re.escape(k) for e in _AGENT_INJECTION_RES_2 for k in e[3]))
+# >= 5 single letters separated by one space or dot: "i g n o r e" -> "ignore"; words are not joined
+_AGENT_SPACED_RE = _re.compile(r"(?<!\w)(?:[^\W\d_][ .]){4,}[^\W\d_](?!\w)")
+_AGENT_SPACED_HINT = _re.compile(r"\b[^\W\d_][ .][^\W\d_][ .][^\W\d_][ .][^\W\d_][ .][^\W\d_]\b")   # cheaper test
+
+
+def _agent_injection_norm(name):
+    """Matching form of an accessible name (the original stays in the output)."""
+    if name.isascii():   # no zero-width characters, no ı/İ; casefold == lower
+        t = name.lower()
+    else:
+        t = _unicodedata.normalize('NFKC', _AGENT_ZW_RE.sub('', name)).casefold()
+        if 'ı' in t or '\u0307' in t:   # casefold turns İ into i + U+0307
+            t = t.replace('ı', 'i').replace('\u0307', '')
+    if _AGENT_SPACED_HINT.search(t):
+        t = _AGENT_SPACED_RE.sub(lambda m: m.group(0).replace(' ', '').replace('.', ''), t)
+    return t
+
 
 def _agent_injection_scan(nodes, limit=5):
     """Nodes whose accessible name reads like instructions to an AI agent:
@@ -15906,11 +16006,15 @@ def _agent_injection_scan(nodes, limit=5):
         name = node.get('name', {}).get('value', '') or ''
         if len(name) < 12 or name in seen:
             continue
-        for tag, rx in _AGENT_INJECTION_RES:
-            if rx.search(name):
-                seen.add(name)
-                out.append({'text': name[:160], 'match': tag})
-                break
+        norm = _agent_injection_norm(name)
+        tag = next((t for t, rx in _AGENT_INJECTION_RES if rx.search(norm)), None)
+        if tag is None and _AGENT_KEYS_RE.search(norm):
+            tag = next((t for t, rx, need, keys in _AGENT_INJECTION_RES_2
+                    if any(k in norm for k in keys) and rx.search(norm)
+                    and (need is None or need.search(norm))), None)
+        if tag is not None:
+            seen.add(name)
+            out.append({'text': name[:160], 'match': tag})
         if len(out) >= limit:
             break
     return out
