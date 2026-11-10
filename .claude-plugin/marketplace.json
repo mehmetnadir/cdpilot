@@ -10,7 +10,7 @@
       "name": "cdpilot",
       "source": "./plugins/cdpilot",
       "description": "Zero-dependency browser automation over raw CDP — 70+ commands, friction ladder, stealth, MCP server. No Puppeteer/Playwright/Selenium.",
-      "version": "0.9.6",
+      "version": "0.9.7",
       "author": {
         "name": "Mehmet Nadir",
         "url": "https://github.com/mehmetnadir"
