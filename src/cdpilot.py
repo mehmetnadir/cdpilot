@@ -8340,6 +8340,31 @@ def _log_heal(cmd, inp, tried, duration_ms, no_heal=False):
         f.write(json.dumps(entry) + "\n")
 
 
+_SET_VALUE_JS = """function __cdpilot_setValue(el, v) {
+    var P = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement
+        : el.tagName === 'SELECT' ? window.HTMLSelectElement
+        : el.tagName === 'INPUT' ? window.HTMLInputElement : null;
+    var d = P && Object.getOwnPropertyDescriptor(P.prototype, 'value');
+    if (d && d.set) { d.set.call(el, v); } else { el.value = v; }
+}"""
+
+
+def _act_value_or_exit(r, selector):
+    """Value of a click/fill Runtime.evaluate result; a timeout, a missing
+    value or a script error prints to stderr and exits 1."""
+    res = (r or {}).get("result", {}) or {}
+    det = (r or {}).get("exceptionDetails")
+    val = res.get("value")
+    if det:
+        desc = (det.get("exception") or {}).get("description") or det.get("text") or "script error"
+        print(f"Error: {str(desc).splitlines()[0]}", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(val, str) or val.startswith("Timeout waiting for"):
+        print(val if isinstance(val, str) else f"Error: no result for '{selector}'", file=sys.stderr)
+        sys.exit(1)
+    return val
+
+
 @_frame_aware("css")
 async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
     if selector.startswith("@") and selector[1:].isdigit():
@@ -8391,8 +8416,8 @@ async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
         try:
             oid = found.get("objectId")
             if not oid:
-                print(found.get("value", "?"))  # 'Timeout waiting for: ...'
-                return
+                print(found.get("value", "Error: no result for '%s'" % selector), file=sys.stderr)  # 'Timeout waiting for: ...'
+                sys.exit(1)
             r3 = await _frame_cdp(route, [(2, "Runtime.callFunctionOn", {
                 "objectId": oid, "functionDeclaration": _CLICK_LABEL_FN, "returnByValue": True}, sid)])
             info = _smart_data(r3.get(2, {}).get("result", {}).get("value"))
@@ -8435,7 +8460,7 @@ async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
     }});
 }})()"""
         r2 = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js_fast, "returnByValue": True, "awaitPromise": True})])
-        print(r2.get(1, {}).get("result", {}).get("value", "?"))
+        print(_act_value_or_exit(r2.get(1, {}), selector))
 
 
 @_frame_aware("css")
@@ -8513,8 +8538,8 @@ async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
         except (ValueError, TypeError):
             data = {}
         if data.get("err"):
-            print(data["err"])
-            return
+            print(data["err"], file=sys.stderr)
+            sys.exit(1)
         # field-focus pause: human moves hand to keyboard
         import random as _r
         _fr = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
@@ -8525,6 +8550,7 @@ async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
         js = f"""
 (function() {{
 {WAIT_AND_QUERY_JS}
+{_SET_VALUE_JS}
     return __cdpilot_waitFor({safe_sel}, {wait_ms}).then(function(el) {{
         if (!el) return 'Timeout waiting for: ' + {safe_sel};
         el.focus();
@@ -8533,14 +8559,7 @@ async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
             window.__cdpilot_vfx.moveCursor(Math.round(r.left + r.width/2), Math.round(r.top + r.height/2));
             window.__cdpilot_vfx.keystroke('\\u2328 ' + {safe_value}.substring(0, 30));
         }}
-        var nativeSet = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-        );
-        if (nativeSet && nativeSet.set) {{
-            nativeSet.set.call(el, {safe_value});
-        }} else {{
-            el.value = {safe_value};
-        }}
+        __cdpilot_setValue(el, {safe_value});
         el.dispatchEvent(new Event('input', {{bubbles: true}}));
         el.dispatchEvent(new Event('change', {{bubbles: true}}));
         var res = 'Filled: ' + el.tagName + ' = ' + el.value.substring(0, 50);
@@ -8549,7 +8568,7 @@ async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
     }});
 }})()"""
         r2 = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})])
-        print(r2.get(1, {}).get("result", {}).get("value", "?"))
+        print(_act_value_or_exit(r2.get(1, {}), selector))
 
 
 @_frame_aware("css")
@@ -12755,9 +12774,8 @@ async def _fill_amazon_solution(ws_url: str, input_id: str, solution: str) -> bo
       try {{
         var el = document.getElementById({safe_id}) || document.querySelector('#captchacharacters');
         if (!el) return false;
-        var setter = Object.getOwnPropertyDescriptor(
-          window.HTMLInputElement.prototype, 'value').set;
-        setter.call(el, {safe_val});
+        {_SET_VALUE_JS}
+        __cdpilot_setValue(el, {safe_val});
         el.dispatchEvent(new Event('input', {{bubbles: true}}));
         el.dispatchEvent(new Event('change', {{bubbles: true}}));
         var form = el.form || el.closest('form');
@@ -15110,16 +15128,8 @@ async def cmd_smart_fill(text, value):
       {'/* cdpilot-var-find */ return best.el;' if strict is not None else ''}
 
       // React-compatible value setting
-      var nativeSetter = Object.getOwnPropertyDescriptor(
-        window.HTMLInputElement.prototype, 'value'
-      ) || Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype, 'value'
-      );
-      if (nativeSetter && nativeSetter.set) {{
-        nativeSetter.set.call(best.el, value);
-      }} else {{
-        best.el.value = value;
-      }}
+      {_SET_VALUE_JS}
+      __cdpilot_setValue(best.el, value);
       best.el.dispatchEvent(new Event('input', {{bubbles: true}}));
       best.el.dispatchEvent(new Event('change', {{bubbles: true}}));
 
