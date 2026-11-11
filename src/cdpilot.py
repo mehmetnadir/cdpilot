@@ -16458,7 +16458,9 @@ def _agent_injection_scan(nodes, limit=5):
 
 
 def _extract_text_summary(nodes, max_chars=2000):
-    text_roles = {'staticText', 'text', 'paragraph', 'heading'}
+    # Chrome's AX role value is 'StaticText' (capital S); a StaticText child
+    # usually repeats its parent's name, so consecutive duplicates are dropped.
+    text_roles = {'StaticText', 'text', 'paragraph', 'heading'}
     parts = []
     for node in nodes:
         if node.get('ignored'):
@@ -16466,7 +16468,7 @@ def _extract_text_summary(nodes, max_chars=2000):
         role = node.get('role', {}).get('value', '')
         if role in text_roles:
             name = node.get('name', {}).get('value', '')
-            if name:
+            if name and (not parts or parts[-1] != name):
                 parts.append(name)
     summary = ' '.join(parts)
     return summary[:max_chars]
