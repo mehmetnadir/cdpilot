@@ -178,6 +178,30 @@ def ax_tree_for(url, values=None):
         tree += [node(7, "StaticText", "Open menu", 107),
                  node(8, "StaticText", "Very long clickable name " + "x" * 90, 108),
                  node(9, "StaticText", "Inside link", 109)]
+    if os.environ.get("FAKE_CDP_AX_NOISE") == "1":
+        # What Chrome really emits around text: role "StaticText" (capital S) with
+        # an InlineTextBox child, empty ones too, a LineBreak, a generic wrapper with
+        # a child and a generic leaf. Noise sits BEFORE the real nodes, so a filter
+        # that dropped a line must not shift the @N numbering of what is left.
+        def extra(i, role, name, bid, children=()):
+            n = node(i, role, name, bid)
+            if children:
+                n["childIds"] = [str(c) for c in children]
+            return n
+        noise = [extra(31, "StaticText", "", 301, [32]),
+                 extra(32, "InlineTextBox", "", 302),
+                 extra(33, "StaticText", "Welcome back", 303, [34]),
+                 extra(34, "InlineTextBox", "Welcome back", 304),
+                 extra(35, "LineBreak", "", 305),
+                 extra(36, "generic", "", 306, [33]),
+                 extra(37, "generic", "", 307)]
+        tree = noise + tree
+    if os.environ.get("FAKE_CDP_AX_FIELD") == "1":
+        # a field with a top-level name, value and description, as Chrome reports them
+        to = node(38, "textbox", "To", 308)
+        to["value"] = {"type": "string", "value": "alice"}
+        to["description"] = {"type": "computedString", "value": "Recipient"}
+        tree = tree + [to]
     return tree
 
 
