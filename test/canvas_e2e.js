@@ -1,14 +1,82 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const http = require('http');
 const assert = require('assert');
+const { spawnSync } = require('child_process');
 const { extractRuntimeFromPy } = require('./canvas_morph.js');
 
 const STATE_HTML_PATH = path.join(__dirname, 'fixtures', 'canvas', 'state.html');
+const CLI_PATH = path.join(__dirname, '..', 'bin', 'cdpilot.js');
+
+// Which browser the canvas e2e tests use (B2 ORTA-2a; shared by every canvas e2e):
+//   CDPILOT_CANVAS_E2E_CDP=127.0.0.1:<port> set -> that browser (local development: the shared
+//   headless Chrome 127.0.0.1:9333); nothing is launched or stopped.
+//   unset (CI: CDPILOT_E2E=1 and no browser on 9333) -> an own headless Chrome on a free port in
+//   a temp CDPILOT_HOME, like the 'record & replay e2e' test (cdpilot launch, CHROME_HEADLESS=1,
+//   CDP_PORT=<free>), stopped by stop().
+function parseCdpHostPort(value) {
+  const m = /^(127\.0\.0\.1|localhost):(\d{1,5})$/.exec(String(value || '').trim());
+  if (!m) throw new Error(`CDPILOT_CANVAS_E2E_CDP must be 127.0.0.1:<port>, got ${JSON.stringify(value)}`);
+  return { host: '127.0.0.1', port: Number(m[2]) };
+}
+
+function freePortSync() {
+  const r = spawnSync(process.execPath, ['-e',
+    "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{process.stdout.write(String(s.address().port));s.close();});"],
+  { encoding: 'utf8', timeout: 10000 });
+  const port = Number((r.stdout || '').trim());
+  if (r.status !== 0 || !port) throw new Error(`no free port: ${r.stderr}`);
+  return port;
+}
+
+function waitCdpSync(port, timeoutMs) {
+  const r = spawnSync(process.execPath, ['-e', `
+    const http = require('http'); const end = Date.now() + ${Number(timeoutMs)};
+    (function poll() {
+      const req = http.get({ host: '127.0.0.1', port: ${Number(port)}, path: '/json/version', timeout: 2000 }, (res) => {
+        let b = ''; res.on('data', (c) => { b += c; });
+        res.on('end', () => { if (b.includes('webSocketDebuggerUrl')) process.exit(0); retry(); });
+      });
+      req.on('error', retry); req.on('timeout', () => req.destroy());
+      function retry() { if (Date.now() > end) process.exit(1); setTimeout(poll, 250); }
+    })();`], { timeout: Number(timeoutMs) + 5000 });
+  return r.status === 0;
+}
+
+function canvasE2ECdp(label = 'canvas') {
+  const preset = process.env.CDPILOT_CANVAS_E2E_CDP;
+  if (preset) {
+    const { host, port } = parseCdpHostPort(preset);
+    return { hostPort: `${host}:${port}`, launched: false, stop() {} };
+  }
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), `cdpilot-canvas-${label}-e2e-`));
+  const port = freePortSync();
+  const env = {
+    ...process.env,
+    CDPILOT_HOME: home,
+    CDPILOT_PROFILE: path.join(home, 'profile'),
+    CDP_PORT: String(port),
+    CHROME_HEADLESS: '1',
+    CDPILOT_LOG: '0',
+  };
+  delete env.CDPILOT_TARGET;
+  delete env.CDPILOT_CANVAS_E2E_CDP;
+  const stop = () => {
+    spawnSync(process.execPath, [CLI_PATH, 'stop'], { env, encoding: 'utf8', timeout: 30000 });
+  };
+  const r = spawnSync(process.execPath, [CLI_PATH, 'launch'], { env, encoding: 'utf8', timeout: 120000 });
+  if (r.status !== 0 || !waitCdpSync(port, 30000)) {
+    stop();
+    throw new Error(`own headless Chrome did not start on 127.0.0.1:${port} (exit ${r.status}): ${r.stderr || r.stdout}`);
+  }
+  return { hostPort: `127.0.0.1:${port}`, launched: true, home, stop };
+}
+
 const CDP_HOST = '127.0.0.1';
-const CDP_PORT = 9333;
+const CDP_PORT = process.env.CDPILOT_CANVAS_E2E_CDP ? parseCdpHostPort(process.env.CDPILOT_CANVAS_E2E_CDP).port : null;
 
 function fetchJsonVersion() {
   return new Promise((resolve, reject) => {
@@ -63,10 +131,11 @@ function connectCDP(wsUrl) {
 }
 
 async function runE2E() {
+  assert(CDP_PORT, 'set CDPILOT_CANVAS_E2E_CDP=127.0.0.1:<port> (test.js sets it, see canvasE2ECdp)');
   const { js } = extractRuntimeFromPy();
   const stateHtml = fs.readFileSync(STATE_HTML_PATH, 'utf8');
   const ver = await fetchJsonVersion();
-  assert(ver && ver.webSocketDebuggerUrl, 'Missing webSocketDebuggerUrl on 127.0.0.1:9333');
+  assert(ver && ver.webSocketDebuggerUrl, `Missing webSocketDebuggerUrl on ${CDP_HOST}:${CDP_PORT}`);
 
   const cdp = await connectCDP(ver.webSocketDebuggerUrl);
   let browserContextId = null;
@@ -300,4 +369,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runE2E };
+module.exports = { runE2E, canvasE2ECdp, parseCdpHostPort };

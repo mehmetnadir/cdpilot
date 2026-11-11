@@ -12338,13 +12338,22 @@ print(json.dumps(res))
 
   test('canvas morph: e2e real focus, selection, scroll, <details>, modal <dialog>, and 1,000-patch heap <= 2x (gated by CDPILOT_E2E=1)', () => {
     if (process.env.CDPILOT_E2E !== '1') {
-      console.log('  - skipped: canvas morph e2e (set CDPILOT_E2E=1 to run against Chrome 127.0.0.1:9333)');
+      console.log('  - skipped: canvas morph e2e (set CDPILOT_E2E=1; CDPILOT_CANVAS_E2E_CDP=127.0.0.1:<port> ' +
+        'uses that browser, unset launches an own headless Chrome)');
       return;
     }
-    const out = execFileSync(process.execPath, [path.join(__dirname, 'canvas_e2e.js')], {
-      encoding: 'utf8',
-      timeout: 60000,
-    });
+    const { canvasE2ECdp } = require('./canvas_e2e.js');
+    const cdp = canvasE2ECdp('morph');
+    let out;
+    try {
+      out = execFileSync(process.execPath, [path.join(__dirname, 'canvas_e2e.js')], {
+        encoding: 'utf8',
+        timeout: 120000,
+        env: { ...process.env, CDPILOT_CANVAS_E2E_CDP: cdp.hostPort },
+      });
+    } finally {
+      cdp.stop();
+    }
     const res = JSON.parse(out.trim());
     assert.strictEqual(res.ok, true);
     assert.strictEqual(res.focusKept, true);
@@ -12430,13 +12439,14 @@ print(json.dumps(res))
   test('canvas host: fake CDP exact setup method order and K8 session-only Fetch', () => {
     const s = getFakeCdpSuite().setup_and_guards;
     assert.deepStrictEqual(
-      s.setup_methods.slice(0, 9).map(([m, sid]) => [m, sid]),
+      s.setup_methods.slice(0, 10).map(([m, sid]) => [m, sid]),
       [
         ['Target.createBrowserContext', null],
         ['Target.createTarget', null],
         ['Target.attachToTarget', null],
         ['Page.enable', 'SES-1'],
         ['Runtime.enable', 'SES-1'],
+        ['Page.addScriptToEvaluateOnNewDocument', 'SES-1'],
         ['Runtime.addBinding', 'SES-1'],
         ['Fetch.enable', 'SES-1'],
         ['Emulation.setFocusEmulationEnabled', 'SES-1'],
@@ -12446,12 +12456,12 @@ print(json.dumps(res))
     assert.deepStrictEqual(s.setup_methods[0][2], { disposeOnDetach: true });
     assert.deepStrictEqual(s.setup_methods[1][2], { url: 'about:blank', browserContextId: 'CTX-1' });
     assert.deepStrictEqual(s.setup_methods[2][2], { targetId: 'TGT-1', flatten: true });
-    assert.deepStrictEqual(s.setup_methods[5][2], { name: '__cdpilotCanvasEmit' });
-    assert.deepStrictEqual(s.setup_methods[6][2], {
+    assert.deepStrictEqual(s.setup_methods[6][2], { name: '__cdpilotCanvasEmit' });
+    assert.deepStrictEqual(s.setup_methods[7][2], {
       patterns: [{ urlPattern: '*', requestStage: 'Request' }],
     });
-    assert.deepStrictEqual(s.setup_methods[7][2], { enabled: true });
-    assert.deepStrictEqual(s.setup_methods[8][2], { url: 'http://cdpilot-canvas.invalid/main/' });
+    assert.deepStrictEqual(s.setup_methods[8][2], { enabled: true });
+    assert.deepStrictEqual(s.setup_methods[9][2], { url: 'http://cdpilot-canvas.invalid/main/' });
     assert(
       !s.setup_methods.some(([m]) => m === 'Target.setAutoAttach'),
       'K8: Target.setAutoAttach must never be called'
@@ -12464,7 +12474,7 @@ print(json.dumps(res))
 
   test('canvas host: requestPaused for canvas URL fulfills 200 with full CSP header and skeleton', () => {
     const s = getFakeCdpSuite().setup_and_guards;
-    const fulfill = s.setup_methods[9];
+    const fulfill = s.setup_methods.find(([m, , p]) => m === 'Fetch.fulfillRequest' && p.responseCode === 200);
     assert(fulfill && fulfill[0] === 'Fetch.fulfillRequest', 'canvas URL must be fulfilled via Fetch.fulfillRequest');
     const fp = fulfill[2];
     assert.strictEqual(fp.responseCode, 200);
@@ -12526,7 +12536,7 @@ print(json.dumps(res))
     assert.strictEqual(s.err_replies[3].params.errorReason, 'BlockedByClient');
   });
 
-  test('canvas host: set calls Page.setDocumentContent and frameNavigated away re-navigates before patch', () => {
+  test('canvas host: set calls Page.setDocumentContent; after frameNavigated away the next patch is refused (code 1) and the canvas reloads', () => {
     const s = getFakeCdpSuite().set_patch_and_doc_loss;
     assert.strictEqual(s.set_res.ok, true);
     assert(typeof s.set_res.ms === 'number');
@@ -12534,22 +12544,27 @@ print(json.dumps(res))
     const setDoc = s.set_calls.find((c) => c.method === 'Page.setDocumentContent');
     assert(setDoc, 'set must call Page.setDocumentContent');
     assert.strictEqual(setDoc.params.frameId, 'FRM-1');
-    assert.strictEqual(setDoc.params.html, '<h1>Hello</h1>');
+    assert(setDoc.params.html.startsWith('<meta data-cdpilot-csp http-equiv="Content-Security-Policy"'),
+      'B2 D2: set must prepend the host CSP meta');
+    assert(setDoc.params.html.endsWith('<h1>Hello</h1>'));
 
     // Empty runtime reports {ok:false, error:'runtime missing', code:1}
     assert.strictEqual(s.missing_res.ok, false);
     assert.strictEqual(s.missing_res.error, 'runtime missing');
     assert.strictEqual(s.missing_res.code, 1);
 
-    // After Page.frameNavigated to about:blank, next patch re-navigates to canvas URL first
-    assert.strictEqual(s.patch_res.ok, true);
-    assert.strictEqual(s.patch_calls[0].method, 'Page.navigate');
-    assert.strictEqual(s.patch_calls[0].params.url, 'http://cdpilot-canvas.invalid/main/');
+    // B2 ORTA-1c: after Page.frameNavigated to about:blank the write is refused (fail closed),
+    // the canvas URL is navigated again, and no patch reaches any document.
+    assert.strictEqual(s.patch_res.ok, false);
+    assert.strictEqual(s.patch_res.code, 1);
+    const nav = s.patch_calls.find((c) => c.method === 'Page.navigate');
+    assert(nav, 'document loss must re-navigate');
+    assert.strictEqual(nav.params.url, 'http://cdpilot-canvas.invalid/main/');
     assert(
-      s.patch_calls.some(
+      !s.patch_calls.some(
         (c) => c.method === 'Runtime.evaluate' && (c.params.expression || '').startsWith('__cdpilotCanvas.patch(')
       ),
-      'patch must call Runtime.evaluate with __cdpilotCanvas.patch'
+      'a refused patch must not be evaluated anywhere'
     );
     const navEvs = (s.events_after_nav && s.events_after_nav.events) || [];
     assert(
@@ -12639,37 +12654,278 @@ print(json.dumps(res))
     }
   });
 
-  if (process.env.CDPILOT_E2E === '1') {
-    test('canvas host: e2e exfil leak vectors (0 hits), counter-experiment (>0 hits), and SIGKILL cleanup', () => {
-      const pyBin = findPython();
-      assert(pyBin, 'python3 is required for canvas host e2e test');
-      const r = spawnSync(pyBin, ['-I', fakeCdpScript, '--e2e', pyCanvasPath, cliJsPath], {
+  // ── B2 security round (11.11): one test per finding ──
+
+  test('canvas host: ORTA-1a whitelist fullmatch — main\\n, main\\r, " main", MAIN exit 2 and never reach a path or URL', () => {
+    const c = getFakeCdpSuite().cli_and_socket;
+    const h = getFakeCdpSuite().hardening;
+    for (const item of c.nl_names) {
+      for (const k of ['open', 'open_eq', 'set', 'close', 'host']) {
+        assert.strictEqual(item[k], 2, `${JSON.stringify(item.name)} via ${k} must exit 2 (got ${item[k]})`);
+      }
+    }
+    assert.deepStrictEqual(c.nl_files, [], 'a refused name must not create any canvas file');
+    assert.deepStrictEqual(c.nl_nav_urls, [], 'a refused name must not reach Page.navigate');
+    for (const u of c.nl_nav_urls) {
+      assert(!/main[\r\n]|MAIN|\/ main/.test(u), `refused name reached a URL: ${JSON.stringify(u)}`);
+    }
+    for (const [n, code] of Object.entries(h.names)) assert.strictEqual(code, 2, `name ${n} must be refused`);
+    assert.strictEqual(h.host_ctor_bad_name, 2);
+    assert.strictEqual(h.hosts["'api.example.com\\n'"], 2, '--allow-net with a trailing newline must be refused');
+    assert.strictEqual(h.hosts["'api.example.com\\r'"], 2);
+    assert.strictEqual(h.hosts["' api.example.com'"], 2);
+    assert.strictEqual(h.hosts["'api.example.com'"], 'api.example.com');
+    assert.strictEqual(h.action_nl, false, 'action whitelist must not accept a trailing newline');
+    const nlHost = c.bad_allow_net.find((x) => x.host === 'api.example.com\n');
+    assert(nlHost && nlHost.code === 2, 'CLI --allow-net "api.example.com\\n" must exit 2');
+  });
+
+  test('canvas host: ORTA-1b Page.navigate errorText fails closed — open exit 1, host exits, tab and context closed', () => {
+    const p = getFakeCdpSuite().proof_and_binding;
+    assert.strictEqual(p.err_setup.code, 1, `setup must fail with code 1: ${JSON.stringify(p.err_setup)}`);
+    assert(/navigation failed/.test(p.err_setup.msg));
+    assert.strictEqual(p.err_frame_url, null, 'nothing may be trusted after a failed navigation');
+    assert.strictEqual(p.err_ctx, null);
+    assert(!p.err_methods.includes('Page.getFrameTree'), 'no proof is attempted after errorText');
+    assert.deepStrictEqual(p.err_methods.slice(-2), ['Target.closeTarget', 'Target.disposeBrowserContext']);
+    const n = getFakeCdpSuite().cli_and_socket.naverr;
+    assert.strictEqual(n.code, 1, `canvas open must exit 1: ${n.stderr}`);
+    assert(/failed to start/.test(n.stderr), n.stderr);
+    const iNav = n.log.indexOf('Page.navigate');
+    assert(iNav >= 0 && n.log.indexOf('Target.closeTarget') > iNav && n.log.indexOf('Target.disposeBrowserContext') > iNav,
+      `host must close its tab and context after errorText: ${n.log.join(', ')}`);
+    assert.deepStrictEqual(n.targets_left, []);
+    assert.deepStrictEqual(n.files, [], 'no reg/sock/ready file may stay behind');
+  });
+
+  test('canvas host: ORTA-1c frame tree URL mismatch refuses set (no write), reloads and emits nav', () => {
+    const p = getFakeCdpSuite().proof_and_binding;
+    assert.strictEqual(p.mismatch_set.ok, false);
+    assert.strictEqual(p.mismatch_set.code, 1);
+    assert.strictEqual(p.mismatch_methods[0], 'Page.getFrameTree', 'the proof runs before any write');
+    assert(!p.mismatch_methods.includes('Page.setDocumentContent'), 'no write into an unproven document');
+    assert(!p.mismatch_methods.includes('Runtime.evaluate'), 'no evaluate into an unproven document');
+    assert(p.mismatch_methods.includes('Page.navigate'), 'refused write must re-navigate');
+    assert.strictEqual(p.after_set.ok, true, 'once the document is proven again, set works');
+    assert.strictEqual(p.after_patch.ok, true);
+    assert(p.nav_events.length >= 1 && p.nav_events[0].data.url === 'about:blank');
+  });
+
+  test('canvas host: ORTA-1c context changed between check and write refuses set and patch (code 1) and reloads', () => {
+    const p = getFakeCdpSuite().proof_and_binding;
+    for (const k of ['swap_reset_err', 'swap_reset_ok', 'swap_patch_err', 'swap_patch_ok']) {
+      const r = p[k];
+      assert.strictEqual(r.res.ok, false, `${k}: write must be refused: ${JSON.stringify(r.res)}`);
+      assert.strictEqual(r.res.code, 1, k);
+      assert(!r.methods.includes('Page.setDocumentContent'), `${k}: no setDocumentContent after the context changed`);
+      assert.strictEqual(r.reloaded, true, `${k}: must re-navigate`);
+      assert.strictEqual(r.reset_after_reload, true, `${k}: history reset after the reload`);
+      assert.strictEqual(r.nav_event, true, `${k}: host nav event`);
+      assert.strictEqual(r.proven_again, true, `${k}: the reloaded canvas is proven again`);
+    }
+  });
+
+  test('canvas host: ORTA-1c writes bound to the proven uniqueContextId; frame_url None until proof', () => {
+    const p = getFakeCdpSuite().proof_and_binding;
+    assert.strictEqual(p.frame_url_before, null);
+    assert.strictEqual(p.proven.frame_url, 'http://cdpilot-canvas.invalid/main/');
+    assert.strictEqual(p.proven.ctx, p.proven.fake_ctx, 'bound context = the document that was proven');
+    assert(p.after_ctx_log.length >= 3, 'reset, paint probe and patch evaluate');
+    for (const [expr, sent, cur] of p.after_ctx_log) {
+      assert(sent, `Runtime.evaluate without uniqueContextId: ${expr}`);
+      assert.strictEqual(sent, cur, `write bound to a stale context: ${expr}`);
+    }
+  });
+
+  test('canvas host: D1 Page.resetNavigationHistory after the canvas loads (and after every reload)', () => {
+    const p = getFakeCdpSuite().proof_and_binding;
+    const m = p.setup_methods;
+    const iNav = m.indexOf('Page.navigate');
+    const iTree = m.indexOf('Page.getFrameTree');
+    const iReset = m.indexOf('Page.resetNavigationHistory');
+    assert(iNav >= 0 && iTree > iNav && iReset > iTree, `order navigate < getFrameTree < reset: ${m.join(', ')}`);
+    assert.strictEqual(m[m.length - 1], 'Page.getFrameTree', 'the document is proven again after the reset');
+    assert(p.mismatch_methods.includes('Page.navigate'));
+    assert(p.swap_reset_err.methods.includes('Page.resetNavigationHistory'));
+  });
+
+  test('canvas host: ORTA-2c WebRTC constructors removed before navigation (non-configurable undefined, runImmediately)', () => {
+    const p = getFakeCdpSuite().proof_and_binding;
+    const m = p.setup_methods;
+    assert(m.indexOf('Page.addScriptToEvaluateOnNewDocument') < m.indexOf('Page.navigate'));
+    assert.strictEqual(p.addscript.runImmediately, true);
+    const names = ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel', 'RTCIceCandidate',
+      'RTCSessionDescription', 'RTCRtpSender', 'RTCRtpReceiver', 'RTCRtpTransceiver', 'RTCIceTransport',
+      'RTCDtlsTransport', 'RTCSctpTransport', 'RTCCertificate'];
+    for (const n of names) assert(p.addscript.source.includes(`"${n}"`), `${n} missing from the removal script`);
+    // Run the exact script against a stand-in window: the page cannot restore the constructors.
+    const vm = require('vm');
+    const sb = {};
+    for (const n of names) sb[n] = function Fake() {};
+    const ctx = vm.createContext(sb);
+    vm.runInContext('var window = globalThis;', ctx);
+    vm.runInContext(p.addscript.source, ctx);
+    const r = JSON.parse(vm.runInContext(`JSON.stringify(${JSON.stringify(names)}.map((n) => {
+      const d = Object.getOwnPropertyDescriptor(globalThis, n);
+      let redefined = false; try { Object.defineProperty(globalThis, n, { value: 1 }); redefined = true; } catch (e) {}
+      try { delete globalThis[n]; } catch (e) {}
+      try { globalThis[n] = function () {}; } catch (e) {}
+      return [n, typeof globalThis[n], d && d.configurable, d && d.writable, redefined];
+    }))`, ctx));
+    for (const [n, type, configurable, writable, redefined] of r) {
+      assert.deepStrictEqual([type, configurable, writable, redefined], ['undefined', false, false, false], n);
+    }
+  });
+
+  test('canvas host: ORTA-2d canvas response carries X-DNS-Prefetch-Control: off', () => {
+    const h = getFakeCdpSuite().hardening;
+    const hdr = (h.fulfill_headers || []).find((x) => x.name.toLowerCase() === 'x-dns-prefetch-control');
+    assert(hdr, 'X-DNS-Prefetch-Control header missing');
+    assert.strictEqual(hdr.value, 'off');
+  });
+
+  test('canvas host: D2 set strips meta refresh, meta CSP, <base>, fake host meta and prepends the CSP meta after the doctype', () => {
+    const h = getFakeCdpSuite().hardening;
+    const o = h.san_out;
+    assert(o.startsWith('<!DOCTYPE html>' + h.meta_tag), `CSP meta must follow the doctype: ${o.slice(0, 120)}`);
+    assert(!/http-equiv="?refresh/i.test(o.replace(/<script>[\s\S]*<\/script>/, '')), 'meta refresh must go');
+    assert(!/content-security-policy ' content/i.test(o), 'page CSP meta must go');
+    assert(!/<base/i.test(o), '<base> must go');
+    assert(!/content="fake"/.test(o), 'page-supplied data-cdpilot-csp meta must go');
+    assert(o.includes('<meta charset="utf-8">'), 'other meta tags stay');
+    assert(o.includes("var s = '<meta http-equiv=refresh content=1>';"), 'script text is not touched');
+    assert.strictEqual(h.san_plain, h.meta_tag + '<h1>Hi</h1>');
+    assert(getFakeCdpSuite().proof_and_binding.after_setdoc_html.startsWith('<!doctype html>' + h.meta_tag));
+    assert(!/refresh|<base/i.test(getFakeCdpSuite().proof_and_binding.after_setdoc_html));
+  });
+
+  test('canvas host: D3 60 KB nested binding payload is dropped and counted, the host lives on', () => {
+    const d = getFakeCdpSuite().hardening.d3;
+    assert.strictEqual(d.reader_alive, true, 'CDP reader must survive a RecursionError payload');
+    assert.strictEqual(d.stopped, false);
+    assert.strictEqual(d.bad_payloads, 3, 'nested, non-string and bad JSON payloads are counted');
+    assert.strictEqual(d.dropped_delta, 3);
+    assert.strictEqual(d.after_event, true, 'a valid event after the bad ones is still accepted');
+    assert.strictEqual(getFakeCdpSuite().hardening.d3_ping.ok, true);
+  });
+
+  test('canvas host: D4 non-string op gets {ok:false, code:2} (never a silent socket)', () => {
+    const h = getFakeCdpSuite().hardening;
+    for (const r of h.d4) assert.deepStrictEqual([r.ok, r.code], [false, 2], JSON.stringify(r));
+    assert.deepStrictEqual([h.d4_events_overflow.ok, h.d4_events_overflow.code], [false, 2]);
+    for (const r of getFakeCdpSuite().cli_and_socket.raw_bad_ops) {
+      assert(r && r.ok === false && r.code === 2, `socket reply for a bad op: ${JSON.stringify(r)}`);
+    }
+  });
+
+  test('canvas host: D5 --allow-net continues only https on port 443 (or no port)', () => {
+    assert.deepStrictEqual(getFakeCdpSuite().hardening.port_replies, [
+      'Fetch.continueRequest', 'Fetch.continueRequest', 'Fetch.failRequest', 'Fetch.failRequest', 'Fetch.failRequest',
+    ]);
+  });
+
+  test('canvas host: D6 page-returned ms, error, code and ops are sanitised', () => {
+    const p = getFakeCdpSuite().proof_and_binding;
+    assert.deepStrictEqual(p.d6_ok.ops, { add: 0, del: 0, move: 0, upd: 3 });
+    assert.strictEqual(p.d6_ok.ms, null, 'ms that is not a finite number becomes null');
+    assert(Number.isInteger(p.d6_ok.t_paint) && p.d6_ok.t_paint < 1e14, 't_paint falls back to the host clock');
+    assert.strictEqual(p.d6_err.code, 1, 'code outside {1,2} becomes 1');
+    assert(p.d6_err.error.startsWith('page: ') && p.d6_err.error.length <= 200);
+    assert.deepStrictEqual([p.d6_err2.error, p.d6_err2.code], ['page: patch failed', 2]);
+    assert.deepStrictEqual([p.d6_err3.ok, p.d6_err3.code], [false, 1], 'a bool code is not a code');
+  });
+
+  test('canvas host: D7 blocked/nav URL events share 100/s, url <= 256 chars, every request still answered', () => {
+    const d = getFakeCdpSuite().hardening.d7;
+    assert.strictEqual(d.replies, 150, 'rate limit applies to events, never to the 204 answers');
+    assert.strictEqual(d.all_204, true);
+    assert(d.url_events <= 100, `at most 100 URL events per second (got ${d.url_events})`);
+    assert.strictEqual(d.url_events + d.dropped_delta, 150);
+    assert.strictEqual(d.max_url_len, 256);
+  });
+
+  test('canvas host: D8 SIGTERM only to a proven canvas host; open never deletes a live host files', () => {
+    const d = getFakeCdpSuite().cli_and_socket.d8;
+    assert.strictEqual(d.close_stranger_code, 0);
+    assert.strictEqual(d.stranger_alive, true, 'a reused pid (not a canvas host) must never be signalled');
+    assert.strictEqual(d.stranger_files_left, false, 'stale files of a dead host are removed');
+    assert.strictEqual(d.open_live_code, 1, d.open_live_stderr);
+    assert(/is running but does not answer/.test(d.open_live_stderr), d.open_live_stderr);
+    assert.strictEqual(d.live_files_kept, true, 'open must not delete a live host files');
+    assert.strictEqual(d.live_alive_after_open, true);
+    assert.strictEqual(d.close_live_code, 0);
+    assert.strictEqual(d.live_gone, true, 'close signals the proven canvas host');
+  });
+
+  test('canvas host: D9 os.name nt is unsupported even when AF_UNIX exists', () => {
+    const w = getFakeCdpSuite().cli_and_socket.windows_nt;
+    for (const k of ['open', 'set', 'list', 'host']) {
+      assert.deepStrictEqual([w[k].code, w[k].stderr], [1, 'canvas is not supported on Windows'], k);
+    }
+  });
+
+  test('canvas host: project-stop closes canvases only for the current project; stop-all still closes them', () => {
+    const c = getFakeCdpSuite().cli_and_socket;
+    const ps = c.project_stop;
+    assert.strictEqual(ps.open_code, 0);
+    assert.strictEqual(ps.other_code, 0);
+    assert.strictEqual(ps.alive_after_other, true, 'stopping another project must not close this canvas');
+    assert.strictEqual(ps.cur_code, 0);
+    assert.strictEqual(ps.closed_after_cur, true, 'stopping the current project closes its canvases');
+    assert.strictEqual(c.stop_all.cleaned, true);
+  });
+
+  test('canvas host: e2e per-vector exfil (counter > 0 or ölçülemedi, guarded 0), D1 history.back, SIGKILL cleanup (gated by CDPILOT_E2E=1)', () => {
+    if (process.env.CDPILOT_E2E !== '1') {
+      console.log('  - skipped: canvas host e2e (set CDPILOT_E2E=1; CDPILOT_CANVAS_E2E_CDP=127.0.0.1:<port> ' +
+        'uses that browser, unset launches an own headless Chrome)');
+      return;
+    }
+    const pyBin = findPython();
+    assert(pyBin, 'python3 with websockets is required for the canvas host e2e test');
+    const { canvasE2ECdp } = require('./canvas_e2e.js');
+    const cdp = canvasE2ECdp('host');
+    let r;
+    try {
+      r = spawnSync(pyBin, ['-I', fakeCdpScript, '--e2e', pyCanvasPath, cliJsPath, cdp.hostPort], {
         encoding: 'utf8',
-        timeout: 90000,
+        timeout: 300000,
       });
-      assert.strictEqual(r.status, 0, `canvas_fake_cdp --e2e failed: ${r.stderr || r.stdout}`);
-      const res = JSON.parse(r.stdout.trim());
-      assert(!res.error, `e2e error:\n${res.error}`);
-      assert.strictEqual(
-        res.guarded.total_hits,
-        0,
-        `K9: guarded canvas must have 0 loopback hits, got ${JSON.stringify(res.guarded)}`
-      );
-      assert(
-        res.guarded.host_blocked_count > 0,
-        `K9: guarded canvas must record host blocked events, got ${JSON.stringify(res.guarded)}`
-      );
-      assert.strictEqual(res.guarded.blob_nav_set_ok, true, 'K2: blob/about:blank nav phase must run');
-      assert(
-        res.counter.total_hits > 0,
-        `K9: counter-experiment without guard must produce >0 hits, got ${JSON.stringify(res.counter)}`
-      );
-      assert.strictEqual(res.sigkill.tid_present_before, true);
-      assert.strictEqual(res.sigkill.ctx_present_before, true);
-      assert.strictEqual(res.sigkill.tid_gone, true, 'C1: SIGKILL must dispose canvas target within 5 s');
-      assert.strictEqual(res.sigkill.ctx_gone, true, 'C1: SIGKILL must dispose browserContext within 5 s');
-    });
-  }
+    } finally {
+      cdp.stop();
+    }
+    assert.strictEqual(r.status, 0, `canvas_fake_cdp --e2e failed: ${r.stderr || r.stdout}`);
+    const res = JSON.parse(r.stdout.trim());
+    assert(!res.error, `e2e error:\n${res.error}`);
+    console.log(`    tarayıcı ${res.browser} · dinleyici ${res.listen_ip} (${res.listen_why}) · bekleme ${res.wait_s} sn` +
+      ` · karşı deneme ${res.counter_attempts}`);
+    if ((res.counter_net_failed || []).length) {
+      console.log(`    karşı deney ağ hataları: ${[...new Set(res.counter_net_failed)].slice(0, 6).join(' | ')}`);
+    }
+    const zeroBoth = [];
+    for (const [name, v] of Object.entries(res.vectors)) {
+      const pg = (v.page_counter ? ` · sayfa karşı: ${v.page_counter}` : '') +
+        (v.page_guarded ? ` · sayfa korumalı: ${v.page_guarded}` : '');
+      console.log(`    vektör ${name}: karşı ${v.counter}, korumalı ${v.guarded}${pg}`);
+      if (v.unmeasurable) console.log(`    ölçülemedi: ${name} — ${v.unmeasurable}`);
+      if (v.unmeasurable && v.counter > 0) console.log(`    not: ${name} karşı deneyde ölçüldü; UNMEASURABLE satırı bayat`);
+      assert.strictEqual(v.guarded, 0, `K9: guarded hits for ${name}: ${JSON.stringify(v)}`);
+      if (!v.unmeasurable && v.counter === 0) zeroBoth.push(name);
+    }
+    assert.deepStrictEqual(zeroBoth, [],
+      `counter-experiment: these vectors hit 0 in both runs and are not in UNMEASURABLE: ${zeroBoth.join(', ')}`);
+    assert.deepStrictEqual(res.guarded_other, {}, `unattributed guarded hits: ${JSON.stringify(res.guarded_other)}`);
+    assert(res.guarded.host_blocked_count > 0, `K9: guarded canvas must record host blocked events`);
+    assert.strictEqual(res.guarded.set1_ok, true);
+    assert.strictEqual(res.guarded.set2_ok, true);
+    assert.strictEqual(res.counter_history_back_url, 'about:blank', 'counter: history.back() reached about:blank');
+    assert.strictEqual(res.guarded.hist_payload_set.ok, true,
+      `D1: after history.back() the canvas must still be the proven document: ${JSON.stringify(res.guarded.hist_payload_set)}`);
+    assert.strictEqual(res.sigkill.tid_present_before, true);
+    assert.strictEqual(res.sigkill.ctx_present_before, true);
+    assert.strictEqual(res.sigkill.tid_gone, true, 'C1: SIGKILL must dispose canvas target within 5 s');
+    assert.strictEqual(res.sigkill.ctx_gone, true, 'C1: SIGKILL must dispose browserContext within 5 s');
+  });
 })();
 // ═══ CANVAS-B TESTS END ═══
 
