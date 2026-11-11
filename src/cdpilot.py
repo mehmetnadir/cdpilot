@@ -22184,6 +22184,7 @@ SLOG_COOKIE_SAFE_SUBS = frozenset({'save', 'load', 'clear', 'auto'})  # print no
 SLOG_OUTPUT_WITHHELD = "«output not logged: may contain cookie or storage values»"
 SLOG_CANVAS_EVENTS_WITHHELD = "«output not logged: canvas events carry user input»"
 SLOG_EVAL_WITHHELD = "«output not logged: the script names a secret-like value»"
+SLOG_RUN_RESULT_RE = _re.compile(r"Result: \d+ passed, \d+ failed(?:, \d+ not clicked)?, \d+ total")
 
 # Flag, header and key names that carry secrets.
 _SLOG_SECRET_NAME_RE = _re.compile(
@@ -22728,9 +22729,11 @@ def _slog_summary(cmd, args, stdout, secrets):
     if cmd == "run":
         # The script runner echoes every step's stdout (canvas events, storage, cookies, eval): the
         # children log their own lines with their own rules; this line keeps the final count only.
-        last = next((ln.strip() for ln in reversed(stdout.splitlines())
-                     if ln.strip().startswith("Result:")), None)
-        return _slog_clip(last, SLOG_SUMMARY_CHARS) if last else None
+        # Only the runner's own count line, matched whole and unindented: `frame eval` prints
+        # "Result: <value>" too, and a cut or truncated output must not promote that line.
+        last = next((ln for ln in reversed(stdout.splitlines())
+                     if SLOG_RUN_RESULT_RE.fullmatch(ln)), None)
+        return last
     if cmd == "canvas" and sub == "events":
         # Page-written events carry what the user typed (input/change/submit values).
         n = sum(1 for ln in stdout.splitlines() if ln.lstrip().startswith("{"))
