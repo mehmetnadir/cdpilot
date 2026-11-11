@@ -775,6 +775,9 @@ function showHelp() {
                        CDPILOT_DAEMON_IDLE seconds, default 1800).
     CDPILOT_JSON       pretty|compact: agent command JSON (default: indented on a
                        terminal, compact UTF-8 when stdout is not a terminal)
+    CDPILOT_OBSERVE_FORMAT
+                       rows: agent observe/act/run print actions as
+                       [ref, role, name, value?] arrays (same as --rows)
     CDPILOT_VAR_HOSTS  Hosts (comma-separated, host:port for another port)
                        an agent flow or replay step may type CDPILOT_VAR_* on
 
@@ -940,6 +943,9 @@ function showHelp() {
     agent run <name> [--var k=v] [--dry-run] [--full] [--rows]
                        Replay by anchors, no model; exit 4 on drift with the
                        page, 2 for a missing or refused variable
+    canvas open|set|patch|stream|watch|events|list|close [--name N] [--allow-net host]
+                       Live canvas tab an agent writes HTML into (experimental,
+                       not on Windows)
     mcp                Start MCP server (stdin/stdout JSON-RPC)
                        --tools core|all|a,b (env CDPILOT_MCP_TOOLS): smaller tool list
 
