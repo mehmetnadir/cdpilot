@@ -31,7 +31,7 @@ for _k in ("CDPILOT_TARGET", "CDPILOT_DAEMON", "CDPILOT_TIMEOUT", "CDPILOT_WS_PO
     os.environ.pop(_k, None)
 
 WS = "ws://fake/devtools/page/1"
-STATE = {"cookies": "ok", "marker": ""}  # marker: put in front of every evaluated expression
+STATE = {"cookies": "ok", "marker": "", "shot": "ok"}  # marker: put in front of every evaluated expression
 
 
 class Transport:
@@ -62,12 +62,18 @@ class FakeWS:
         if method == "Runtime.evaluate":
             if "DROP" in expr:
                 return
-            if "ERROR" in expr:
+            if "THROW" in expr:  # a page-side exception: a reply, with exceptionDetails
+                reply = {"id": mid, "result": {"result": {"type": "object", "subtype": "error"},
+                                               "exceptionDetails": {"text": "Uncaught", "exception": {
+                                                   "description": "ReferenceError: nope is not defined"}}}}
+            elif "ERROR" in expr:
                 reply = {"id": mid, "error": {"code": -32000, "message": "Cannot find context with specified id"}}
             elif "EMPTY" in expr:
                 reply = {"id": mid, "result": {"result": {"type": "object", "value": {}}}}
             else:
                 reply = {"id": mid, "result": {"result": {"type": "string", "value": "ok:" + expr[:40]}}}
+        elif method in ("Page.captureScreenshot", "Page.printToPDF"):
+            reply = {"id": mid, "result": {} if STATE["shot"] == "nodata" else {"data": "QQ=="}}
         elif method == "Network.getCookies":
             if STATE["cookies"] == "drop":
                 return
@@ -224,7 +230,41 @@ def scenario_daemon(mod):
     return out
 
 
+def scenario_failures(mod):
+    """A page-side JS exception and a screenshot / PDF without data: exit 1, text kept."""
+    out = {}
+    out["eval_throw"] = run(mod, mod.cmd_eval, "THROW")
+    out["frame_eval_throw"] = run(mod, mod.cmd_frame, "eval", "THROW")
+    out["batch_throw"] = run(mod, mod.cmd_eval_batch, '["THROW"]')
+    shot = os.path.join(HOME, "s.png")
+    for tag in ("ok", "nodata"):
+        STATE["shot"] = tag
+        out[f"shot_{tag}"] = run(mod, mod.cmd_shot, shot)
+        out[f"annotated_{tag}"] = run(mod, mod.cmd_shot_annotated, shot)
+        out[f"pdf_{tag}"] = run(mod, mod.cmd_pdf, os.path.join(HOME, "p.pdf"))
+    STATE["shot"] = "ok"
+    # the warm paths: exit code, stdout/stderr, MCP isError
+    os.environ["CDPILOT_DAEMON"] = "1"
+    try:
+        o, e = io.StringIO(), io.StringIO()
+        code = mod._daemon_execute({"argv": ["eval", "THROW"], "cwd": os.getcwd(), "env": dict(os.environ),
+                                    "stdin": ""}, o, e, lambda r: None)
+        out["daemon_throw"] = {"code": code, "stdout": o.getvalue(), "stderr": e.getvalue()}
+        server = mod.MCPServer()
+        with contextlib.redirect_stderr(io.StringIO()):
+            out["mcp_throw"] = server._execute_tool(1, "browser_eval", {"expression": "THROW"})["result"]
+            STATE["shot"] = "nodata"
+            out["mcp_shot"] = server._execute_tool(
+                2, "browser_screenshot", {"filename": "s2.png"})["result"]
+            STATE["shot"] = "ok"
+    finally:
+        os.environ.pop("CDPILOT_DAEMON", None)
+        STATE["shot"] = "ok"
+    return out
+
+
 SCENARIOS = {
+    "failures": scenario_failures,
     "eval": scenario_eval,
     "helper": scenario_helper,
     "commands": scenario_commands,

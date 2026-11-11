@@ -8553,6 +8553,62 @@ print(json.dumps(out))
     assert.strictEqual(d.mcp_batch.error.isError, true);
   });
 
+  test('eval failures (fake browser): a page-side JS exception exits 1 with the same text; shot / pdf without data exit 1; MCP isError', () => {
+    // Fails on 38070b8: eval printed the Error line and exited 0; shot / pdf printed their failure on stderr and exited 0.
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const t = cli(['eval', 'FAKE_EVAL_THROW'], env);
+      assert.strictEqual(t.status, 1, t.stdout + t.stderr);
+      assert.strictEqual(t.stdout.trim(), 'Error: Uncaught — ReferenceError: nope is not defined', 'text stays on stdout');
+      const shot = cli(['shot', path.join(home, 's.png')], env);  // the fake has no Page.captureScreenshot data
+      assert.strictEqual(shot.status, 1, shot.stdout + shot.stderr);
+      assert(shot.stderr.includes('Screenshot failed'), shot.stderr);
+      const pdf = cli(['pdf', path.join(home, 'p.pdf')], env);
+      assert.strictEqual(pdf.status, 1, pdf.stdout + pdf.stderr);
+      assert(pdf.stderr.includes('PDF generation failed'), pdf.stderr);
+      const call = (id, name, args) => ({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } });
+      const lines = [
+        { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+        { jsonrpc: '2.0', method: 'notifications/initialized' },
+        call(10, 'browser_eval', { expression: 'FAKE_EVAL_THROW' }),
+        call(11, 'browser_screenshot', { filename: 's3.png' }),
+      ].map((m) => JSON.stringify(m)).join('\n') + '\n';
+      const r = spawnSync(process.execPath, [CLI, 'mcp'], {
+        input: lines, encoding: 'utf-8', timeout: 60000, cwd: home,
+        env: { ...env, CDPILOT_WEBMCP: '0', CDPILOT_MCP_TOOLS: '' },
+      });
+      assert.strictEqual(r.status, 0, r.stderr);
+      const msgs = r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+      const res = (id) => msgs.find((m) => m.id === id).result;
+      assert.strictEqual(res(10).isError, true);
+      assert.strictEqual(res(10).content[0].text, 'Error: Uncaught — ReferenceError: nope is not defined');
+      assert.strictEqual(res(11).isError, true, JSON.stringify(res(11)));
+    } finally { fake.stop(); }
+  });
+
+  test('eval failures (fake CDP, in-process): JS exception exits 1 for eval / frame eval, text kept; shot / annotated / pdf failure exit 1; daemon + MCP warm', () => {
+    // Fails on 38070b8: every res below was ['ok', null] / daemon code 0 / isError false.
+    const out = execFileSync(PY_BIN, [path.join(__dirname, 'eval_reply_fake.py'), path.join(__dirname, '..', 'src', 'cdpilot.py'), 'failures'],
+      { encoding: 'utf-8', timeout: 120000 });
+    const f = JSON.parse(out.trim().split('\n').pop()).failures;
+    assert(typeof f.error !== 'string', f.error);
+    const text = 'Error: Uncaught — ReferenceError: nope is not defined\n';
+    assert.deepStrictEqual([f.eval_throw.res, f.eval_throw.stdout, f.eval_throw.stderr], [['exit', 1], text, '']);
+    assert.deepStrictEqual(f.frame_eval_throw.res, ['exit', 1]);
+    assert(f.frame_eval_throw.stderr.startsWith('Error: {'), f.frame_eval_throw.stderr);
+    assert.deepStrictEqual(f.batch_throw.res, ['exit', 1]);
+    for (const k of ['shot', 'annotated', 'pdf']) assert.deepStrictEqual(f[`${k}_ok`].res, ['ok', null], `${k} ok`);
+    assert.deepStrictEqual([f.shot_nodata.res, f.shot_nodata.stderr], [['exit', 1], 'Screenshot failed\n']);
+    assert.deepStrictEqual([f.annotated_nodata.res, f.annotated_nodata.stderr], [['exit', 1], 'Screenshot failed\n']);
+    assert.deepStrictEqual([f.pdf_nodata.res, f.pdf_nodata.stderr], [['exit', 1], 'PDF generation failed\n']);
+    assert.deepStrictEqual([f.daemon_throw.code, f.daemon_throw.stdout], [1, text]);
+    assert.deepStrictEqual(f.mcp_throw, { content: [{ type: 'text', text: text.trim() }], isError: true });
+    assert.deepStrictEqual(f.mcp_shot, { content: [{ type: 'text', text: 'stderr: Screenshot failed' }], isError: true });
+  });
+
   test('external guard: connect refuses over a live cdpilot-launched browser (no orphan)', () => {
     const fake = startFake();
     try {
