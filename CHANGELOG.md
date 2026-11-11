@@ -5,7 +5,7 @@ All notable changes to cdpilot will be documented in this file.
 ## [Unreleased]
 
 ### Added
-- **`agent find "<text>" [--role r] [--max 20]`**: lists the entries of the whole page whose name contains the text (any case), as `{ref, role, name}` plus `total_matches`. It reads the full accessibility snapshot (the cut below does not apply), writes no trail, and its refs work with `agent act`. MCP: `browser_agent_find` (not in `--tools core`).
+- **`agent find "<text>" [--role r] [--max 20]`**: lists the entries of the whole page whose name contains the text (any case), as `{ref, role, name}` plus `total_matches`. It reads the full accessibility snapshot (the cut below does not apply), writes no trail, and its refs work with `agent act`; matched names go through the `injection_suspect` scan like `observe`. MCP: `browser_agent_find` (not in `--tools core`).
 - **`agent observe|act|run --all`** (MCP `browser_agent_observe` `all: true`) and **`CDPILOT_OBSERVE_MAX`** (default 400, `0` = no limit): see Changed.
 
 ### Changed

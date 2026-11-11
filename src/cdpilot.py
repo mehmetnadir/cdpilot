@@ -17366,6 +17366,11 @@ async def cmd_agent_find(text, role=None, max_n=20):
            'total_matches': len(hits)}
     if role:
         res['role'] = role
+    shown = {a['backend_node_id'] for a in hits[:n]}
+    suspects = _agent_injection_scan([nd for nd in nodes
+                                      if (nd.get('backendDOMNodeId') or nd.get('backendNodeId')) in shown])
+    if suspects:
+        res['injection_suspect'] = suspects
     _agent_json(res)
 
 
