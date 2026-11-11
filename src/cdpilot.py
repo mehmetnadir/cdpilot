@@ -141,6 +141,13 @@ import threading
 import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+
+def _utcnow():
+    """Naive UTC now: the value the deprecated utcnow gave, without its DeprecationWarning
+    (Python 3.12+ printed it on stderr, where agents read it as the error text)."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
 # ─── Project-Based Multi-Instance Configuration ───
 # Each project directory (cwd) gets its own browser instance with
 # a unique CDP port and isolated profile directory. Zero-config.
@@ -8357,11 +8364,10 @@ def _log_heal(cmd, inp, tried, duration_ms, no_heal=False):
         return
     if not PROJECT_ID:
         return
-    import datetime as _dt2
     path = os.path.join(CDPILOT_HOME, "projects", PROJECT_ID, "heal.jsonl")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     entry = {
-        "ts": _dt2.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ts": _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "cmd": cmd,
         "input": inp,
         "tried": tried,
@@ -9094,7 +9100,7 @@ def _save_host_cookies(host, cookies):
     meta = {
         'cf_clearance_present': any(c.get('name') in CF_CLEARANCE_COOKIES for c in cookies),
         'expires_soonest_unix': expires_soonest,
-        'saved_at': datetime.datetime.utcnow().isoformat() + 'Z',
+        'saved_at': _utcnow().isoformat() + 'Z',
     }
     _atomic_write_json(f_path, {'host': host, 'cookies': cookies, 'metadata': meta})
     try:
@@ -9344,7 +9350,7 @@ async def cmd_cookies(*args):
                     data = json.load(f)
                 meta = data.get('metadata', {})
                 saved_at = datetime.datetime.fromisoformat(meta['saved_at'].rstrip('Z'))
-                age = datetime.datetime.utcnow() - saved_at
+                age = _utcnow() - saved_at
                 age_str = f"{age.days}d" if age.days > 0 else f"{age.seconds // 3600}h"
                 cf = "cf_clearance" if meta.get('cf_clearance_present') else ""
                 print(f"  {host_dir:40} {age_str:10} {cf}")
@@ -9364,7 +9370,7 @@ async def cmd_cookies(*args):
                 print("No per-host cookies stored.")
                 return
             days = int(args[2].rstrip('d'))
-            now = datetime.datetime.utcnow()
+            now = _utcnow()
             removed = 0
             for host_dir in os.listdir(COOKIES_DIR):
                 d = os.path.join(COOKIES_DIR, host_dir)
@@ -21318,7 +21324,7 @@ def _cmd_watch_daemon_entry():
     except Exception as e:
         try:
             with open(_watch_log_path(), 'a') as f:
-                f.write(f"[{datetime.datetime.utcnow().isoformat()}] daemon crash: {e}\n")
+                f.write(f"[{_utcnow().isoformat()}] daemon crash: {e}\n")
         except OSError:
             pass
 
