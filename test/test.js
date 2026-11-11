@@ -12924,7 +12924,8 @@ print(json.dumps(res))
     const env = makeIsolatedEnv(home);
     const flowPath = path.join(home, 'delay-flow.json');
 
-    // Recorded with a 6-second gap
+    // Recorded with a 10-second gap (the replay cap): a sleep would take >= 10 s, while three
+    // process starts take well under that even on a loaded machine (11.11: 5.2 s at load 88).
     const delayFlow = {
       cdpilot_flow: 1,
       name: 'delay-test',
@@ -12932,7 +12933,7 @@ print(json.dumps(res))
       cdpilot_version: '0.9.4',
       steps: [
         { cmd: 'block', args: ['on'], t_ms: 0 },
-        { cmd: 'entropy', args: ['on'], t_ms: 6000 },
+        { cmd: 'entropy', args: ['on'], t_ms: 10000 },
       ],
       vars: {},
     };
@@ -12943,7 +12944,7 @@ print(json.dumps(res))
     const elapsed = Date.now() - t0;
 
     assert.strictEqual(r.status, 0);
-    assert(elapsed < 3000, `--delay none should run without sleeping (took ${elapsed}ms, expected < 3000ms)`);
+    assert(elapsed < 9500, `--delay none should run without sleeping (took ${elapsed}ms, a 10 s sleep would show)`);
   });
 
   test('record: unknown option exits 2, no subcommand exits 2', () => {
