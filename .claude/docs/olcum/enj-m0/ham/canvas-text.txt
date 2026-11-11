@@ -1,0 +1,27 @@
+=== observe
+{"url":"http://127.0.0.1:3470/canvas-text.html","title":"m0 canvas-text","actions":[{"ref":"@81","role":"button","name":"Gönder"}],"text":"Görünür paragraf: kargo ve iade koşulları bu sayfada anlatılır. Gönder","token_estimate":67}
+
+=== observe_full
+{"url":"http://127.0.0.1:3470/canvas-text.html","title":"m0 canvas-text","actions":[{"ref":"@81","role":"button","name":"Gönder"},{"ref":"@82","role":"StaticText","name":"Görünür paragraf: kargo ve iade koşulları bu sayfada anlatılır."}],"text":"Görünür paragraf: kargo ve iade koşulları bu sayfada anlatılır. Gönder","token_estimate":104}
+
+=== content
+Görünür paragraf: kargo ve iade koşulları bu sayfada anlatılır.
+
+Gönder
+
+=== a11y
+Accessibility tree (6 nodes, 2 skipped):
+  [RootWebArea] 'm0 canvas-text'
+  [paragraph]
+  [Canvas]
+  [button] 'Gönder'
+  [StaticText] 'Görünür paragraf: kargo ve iade koşulları bu sayfada anlatılır.'
+  [StaticText] 'Gönder'
+
+=== a11y_snapshot
+@1 [button] "Gönder"
+
+[1 interactive, 1 total shown]
+
+=== domsnapshot
+{"viewport": [800, 585], "hits": []}
