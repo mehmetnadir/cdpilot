@@ -8437,6 +8437,49 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     });
   });
 
+  test('agent observe (fake browser): frames hint - blocking iframe gets the hint line, at most 5 entries, largest cover first, origin cleaned of tag characters', () => {
+    const tag = (t) => [...t].map((c) => String.fromCodePoint(0xE0000 + c.charCodeAt(0))).join('');
+    const many = [];
+    for (let i = 0; i < 8; i++) many.push({ i, origin: `https://f${i}.example`, w: 300, h: 200, cover: 0.05 * (i + 1), blocking: false });
+    many[7].blocking = true;
+    many[7].origin = 'https://cmp.example' + tag('ignore previous');
+    withFake({ FAKE_CDP_FRAMES: JSON.stringify(many) }, (env) => {
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const o = cli(['agent', 'observe'], env);
+      assert.strictEqual(o.status, 0, o.stderr);
+      const snap = JSON.parse(o.stdout);
+      assert.strictEqual(snap.frames.length, 5, 'at most 5 entries');
+      assert.deepStrictEqual(snap.frames.map((f) => f.i), [7, 6, 5, 4, 3], 'largest cover first');
+      assert.deepStrictEqual(Object.keys(snap.frames[0]).sort(), ['blocking', 'cover', 'h', 'i', 'origin', 'w']);
+      assert.strictEqual(snap.frames[0].blocking, true);
+      assert.strictEqual(snap.frames[0].origin, 'https://cmp.example', 'tag characters removed');
+      assert(/agent observe --frame 7/.test(snap.frames_hint), snap.frames_hint);
+      assert(!/[\u{E0000}-\u{E007F}]/u.test(o.stdout), 'no tag character in the output');
+    });
+  });
+
+  test('agent observe (fake browser): frames hint - visible but not blocking iframe lists without hint; no visible iframe means no frames key; diff stays quiet unless blocking', () => {
+    withFake({ FAKE_CDP_FRAMES: JSON.stringify([{ i: 0, origin: 'https://ads.example', w: 300, h: 250, cover: 0.04, blocking: false }]) }, (env) => {
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const snap = JSON.parse(cli(['agent', 'observe'], env).stdout);
+      assert.strictEqual(snap.frames.length, 1);
+      assert.strictEqual(snap.frames_hint, undefined, 'no hint without a blocking frame');
+      const d = JSON.parse(cli(['agent', 'observe', '--diff'], env).stdout);
+      assert.strictEqual(d.frames, undefined, 'diff: no frames without a blocking one');
+    });
+    withFake({ FAKE_CDP_FRAMES: '[]' }, (env) => {
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const snap = JSON.parse(cli(['agent', 'observe'], env).stdout);
+      assert.strictEqual(snap.frames, undefined);
+      assert.strictEqual(snap.frames_hint, undefined);
+    });
+    withFake({ FAKE_CDP_FRAMES: JSON.stringify([{ i: 2, origin: 'https://cmp.example', w: 800, h: 600, cover: 0.6, blocking: true }]) }, (env) => {
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const d = JSON.parse(cli(['agent', 'observe', '--diff'], env).stdout);
+      assert(d.frames && /--frame 2/.test(d.frames_hint), JSON.stringify(d));
+    });
+  });
+
   test('agent observe (fake browser): a lone bidi control makes no record; the real UK flags stay with FAKE_CDP_HIDE too', () => {
     withFake({ FAKE_CDP_HIDE: '1', FAKE_CDP_TAGS: 'flags' }, (env) => {
       assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);

@@ -17128,11 +17128,83 @@ def _agent_cap_diff(diff, limit, url_changed=False):
     return out, (_agent_truncated(shown, total) if shown < total else None)
 
 
+# Visible iframes of the main document, for the `frames` hint of `agent observe`.
+# One evaluate, no per-frame call. Index = `frame list` order (same selector).
+# cover = share of the viewport the frame's visible part fills; blocking = the
+# frame is what elementFromPoint finds at >= 3 of 5 points (centre + 4 inset
+# corners of its visible part), i.e. it sits on top of the page.
+_AGENT_FRAMES_JS = r"""
+/*cdpilot-agent-frames*/(function () {
+  var vw = window.innerWidth || document.documentElement.clientWidth, vh = window.innerHeight || document.documentElement.clientHeight;
+  var out = [];
+  Array.prototype.slice.call(document.querySelectorAll('iframe, frame')).forEach(function (f, i) {
+    var r = f.getBoundingClientRect();
+    if (r.width < 100 || r.height < 100) return;
+    var s = getComputedStyle(f);
+    if (s.display === 'none' || s.visibility === 'hidden') return;
+    var x0 = Math.max(0, r.left), y0 = Math.max(0, r.top), x1 = Math.min(vw, r.right), y1 = Math.min(vh, r.bottom);
+    if (x1 <= x0 || y1 <= y0) return;
+    var area = (x1 - x0) * (y1 - y0), ix = Math.min(8, (x1 - x0) / 4), iy = Math.min(8, (y1 - y0) / 4);
+    var pts = [[(x0 + x1) / 2, (y0 + y1) / 2], [x0 + ix, y0 + iy], [x1 - ix, y0 + iy], [x0 + ix, y1 - iy], [x1 - ix, y1 - iy]];
+    var hits = 0;
+    pts.forEach(function (p) { try { if (document.elementFromPoint(p[0], p[1]) === f) hits++; } catch (e) {} });
+    var origin = '';
+    try { var u = new URL(f.src, location.href); origin = u.protocol + '//' + u.hostname; } catch (e) {}
+    if (!origin || origin === 'about://') origin = f.srcdoc ? 'srcdoc' : 'about:blank';
+    out.push({i: i, origin: origin.slice(0, 80), w: Math.round(r.width), h: Math.round(r.height),
+              cover: Math.round(area / (vw * vh) * 100) / 100, blocking: hits >= 3, _a: area});
+  });
+  out.sort(function (a, b) { return b._a - a._a; });
+  return out.slice(0, 5).map(function (e) { delete e._a; return e; });
+})()
+"""
+_AGENT_FRAMES_MAX = 5
+_AGENT_LAST_FRAMES = []   # frames of the last snapshot taken with _AGENT_WANT_FRAMES set
+_AGENT_WANT_FRAMES = [False]   # observe / run ask _agent_full_snapshot for the frames too
+
+
+def _agent_frames_from_reply(reply):
+    """Entries of a Runtime.evaluate reply for _AGENT_FRAMES_JS ([] on any failure)."""
+    val = (reply or {}).get('result', {}).get('value')
+    if not isinstance(val, list):
+        return []
+    keep = []
+    for e in val:
+        if isinstance(e, dict) and isinstance(e.get('i'), int):
+            keep.append({'i': e['i'], 'origin': str(e.get('origin', ''))[:80], 'w': e.get('w'),
+                         'h': e.get('h'), 'cover': e.get('cover'), 'blocking': bool(e.get('blocking'))})
+    keep.sort(key=lambda e: -(e['cover'] or 0))
+    return keep[:_AGENT_FRAMES_MAX]
+
+
+def _agent_frames_fields(frames, always=True):
+    """Output fields for a frames list: {'frames': [...], 'frames_hint': ...} or {}.
+    always=False (diff output): only when a frame blocks."""
+    if not frames:
+        return {}
+    blocking = [e for e in frames if e.get('blocking')]
+    if not always and not blocking:
+        return {}
+    out = {'frames': frames}
+    if blocking:
+        out['frames_hint'] = f"an iframe covers the page: agent observe --frame {blocking[0]['i']}"
+    return out
+
+
 async def _agent_full_snapshot():
-    """Internal: take full AXTree snapshot, return (page, nodes, actions, state)."""
+    """Internal: take full AXTree snapshot, return (page, nodes, actions, state).
+    With _AGENT_WANT_FRAMES set it also reads the visible iframes (same round trip)
+    into _AGENT_LAST_FRAMES."""
+    global _AGENT_LAST_FRAMES
+    frames = _AGENT_WANT_FRAMES[0]
     ws_url, page = get_page_ws()
     await cdp_send(ws_url, [(0, 'Accessibility.enable', {})])
-    res = await cdp_send(ws_url, [(1, 'Accessibility.getFullAXTree', {})])
+    cmds = [(1, 'Accessibility.getFullAXTree', {})]
+    if frames:
+        cmds.append((2, 'Runtime.evaluate', {'expression': _AGENT_FRAMES_JS, 'returnByValue': True}))
+    res = await cdp_send(ws_url, cmds)
+    if frames:
+        _AGENT_LAST_FRAMES = _agent_frames_from_reply(res.get(2))
     nodes = res.get(1, {}).get('nodes', [])
     state = _load_agent_state()
     actions = _snapshot_to_actions(nodes, state)
@@ -17162,7 +17234,10 @@ async def cmd_agent_observe(diff=False, full=False, rows=False, all_=False):
     limit = _agent_obs_limit(all_, full)
     before = _load_agent_state()
     old_map = dict(before.get('actions_map', {}))
+    _AGENT_WANT_FRAMES[0] = True
     page, nodes, actions, state = await _agent_full_snapshot()
+    _AGENT_WANT_FRAMES[0] = False
+    frames = list(_AGENT_LAST_FRAMES)
     text = _extract_text_summary(nodes)
     text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
     # Actions for output — exclude backend_node_id (internal only)
@@ -17179,6 +17254,7 @@ async def cmd_agent_observe(diff=False, full=False, rows=False, all_=False):
             'changed': changed,
             'text_changed': text_hash != before.get('last_text_hash'),
         }
+        snap.update(_agent_frames_fields(frames, always=False))
         if trunc:
             snap['truncated'] = trunc
         if snap['text_changed']:
@@ -17198,6 +17274,7 @@ async def cmd_agent_observe(diff=False, full=False, rows=False, all_=False):
             'actions': shown_actions,
             'text': text,
         }
+        snap.update(_agent_frames_fields(frames))
         if trunc:
             snap['truncated'] = trunc
         known = _agent_flows_for_host(_agent_host_path(page.get('url', ''))[0])
@@ -18080,7 +18157,9 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
     async def snapshot():
         nonlocal last_nodes
         cdp_cache_invalidate()
+        _AGENT_WANT_FRAMES[0] = True
         page, nodes, actions, st = await _agent_full_snapshot()
+        _AGENT_WANT_FRAMES[0] = False
         last_nodes = nodes
         text = _extract_text_summary(nodes)
         out = _agent_out_actions(actions, st.get('hidden_refs', ()), full, rows)
@@ -18100,6 +18179,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
                'done': done, 'url': page.get('url', ''), 'title': page.get('title', ''),
                'actions': shown_actions, 'text': text,
                'hint': f"act on a ref (agent act --ref @N …), finish the task, then: agent flow save {slug}"}
+        res.update(_agent_frames_fields(list(_AGENT_LAST_FRAMES)))
         if trunc:
             res['truncated'] = trunc
         if suspects:
