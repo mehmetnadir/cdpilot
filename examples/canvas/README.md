@@ -5,7 +5,7 @@ This example opens a sandboxed live canvas tab (`canvas open`), streams generate
 ## Commands
 
 ```bash
-cdpilot launch
+cdpilot launch   # or: cdpilot connect <port>
 cdpilot canvas open --name demo
 printf '%s\n' '<main><h1>Flight Deals</h1><button id="sort-btn" data-action="sort_price">Sort by price</button></main>' | cdpilot canvas stream --name demo
 cdpilot canvas events --name demo --follow
@@ -15,24 +15,27 @@ cdpilot canvas close --name demo
 cdpilot stop
 ```
 
-## Expected Output
-
-> **Note:** Lanes A (`CANVAS_RUNTIME_JS`), B (`canvas open`/host), and C (`canvas stream`) are built in parallel branches and are not merged into `lane/canvas-d` yet, so `run.sh` cannot run end-to-end here. The block below shows the **expected** output per the frozen v0 contract (`.claude/docs/canvas-sozlesme-v0.md`); after merging all four lanes, run `./examples/canvas/run.sh`, rename this heading to `## Captured Output`, and run `python3 examples/sync-readmes.py`.
+## Captured Output
 
 ```text
-$ cdpilot launch
-Launching browser (isolated session, port 59858)...
-CDP ready! (port 59858)
+$ cdpilot connect 9333
+⚠  This browser's cookies and sessions are accessible to cdpilot commands.
+✓ Connected to HeadlessChrome/152.0.7977.30 on port 9333
+  WebSocket: ws://127.0.0.1:9333/devtools/browser/<id>
+  Tabs: <n>
+  Commands now run in YOUR browser; cdpilot will never close it.
 $ cdpilot canvas open --name demo
 canvas: demo <targetId>
 $ emit_html_chunks | cdpilot canvas stream --name demo
-ok ... ms
+ok 1 patches (0 coalesced) <n> ms 233 bytes
 $ cdpilot canvas events --name demo --follow   # stopped with SIGINT after click
-{"seq":1,"t":1762810000000,"src":"page","type":"click","action":"sort_price","id":"sort-btn","data":{}}
+{"seq":1,"t":<ms>,"src":"page","type":"click","action":"sort_price","id":"sort-btn","data":{}}
 $ cdpilot shot output/screenshot.png
-output/screenshot.png (...)
+output/screenshot.png (<size>)
 $ cdpilot canvas close --name demo
 closed demo
-$ cdpilot stop
-Browser stopped (port 59858).
+$ cdpilot disconnect
+Disconnected from HeadlessChrome/152.0.7977.30 (port 9333); your browser keeps running.
 ```
+
+Captured in connect mode (`CDPILOT_CONNECT_PORT=9333 sh examples/canvas/run.sh`); without that variable `run.sh` launches its own isolated headless browser.

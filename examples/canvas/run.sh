@@ -6,7 +6,14 @@ cd "$SCRIPT_DIR"
 
 CDPILOT="${CDPILOT:-node $(cd ../.. && pwd)/bin/cdpilot.js}"
 export CDPILOT_PYTHON="${CDPILOT_PYTHON:-/opt/homebrew/bin/python3.13}"
-export CDP_PORT="${CDP_PORT:-59858}"
+# CDPILOT_CONNECT_PORT=<port>: drive an already running browser (connect mode).
+# Unset: launch an isolated headless browser on CDP_PORT (default, used by CI).
+CONNECT_PORT="${CDPILOT_CONNECT_PORT:-}"
+if [ -z "$CONNECT_PORT" ]; then
+  export CDP_PORT="${CDP_PORT:-59858}"
+else
+  unset CDP_PORT
+fi
 export CHROME_HEADLESS=1
 
 TMP_DIR="$(mktemp -d)"
@@ -23,7 +30,11 @@ cleanup() {
     wait "$EVENTS_PID" 2>/dev/null || true
   fi
   $CDPILOT canvas close --name demo >/dev/null 2>&1 || true
-  $CDPILOT stop >/dev/null 2>&1 || true
+  if [ -n "$CONNECT_PORT" ]; then
+    $CDPILOT disconnect >/dev/null 2>&1 || true
+  else
+    $CDPILOT stop >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
@@ -36,11 +47,19 @@ emit_html_chunks() {
 }
 
 {
-  echo "$ cdpilot launch"
-  $CDPILOT launch 2>&1
+  if [ -n "$CONNECT_PORT" ]; then
+    echo "$ cdpilot connect $CONNECT_PORT"
+    $CDPILOT connect "$CONNECT_PORT" 2>&1
+  else
+    echo "$ cdpilot launch"
+    $CDPILOT launch 2>&1
+  fi
 
   echo "$ cdpilot canvas open --name demo"
-  $CDPILOT canvas open --name demo 2>&1
+  OPEN_OUT="$($CDPILOT canvas open --name demo 2>&1)"
+  echo "$OPEN_OUT"
+  # The canvas tab is addressed by its target id, so click and shot hit it in either mode.
+  CANVAS_TARGET="$(printf '%s\n' "$OPEN_OUT" | awk '/^canvas: /{print $3}')"
 
   echo "$ emit_html_chunks | cdpilot canvas stream --name demo"
   emit_html_chunks | $CDPILOT canvas stream --name demo 2>&1
@@ -50,7 +69,7 @@ emit_html_chunks() {
   EVENTS_PID=$!
   sleep 0.3
 
-  $CDPILOT click "#sort-btn" >/dev/null 2>&1
+  CDPILOT_TARGET="$CANVAS_TARGET" $CDPILOT click "#sort-btn" >/dev/null 2>&1
   sleep 0.4
 
   kill -INT "$EVENTS_PID"
@@ -59,16 +78,27 @@ emit_html_chunks() {
   cat "$EVENTS_OUT"
 
   echo "$ cdpilot shot output/screenshot.png"
-  $CDPILOT shot output/screenshot.png 2>&1
+  CDPILOT_TARGET="$CANVAS_TARGET" $CDPILOT shot output/screenshot.png 2>&1
 
   echo "$ cdpilot canvas close --name demo"
   $CDPILOT canvas close --name demo 2>&1
 
-  echo "$ cdpilot stop"
-  $CDPILOT stop 2>&1
+  if [ -n "$CONNECT_PORT" ]; then
+    echo "$ cdpilot disconnect"
+    $CDPILOT disconnect 2>&1
+  else
+    echo "$ cdpilot stop"
+    $CDPILOT stop 2>&1
+  fi
 } > "$RAW_LOG"
 
 sed \
+  -e "s|/devtools/browser/[0-9a-f-]*|/devtools/browser/<id>|g" \
+  -e "s|^canvas: demo [0-9A-F]*|canvas: demo <targetId>|" \
+  -e 's|"t":[0-9]*|"t":<ms>|' \
+  -e 's|^\(ok .*patches.*coalesced)\) [0-9.]* ms|\1 <n> ms|' \
+  -e 's|^\(output/screenshot.png\) ([0-9.]*[KM]*B)|\1 (<size>)|' \
+  -e 's|^  Tabs: [0-9]*|  Tabs: <n>|' \
   -e "s|${TMP_DIR}|<tmp>|g" \
   -e "s|$(cd "$SCRIPT_DIR/../.." && pwd)|<repo>|g" \
   -e "s|${HOME}|~|g" \
