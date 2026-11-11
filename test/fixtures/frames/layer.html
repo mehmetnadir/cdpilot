@@ -1,0 +1,14 @@
+<!doctype html>
+<title>layer host</title>
+<button id="main" style="position:absolute;left:40px;top:20px">Main button</button>
+<script>
+  var child = new URLSearchParams(location.search).get('child') || 'inner-layer.html';
+  var f = document.createElement('iframe');
+  f.id = 'layer';
+  f.src = child;
+  f.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0;z-index:99;background:#fff';
+  document.body.appendChild(f);
+  addEventListener('message', function (e) {
+    if (e.data === 'layer-accepted') { f.remove(); document.title = 'layer-gone'; }
+  });
+</script>
