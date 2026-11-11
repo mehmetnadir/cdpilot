@@ -15983,6 +15983,49 @@ print(json.dumps(out))
   });
 })();
 
+// ─── Lane/UTC: datetime.utcnow() deprecation tests ───
+(() => {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+
+  function makeIsolatedEnv(home) {
+    return {
+      ...process.env,
+      CDPILOT_HOME: home,
+      CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDPILOT_LOG: '0',
+      CDPILOT_NO_AUTOLAUNCH: '1',
+      CDP_PORT: '19230',
+    };
+  }
+
+  function runCli(args, env) {
+    const r = spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf-8', timeout: 15000 });
+    return {
+      status: r.status,
+      stdout: r.stdout || '',
+      stderr: r.stderr || '',
+    };
+  }
+
+  test('utcnow: static check - src/cdpilot.py has no datetime.utcnow calls', () => {
+    assert(!/\butcnow\(/.test(PY_CONTENT), 'src/cdpilot.py must not call utcnow() directly');
+    assert(!/\.utcnow\(/.test(PY_CONTENT), 'src/cdpilot.py must not call .utcnow()');
+  });
+
+  test('utcnow: behavior - record status with PYTHONWARNINGS=error::DeprecationWarning exits 0 without DeprecationWarning on stderr', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-utc-'));
+    const env = {
+      ...makeIsolatedEnv(home),
+      PYTHONWARNINGS: 'error::DeprecationWarning',
+    };
+    const r = runCli(['record', 'status'], env);
+    assert.strictEqual(r.status, 0, `status must be 0 (stderr: ${r.stderr})`);
+    assert(!r.stderr.includes('DeprecationWarning'), `stderr must not contain DeprecationWarning: ${r.stderr}`);
+    assert(r.stdout.includes('No recording active'), `stdout must contain 'No recording active', got: ${r.stdout}`);
+  });
+})();
+
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);
