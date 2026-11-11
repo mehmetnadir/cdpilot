@@ -1361,6 +1361,31 @@ print("ok")
   assert(/^ok/m.test(r.stdout), r.stdout);
 });
 
+test('agent observe text summary (unit): Chrome AX role StaticText feeds `text`, consecutive duplicates dropped, max_chars kept', () => {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-textsum-'));
+  const script = `
+import importlib.util
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+def n(role, name, ignored=False):
+    return {"ignored": ignored, "role": {"value": role}, "name": {"value": name}, "backendDOMNodeId": 1}
+nodes = [n("RootWebArea", "Page"), n("heading", "Pricing"), n("StaticText", "Pricing"),
+         n("paragraph", "Plans start at 5 dollars"), n("StaticText", "Plans start at 5 dollars"),
+         n("StaticText", "Cancel any time"), n("link", "Sign up"), n("StaticText", "Hidden", True),
+         n("InlineTextBox", "Cancel any time"), n("StaticText", "")]
+t = mod._extract_text_summary(nodes)
+assert t == "Pricing Plans start at 5 dollars Cancel any time", repr(t)
+assert mod._extract_text_summary([n("StaticText", "x" * 50)], max_chars=10) == "x" * 10
+print("ok")
+`;
+  const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
+    { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
+  assert.strictEqual(r.status, 0, `text summary unit test failed: ${r.stderr}`);
+  assert(/^ok/m.test(r.stdout), r.stdout);
+});
+
 test('injection-aware observe (unit): text addressed to an AI agent is flagged, pages about AI are not, at most 5, never hidden; 20 + 20 corpus: >= 19 caught, 0 false alarms', () => {
   const { spawnSync } = require('child_process');
   const os = require('os');
