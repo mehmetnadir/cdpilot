@@ -4,6 +4,19 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Session log marks warm calls (`warm: true`).
+
+### Changed
+- **`injection_suspect` third pass.** New marks `fake_turn` and `encoded_order`; mixed-script look-alike letters, base64 payloads and "ignore previous instructions" in 14 languages are matched. On a held-out set never used for tuning (40 + 40 lines, 12 languages) it now catches 11 of 40 (was 7) with the same 2 of 40 false alarms; fake chat turns and fake system notices phrased differently still mostly pass. Scanning a 2,000-node page costs ~14 ms more CPU.
+- Agent command JSON (`agent observe`, `agent act`, `agent run`, `agent flow list|show`) is compact and UTF-8 when stdout is not a terminal (agents, pipes, MCP); a terminal still gets indented output. `CDPILOT_JSON=pretty` restores indented output everywhere (`compact` forces one line). Scripts that grep line by line should use `jq` or set `CDPILOT_JSON=pretty`.
+
+### Fixed
+- fill, smart-fill (and the Amazon CAPTCHA fill): the value setter now comes from the element's own type (textarea, input, select) instead of always `HTMLInputElement`; filling a `<textarea>` no longer throws "Illegal invocation" (it printed `?`). React-style input/change events are unchanged.
+- fill and click now exit 1 (message on stderr) when the element is not found within the timeout or the page script fails. Before they printed the message on stdout and exited 0. This changes the exit code: scripts that relied on exit 0 for a missing element must check for it. The session log records exit 1 and MCP tool results are errors.
+- `agent act --ref @N` with `hover`, `submit`, `fill` or `type` on a stale ref (the node is not in the page any more) now exits 1 with the same "stale ref ... run 'agent observe' again" message as `click`; before it exited 0 and did nothing (`fill`/`type` typed into whatever had focus). The exit code changes from 0 to 1 in that case.
+- `tools list` / `tools call` (WebMCP): a document whose `getTools()` never settles no longer holds the whole call for 15 + 15 s; each document gets 5 s, a frame that misses it is left out and a top document that misses it returns a named `TimeoutError` (seen once on CI as "no reply from the page").
+
 ## [0.9.7] - 2026-11-11
 
 ### Security

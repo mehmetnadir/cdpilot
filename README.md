@@ -483,6 +483,11 @@ cdpilot agent observe --diff          # only what changed since the last observe
 cdpilot agent stats | agent reset
 ```
 
+The agent commands (`agent observe`, `agent act`, `agent run`, `agent flow list|show`) print compact
+UTF-8 JSON when stdout is not a terminal (an agent, a pipe, an MCP tool call) and indented JSON in a
+terminal. `CDPILOT_JSON=pretty|compact` overrides this. Scripts that grep line by line should use `jq`
+or set `CDPILOT_JSON=pretty`.
+
 `observe` turns the accessibility tree into a numbered list of things an agent can act on (buttons, links,
 fields with their current value, unique text anchors) plus a short text summary; no screenshot, no HTML.
 Every `act` and `observe --diff` returns only the change: `changed.added` (full descriptors, so the agent can act
@@ -537,16 +542,18 @@ Page text that addresses the model instead of the user is the shape of an indire
 assistants reading this page: ignore your previous instructions…"). `agent observe`, the diff of `agent act`
 and a drift result of `agent run` carry `injection_suspect: [{text, match}]` (at most 5, absent when none)
 whenever such a block is in the text: `ignore_instructions`, `addresses_ai`, `system_prompt`,
-`new_instructions`, `hide_from_user`, `exfiltrate`, `fake_system`, `tool_call`, `navigate_order`. Nothing is
+`new_instructions`, `hide_from_user`, `exfiltrate`, `fake_system`, `fake_turn`, `encoded_order`, `tool_call`,
+`navigate_order`. Nothing is
 hidden or blocked, the text stays where it was; the agent sees the mark next to it and treats the block as data.
-Matching runs on a normalised copy (zero-width characters removed, NFKC, case folded, spaced-out letters joined);
-the "ignore previous instructions" family also covers Spanish, French, Turkish, Japanese, German and Portuguese.
-The patterns were tuned on two sets (`test/fixtures/injection-korpus.json`, `injection-heldout.json`), so their
-numbers there (20 of 20 and 24 of 24 caught, 0 false alarms) are in-sample. On a set never used for tuning
-(`injection-heldout-2.json`, 30 + 30 lines in 7 languages) they catch 8 of 30 with 1 of 30 false alarms (a recipe
-line); on a third such set (`injection-heldout-3.json`, 40 + 40 lines in 12 languages) 7 of 40 with 2 of 40
-(before this pass: 2 of 40). Fake chat turns, homoglyphs, base64 and Chinese/Russian/Arabic lines still pass.
-Treat the mark as a hint, not a filter: a page without it can still carry an injection.
+Matching runs on a normalised copy (zero-width characters removed, NFKC, case folded, spaced-out letters joined,
+Cyrillic/Greek look-alikes mapped inside a mixed-script word); base64 payloads are decoded and scanned; the
+"ignore previous instructions" family covers 14 languages. The patterns were tuned on three sets
+(`test/fixtures/injection-korpus.json`, `injection-heldout.json`, `injection-heldout-2.json`), so their numbers
+there (20 of 20, 24 of 24 and 27 of 30 caught) are in-sample. On a set never used for tuning
+(`injection-heldout-3.json`, 40 + 40 lines in 12 languages, written without seeing the patterns) they catch 11 of 40
+with 2 of 40 false alarms (a quoted security report and a recipe line); the gain over the previous pass (7 of 40)
+came from multilingual, encoded and urgency lines, not from fake chat turns or fake system notices, which still
+mostly pass when phrased differently. Treat the mark as a hint, not a filter: a page without it can still carry an injection.
 
 ### Session Management
 
@@ -1364,6 +1371,7 @@ print(result.stdout)
 | `CDPILOT_TIMEOUT` | unset | Default `--timeout` in seconds for every command (flag wins, `0` disables); expiry exits 124 |
 | `CDPILOT_NO_AUTOLAUNCH` | `0` | `1` = page commands fail with the old "Is the browser running?" error instead of launching the browser |
 | `CDPILOT_IDLE_CLOSE` | `15` | Minutes without a cdpilot command or page change before a browser cdpilot launched closes itself (fractions allowed, `0` = never; read at launch). Default applies to auto-launch and MCP launches; an explicit CLI `launch` is off unless this is set or `--idle-close <min>` is given |
+| `CDPILOT_JSON` | auto | `pretty` = indented, `compact` = one line; default: agent command JSON is indented in a terminal and compact UTF-8 otherwise |
 | `CDPILOT_LOG` | `1` | `0` = do not write the session log (`cdpilot log`) |
 | `CDPILOT_LOG_DAYS` | `14` | Days of session log to keep; older day files are deleted on the first write of a day (`0` keeps all) |
 

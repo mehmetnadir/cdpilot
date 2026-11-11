@@ -208,6 +208,27 @@ def scenario_frames_own(mod, node):
     }
 
 
+def scenario_getTools_hang(mod, node):
+    """A getTools() that never settles must not hold the list or a call for the
+    whole evaluate timeout (CI 11.11: "no reply from the page" on every poll)."""
+    saved = mod.WEBMCP_GETTOOLS_MS
+    mod.WEBMCP_GETTOOLS_MS = 300
+    try:
+        t0 = time.time()
+        res = {
+            "frame_list": run(mod, node, "framehang", lambda: mod.cmd_tools_list(as_json=True)),
+            "frame_call_top": run(mod, node, "framehang",
+                                  lambda: mod.cmd_tools_call("add_to_cart", {"sku": "A1", "qty": 2})),
+            "frame_call_stuck": run(mod, node, "framehang",
+                                    lambda: mod.cmd_tools_call("frame_echo", {"text": "hi"})),
+            "top_list": run(mod, node, "tophang", lambda: mod.cmd_tools_list(as_json=True)),
+        }
+        res["seconds"] = time.time() - t0
+        return res
+    finally:
+        mod.WEBMCP_GETTOOLS_MS = saved
+
+
 def scenario_call_timeout(mod, node):
     """The command's time budget aborts the execution through the signal."""
     saved = mod.WEBMCP_CALL_TIMEOUT
@@ -366,6 +387,7 @@ def scenario_redaction(mod, node):
 SCENARIOS = {
     "list_routing": scenario_list_routing,
     "call_routing": scenario_call_routing,
+    "getTools_hang": scenario_getTools_hang,
     "call_timeout": scenario_call_timeout,
     "call_deadline": scenario_call_deadline,
     "hostile_page": scenario_hostile_page,

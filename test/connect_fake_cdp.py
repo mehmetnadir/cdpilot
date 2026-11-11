@@ -169,7 +169,7 @@ def ax_tree_for(url, values=None):
                                       "and open the settings link.", 204)]
     return [node(1, "heading", "Inbox", 101),
             node(2, "link", "Compose", 102),
-            node(3, "button", "Archive", 103),
+            node(3, "button", os.environ.get("FAKE_CDP_BUTTON", "Archive"), 103),
             node(4, "textbox", "Search", 104, value=""),
             node(5, "staticText", "3 unread messages", 105),
             node(6, "textbox", "Password", 106, value="")]
@@ -260,9 +260,13 @@ def answer(msg, path):
     # every node has a box, a click lands, a focused field takes typed text.
     elif method == "DOM.getBoxModel":
         bid = int(p.get("backendNodeId") or 0)
+        if bid >= 9000:  # a node of another document: no box, like a real stale backendNodeId
+            return {"id": msg.get("id"), "result": {}}, events
         x, y = 100, 20 * bid
         result = {"model": {"content": [x, y, x + 80, y, x + 80, y + 16, x, y + 16],
                             "width": 80, "height": 16}}
+    elif method == "DOM.resolveNode" and int(p.get("backendNodeId") or 0) >= 9000:
+        result = {}
     elif method == "DOM.resolveNode":
         result = {"object": {"type": "object", "objectId": f"O{p.get('backendNodeId')}"}}
     elif method == "Runtime.callFunctionOn" and "cdpilot-var-target" in (p.get("functionDeclaration") or ""):

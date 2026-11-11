@@ -772,6 +772,8 @@ function showHelp() {
                        a fresh process when it is missing or busy; not with
                        --timeout; 'daemon status|stop'; idle exit after
                        CDPILOT_DAEMON_IDLE seconds, default 1800).
+    CDPILOT_JSON       pretty|compact: agent command JSON (default: indented on a
+                       terminal, compact UTF-8 when stdout is not a terminal)
     CDPILOT_VAR_HOSTS  Hosts (comma-separated, host:port for another port)
                        an agent flow or replay step may type CDPILOT_VAR_* on
 
@@ -1235,7 +1237,7 @@ if (cmd === 'status') {
     const sockPath = daemonSockPath(daemonKey(env, python));
     // env: the daemon applies the caller's environment to the request (proxy
     // and solver keys, PATH, TZ … are read when a command runs, not at import).
-    const payload = { argv: args, cwd: process.cwd(), env };
+    const payload = { argv: args, cwd: process.cwd(), env, tty: process.stdout.isTTY === true };
     const stdin = daemonStdin(cmd, args);
     if (stdin !== undefined) payload.stdin = stdin;
     daemonRequest(sockPath, payload, (m) => {
