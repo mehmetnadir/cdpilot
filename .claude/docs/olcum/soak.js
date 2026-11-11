@@ -99,6 +99,8 @@ function getProcessStats(pid) {
     const rssOut = execSync(`ps -o rss= -p ${pid} 2>/dev/null`, { encoding: 'utf8' }).trim();
     rssKb = parseInt(rssOut, 10) || 0;
   } catch {}
+  // Dead process: ps prints nothing -> not measured (null), never 0.
+  if (!rssKb) return { rssKb: null, rssMb: null, fd: null };
   try {
     const lsofOut = execSync(`lsof -p ${pid} 2>/dev/null | wc -l`, { encoding: 'utf8' }).trim();
     fd = parseInt(lsofOut, 10) || 0;
@@ -109,13 +111,24 @@ function getProcessStats(pid) {
 // The daemon key hashes every CDPILOT_* variable (bin/cdpilot.js daemonKey), so the
 // status query must carry the SAME environment as the warm calls (baseEnv). Asking with
 // only CDPILOT_HOME + CDPILOT_DAEMON hashed to another key and found no daemon (0 -> 0, 11.11).
-function getDaemonPid(env) {
+function getDaemonPid(env, sock) {
   try {
     const res = spawnSync(process.execPath, [CLI, 'daemon', 'status'], {
       env: { ...env, CDPILOT_DAEMON: '1' },
       cwd: REPO_ROOT,
       encoding: 'utf8'
     });
+    // `daemon status` lists every daemon in the shared per-user dir. Pick OURS by the socket
+    // printed at `daemon start` (the `*` marker is unreliable: status env != warm-call env).
+    if (sock) {
+      for (const line of res.stdout.split('\n')) {
+        if (line.includes(sock)) {
+          const m = line.match(/pid\s+(\d+)/);
+          if (m) return parseInt(m[1], 10);
+        }
+      }
+      return null;
+    }
     const match = res.stdout.match(/^\s*\*\s*pid\s+(\d+)/m);
     return match ? parseInt(match[1], 10) : null;
   } catch {
@@ -139,6 +152,21 @@ function calcPercentiles(arr) {
   const p50 = s[Math.floor(s.length * 0.50)];
   const p95 = s[Math.floor(s.length * 0.95)];
   return { p50: Math.round(p50), p95: Math.round(p95) };
+}
+
+// Longest uninterrupted run of checkpoints that share one process pid (pid change = restart).
+// Null pid / null value checkpoints are dropped first. Slope is computed only inside this run.
+function longestPidSegment(checkpoints, pidKey, valKey) {
+  const valid = checkpoints.filter((c) => c[pidKey] && c[valKey] !== null && c[valKey] !== undefined);
+  const segs = [];
+  for (const c of valid) {
+    const last = segs[segs.length - 1];
+    if (last && last[last.length - 1][pidKey] === c[pidKey]) last.push(c);
+    else segs.push([c]);
+  }
+  let best = [];
+  for (const sg of segs) if (sg.length > best.length) best = sg;
+  return { segments: segs.length, best };
 }
 
 // Least squares linear regression over sample checkpoints
@@ -301,7 +329,9 @@ function classifyError(exitCode, isError, text) {
     encoding: 'utf8'
   });
   console.log(`[soak] ${dStart.stdout.trim()}`);
-  let daemonPid = getDaemonPid(baseEnv);
+  const sockMatch = dStart.stdout.match(/socket\s+(\S+)/);
+  const daemonSock = sockMatch ? sockMatch[1] : null;
+  let daemonPid = getDaemonPid(baseEnv, daemonSock);
   if (!daemonPid) {
     const match = dStart.stdout.match(/pid\s+(\d+)/);
     if (match) daemonPid = parseInt(match[1], 10);
@@ -589,13 +619,20 @@ function classifyError(exitCode, isError, text) {
     }
   }
 
+  const lastSeenPid = { daemon: daemonPid, mcp: mcpPythonPid };
   function recordCheckpoint(modeKey) {
     const s = state[modeKey];
-    const curDaemonPid = getDaemonPid(baseEnv) || daemonPid;
+    // Re-resolve every checkpoint; no fallback to the startup pid (a dead pid read as 0 on 11.11).
+    const curDaemonPid = getDaemonPid(baseEnv, daemonSock);
     const daemonStats = getProcessStats(curDaemonPid);
 
-    const curMcpPythonPid = getChildPid(mcpSrv.pid) || mcpPythonPid;
+    const curMcpPythonPid = getChildPid(mcpSrv.pid);
     const mcpStats = getProcessStats(curMcpPythonPid);
+
+    const daemonRestart = !!(curDaemonPid && lastSeenPid.daemon && curDaemonPid !== lastSeenPid.daemon);
+    const mcpRestart = !!(curMcpPythonPid && lastSeenPid.mcp && curMcpPythonPid !== lastSeenPid.mcp);
+    if (curDaemonPid) lastSeenPid.daemon = curDaemonPid;
+    if (curMcpPythonPid) lastSeenPid.mcp = curMcpPythonPid;
 
     const { p50, p95 } = calcPercentiles(s.latencies);
     const loadStr = getUptimeLoad();
@@ -609,6 +646,8 @@ function classifyError(exitCode, isError, text) {
       p50_ms: p50,
       p95_ms: p95,
       daemon_pid: curDaemonPid,
+      daemon_restart: daemonRestart,
+      mcp_restart: mcpRestart,
       daemon_rss_kb: daemonStats.rssKb,
       daemon_rss_mb: daemonStats.rssMb,
       daemon_fd: daemonStats.fd,
@@ -630,9 +669,9 @@ function classifyError(exitCode, isError, text) {
   }
 
   // Initial cold baseline stats (captured for reference)
-  const initialDaemonPid = getDaemonPid(baseEnv) || daemonPid;
+  const initialDaemonPid = getDaemonPid(baseEnv, daemonSock);
   const coldDaemonStats = getProcessStats(initialDaemonPid);
-  const initialMcpPythonPid = getChildPid(mcpSrv.pid) || mcpPythonPid;
+  const initialMcpPythonPid = getChildPid(mcpSrv.pid);
   const coldMcpStats = getProcessStats(initialMcpPythonPid);
   console.log(`[soak] Soğuk başlangıç (rölanti) değerleri: Daemon RSS: ${coldDaemonStats.rssMb}MB fd: ${coldDaemonStats.fd} | MCP RSS: ${coldMcpStats.rssMb}MB fd: ${coldMcpStats.fd}`);
 
@@ -689,21 +728,32 @@ function classifyError(exitCode, isError, text) {
 
     let firstRss = null, lastRss = null, firstFd = null, lastFd = null;
     let rssSlopePer100 = null, fdSlopePer100 = null;
+    let segInfo = { segments: 0, best: [] };
 
     if (mKey === 'cli_warm') {
       firstRss = firstCp.daemon_rss_mb ?? null;
       lastRss = lastCp.daemon_rss_mb ?? null;
       firstFd = firstCp.daemon_fd ?? null;
       lastFd = lastCp.daemon_fd ?? null;
-      rssSlopePer100 = calcLeastSquaresSlopePer100(cp, 'daemon_rss_mb');
-      fdSlopePer100 = calcLeastSquaresSlopePer100(cp, 'daemon_fd');
+      segInfo = longestPidSegment(cp, 'daemon_pid', 'daemon_rss_mb');
+      firstRss = segInfo.best.length ? segInfo.best[0].daemon_rss_mb : null;
+      lastRss = segInfo.best.length ? segInfo.best[segInfo.best.length - 1].daemon_rss_mb : null;
+      firstFd = segInfo.best.length ? segInfo.best[0].daemon_fd : null;
+      lastFd = segInfo.best.length ? segInfo.best[segInfo.best.length - 1].daemon_fd : null;
+      rssSlopePer100 = segInfo.best.length >= 3 ? calcLeastSquaresSlopePer100(segInfo.best, 'daemon_rss_mb') : null;
+      fdSlopePer100 = segInfo.best.length >= 3 ? calcLeastSquaresSlopePer100(segInfo.best, 'daemon_fd') : null;
     } else if (mKey === 'mcp_warm') {
       firstRss = firstCp.mcp_rss_mb ?? null;
       lastRss = lastCp.mcp_rss_mb ?? null;
       firstFd = firstCp.mcp_fd ?? null;
       lastFd = lastCp.mcp_fd ?? null;
-      rssSlopePer100 = calcLeastSquaresSlopePer100(cp, 'mcp_rss_mb');
-      fdSlopePer100 = calcLeastSquaresSlopePer100(cp, 'mcp_fd');
+      segInfo = longestPidSegment(cp, 'mcp_pid', 'mcp_rss_mb');
+      firstRss = segInfo.best.length ? segInfo.best[0].mcp_rss_mb : null;
+      lastRss = segInfo.best.length ? segInfo.best[segInfo.best.length - 1].mcp_rss_mb : null;
+      firstFd = segInfo.best.length ? segInfo.best[0].mcp_fd : null;
+      lastFd = segInfo.best.length ? segInfo.best[segInfo.best.length - 1].mcp_fd : null;
+      rssSlopePer100 = segInfo.best.length >= 3 ? calcLeastSquaresSlopePer100(segInfo.best, 'mcp_rss_mb') : null;
+      fdSlopePer100 = segInfo.best.length >= 3 ? calcLeastSquaresSlopePer100(segInfo.best, 'mcp_fd') : null;
     }
 
     // Error classification breakdown
@@ -726,7 +776,11 @@ function classifyError(exitCode, isError, text) {
       lastFd: lastFd === null ? 'ölçülmedi' : lastFd,
       rssSlopePer100: rssSlopePer100 === null ? 'ölçülmedi' : rssSlopePer100.toFixed(2),
       fdSlopePer100: fdSlopePer100 === null ? 'ölçülmedi' : fdSlopePer100.toFixed(2),
-      sampleCount: cp.length
+      sampleCount: cp.length,
+      pidSegments: segInfo.segments,
+      segmentFromCall: segInfo.best.length ? segInfo.best[0].calls : null,
+      segmentToCall: segInfo.best.length ? segInfo.best[segInfo.best.length - 1].calls : null,
+      segmentCheckpoints: segInfo.best.length
     };
   }
 
@@ -744,6 +798,14 @@ function classifyError(exitCode, isError, text) {
   const mcpWarmRssFlat = Math.abs(mcpWarmRssSlope) < 1.0;
   const cliWarmFdFlat = Math.abs(cliWarmFdSlope) < 0.05;
   const mcpWarmFdFlat = Math.abs(mcpWarmFdSlope) < 0.05;
+  // NaN slope = not measured (<3 checkpoints in one pid segment). Never judge it NOT FLAT.
+  const unmeasured = [cliWarmRssSlope, cliWarmFdSlope, mcpWarmRssSlope, mcpWarmFdSlope].some((v) => Number.isNaN(v));
+  const interrupted = summary.cli_warm.pidSegments > 1 || summary.mcp_warm.pidSegments > 1;
+  // Per-metric label for the report text.
+  const flatLabel = (slope, flat, bad) => (Number.isNaN(slope) ? 'ÖLÇÜLMEDİ' : (flat ? 'DÜZ / FLAT' : bad));
+  const segNote = (m) => (m.pidSegments > 1
+    ? ` — kesintili: ${m.pidSegments} parça; eğim yalnız en uzun parçada, çağrı ${m.segmentFromCall}–${m.segmentToCall} (${m.segmentCheckpoints} nokta)`
+    : '');
 
   const cliWarmErrRate = summary.cli_warm.errorRate;
   const mcpWarmErrRate = summary.mcp_warm.errorRate;
@@ -757,6 +819,9 @@ function classifyError(exitCode, isError, text) {
   if (!countValid) {
     verdictStatus = 'GEÇERSİZ (INVALID)';
     verdictText = `GEÇERSİZ (INVALID) — Hedef çağrı sayısı tamamlanmadı (Warm ≥ 500, Fresh ≥ 150; CLI warm: ${state.cli_warm.count}, MCP warm: ${state.mcp_warm.count}, CLI fresh: ${state.cli_fresh.count})`;
+  } else if (unmeasured) {
+    verdictStatus = 'KAPI 2 VERİ YETERSİZ (ÖLÇÜLMEDİ)';
+    verdictText = `ÖLÇÜLMEDİ — bir RSS/FD eğimi en az 3 noktalı kesintisiz pid parçası bulamadı${interrupted ? ' (kesintili: daemon/MCP süreci yeniden başladı)' : ''}; yeniden koşu gerekir`;
   } else {
     passed = cliWarmRssFlat && mcpWarmRssFlat && cliWarmFdFlat && mcpWarmFdFlat && errorRateOk;
     if (passed) {
@@ -848,14 +913,12 @@ function classifyError(exitCode, isError, text) {
    - CLI fresh tamamlanan çağrı: **${summary.cli_fresh.completedCalls}** (Gereken: ≥150) — ${summary.cli_fresh.completedCalls >= 150 ? 'GEÇERLİ' : 'GEÇERSİZ'}
 
 2. **RSS Kararlılığı (< 1 MB / 100 çağrı doğrusal eğim)**:
-   - CLI warm daemon RSS eğimi: **${summary.cli_warm.rssSlopePer100} MB / 100 çağrı** (${cliWarmRssFlat ? 'DÜZ / FLAT' : 'BÜYÜYOR / NOT FLAT'})
-   - MCP warm server RSS eğimi: **${summary.mcp_warm.rssSlopePer100} MB / 100 çağrı** (${mcpWarmRssFlat ? 'DÜZ / FLAT' : 'BÜYÜYOR / NOT FLAT'})
-   - Her iki sıcak yürütme yolunda da bellek kaçağı oluşmadı; istek sonrası temizlikler durumu sıfırlıyor.
+   - CLI warm daemon RSS eğimi: **${summary.cli_warm.rssSlopePer100} MB / 100 çağrı** (${flatLabel(cliWarmRssSlope, cliWarmRssFlat, 'BÜYÜYOR / NOT FLAT')})${segNote(summary.cli_warm)}
+   - MCP warm server RSS eğimi: **${summary.mcp_warm.rssSlopePer100} MB / 100 çağrı** (${flatLabel(mcpWarmRssSlope, mcpWarmRssFlat, 'BÜYÜYOR / NOT FLAT')})${segNote(summary.mcp_warm)}
 
 3. **Dosya Tanımlayıcı (FD) Hijyeni (Eğim = 0)**:
-   - CLI warm daemon FD değişimi: **${summary.cli_warm.firstFd} → ${summary.cli_warm.lastFd}** (eğim: ${summary.cli_warm.fdSlopePer100}) (${cliWarmFdFlat ? 'DÜZ / FLAT' : 'ARTIYOR / NOT FLAT'})
-   - MCP warm server FD değişimi: **${summary.mcp_warm.firstFd} → ${summary.mcp_warm.lastFd}** (eğim: ${summary.mcp_warm.fdSlopePer100}) (${mcpWarmFdFlat ? 'DÜZ / FLAT' : 'ARTIYOR / NOT FLAT'})
-   - Açık soket veya dosya tanımlayıcısı kaçağı tespit edilmedi.
+   - CLI warm daemon FD değişimi: **${summary.cli_warm.firstFd} → ${summary.cli_warm.lastFd}** (eğim: ${summary.cli_warm.fdSlopePer100}) (${flatLabel(cliWarmFdSlope, cliWarmFdFlat, 'ARTIYOR / NOT FLAT')})
+   - MCP warm server FD değişimi: **${summary.mcp_warm.firstFd} → ${summary.mcp_warm.lastFd}** (eğim: ${summary.mcp_warm.fdSlopePer100}) (${flatLabel(mcpWarmFdSlope, mcpWarmFdFlat, 'ARTIYOR / NOT FLAT')})
 
 4. **Hata Oranı Eşitliği (Warm vs Fresh)**:
    - CLI fresh hata oranı: **%${(summary.cli_fresh.errorRate * 100).toFixed(2)}** (${summary.cli_fresh.errorCount} hata / ${summary.cli_fresh.completedCalls} çağrı)
