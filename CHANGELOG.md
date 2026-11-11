@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Live canvas (experimental, macOS/Linux): `cdpilot canvas open|set|patch|stream|watch|events|list|close`.** An agent writes HTML into a tab it owns and updates it in place (morph keeps scroll, focus and form state); clicks and form input come back as events (`data-action`/`data-emit`), marked untrusted. The page is treated as untrusted: own off-the-record browser context closed on exit (even SIGKILL), only `http://cdpilot-canvas.invalid/<name>/` served with a CSP and `sandbox allow-scripts`, other navigations 204, subresources refused, a dead proxy for anything that slips past interception (speculation-rules prefetch did), WebRTC removed, foreign pop-ups closed, writes only into the document cdpilot loaded; `--allow-net <host>` opens one https host. A leak test checks 26 vectors against an unguarded and a guarded canvas (5 more cannot be measured there and are listed with the reason). MCP: `browser_canvas_set/patch/events`, listed only while a canvas is open (`tools/list_changed`), not in `--tools core`. Two independent security reviews (the second: merge yes). Not on Windows yet; paint latency not published until measured on an idle machine.
+
 ## [0.9.7] - 2026-11-11
 
 ### Security

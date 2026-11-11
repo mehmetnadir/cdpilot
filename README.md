@@ -542,6 +542,57 @@ On text written without seeing the patterns they catch far less: 7 of 24 with 0 
 (`test/fixtures/injection-heldout.json`) and 4 of 30 with 1 of 30 (`injection-heldout-2.json`, a recipe line).
 Treat the mark as a hint, not a filter: a page without it can still carry an injection.
 
+### Live canvas (experimental)
+
+A canvas is a tab in your browser that an agent writes HTML into and updates in place: a status board, a form the
+user fills in, a table that grows while the model streams. The tab keeps its scroll position, focus and form state
+between updates (the new HTML is morphed into the page, not reloaded). Clicks and form input come back as events; treat their content as untrusted page data (an `untrusted` field says
+which fields).
+
+```bash
+cdpilot canvas open --name board                 # opens the tab; prints "canvas: board <targetId>"
+cdpilot canvas set page.html --name board        # replace the content ("-" reads stdin)
+cdpilot canvas patch page.html --name board      # morph to the new HTML: "ok +add -del ~upd ↕move <ms> ms"
+llm-cli ... | cdpilot canvas stream --name board # stdin as it arrives, patched whole-document
+cdpilot canvas watch page.html --name board      # re-patch on every save; Ctrl+C stops
+cdpilot canvas events --name board --follow      # one JSON line per click / submit / input
+cdpilot canvas list                              # name, targetId, pid, age
+cdpilot canvas close --name board                # or --all
+```
+
+Mark the elements that report back with `data-action` (or `data-emit`): a click on them, a form `submit` and
+`input` become `{seq, t, src, type, action, id, data}` lines; `src` is `page` for the page's events and `host` for
+cdpilot's own (`blocked`, `nav`, `closed`). Event `data` is capped at 1 KB; `data.url` in host events is chosen by the
+page and is not trusted.
+
+MCP: `browser_canvas_set`, `browser_canvas_patch`, `browser_canvas_events` appear in `tools/list` only while a canvas
+of the project is open (the server sends `notifications/tools/list_changed`); `browser_tools enable` lists them
+anyway. They are not in `--tools core`. A canvas is opened from the CLI (`cdpilot canvas open`). HTML goes to the canvas process over a local socket, never in a
+command line or the session log.
+
+What the canvas page cannot do (the HTML is treated as untrusted — an agent may have copied it from anywhere):
+- It runs in its own browser context, so it never sees your other tabs, cookies or storage; the context and the tab
+  close when the canvas process ends, even on SIGKILL.
+- Only `http://cdpilot-canvas.invalid/<name>/` is served to it, with a CSP (`default-src 'none'`, inline script and
+  style only, `data:`/`blob:` images) and `sandbox allow-scripts`. Every other navigation gets an empty 204 and a
+  `blocked` event; every subresource request is refused (`BlockedByClient`). `--allow-net <host>` at `open` allows
+  https requests to that exact host on port 443 and nothing else.
+- The canvas runs in a browser context whose proxy is a local port that never answers (`--allow-net` hosts bypass
+  it), so a request that slips past cdpilot's interception goes nowhere (speculation-rules prefetch did, measured
+  before this was added). Pop-ups the page opens in that context are closed.
+- WebRTC constructors are removed before the page's scripts run, in its frames too (CSP does not cover WebRTC).
+- The document is written only after cdpilot has proven it is the canvas document (frame URL and execution context);
+  if the context changes, the write is refused and the page reopened. Navigation history is cleared after each load.
+- A leak test runs every vector we know (fetch, img, script, iframe, WebSocket, prefetch, ping, window.open, form,
+  meta refresh, `blob:` navigation, `history.back()`, speculation rules, pop-ups from derived documents, WebRTC
+  STUN/TURN in the page and in srcdoc frames) against an unguarded and a guarded canvas:
+  each vector must reach the test listener unguarded and show 0 requests guarded. Not measurable there: `data:`
+  navigation (Chrome blocks it itself), preconnect and DNS prefetch (the canvas's off-the-record context does not
+  send these hints; the canvas also sends `X-DNS-Prefetch-Control: off`).
+
+Not supported on Windows yet (the canvas process uses a Unix socket). Paint latency is not published until it is
+measured on an idle machine.
+
 ### Session Management
 
 ```bash
