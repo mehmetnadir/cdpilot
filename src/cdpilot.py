@@ -4048,6 +4048,32 @@ async def cdp_send(ws_url, commands, timeout=15):
             raise
 
 
+def _cdp_error_reply(reply):
+    """True when `reply` is a CDP error object ({code, message}) that cdp_send
+    stored in place of a result. A real result never carries both keys."""
+    return (isinstance(reply, dict) and isinstance(reply.get("code"), int)
+            and isinstance(reply.get("message"), str) and "result" not in reply)
+
+
+def _cdp_reply(r, cid, method, timeout=15):
+    """The result dict for command `cid` in a cdp_send result `r`.
+
+    cdp_send returns what it has when its timeout ends (an id with no reply is
+    missing) and stores a CDP error reply as the result. A command whose output
+    IS the value must not print an empty value for either: no reply ->
+    "Error: no reply from the browser to <method> within <timeout> s", a CDP
+    error -> "Error: <message> (CDP <code>)"; both on stderr, exit 1. Commands
+    that tolerate a missing reply keep reading r.get(cid, {})."""
+    reply = r.get(cid)
+    if reply is None:
+        print(f"Error: no reply from the browser to {method} within {timeout} s", file=sys.stderr)
+        sys.exit(1)
+    if _cdp_error_reply(reply):
+        print(f"Error: {reply['message']} (CDP {reply['code']})", file=sys.stderr)
+        sys.exit(1)
+    return reply
+
+
 # ─── Frame targeting: iframes, including cross-origin (OOPIF) ───
 #
 # Element commands act on the top document unless the selector names a
@@ -7605,7 +7631,7 @@ async def cmd_content():
         "expression": "document.body.innerText.substring(0, 1048576)",
         "returnByValue": True,
     })])
-    content = r.get(1, {}).get("result", {}).get("value", "(empty)")
+    content = _cdp_reply(r, 1, "Runtime.evaluate", 15).get("result", {}).get("value", "(empty)")
     print(content)
     if len(content) >= 1048576:
         print("[Output truncated at 1MB]")
@@ -7617,7 +7643,7 @@ async def cmd_html():
         "expression": "document.documentElement.outerHTML.substring(0, 1048576)",
         "returnByValue": True,
     })])
-    html_content = r.get(1, {}).get("result", {}).get("value", "(empty)")
+    html_content = _cdp_reply(r, 1, "Runtime.evaluate", 15).get("result", {}).get("value", "(empty)")
     print(html_content)
     if len(html_content) >= 1048576:
         print("[Output truncated at 1MB]")
@@ -7685,6 +7711,7 @@ async def cmd_shot(output=None, quality=None, element=None, fmt=None):
         print(f"{output} ({size_kb:.1f}KB)")
     else:
         print("Screenshot failed", file=sys.stderr)
+        sys.exit(1)
 
 
 async def cmd_shot_annotated(output=None):
@@ -7766,6 +7793,7 @@ async def cmd_shot_annotated(output=None):
         print(f"{output} ({badge_count} badge)")
     else:
         print("Screenshot failed", file=sys.stderr)
+        sys.exit(1)
 
 
 async def cmd_eval(js_code):
@@ -7775,10 +7803,11 @@ async def cmd_eval(js_code):
         "returnByValue": True,
         "awaitPromise": True,
     })])
-    result = r.get(1, {})
+    result = _cdp_reply(r, 1, "Runtime.evaluate", 15)
     if "exceptionDetails" in result:
         exc = result["exceptionDetails"]
         print(f"Error: {exc.get('text', '')} — {exc.get('exception', {}).get('description', '')}")
+        sys.exit(1)  # a page-side exception is a failure (stdout text kept for compatibility)
     else:
         val = result.get("result", {})
         if val.get("type") == "undefined":
@@ -7832,7 +7861,7 @@ async def cmd_eval_batch(exprs_json):
         "returnByValue": True,
         "awaitPromise": True,
     })], timeout=30)
-    result = r.get(1, {})
+    result = _cdp_reply(r, 1, "Runtime.evaluate", 30)
     if "exceptionDetails" in result:
         exc = result["exceptionDetails"]
         print(json.dumps({"error": f"batch failed: {exc.get('text', '')}"}), file=sys.stderr)
@@ -9216,7 +9245,7 @@ async def cmd_cookies(*args):
             host = args[2]
             ws, _ = get_page_ws()
             r = await cdp_send(ws, [(1, "Network.getCookies", {})])
-            all_c = r.get(1, {}).get("cookies", [])
+            all_c = _cdp_reply(r, 1, "Network.getCookies", 15).get("cookies", [])
             host_c = [c for c in all_c if host.endswith(c.get('domain', '').lstrip('.'))]
             if not host_c:
                 print(f"No cookies found for host: {host}", file=sys.stderr)
@@ -9234,7 +9263,7 @@ async def cmd_cookies(*args):
         # Get all cookies (no urls filter → all). Domain filter is applied
         # client-side so we can match subdomains via endswith.
         r = await cdp_send(ws, [(1, "Network.getCookies", {})])
-        cookies = r.get(1, {}).get("cookies", [])
+        cookies = _cdp_reply(r, 1, "Network.getCookies", 15).get("cookies", [])
         if domain_filter:
             d = domain_filter.lstrip('.')
             cookies = [c for c in cookies
@@ -9428,7 +9457,7 @@ async def cmd_cookies(*args):
     if domain:
         params["urls"] = [f"https://{domain}", f"http://{domain}"]
     r = await cdp_send(ws, [(1, "Network.getCookies", params)])
-    cookies = r.get(1, {}).get("cookies", [])
+    cookies = _cdp_reply(r, 1, "Network.getCookies", 15).get("cookies", [])
     for c in cookies:
         sec = "🔒" if c.get("secure") else "  "
         print(f"  {sec} {c['name'][:35]:35} = {str(c.get('value',''))[:50]:50} ({c.get('domain','')})")
@@ -9441,7 +9470,7 @@ async def cmd_storage():
         "expression": "JSON.stringify(Object.fromEntries(Object.entries(localStorage).map(([k,v])=>[k,v.substring(0,200)])))",
         "returnByValue": True,
     })])
-    val = r.get(1, {}).get("result", {}).get("value", "{}")
+    val = _cdp_reply(r, 1, "Runtime.evaluate", 15).get("result", {}).get("value", "{}")
     try:
         data = json.loads(val)
         for k, v in data.items():
@@ -10668,6 +10697,7 @@ async def cmd_pdf(output=None):
         print(f'PDF saved: {output}')
     else:
         print('PDF generation failed', file=sys.stderr)
+        sys.exit(1)
 
 async def cmd_upload(selector, file_path):
     """Upload a file to a file input element."""
@@ -14608,7 +14638,7 @@ async def cmd_observe():
     })()
     """
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-    result = r.get(1, {}).get("result", {}).get("value", "No interactive elements found")
+    result = _cdp_reply(r, 1, "Runtime.evaluate", 15).get("result", {}).get("value", "No interactive elements found")
     print(f"=== What you can do on this page ===\n")
     print(result)
 
@@ -18929,9 +18959,10 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
             sys.exit(1)
         js_code = " ".join(subcmd_args)
         res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js_code, "returnByValue": True})])
-        val = res.get(1, {})
+        val = _cdp_reply(res, 1, "Runtime.evaluate", 15)
         if "error" in val or val.get("exceptionDetails"):
             print(f"Error: {val}", file=sys.stderr)
+            sys.exit(1)
         else:
             print(f"Result: {val.get('result', {}).get('value', val)}")
 
