@@ -15145,6 +15145,7 @@ class FakeCanvasHost:
         self.reqs = []
         self.lock = threading.Lock()
         self.first_in = threading.Event()
+        self.hold = None
         self.patch_event = threading.Event()
         self._stop = threading.Event()
         self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -15181,7 +15182,9 @@ class FakeCanvasHost:
                 if msg.get("op") not in mod.CANVAS_OPS:
                     rep = {"ok": False, "error": "bad op", "code": 2}
                 else:
-                    if self.delay_s > 0:
+                    if self.hold is not None:
+                        self.hold.wait(5.0)
+                    elif self.delay_s > 0:
                         time.sleep(self.delay_s)
                     rep = {
                         "ok": True,
@@ -15351,7 +15354,8 @@ out["whole"] = {
 }
 
 # 6. Coalescing under a slow fake host
-h6 = FakeCanvasHost("slow", delay_s=0.180)
+h6 = FakeCanvasHost("slow")
+h6.hold = threading.Event()
 def feed_slow(w):
     time.sleep(0.01)
     os.write(w, b"<div>1</div>")
@@ -15359,6 +15363,8 @@ def feed_slow(w):
     for k in (2, 3, 4, 5):
         time.sleep(0.025)
         os.write(w, f"<div>{k}</div>".encode("utf-8"))
+    time.sleep(0.3)
+    h6.hold.set()
 rc6, out6, _ = run_stream_with_feeder("slow", feed_slow)
 h6.close()
 out["coalesce"] = {
