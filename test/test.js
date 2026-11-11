@@ -8715,6 +8715,18 @@ print("ok")
       const envRows = run(fake, ['agent', 'observe'], { CDPILOT_OBSERVE_FORMAT: 'rows' });
       assert.deepStrictEqual(envRows.actions, rows.actions);
       assert(!run(fake, ['agent', 'observe']).actions.some(Array.isArray), 'objects stay the default');
+      const password = rows.actions.find((r) => r[2] === 'Password');
+      assert.strictEqual(password[1], '', 'consecutive same role writes "" (E1)');
+      const openMenu = rows.actions.find((r) => r[2] === 'Open menu');
+      assert.strictEqual(openMenu[1], 'StaticText', 'role change writes full role');
+      const veryLong = rows.actions.find((r) => r[2].startsWith('Very long clickable name'));
+      assert.strictEqual(veryLong[1], '', 'consecutive StaticText writes "" (E1)');
+      const objFlag = run(fake, ['agent', 'observe', '--objects'], { CDPILOT_OBSERVE_FORMAT: 'rows' });
+      assert(!objFlag.actions.some(Array.isArray), '--objects overrides CDPILOT_OBSERVE_FORMAT=rows');
+      const envObj = run(fake, ['agent', 'observe'], { CDPILOT_OBSERVE_FORMAT: 'objects' });
+      assert(!envObj.actions.some(Array.isArray), 'CDPILOT_OBSERVE_FORMAT=objects gives objects');
+      const rowsFlag = run(fake, ['agent', 'observe', '--rows'], { CDPILOT_OBSERVE_FORMAT: 'objects' });
+      assert(rowsFlag.actions.every(Array.isArray), '--rows overrides CDPILOT_OBSERVE_FORMAT=objects');
       // --diff: added AND removed go through the view; a hidden ref is never listed as removed
       run(fake, ['agent', 'reset']);
       const before = run(fake, ['agent', 'observe']);
@@ -9086,6 +9098,32 @@ print("ok")
       assert(!names.includes('browser_agent_find') && !names.includes('browser_agent_observe'), names.join());
       assert.strictEqual(names.length, 11, 'core profile: 10 tools + browser_tools');
     } finally { fake.stop(); }
+  });
+
+  test('agent rows E1 (unit): "" for a role equal to the previous row, first row full, value rows, unnamed rows, objects untouched, round trip', () => {
+    const { spawnSync } = require('child_process');
+    const script = `
+import importlib.util, json
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+rows = [["@1","link","A"],["@2","link","B"],["@3","textbox","To","x"],["@4","textbox","Cc","y"],["@5","link",""],["@6","link",""]]
+out = mod._agent_rows_e1(rows)
+objs = [{"ref":"@1","role":"link","name":"A"},{"ref":"@2","role":"link","name":"B"}]
+print(json.dumps({"out": out, "src_unchanged": rows[1][1] == "link", "objs": mod._agent_rows_e1(objs), "empty": mod._agent_rows_e1([]),
+                  "cut": mod._agent_rows_e1(mod._agent_cap_list(rows, 3)[0][1:])}))
+`;
+    const r = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf-8', timeout: 30000 });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const o = JSON.parse(r.stdout.trim().split('\n').pop());
+    assert.deepStrictEqual(o.out, [["@1","link","A"],["@2","","B"],["@3","textbox","To","x"],["@4","","Cc","y"],["@5","link",""],["@6","",""]]);
+    assert.strictEqual(o.src_unchanged, true, 'the input list is not modified');
+    assert.deepStrictEqual(o.objs, [{"ref":"@1","role":"link","name":"A"},{"ref":"@2","role":"link","name":"B"}], 'objects are never rewritten');
+    assert.deepStrictEqual(o.empty, []);
+    assert.strictEqual(o.cut[0][1], 'link', 'the first row of every printed list carries its full role');
+    // round trip: a reader fills "" from the previous row and gets the rows back
+    let prev = null;
+    const back = o.out.map((row) => { const r2 = row.slice(); if (r2[1] === '') r2[1] = prev; prev = r2[1]; return r2; });
+    assert.deepStrictEqual(back, [["@1","link","A"],["@2","link","B"],["@3","textbox","To","x"],["@4","textbox","Cc","y"],["@5","link",""],["@6","link",""]]);
   });
 
   test('agent observe view (unit, scale): _agent_clickable_bids on 19,000 nodes / 17,000 layout entries / 2,000 candidates returns the expected set in < 100 ms (document tables built once, ancestor walks memoised)', () => {
