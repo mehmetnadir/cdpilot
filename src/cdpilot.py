@@ -16683,9 +16683,26 @@ def _agent_injection_norm(name):
     return t + ''.join('\n' + _agent_norm_text(d) for d in decoded) if decoded else t
 
 
-def _agent_injection_scan(nodes, limit=5):
+def _agent_injection_match(name):
+    """The pattern an accessible name matches (see _AGENT_INJECTION_RES), else None; a name under
+    12 characters never matches."""
+    if len(name) < 12:
+        return None
+    norm = _agent_injection_norm(name)
+    tag = next((t for t, rx in _AGENT_INJECTION_RES if rx.search(norm)), None)
+    asc = norm.isascii()
+    if tag is None and (_AGENT_KEYS_ASCII_RE if asc else _AGENT_KEYS_RE).search(norm):
+        tag = next((t for t, rx, need, keys in (_AGENT_INJECTION_LATER_ASCII if asc else _AGENT_INJECTION_LATER)
+                if any(k in norm for k in keys) and rx.search(norm)
+                and (need is None or need.search(norm))), None)
+    return tag
+
+
+def _agent_injection_scan(nodes, limit=5, why=None, names=None):
     """Nodes whose accessible name reads like instructions to an AI agent:
-    [{"text": <≤160 chars>, "match": <pattern>}], at most `limit`."""
+    [{"text": <≤160 chars>, "match": <pattern>}], at most `limit`. `why` (backend node id ->
+    visibility labels, see _agent_text_view) adds "why": ["pattern", "hidden:<label>", …] to a
+    record whose node the page does not show; `names` (a list) collects the matched names uncut."""
     out, seen = [], set()
     for node in nodes:
         if node.get('ignored'):
@@ -16693,24 +16710,26 @@ def _agent_injection_scan(nodes, limit=5):
         name = node.get('name', {}).get('value', '') or ''
         if len(name) < 12 or name in seen:
             continue
-        norm = _agent_injection_norm(name)
-        tag = next((t for t, rx in _AGENT_INJECTION_RES if rx.search(norm)), None)
-        asc = norm.isascii()
-        if tag is None and (_AGENT_KEYS_ASCII_RE if asc else _AGENT_KEYS_RE).search(norm):
-            tag = next((t for t, rx, need, keys in (_AGENT_INJECTION_LATER_ASCII if asc else _AGENT_INJECTION_LATER)
-                    if any(k in norm for k in keys) and rx.search(norm)
-                    and (need is None or need.search(norm))), None)
+        tag = _agent_injection_match(name)
         if tag is not None:
             seen.add(name)
-            out.append({'text': name[:160], 'match': tag})
+            rec = {'text': name[:160], 'match': tag}
+            labels = why.get(node.get('backendDOMNodeId')) if why else None
+            if labels:
+                rec['why'] = ['pattern'] + ['hidden:' + lab for lab in labels]
+            out.append(rec)
+            if names is not None:
+                names.append(name)
         if len(out) >= limit:
             break
     return out
 
 
-def _extract_text_summary(nodes, max_chars=2000):
+def _extract_text_summary(nodes, max_chars=2000, skip=(), strip=()):
     # Chrome's AX role value is 'StaticText' (capital S); a StaticText child
     # usually repeats its parent's name, so consecutive duplicates are dropped.
+    # skip: backend node ids left out; strip: texts cut out of the names kept (a
+    # heading's name repeats the text nodes below it). Both from _agent_text_view.
     text_roles = {'StaticText', 'text', 'paragraph', 'heading'}
     parts = []
     for node in nodes:
@@ -16718,7 +16737,13 @@ def _extract_text_summary(nodes, max_chars=2000):
             continue
         role = node.get('role', {}).get('value', '')
         if role in text_roles:
+            if skip and node.get('backendDOMNodeId') in skip:
+                continue
             name = node.get('name', {}).get('value', '')
+            if strip and name:
+                for s in strip:
+                    if s in name:
+                        name = ' '.join(name.replace(s, ' ').split())
             if name and (not parts or parts[-1] != name):
                 parts.append(name)
     summary = ' '.join(parts)
@@ -16814,7 +16839,16 @@ def _agent_snapshot_valid(res):
     return isinstance(res, dict) and isinstance(res.get('documents'), list) and isinstance(res.get('strings'), list)
 
 
-def _agent_clickable_bids(res, bids):
+def _agent_snapshot_where(res):
+    """backendNodeId -> (document index, node index) of a DOMSnapshot reply."""
+    where = {}
+    for di, doc in enumerate(res['documents']):
+        for i, b in enumerate((doc.get('nodes') or {}).get('backendNodeId') or []):
+            where[b] = (di, i)
+    return where
+
+
+def _agent_clickable_bids(res, bids, where=None):
     """Of `bids` (non-interactive entries' backend node ids), the ones a user can
     click although the AX tree calls them text: the element (the node itself, or
     its parent for a text node) starts `cursor:pointer` (its parent is not
@@ -16827,10 +16861,7 @@ def _agent_clickable_bids(res, bids):
     def s_(i):
         return strings[i] if isinstance(i, int) and 0 <= i < len(strings) else ''
 
-    where = {}
-    for di, doc in enumerate(res['documents']):
-        for i, b in enumerate((doc.get('nodes') or {}).get('backendNodeId') or []):
-            where[b] = (di, i)
+    where = _agent_snapshot_where(res) if where is None else where
     # Per document, built once: the isClickable set and node index -> cursor.
     # Per element, memoised: "is it or does it sit in a native interactive
     # element" (siblings share ancestors, so each node is walked once).
@@ -16928,26 +16959,337 @@ def _agent_drop_container_names(nodes, actions, hidden):
             hidden.add(a['ref'])
 
 
-async def _agent_hidden_refs(ws_url, nodes, actions):
+# ── Hidden text: what the AX tree keeps but the page does not show a person (2026-11-11, B1) ──
+# Design .claude/docs/enjeksiyon-yontem-tasarim.md §4.1, inventory .claude/docs/olcum/enjeksiyon-m0-2026-11-11.md,
+# jury D-0105. An AX text node gets a label from its layout (the same one DOMSnapshot call as the view):
+#   offscreen    its box lies outside the document's content area, or wholly outside (on an axis that clips)
+#                the box of the nearest ancestor with overflow hidden|clip that clips it (a carousel slide)
+#   tiny         font-size < 4 px, or a box of <= 4 px² (transform: scale(0) gives a 0 x 0 box)
+#   transparent  the alpha of its color x the opacity of its element and every ancestor < 0.1
+#   camouflage   contrast < 1.2 between its color and the background Chrome blends behind it, and no
+#                background-image on the way up (over an image Chrome reports no blend: then no label)
+# An element whose accessible name comes from aria-label, differs from its own content and is not an image
+# (alt is what an image shows) gets `name_attr` (AX only). Left out of v1 as ambiguous (M0): clip-path,
+# title / aria-description, transforms other than scale(0), sr-only (its 1 px clip looks like legitimate use).
+# The rule was fixed before the blind measurements (M1, M2) and is not tuned on them.
+AGENT_HIDDEN_MIN_WORDS = 8
+AGENT_HIDDEN_MAX = 5
+# cursor stays first: _agent_clickable_bids reads styles[0]
+_AGENT_SNAP_STYLES = ('cursor', 'font-size', 'color', 'background-image', 'opacity', 'overflow-x', 'overflow-y',
+                      'position')
+_AGENT_CLIP_VALUES = frozenset({'hidden', 'clip'})
+_AGENT_TEXT_ROLES = frozenset({'StaticText', 'text'})
+_AGENT_IMAGE_ROLES = frozenset({'image', 'img', 'figure', 'Canvas', 'SvgRoot', 'graphics-document',
+                                'graphics-object', 'graphics-symbol', 'video', 'Video', 'Audio'})
+# A part may leave `text` only when it is offscreen or tiny AND one of its nodes matches an injection
+# pattern (D-0105 J2-3); a part labelled transparent or camouflage stays in `text` until M1 + M2 pass
+# (J1-1); name_attr never touches a name, a ref or the text (J1-3).
+_AGENT_HIDDEN_CUT = frozenset({'offscreen', 'tiny'})
+_AGENT_HIDDEN_KEEP = frozenset({'transparent', 'camouflage', 'name_attr'})
+_AGENT_RGB_RE = _re.compile(r'rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)(?:\s*[,/]\s*([\d.]+)(%?))?\s*\)')
+
+
+def _agent_rgba(s):
+    """(r, g, b, a) of a computed color as Chrome writes one (rgb()/rgba()); None for anything else
+    (another color space gives no label rather than a guess)."""
+    m = _AGENT_RGB_RE.fullmatch((s or '').strip())
+    if not m:
+        return None
+    try:
+        a = 1.0 if m.group(4) is None else float(m.group(4)) / (100 if m.group(5) else 1)
+        return float(m.group(1)), float(m.group(2)), float(m.group(3)), a
+    except ValueError:
+        return None
+
+
+def _agent_contrast(fg, bg):
+    """WCAG contrast ratio of fg (alpha composited on bg) and bg (alpha composited on white)."""
+    def lum(c):
+        ch = [v / 255 for v in c]
+        ch = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in ch]
+        return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]
+    b = [bg[i] * bg[3] + 255 * (1 - bg[3]) for i in range(3)]
+    f = [fg[i] * fg[3] + b[i] * (1 - fg[3]) for i in range(3)]
+    hi, lo = sorted((lum(f), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _agent_px(s):
+    if not s.endswith('px'):
+        return None
+    try:
+        return float(s[:-2])
+    except ValueError:
+        return None
+
+
+def _agent_invisible_bids(res, bids, where=None):
+    """{backend node id: [labels]} for the text nodes `bids` (AX StaticText ids) the page does not
+    show a person: offscreen, tiny, transparent, camouflage (see above). `res` is a snapshot taken
+    with _AGENT_SNAP_STYLES and includeBlendedBackgroundColors. A node without a layout box gets no
+    label; an all-zero box (a node Chrome did not lay out) is not judged by its box. Ancestor facts
+    (clipping box, opacity, background image) are filled once per element, top-down, and shared."""
+    strings = res['strings']
+
+    def s_(i):
+        return strings[i] if isinstance(i, int) and 0 <= i < len(strings) else ''
+
+    where = _agent_snapshot_where(res) if where is None else where
+    docs = {}
+    root = (None, None, 1.0, False)
+
+    def doc_info(di):
+        info = docs.get(di)
+        if info is None:
+            doc = res['documents'][di]
+            nd, lay = doc.get('nodes') or {}, doc.get('layout') or {}
+            info = docs[di] = {
+                'par': nd.get('parentIndex') or [], 'types': nd.get('nodeType') or [],
+                'lk': {ni: k for k, ni in enumerate(lay.get('nodeIndex') or [])},
+                'styles': lay.get('styles') or [], 'bounds': lay.get('bounds') or [],
+                'blend': lay.get('blendedBackgroundColors') or [],
+                'cw': doc.get('contentWidth'), 'ch': doc.get('contentHeight'), 'memo': {}}
+        return info
+
+    def style(info, k, j):
+        st = info['styles'][k] if k is not None and k < len(info['styles']) else None
+        return s_(st[j]) if st and j < len(st) else ''
+
+    def box(info, k):
+        b = info['bounds'][k] if k is not None and k < len(info['bounds']) else None
+        return b if isinstance(b, list) and len(b) >= 4 else None
+
+    def facts(info, x):
+        # (clip box for in-flow children, clip box for absolutely positioned children, opacity product,
+        # background image on the way up). An overflow box clips an absolutely positioned descendant only
+        # when it is positioned or above the descendant's containing block; nothing clips a fixed one.
+        memo, par, types = info['memo'], info['par'], info['types']
+        path, a = [], x
+        while a is not None and a >= 0 and a not in memo and len(path) < 5000:
+            path.append(a)
+            a = par[a] if a < len(par) else None
+        base = memo.get(a, root) if a is not None and a >= 0 else root
+        for n in reversed(path):
+            k = info['lk'].get(n)
+            if k is not None and n < len(types) and types[n] == 1:
+                cfc, cfp, op, img = base
+                pos = style(info, k, 7) or 'static'
+                applying = None if pos == 'fixed' else (cfp if pos == 'absolute' else cfc)
+                own = n if (style(info, k, 5) in _AGENT_CLIP_VALUES or style(info, k, 6) in _AGENT_CLIP_VALUES) \
+                    else applying
+                try:
+                    o = float(style(info, k, 4) or 1)
+                except ValueError:
+                    o = 1.0
+                base = (own, own if pos != 'static' else cfp, op * o, img or style(info, k, 3) not in ('', 'none'))
+            memo[n] = base
+        return memo.get(x, base)
+
+    out = {}
+    for b in bids:
+        loc = where.get(b)
+        if loc is None:
+            continue
+        info = doc_info(loc[0])
+        i, par, types = loc[1], info['par'], info['types']
+        k = info['lk'].get(i)
+        bx = box(info, k)
+        if bx is None:
+            continue
+        el = i if i < len(types) and types[i] == 1 else (par[i] if i < len(par) else -1)
+        if el is None or el < 0:
+            continue
+        x, y, w, h = bx[:4]
+        judged = bool(x or y or w or h)
+        cw, ch = info['cw'], info['ch']
+        off = judged and (x + w <= 0 or y + h <= 0 or (isinstance(cw, (int, float)) and x >= cw)
+                          or (isinstance(ch, (int, float)) and y >= ch))
+        if not off and w > 0 and h > 0:
+            if el == i:  # the node is an element: what clips it depends on its own position
+                pe = par[el] if el < len(par) else -1
+                pf = facts(info, pe) if pe is not None and pe >= 0 else root
+                pos = style(info, k, 7) or 'static'
+                clip = None if pos == 'fixed' else (pf[1] if pos == 'absolute' else pf[0])
+            else:
+                clip = facts(info, el)[0]
+            ck = info['lk'].get(clip) if clip is not None else None
+            cb = box(info, ck)
+            if cb is not None:
+                ow = min(x + w, cb[0] + cb[2]) - max(x, cb[0])
+                oh = min(y + h, cb[1] + cb[3]) - max(y, cb[1])
+                off = ((style(info, ck, 5) in _AGENT_CLIP_VALUES and ow <= 0)
+                       or (style(info, ck, 6) in _AGENT_CLIP_VALUES and oh <= 0))
+        labels = ['offscreen'] if off else []
+        fs = _agent_px(style(info, k, 1))
+        if (fs is not None and fs < 4) or (judged and w * h <= 4):
+            labels.append('tiny')
+        _cfc, _cfp, op, img = facts(info, el)
+        fg = _agent_rgba(style(info, k, 2))
+        if fg is not None and fg[3] * op < 0.1:
+            labels.append('transparent')
+        elif fg is not None and not img:
+            ek = info['lk'].get(el)
+            bg = _agent_rgba(s_(info['blend'][ek])) if ek is not None and ek < len(info['blend']) else None
+            if bg is not None and _agent_contrast((fg[0], fg[1], fg[2], fg[3] * op), bg) < 1.2:
+                labels.append('camouflage')
+        if labels:
+            out[b] = labels
+    return out
+
+
+def _agent_name_attr(nodes):
+    """{backend node id: name} of the elements whose accessible name comes from aria-label (the AX
+    name source that won), has >= AGENT_HIDDEN_MIN_WORDS words and differs from the element's own
+    content; images are left out (alt is what an image shows)."""
+    out = {}
+    for n in nodes:
+        if n.get('ignored'):
+            continue
+        role = (n.get('role') or {}).get('value', '')
+        if role in _AGENT_IMAGE_ROLES or role in _AGENT_TEXT_ROLES:
+            continue
+        nm = n.get('name') or {}
+        name = nm.get('value') or ''
+        if not isinstance(name, str) or len(name.split()) < AGENT_HIDDEN_MIN_WORDS:
+            continue
+        srcs = [s for s in (nm.get('sources') or []) if isinstance(s, dict)]
+        win = next((s for s in srcs if 'value' in s and not s.get('superseded') and not s.get('invalid')), None)
+        if not win or win.get('type') != 'attribute' or win.get('attribute') != 'aria-label':
+            continue
+        content = next(((s.get('value') or {}).get('value') or '' for s in srcs if s.get('type') == 'contents'), '')
+        if ' '.join(str(content).split()).casefold() == ' '.join(name.split()).casefold():
+            continue
+        bid = n.get('backendDOMNodeId')
+        if bid:
+            out[bid] = name
+    return out
+
+
+def _agent_text_bids(nodes):
+    """Backend ids of the non-empty AX text nodes, or [] when all of them together have fewer than
+    AGENT_HIDDEN_MIN_WORDS words (no part could be listed: the snapshot takes no extra styles)."""
+    bids, words = [], 0
+    for n in nodes:
+        if n.get('ignored') or (n.get('role') or {}).get('value') not in _AGENT_TEXT_ROLES:
+            continue
+        name = (n.get('name') or {}).get('value') or ''
+        b = n.get('backendDOMNodeId')
+        if b and isinstance(name, str) and name.strip():
+            bids.append(b)
+            if words < AGENT_HIDDEN_MIN_WORDS:
+                words += len(name.split())
+    return bids if words >= AGENT_HIDDEN_MIN_WORDS else []
+
+
+def _agent_text_view(nodes, vis=None):
+    """The text side of one observation: {text, text_hash, hidden_text, hidden_check, why, parts}.
+    Consecutive AX text nodes with the same labels (vis['labels'], _agent_invisible_bids) are one
+    part; a part of >= AGENT_HIDDEN_MIN_WORDS words is listed in hidden_text ({text <= 160, how,
+    words}, at most AGENT_HIDDEN_MAX), then name_attr names. A part leaves `text` only when it is
+    offscreen or tiny, carries no transparent/camouflage label and one of its nodes matches an
+    injection pattern; those are listed first, so every part cut from `text` is in hidden_text.
+    `why` maps a node to its labels (injection_suspect); `parts` are the listed texts uncut."""
+    vis = vis or {}
+    labels = vis.get('labels') or {}
+    attr = _agent_name_attr(nodes)
+    runs, cur = [], None
+    for n in (nodes if labels else ()):
+        if n.get('ignored') or (n.get('role') or {}).get('value') not in _AGENT_TEXT_ROLES:
+            continue
+        name = (n.get('name') or {}).get('value') or ''
+        if not isinstance(name, str) or not name.strip():
+            continue  # a whitespace node between two hidden ones does not end the part
+        lab = labels.get(n.get('backendDOMNodeId'))
+        if not lab:
+            cur = None
+        elif cur is not None and cur[0] == lab:
+            cur[1].append(n)
+        else:
+            cur = (lab, [n])
+            runs.append(cur)
+    cut, keep = [], []
+    for lab, ns in runs:
+        names = [(n.get('name') or {}).get('value') or '' for n in ns]
+        text = ' '.join(' '.join(nm.split()) for nm in names)
+        words = len(text.split())
+        if words < AGENT_HIDDEN_MIN_WORDS:
+            continue
+        rec = {'text': text[:160], 'how': '+'.join(lab), 'words': words}
+        cuts = bool(_AGENT_HIDDEN_CUT.intersection(lab)) and not _AGENT_HIDDEN_KEEP.intersection(lab) \
+            and any(_agent_injection_match(nm) for nm in names)
+        (cut if cuts else keep).append((rec, text, ns))
+    for _bid, name in attr.items():
+        keep.append(({'text': name[:160], 'how': 'name_attr', 'words': len(name.split())}, name, ()))
+    listed = (cut + keep)[:AGENT_HIDDEN_MAX]
+    gone = cut[:AGENT_HIDDEN_MAX]
+    skip = {n.get('backendDOMNodeId') for _r, _t, ns in gone for n in ns}
+    strip = sorted({(n.get('name') or {}).get('value') for _r, _t, ns in gone for n in ns
+                    if len((n.get('name') or {}).get('value') or '') >= 12}, key=len, reverse=True)
+    text = _extract_text_summary(nodes, skip=skip, strip=strip)
+    hidden_text = [r for r, _t, _ns in listed]
+    why = {b: list(lab) for b, lab in labels.items()}
+    for b in attr:
+        why.setdefault(b, []).append('name_attr')
+    # the hash covers the listed hidden parts too, so a diff reports them when only they changed;
+    # without any it is the hash of `text` alone, as before
+    h = text + ('\0' + json.dumps(hidden_text, sort_keys=True, ensure_ascii=False) if hidden_text else '')
+    return {'text': text, 'text_hash': hashlib.md5(h.encode()).hexdigest()[:8], 'hidden_text': hidden_text,
+            'hidden_check': vis.get('check'), 'why': why, 'parts': [t for _r, t, _ns in cut + keep]}
+
+
+def _agent_text_fields(view, nodes, state, out):
+    """Write one observation's text side into `out`: text, then injection_suspect, hidden_text and
+    hidden_check, each only when it has something."""
+    out['text'] = view['text']
+    suspects = _agent_injection_scan(nodes, why=view.get('why'))
+    if suspects:
+        out['injection_suspect'] = suspects
+    if view.get('hidden_text'):
+        out['hidden_text'] = view['hidden_text']
+    if view.get('hidden_check'):
+        out['hidden_check'] = view['hidden_check']
+    return out
+
+
+async def _agent_hidden_refs(ws_url, nodes, actions, vis=None):
     """Refs the default output leaves out. Interactive roles and landmarks stay;
     other entries (StaticText, cell, ListMarker …) stay only when clickable (see
     _agent_clickable_bids). Fail open: when the one DOMSnapshot call errors, times
     out (2 s) or returns no document, nothing is hidden for this snapshot — a
-    broken probe must never make a page look emptier than it is."""
+    broken probe must never make a page look emptier than it is.
+    With `vis` (a dict) the same call also takes the styles of the hidden-text rule
+    (only when the page has AGENT_HIDDEN_MIN_WORDS words of text or more) and fills
+    vis['labels'] (_agent_invisible_bids); a probe that fails then sets
+    vis['check'] = 'unavailable': a page can bloat its DOM to make the probe fail,
+    and the model must know the text was not checked."""
     cand = [a for a in actions
             if a['role'] not in AGENT_INTERACTIVE_ROLES and a['role'] not in AGENT_LANDMARK_ROLES]
     hidden = set()
-    if cand:
+    texts = _agent_text_bids(nodes) if vis is not None else []
+    if cand or texts:
+        params = {'computedStyles': list(_AGENT_SNAP_STYLES) if texts else ['cursor'], 'includeDOMRects': False}
+        if texts:
+            params['includeBlendedBackgroundColors'] = True
         try:
-            r = await cdp_send(ws_url, [(1, 'DOMSnapshot.captureSnapshot',
-                                         {'computedStyles': ['cursor'], 'includeDOMRects': False})], timeout=2)
+            r = await cdp_send(ws_url, [(1, 'DOMSnapshot.captureSnapshot', params)], timeout=2)
             res = r.get(1)
         except Exception:
             res = None
         if not _agent_snapshot_valid(res):
-            return hidden
-        ok = _agent_clickable_bids(res, [a['backend_node_id'] for a in cand])
-        hidden = {a['ref'] for a in cand if a['backend_node_id'] not in ok}
+            if texts:
+                vis['check'] = 'unavailable'
+            if cand:
+                return hidden
+        else:
+            where = _agent_snapshot_where(res)
+            if cand:
+                ok = _agent_clickable_bids(res, [a['backend_node_id'] for a in cand], where)
+                hidden = {a['ref'] for a in cand if a['backend_node_id'] not in ok}
+            if texts:
+                try:
+                    vis['labels'] = _agent_invisible_bids(res, texts, where)
+                except (TypeError, ValueError, IndexError, KeyError, AttributeError):
+                    vis['check'] = 'unavailable'  # a malformed reply: not judged, and said so
     _agent_drop_container_names(nodes, actions, hidden)
     return hidden
 
@@ -16989,7 +17331,7 @@ def _agent_out_diff(diff, old_map, old_hidden, new_actions, new_hidden, full=Fal
 
 
 async def _agent_full_snapshot():
-    """Internal: take full AXTree snapshot, return (page, nodes, actions, state)."""
+    """Internal: take full AXTree snapshot, return (page, nodes, actions, state, view); view = text side."""
     ws_url, page = get_page_ws()
     await cdp_send(ws_url, [(0, 'Accessibility.enable', {})])
     res = await cdp_send(ws_url, [(1, 'Accessibility.getFullAXTree', {})])
@@ -16998,12 +17340,13 @@ async def _agent_full_snapshot():
     actions = _snapshot_to_actions(nodes, state)
     # Rebuild actions_map from new actions
     state['actions_map'] = {a['ref']: a for a in actions}
-    state['hidden_refs'] = sorted(await _agent_hidden_refs(ws_url, nodes, actions))
+    vis = {}
+    state['hidden_refs'] = sorted(await _agent_hidden_refs(ws_url, nodes, actions, vis))
     # Sync _A11Y_REF_MAP for compatibility with click-ref
     global _A11Y_REF_MAP
     _A11Y_REF_MAP = {int(a['ref'].lstrip('@')): a['backend_node_id'] for a in actions}
     _save_a11y_refs(_A11Y_REF_MAP)
-    return page, nodes, actions, state
+    return page, nodes, actions, state, _agent_text_view(nodes, vis)
 
 
 async def cmd_agent_observe(diff=False, full=False, rows=False):
@@ -17019,9 +17362,9 @@ async def cmd_agent_observe(diff=False, full=False, rows=False):
     rows = _agent_rows_wanted(rows)
     before = _load_agent_state()
     old_map = dict(before.get('actions_map', {}))
-    page, nodes, actions, state = await _agent_full_snapshot()
-    text = _extract_text_summary(nodes)
-    text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
+    page, nodes, actions, state, view = await _agent_full_snapshot()
+    text = view['text']
+    text_hash = view['text_hash']
     # Actions for output — exclude backend_node_id (internal only)
     out_actions = _agent_out_actions(actions, state.get('hidden_refs', ()), full, rows)
     full_tok = _estimate_tokens({'actions': out_actions, 'text': text})
@@ -17034,10 +17377,7 @@ async def cmd_agent_observe(diff=False, full=False, rows=False):
             'text_changed': text_hash != before.get('last_text_hash'),
         }
         if snap['text_changed']:
-            snap['text'] = text
-            suspects = _agent_injection_scan(nodes)
-            if suspects:
-                snap['injection_suspect'] = suspects
+            _agent_text_fields(view, nodes, state, snap)
         token_est = _estimate_tokens(snap)
         snap['token_estimate'] = token_est
         snap['saved_vs_full'] = round(max(0.0, 1.0 - token_est / full_tok), 3) if full_tok else 0.0
@@ -17052,9 +17392,7 @@ async def cmd_agent_observe(diff=False, full=False, rows=False):
         known = _agent_flows_for_host(_agent_host_path(page.get('url', ''))[0])
         if known:
             snap['known_flows'] = known
-        suspects = _agent_injection_scan(nodes)
-        if suspects:
-            snap['injection_suspect'] = suspects
+        _agent_text_fields(view, nodes, state, snap)
         token_est = _estimate_tokens(snap)
         snap['token_estimate'] = token_est
         state['total_tokens_full'] = state.get('total_tokens_full', 0) + token_est
@@ -17198,7 +17536,7 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None, full=Fals
     # Take new snapshot for diff. The action may have changed the tab's URL
     # and title; the 0.5 s /json cache would still show the old ones.
     cdp_cache_invalidate()
-    page, nodes, new_actions, new_state = await _agent_full_snapshot()
+    page, nodes, new_actions, new_state, view = await _agent_full_snapshot()
     # The trail: what a flow is saved from. Anchors, never refs or node ids;
     # a typed secret is a {{placeholder}} before it reaches agent-state.json.
     if url:
@@ -17214,18 +17552,15 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None, full=Fals
     _agent_trail_push(new_state, entry)
     diff = _agent_out_diff(_diff_snapshots(old_map, new_actions), old_map, state.get('hidden_refs'),
                            new_actions, new_state.get('hidden_refs'), full, rows)
-    new_text = _extract_text_summary(nodes)
-    text_hash = hashlib.md5(new_text.encode()).hexdigest()[:8]
+    new_text = view['text']
+    text_hash = view['text_hash']
     result = {
         'url': page.get('url', ''),
         'changed': diff,
         'text_changed': text_hash != state.get('last_text_hash'),
     }
     if result['text_changed']:
-        result['text'] = new_text
-        suspects = _agent_injection_scan(nodes)
-        if suspects:
-            result['injection_suspect'] = suspects
+        _agent_text_fields(view, nodes, new_state, result)
     diff_tok = _estimate_tokens(result)
     out_actions = _agent_out_actions(new_actions, new_state.get('hidden_refs', ()), full, rows)
     full_tok = _estimate_tokens({'actions': out_actions, 'text': new_text})
@@ -17893,32 +18228,32 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
     done = []
     state = None
 
-    last_nodes = []
+    last_nodes, last_view = [], {}
 
     async def snapshot():
-        nonlocal last_nodes
+        nonlocal last_nodes, last_view
         cdp_cache_invalidate()
-        page, nodes, actions, st = await _agent_full_snapshot()
-        last_nodes = nodes
-        text = _extract_text_summary(nodes)
+        page, nodes, actions, st, view = await _agent_full_snapshot()
+        last_nodes, last_view = nodes, view
+        text = view['text']
         out = _agent_out_actions(actions, st.get('hidden_refs', ()), full, rows)
         return page, actions, out, text, st
 
-    def drift(step, reason, page, out_actions, text, st, suspects=None):
-        # The page the model needs, once: refs stay valid for `agent act`.
-        st['last_url'] = page.get('url', '')
-        st['last_text_hash'] = hashlib.md5(text.encode()).hexdigest()[:8]
-        st['step'] = st.get('step', 0) + 1
-        st['total_tokens_avoided'] = st.get('total_tokens_avoided', 0) + tokens_avoided
-        _save_agent_state(st)
-        _agent_flow_stats_bump(path, 'drift', ms=int((time.monotonic() - t0) * 1000))
+    def drift(step, reason, page, out_actions, text, st):
+        # The page the model needs, once: refs stay valid for `agent act`. The text side
+        # (text, injection_suspect, hidden_text, …) is that of the last snapshot, the one shown.
         res = {'status': 'drift', 'flow': slug, 'step': step['n'], 'reason': reason,
                'expected': step.get('anchor') or {'kind': step.get('kind')},
                'done': done, 'url': page.get('url', ''), 'title': page.get('title', ''),
                'actions': out_actions, 'text': text,
                'hint': f"act on a ref (agent act --ref @N …), finish the task, then: agent flow save {slug}"}
-        if suspects:
-            res['injection_suspect'] = suspects
+        _agent_text_fields(last_view, last_nodes, st, res)
+        st['last_url'] = page.get('url', '')
+        st['last_text_hash'] = last_view.get('text_hash') or hashlib.md5(text.encode()).hexdigest()[:8]
+        st['step'] = st.get('step', 0) + 1
+        st['total_tokens_avoided'] = st.get('total_tokens_avoided', 0) + tokens_avoided
+        _save_agent_state(st)
+        _agent_flow_stats_bump(path, 'drift', ms=int((time.monotonic() - t0) * 1000))
         res['token_estimate'] = _estimate_tokens(res)
         _agent_json(res)
         sys.exit(AGENT_RUN_DRIFT_EXIT)
@@ -17938,7 +18273,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
         anchor = step.get('anchor') or {}
         match, how = _agent_find_anchor(anchor, actions)
         if match is None:
-            drift(step, 'anchor not found', page, out_actions, text, state, _agent_injection_scan(last_nodes))
+            drift(step, 'anchor not found', page, out_actions, text, state)
         amap = {a['ref']: a for a in actions}
         if step.get('text') and _AGENT_VAR_RE.search(step['text']):
             # A placeholder value is typed only where it was recorded: same origin
@@ -17952,7 +18287,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
             if not recorded or not here or here != recorded:
                 drift(step, f"a placeholder value is typed only where it was recorded "
                             f"({recorded or 'no recorded host'}); this page is {here or 'an opaque origin'}",
-                      page, out_actions, text, state, _agent_injection_scan(last_nodes))
+                      page, out_actions, text, state)
             if step['n'] in env_by_step:  # an environment value: https on a listed host, as replay
                 why = _var_url_allowed(page.get('url', ''), _var_host_entries())
                 if why:
@@ -17983,15 +18318,14 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
         after = step.get('after') or {}
         host_now = _agent_host_path(page2.get('url', ''))[0]
         if after.get('host') and host_now and host_now != after['host']:
-            drift(step, f"landed on {host_now}, recorded {after['host']}", page2, out2, text2, state,
-                  _agent_injection_scan(last_nodes))
+            drift(step, f"landed on {host_now}, recorded {after['host']}", page2, out2, text2, state)
         page, out_actions, text = page2, out2, text2
 
     ms = int((time.monotonic() - t0) * 1000)
     if state is None:  # an empty flow: nothing ran
         page, actions, out_actions, text, state = await snapshot()
     state['last_url'] = page.get('url', '')
-    state['last_text_hash'] = hashlib.md5(text.encode()).hexdigest()[:8]
+    state['last_text_hash'] = last_view.get('text_hash') or hashlib.md5(text.encode()).hexdigest()[:8]
     state['step'] = state.get('step', 0) + 1
     state['total_tokens_avoided'] = state.get('total_tokens_avoided', 0) + tokens_avoided
     _save_agent_state(state)
