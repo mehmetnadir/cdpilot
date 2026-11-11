@@ -16146,6 +16146,68 @@ def _stale_ref_exit(ref, what="Could not get coordinates for"):
     sys.exit(1)
 
 
+async def _scroll_into_view(ws_url, backend_node_id):
+    """Scroll the element into view so clicks and hover land on screen.
+    Tries DOM.scrollIntoViewIfNeeded first; on error or timeout falls back
+    to DOM.resolveNode + Runtime.callFunctionOn with
+    this.scrollIntoView({block:'center',inline:'center'}).
+    """
+    scrolled = False
+    try:
+        res = await cdp_send(ws_url, [(0, "DOM.enable", {}),
+                                      (1, "DOM.scrollIntoViewIfNeeded", {"backendNodeId": backend_node_id})])
+        r1 = res.get(1)
+        if isinstance(r1, dict) and "code" not in r1 and "error" not in r1:
+            scrolled = True
+    except Exception:
+        scrolled = False
+
+    if not scrolled:
+        try:
+            res_r = await cdp_send(ws_url, [(2, "DOM.resolveNode", {"backendNodeId": backend_node_id})])
+            oid = res_r.get(2, {}).get("object", {}).get("objectId")
+            if oid:
+                await cdp_send(ws_url, [(3, "Runtime.callFunctionOn", {
+                    "objectId": oid,
+                    "functionDeclaration": "function(){if(this.scrollIntoView)this.scrollIntoView({block:'center',inline:'center'});}",
+                    "returnByValue": True,
+                })])
+        except Exception:
+            pass
+
+
+async def _assert_in_viewport(ws_url, x, y, ref_num):
+    """Check if (x, y) is inside the viewport.
+    Uses Page.getLayoutMetrics -> cssLayoutViewport.clientWidth/clientHeight.
+    If 0 <= x < w and 0 <= y < h is false, exits 1 without clicking/hovering.
+    """
+    res_m = await cdp_send(ws_url, [(90, "Page.getLayoutMetrics", {})])
+    metrics = res_m.get(90, {})
+    vp = metrics.get("cssLayoutViewport") or metrics.get("layoutViewport") or {}
+    w = vp.get("clientWidth")
+    h = vp.get("clientHeight")
+    if w is None or h is None:
+        vp2 = metrics.get("visualViewport") or {}
+        w = w or vp2.get("clientWidth")
+        h = h or vp2.get("clientHeight")
+    if w is None or h is None:
+        try:
+            r = await cdp_send(ws_url, [(91, "Runtime.evaluate", {
+                "expression": "JSON.stringify({w: window.innerWidth, h: window.innerHeight})",
+                "returnByValue": True,
+            })])
+            val = json.loads(r.get(91, {}).get("result", {}).get("value") or "{}")
+            w = w or val.get("w")
+            h = h or val.get("h")
+        except Exception:
+            pass
+    if w is not None and h is not None:
+        if not (0 <= x < w and 0 <= y < h):
+            num = str(ref_num).lstrip("@")
+            print(f"Error: Element @{num} is outside the viewport after scrolling", file=sys.stderr)
+            sys.exit(1)
+
+
 async def cmd_click_ref(ref_str):
     """Click an element by its @N reference from the last a11y-snapshot."""
     ws_url, _ = get_page_ws()
@@ -16162,6 +16224,9 @@ async def cmd_click_ref(ref_str):
         print(f"Error: Reference '@{ref_num}' not found. Run 'a11y-snapshot' first.", file=sys.stderr)
         sys.exit(1)
 
+    # Scroll element into view before measuring box
+    await _scroll_into_view(ws_url, backend_node_id)
+
     # Get element box model via backendNodeId directly
     await cdp_send(ws_url, [(0, "DOM.enable", {})])
     res1 = await cdp_send(ws_url, [(1, "DOM.getBoxModel", {"backendNodeId": backend_node_id})])
@@ -16172,7 +16237,7 @@ async def cmd_click_ref(ref_str):
         oid = res_r.get(10, {}).get("object", {}).get("objectId")
         if oid:
             res_js = await cdp_send(ws_url, [(11, "Runtime.callFunctionOn", {
-                "functionDeclaration": "function(){var r=this.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};}",
+                "functionDeclaration": "function(){if(this.scrollIntoView)this.scrollIntoView({block:'center'});var r=this.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};}",
                 "objectId": oid, "returnByValue": True,
             })])
             val = res_js.get(11, {}).get("result", {}).get("value")
@@ -16198,6 +16263,7 @@ async def cmd_click_ref(ref_str):
         _stale_ref_exit(ref_num)
 
     x, y = val["x"], val["y"]
+    await _assert_in_viewport(ws_url, x, y, ref_num)
     await _vfx_ripple(ws_url, x, y)
     async with _blocker_passthrough(ws_url):
         await _mouse_click_held(ws_url, x, y, cid=3)
@@ -17271,12 +17337,14 @@ async def _agent_perform(ref, action, text, old_map):
             _stale_ref_exit(ref, 'Could not focus')
         await cdp_send(ws_url, [(4, 'Input.insertText', {'text': text or ''})])
     elif action == 'hover':
+        await _scroll_into_view(ws_url, bid)
         res_b = await cdp_send(ws_url, [(5, 'DOM.getBoxModel', {'backendNodeId': bid})])
         content = res_b.get(5, {}).get('model', {}).get('content', [])
         if len(content) < 8:
             _stale_ref_exit(ref, 'Could not get coordinates for')
         mx = int((content[0] + content[2] + content[4] + content[6]) / 4)
         my = int((content[1] + content[3] + content[5] + content[7]) / 4)
+        await _assert_in_viewport(ws_url, mx, my, ref)
         await cdp_send(ws_url, [(6, 'Input.dispatchMouseEvent', {
             'type': 'mouseMoved', 'x': mx, 'y': my,
         })])

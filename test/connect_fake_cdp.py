@@ -37,6 +37,7 @@ LOCK = threading.Lock()
 PAGES = [{"id": "PAGE1", "type": "page", "url": "https://user.example/inbox",
           "title": "The user's own tab"}]
 SEQ = [1]
+SCROLLED_NODES = set()
 # The field check cdpilot runs before it types a flow's placeholder value
 # (_VAR_TARGET_FN; the real logic is unit-tested in test.js): the fake reports
 # a node as an <iframe> when its backend id is in FAKE_CDP_FRAME_NODES, or a
@@ -400,11 +401,27 @@ def answer(msg, path):
         result = {"nodes": ax_tree_for(pg["url"] if pg else "", (pg or {}).get("values"))}
     # Enough of DOM/Input for `agent act` / `agent run` on the fake tree:
     # every node has a box, a click lands, a focused field takes typed text.
+    elif method == "DOM.scrollIntoViewIfNeeded":
+        bid = int(p.get("backendNodeId") or 0)
+        if os.environ.get("FAKE_CDP_SCROLL_FAIL") == "1":
+            return {"id": msg.get("id"), "error": {"code": -32000, "message": "scroll failed"}}, events
+        with LOCK:
+            SCROLLED_NODES.add(bid)
+        result = {}
+    elif method == "Page.getLayoutMetrics":
+        result = {
+            "cssLayoutViewport": {"clientWidth": 800, "clientHeight": 600},
+            "layoutViewport": {"clientWidth": 800, "clientHeight": 600},
+            "visualViewport": {"clientWidth": 800, "clientHeight": 600},
+        }
     elif method == "DOM.getBoxModel":
         bid = int(p.get("backendNodeId") or 0)
         if bid >= 9000:  # a node of another document: no box, like a real stale backendNodeId
             return {"id": msg.get("id"), "result": {}}, events
-        x, y = 100, 20 * bid
+        outside = os.environ.get("FAKE_CDP_OUTSIDE_VIEWPORT") == "1"
+        is_scrolled = (bid in SCROLLED_NODES) and not outside
+        x = 100
+        y = 200 if is_scrolled else (2000 if outside else 20 * bid)
         result = {"model": {"content": [x, y, x + 80, y, x + 80, y + 16, x, y + 16],
                             "width": 80, "height": 16}}
     elif method == "DOM.resolveNode" and int(p.get("backendNodeId") or 0) >= 9000:
@@ -424,11 +441,33 @@ def answer(msg, path):
             verdict = {"ok": True, "tag": "INPUT"}
         result = {"result": {"type": "object", "value": verdict}}
     elif method == "Runtime.callFunctionOn":
+        fn_decl = p.get("functionDeclaration") or ""
         pg = page_for(path)
-        if pg is not None and "focus()" in (p.get("functionDeclaration") or ""):
-            with LOCK:
-                pg["focus"] = str(p.get("objectId", ""))[1:]
-        result = {"result": {"type": "undefined"}}
+        if "focus()" in fn_decl:
+            if pg is not None:
+                with LOCK:
+                    pg["focus"] = str(p.get("objectId", ""))[1:]
+            result = {"result": {"type": "undefined"}}
+        elif "getBoundingClientRect" in fn_decl:
+            oid = str(p.get("objectId", ""))
+            bid = int(oid[1:]) if (oid.startswith("O") and oid[1:].isdigit()) else 0
+            if "scrollIntoView" in fn_decl and bid:
+                with LOCK:
+                    SCROLLED_NODES.add(bid)
+            outside = os.environ.get("FAKE_CDP_OUTSIDE_VIEWPORT") == "1"
+            is_scrolled = (bid in SCROLLED_NODES) and not outside
+            x = 100
+            y = 200 if is_scrolled else (2000 if outside else 20 * bid)
+            result = {"result": {"type": "object", "value": {"x": x, "y": y}}}
+        elif "scrollIntoView" in fn_decl:
+            oid = str(p.get("objectId", ""))
+            if oid.startswith("O") and oid[1:].isdigit():
+                bid = int(oid[1:])
+                with LOCK:
+                    SCROLLED_NODES.add(bid)
+            result = {"result": {"type": "undefined"}}
+        else:
+            result = {"result": {"type": "undefined"}}
     elif method == "Input.insertText":
         pg = page_for(path)
         if pg is not None and pg.get("focus"):
