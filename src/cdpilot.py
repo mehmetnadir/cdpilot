@@ -16229,8 +16229,55 @@ def _agent_json_pretty():
         return False
 
 
+# Unicode "tag" characters (U+E0000-E007F) are invisible and mirror ASCII (U+E0041 = "A"): a page can
+# hide an instruction in them ("ASCII smuggling") and some models read them as text. Since 0.9.8 the
+# agent JSON is raw UTF-8, so they would reach the model. _agent_json strips them from every string
+# it prints and reports what they spelled as an injection_suspect record.
+_AGENT_TAG_RE = _re.compile('[\U000e0000-\U000e007f]')
+# a subdivision flag (England, Scotland, Wales) is U+1F3F4 + tag letters/digits + U+E007F: it stays
+_AGENT_TAG_FLAG_RE = _re.compile('\U0001f3f4[\U000e0030-\U000e0039\U000e0061-\U000e007a]{1,6}\U000e007f')
+
+
+def _strip_tag_chars(s):
+    """(clean text, hidden ASCII): tag characters removed, the ASCII they spell collected."""
+    if not _AGENT_TAG_RE.search(s):
+        return s, ''
+    hidden, out, pos = [], [], 0
+    for m in list(_AGENT_TAG_FLAG_RE.finditer(s)) + [None]:
+        end = m.start() if m else len(s)
+        for ch in s[pos:end]:
+            c = ord(ch)
+            if 0xE0000 <= c <= 0xE007F:
+                if 0xE0020 <= c <= 0xE007E:
+                    hidden.append(chr(c - 0xE0000))
+            else:
+                out.append(ch)
+        if m:
+            out.append(m.group(0))
+            pos = m.end()
+    return ''.join(out), ''.join(hidden)
+
+
+def _agent_strip_tags(obj, hidden):
+    if isinstance(obj, str):
+        clean, h = _strip_tag_chars(obj)
+        if h:
+            hidden.append(h)
+        return clean
+    if isinstance(obj, list):
+        return [_agent_strip_tags(v, hidden) for v in obj]
+    if isinstance(obj, dict):
+        return {_agent_strip_tags(k, hidden): _agent_strip_tags(v, hidden) for k, v in obj.items()}
+    return obj
+
+
 def _agent_json(obj):
     """Print obj as agent-command JSON (see _agent_json_pretty)."""
+    hidden = []
+    obj = _agent_strip_tags(obj, hidden)
+    if hidden and isinstance(obj, dict):
+        rec = {'text': ' | '.join(dict.fromkeys(hidden))[:160], 'match': 'invisible_tags'}
+        obj['injection_suspect'] = list(obj.get('injection_suspect') or []) + [rec]
     kw = {'indent': 2} if _agent_json_pretty() else {'separators': (',', ':')}
     try:
         text = json.dumps(obj, ensure_ascii=False, **kw)
