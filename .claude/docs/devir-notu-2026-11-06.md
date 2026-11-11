@@ -383,3 +383,18 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
 - Ders: sürüm commit'inde tutanak push'tan ÖNCE koşulur ([Unreleased]'e bağlı testler sürüm geçişinde düşer).
 - Sonraki (0.9.9): lane/tagpage + lane/gofast birleşimi (CHANGELOG'da 0.9.8 metnine dokunulmaz), gofast şart 4 (boş makinede
   settle ölçümü), lane/b1 → M1 (mühürlü küme, bir kez) + M2, observe eylem bütçesi tasarımı + jüri (K-0099), c5caf1d hızlı T1.
+
+## 18. Delta 11.11 07:15– — 0.9.9 hazırlığı: gofast birleşti, B1 ölçüldü (D-0109), yeni ölçüm şeritleri
+
+| Konu | Durum | Not |
+|---|---|---|
+| lane/gofast | ✅ main 235332c | CHANGELOG maddesi [Unreleased] ### Changed'e taşındı (merge amend); CI 42960172388 13/13 |
+| lane/enjm0 | ✅ main | M0 belgeleri |
+| c5caf1d hızlı T1 | ✅ temiz (şef) | `SLOG_RUN_RESULT_RE.fullmatch` yalnız rakam taşır; değer sızamaz |
+| B1 M1/M2 | D-0109 | M1 yakalama 42/50 GEÇTİ, temiz `hidden_text` 10/60 KALDI (sr-only 6/6, karusel 4/5), yanlış alarm 0/60; M2 35 sayfa 3/3 (+10,6 ms, +%1,69). Karar: `hidden_text` yalnız `CDPILOT_AGENT_HIDDEN=1`; `why: hidden:*`, desenli gizli parçanın çıkışı ve guard warn varsayılan. lane/b1 Opus ajanı uyguluyor |
+| lane/tagpage uzantısı | ⏳ tam paket | bidi (U+202A–E, 2066–9) + ek seçici (U+E0100–E01EF) silme, `invisible_selectors` kaydı; şef incelemesi temiz; tam paket → commit → main ([Unreleased] ### Security, 0.9.8 metnine dokunma) |
+| lane/obsbutce (K-0099) | ⏳ Sonnet | D-0108 şart 1–5; şart 6 (model ölçümü, A-0272) 0.9.9 öncesi |
+| M1-2 kör küme (A-0273) | ⏳ agy | `kor-kume/m1-2/`: aynı teknikle (sr-only / karusel / ekran dışı) 45 saldırı + 60 meşru; v2 görünürlük kuralı için, yazar yalıtılmış |
+| Sıkıştırma ölçümü (K-0104) | ⏳ agy | çevrimdışı, 13 sayfa ham observe: kısa ref, rol sürekliliği, satır biçimi, adsız/uzun ad; gidiş-dönüş çapa testi |
+| Görüntü bütçesi (K-0105) | ⏳ agy | `shot` "JPEG ~5-7x token" ve MCP "~5x smaller" iddiaları: model görüntüyü pikselle sayar → iddia tablosu + resmî formül |
+| gofast şart 4 (A-0264) | ⏳ yük | yük 18 (10 çekirdek); < 10 olunca settle-t0-2.py |
