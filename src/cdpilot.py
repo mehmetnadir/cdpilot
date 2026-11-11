@@ -13500,7 +13500,10 @@ def cmd_project_stop(name):
         sys.exit(1)
 
     info = registry[target_id]
-    _canvas_close_all(quiet=True)
+    if target_id == PROJECT_ID:
+        # The canvas dir belongs to this process's PROFILE_DIR: only the current project's
+        # canvases may be closed here (canvas B2); another project's canvases are not ours.
+        _canvas_close_all(quiet=True)
     port = info.get("port")
     if _is_external(info) or _is_external(port, registry):
         print(f"{target_id}: {EXTERNAL_LEFT_RUNNING}")
@@ -23417,7 +23420,7 @@ def _daemon_serve_entry(args):
 # ═══════════════════════════════════════════════════════════════════════════
 
 CANVAS_HOST_FLAG = '--_canvas-host'          # hidden: `cdpilot.py --_canvas-host <name> [--allow-net h]...`
-CANVAS_NAME_RE = _re.compile(r'^[a-z0-9_-]{1,32}$')
+CANVAS_NAME_RE = _re.compile(r'^[a-z0-9_-]{1,32}\Z')   # always .fullmatch: `$` also matches before a final '\n' (B2, 11.11)
 CANVAS_DEFAULT_NAME = 'main'
 CANVAS_URL_FMT = 'http://cdpilot-canvas.invalid/{name}/'
 CANVAS_BINDING = '__cdpilotCanvasEmit'
@@ -23453,7 +23456,7 @@ def _canvas_dir():
 
 def _canvas_check_name(name):
     """The canvas name or CanvasError(code 2). Names are path components: [a-z0-9_-]{1,32}."""
-    if not isinstance(name, str) or not CANVAS_NAME_RE.match(name):
+    if not isinstance(name, str) or not CANVAS_NAME_RE.fullmatch(name):
         raise CanvasError(f"canvas name must match [a-z0-9_-]{{1,32}}: {name!r}", 2)
     return name
 
@@ -23872,17 +23875,38 @@ CANVAS_BASE_CSP = (
     "frame-src 'none'; "
     "sandbox allow-scripts"
 )
+# Whitelists: always `.fullmatch` and `\Z` (B2 ORTA-1: `^…$` + `.match` accepted 'main\n').
 _CANVAS_HOSTNAME_RE = _re.compile(
-    r'^(?=.{1,253}$)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?'
-    r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$'
+    r'(?=.{1,253}\Z)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?'
+    r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\Z'
 )
-_CANVAS_ACTION_RE = _re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+_CANVAS_ACTION_RE = _re.compile(r'[a-zA-Z0-9_-]{1,64}\Z')
 _canvas_base_paths = _canvas_paths
+# WebRTC is not stopped by CSP or sandbox (B2 ORTA-2c). These constructors become
+# non-configurable `undefined` own properties of every canvas window before any page script.
+_CANVAS_WEBRTC_NAMES = (
+    'RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel', 'RTCIceCandidate',
+    'RTCSessionDescription', 'RTCRtpSender', 'RTCRtpReceiver', 'RTCRtpTransceiver',
+    'RTCIceTransport', 'RTCDtlsTransport', 'RTCSctpTransport', 'RTCCertificate',
+)
+_CANVAS_NO_WEBRTC_JS = (
+    '(()=>{const N=' + json.dumps(list(_CANVAS_WEBRTC_NAMES)) + ';'
+    'const k=(w)=>{try{for(const n of N){try{Object.defineProperty(w,n,{value:undefined,'
+    'writable:false,enumerable:false,configurable:false});}catch(e){}}}catch(e){}};'
+    'k(window);try{for(let i=0;i<window.length;i++){try{k(window[i]);}catch(e){}}}catch(e){}})()'
+)
+_CANVAS_URL_EVENT_RATE = 100        # host blocked/nav events with page-chosen URLs: per second, shared (D7)
+_CANVAS_URL_MAX = 256               # data.url is page-controlled and cut to this length
+
+
+def _canvas_unsupported_os():
+    """True on Windows (Python 3.13+ may expose AF_UNIX there; canvas still is not supported, D9)."""
+    return os.name == 'nt' or not hasattr(socket, 'AF_UNIX')
 
 
 def _canvas_check_allow_net(host):
     """Validate a plain hostname for --allow-net; raise CanvasError(code 2) otherwise."""
-    if not isinstance(host, str) or not _CANVAS_HOSTNAME_RE.match(host):
+    if not isinstance(host, str) or not _CANVAS_HOSTNAME_RE.fullmatch(host):
         raise CanvasError(f"invalid --allow-net hostname: {host!r}", 2)
     labels = host.split('.')
     if all(lbl.isdigit() for lbl in labels):
@@ -23947,17 +23971,124 @@ def _canvas_csp_header(allow_net=()):
     )
 
 
+def _canvas_meta_csp_tag(allow_net=()):
+    """The host's `<meta data-cdpilot-csp>`: the header CSP without `sandbox` (meta cannot carry it)."""
+    meta_csp = _canvas_csp_header(allow_net).replace('; sandbox allow-scripts', '')
+    esc_csp = meta_csp.replace('&', '&amp;').replace('"', '&quot;')
+    return f'<meta data-cdpilot-csp http-equiv="Content-Security-Policy" content="{esc_csp}">'
+
+
 def _canvas_skeleton_html(allow_net=()):
     """Initial canvas document with host-inserted <meta data-cdpilot-csp> and inline runtime."""
-    csp_full = _canvas_csp_header(allow_net)
-    meta_csp = csp_full.replace('; sandbox allow-scripts', '')
-    esc_csp = meta_csp.replace('&', '&amp;').replace('"', '&quot;')
     rt = f'<script>{CANVAS_RUNTIME_JS}</script>' if CANVAS_RUNTIME_JS else ''
     return (
         '<!doctype html><html><head><meta charset="utf-8">'
-        f'<meta data-cdpilot-csp http-equiv="Content-Security-Policy" content="{esc_csp}">'
+        f'{_canvas_meta_csp_tag(allow_net)}'
         f'{rt}</head><body></body></html>'
     )
+
+
+def _canvas_sanitize_set_html(html, allow_net=()):
+    """`set` gets the sanitising `patch` gets (plan §3.3, B2 D2): drop every `<base>`, every
+    `<meta http-equiv=refresh|content-security-policy>` and every `<meta data-cdpilot-csp>`
+    the page brought, then put the host CSP meta first (after a leading doctype, so the
+    document does not fall into quirks mode). The header CSP + sandbox stay the real
+    guard; this is the second layer."""
+    from html.parser import HTMLParser
+
+    cuts = []
+
+    class _Scan(HTMLParser):
+        def _tag(self, tag, attrs):
+            t = (tag or '').lower()
+            if t not in ('meta', 'base'):
+                return
+            names = {(k or '').lower(): (v or '') for k, v in attrs}
+            he = names.get('http-equiv', '').strip().lower()
+            if t == 'base' or 'data-cdpilot-csp' in names or he in ('refresh', 'content-security-policy'):
+                text = self.get_starttag_text() or ''
+                cuts.append((self.getpos(), text))
+
+        def handle_starttag(self, tag, attrs):
+            self._tag(tag, attrs)
+
+        def handle_startendtag(self, tag, attrs):
+            self._tag(tag, attrs)
+
+    scan = _Scan(convert_charrefs=False)
+    try:
+        scan.feed(html)
+        scan.close()
+    except Exception:
+        cuts = None
+    if cuts is None:
+        # The scanner gave up: fail closed by neutralising every tag opener of the three kinds.
+        out = _re.sub(r'(?i)<(?=\s*(?:base|meta)\b)', '&lt;', html)
+    else:
+        line_starts = [0]
+        for m in _re.finditer('\n', html):
+            line_starts.append(m.end())
+        spans = sorted((line_starts[ln - 1] + col, text) for (ln, col), text in cuts)
+        if any(not text or html[start:start + len(text)] != text for start, text in spans):
+            # Position bookkeeping disagrees with the source: fail closed as above.
+            out = _re.sub(r'(?i)<(?=\s*(?:base|meta)\b)', '&lt;', html)
+        else:
+            parts, pos = [], 0
+            for start, text in spans:
+                if start < pos:
+                    continue
+                parts.append(html[pos:start])
+                pos = start + len(text)
+            parts.append(html[pos:])
+            out = ''.join(parts)
+    meta = _canvas_meta_csp_tag(allow_net)
+    m = _re.match(r'(?is)\s*(?:<!--.*?-->\s*)*<!doctype[^>]*>', out)
+    if m:
+        return out[:m.end()] + meta + out[m.end():]
+    return meta + out
+
+
+def _canvas_page_num(v):
+    """A page-returned number is untrusted (B2 D6): finite int/float (not bool) -> float, else None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        f = float(v)
+    except (OverflowError, ValueError):
+        return None
+    return f if f == f and f not in (float('inf'), float('-inf')) else None
+
+
+def _canvas_page_epoch_ms(v):
+    """t_paint from the page: a sane epoch-ms integer, else the host clock."""
+    f = _canvas_page_num(v)
+    if f is None or not (0 <= f < 1e14):
+        return int(time.time() * 1000)
+    return int(f)
+
+
+def _canvas_page_patch_reply(val, t0):
+    """Socket reply from the page's patch() result; every field is untrusted (D6): ms float or
+    None, error str <= 200 chars prefixed 'page: ', code in {1, 2} else 1, ops only int
+    add/del/move/upd."""
+    if val.get('ok', True) is not True:
+        err = val.get('error')
+        err_s = str(err) if isinstance(err, (str, int, float)) and not isinstance(err, bool) else 'patch failed'
+        code = val.get('code')
+        if isinstance(code, bool) or code not in (1, 2):
+            code = 1
+        return {'ok': False, 'error': ('page: ' + err_s)[:200], 'code': code}
+    ops = val.get('ops') if isinstance(val.get('ops'), dict) else {}
+
+    def _n(k):
+        x = ops.get(k, 0)
+        return x if isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 1 << 31 else 0
+    return {
+        'ok': True,
+        'ops': {'add': _n('add'), 'del': _n('del'), 'move': _n('move'), 'upd': _n('upd')},
+        'ms': _canvas_page_num(val.get('ms')),
+        't_paint': _canvas_page_epoch_ms(val.get('t_paint')),
+    }
 
 
 class _CanvasHost:
@@ -23977,19 +24108,26 @@ class _CanvasHost:
         self.target_id = None
         self.session_id = None
         self.frame_id = None
-        self.frame_url = None
+        self.frame_url = None          # None until the document is proven (getFrameTree, B2 ORTA-1c)
+        self.ctx_unique_id = None      # uniqueContextId every write is bound to (proven document only)
+        self._last_nav_url = ''
+        self.doc_epoch = 0             # +1 on main-frame navigation / contexts cleared
+        self._main_ctx = {}            # frameId -> (uniqueId, epoch) of the default context
+        self.load_event = asyncio.Event()
         self.events = []
         self.event_bytes = 0
         self.seq = 0
         self.dropped = 0
+        self.bad_payloads = 0
         self.rate_window = int(time.monotonic())
         self.rate_count = 0
+        self.url_rate_window = int(time.monotonic())
+        self.url_rate_count = 0
         self.event_wakeup = asyncio.Event()
         self.stop_event = asyncio.Event()
         self.req_lock = asyncio.Lock()
         self.closed_by_op = False
         self._error_on_paused = False
-        self._init_nav_task = None
 
     async def send(self, method, params=None, session=None):
         self.next_id += 1
@@ -24052,25 +24190,30 @@ class _CanvasHost:
     def _emit_host_event(self, ev_type, data=None):
         self._append_event('host', ev_type, '', '', data)
 
+    def _emit_url_event(self, ev_type, url, **extra):
+        """`blocked`/`nav` host events carry a page-chosen URL: one shared rate limit
+        (_CANVAS_URL_EVENT_RATE per second, then `dropped`), url cut to _CANVAS_URL_MAX (D7)."""
+        now_s = int(time.monotonic())
+        if now_s != self.url_rate_window:
+            self.url_rate_window = now_s
+            self.url_rate_count = 0
+        self.url_rate_count += 1
+        if self.url_rate_count > _CANVAS_URL_EVENT_RATE:
+            self.dropped += 1
+            return
+        data = {'url': (url if isinstance(url, str) else '')[:_CANVAS_URL_MAX]}
+        data.update(extra)
+        self._append_event('host', ev_type, '', '', data)
+
+    def _ours(self, session_id):
+        return not (session_id and self.session_id and session_id != self.session_id)
+
     def on_binding_called(self, params, session_id=None):
-        if session_id and self.session_id and session_id != self.session_id:
+        """Page events are untrusted (K5). The rate limit runs before any parsing and a bad
+        payload (bad JSON, too deep, wrong shape) is dropped and counted; it never ends the host (D3)."""
+        if not self._ours(session_id):
             return
         if (params or {}).get('name') != CANVAS_BINDING:
-            return
-        payload = (params or {}).get('payload')
-        if not isinstance(payload, str) or len(payload.encode('utf-8')) > 65536:
-            return
-        try:
-            obj = json.loads(payload)
-        except ValueError:
-            return
-        if not isinstance(obj, dict):
-            return
-        ev_type = obj.get('type')
-        if ev_type not in CANVAS_PAGE_EVENT_TYPES:
-            return
-        action = obj.get('action') or ''
-        if action and (not isinstance(action, str) or not _CANVAS_ACTION_RE.match(action)):
             return
         now_s = int(time.monotonic())
         if now_s != self.rate_window:
@@ -24080,23 +24223,83 @@ class _CanvasHost:
         if self.rate_count > 100:
             self.dropped += 1
             return
+        payload = (params or {}).get('payload')
+        try:
+            if not isinstance(payload, str) or len(payload.encode('utf-8')) > 65536:
+                raise ValueError('payload is not a string or is too large')
+            obj = json.loads(payload)
+        except (ValueError, RecursionError):
+            self.bad_payloads += 1
+            self.dropped += 1
+            return
+        if not isinstance(obj, dict):
+            self.bad_payloads += 1
+            self.dropped += 1
+            return
+        ev_type = obj.get('type')
+        if not isinstance(ev_type, str) or ev_type not in CANVAS_PAGE_EVENT_TYPES:
+            return
+        action = obj.get('action') or ''
+        if action and (not isinstance(action, str) or not _CANVAS_ACTION_RE.fullmatch(action)):
+            return
+        elem_id = obj.get('id') or ''
+        if not isinstance(elem_id, (str, int, float)) or isinstance(elem_id, bool):
+            elem_id = ''
         self._append_event(
             'page',
             ev_type,
             action=action,
-            elem_id=obj.get('id') or '',
+            elem_id=elem_id,
             data=obj.get('data'),
         )
 
     def on_frame_navigated(self, params, session_id=None):
-        if session_id and self.session_id and session_id != self.session_id:
+        """Main-frame navigation: the document changed, so the proof and the bound context
+        are gone (K4: browser truth, never window fields)."""
+        if not self._ours(session_id):
             return
         frame = (params or {}).get('frame') or {}
         if not frame.get('parentId'):
+            self.doc_epoch += 1
+            self.ctx_unique_id = None
             if frame.get('id'):
                 self.frame_id = frame['id']
-            if 'url' in frame:
-                self.frame_url = frame.get('url') or ''
+            self.frame_url = None
+            self._last_nav_url = frame.get('url') or ''
+
+    def on_context_created(self, params, session_id=None):
+        if not self._ours(session_id):
+            return
+        ctx = (params or {}).get('context') or {}
+        aux = ctx.get('auxData') or {}
+        if aux.get('isDefault') and aux.get('frameId') and ctx.get('uniqueId'):
+            self._main_ctx[aux['frameId']] = (ctx['uniqueId'], self.doc_epoch)
+
+    def on_context_destroyed(self, params, session_id=None):
+        if not self._ours(session_id):
+            return
+        p = params or {}
+        uid = p.get('executionContextUniqueId')
+        for fid, (cu, ep) in list(self._main_ctx.items()):
+            if uid and cu == uid:
+                self._main_ctx.pop(fid, None)
+        if uid and uid == self.ctx_unique_id:
+            self.ctx_unique_id = None
+            self.frame_url = None
+            self.doc_epoch += 1
+        elif not uid and p.get('executionContextId') is not None:
+            # Old protocol without unique ids: any destroyed context ends the proof (fail closed).
+            self.ctx_unique_id = None
+            self.frame_url = None
+            self.doc_epoch += 1
+
+    def on_contexts_cleared(self, session_id=None):
+        if not self._ours(session_id):
+            return
+        self._main_ctx.clear()
+        self.ctx_unique_id = None
+        self.frame_url = None
+        self.doc_epoch += 1
 
     async def on_request_paused(self, params, session_id=None):
         sid = session_id or self.session_id
@@ -24123,11 +24326,12 @@ class _CanvasHost:
                         'responseHeaders': [
                             {'name': 'Content-Type', 'value': 'text/html; charset=utf-8'},
                             {'name': 'Content-Security-Policy', 'value': _canvas_csp_header(self.allow_net)},
+                            {'name': 'X-DNS-Prefetch-Control', 'value': 'off'},
                         ],
                         'body': base64.b64encode(html_bytes).decode('ascii'),
                     }, session=sid)
                     return
-                self._emit_host_event('blocked', {'url': url[:256], 'resourceType': 'Document'})
+                self._emit_url_event('blocked', url, resourceType='Document')
                 await self.send('Fetch.fulfillRequest', {
                     'requestId': request_id,
                     'responseCode': 204,
@@ -24139,10 +24343,11 @@ class _CanvasHost:
             sp = _urlparse.urlsplit(url)
             scheme = (sp.scheme or '').lower()
             host = (sp.hostname or '').lower()
-            if scheme == 'https' and host and host in self.allow_net:
+            port = sp.port          # ValueError on a bad port -> except -> failRequest
+            if scheme == 'https' and host and host in self.allow_net and port in (None, 443):
                 await self.send('Fetch.continueRequest', {'requestId': request_id}, session=sid)
                 return
-            self._emit_host_event('blocked', {'url': url[:256], 'resourceType': resource_type or 'Other'})
+            self._emit_url_event('blocked', url, resourceType=str(resource_type or 'Other')[:32])
             await self.send('Fetch.failRequest', {
                 'requestId': request_id,
                 'errorReason': 'BlockedByClient',
@@ -24166,6 +24371,32 @@ class _CanvasHost:
             except Exception:
                 pass
 
+    def _dispatch_event(self, method, params, sid):
+        if method == 'Runtime.bindingCalled':
+            self.on_binding_called(params, sid)
+        elif method == 'Page.frameNavigated':
+            self.on_frame_navigated(params, sid)
+        elif method == 'Runtime.executionContextCreated':
+            self.on_context_created(params, sid)
+        elif method == 'Runtime.executionContextDestroyed':
+            self.on_context_destroyed(params, sid)
+        elif method == 'Runtime.executionContextsCleared':
+            self.on_contexts_cleared(sid)
+        elif method == 'Page.loadEventFired':
+            if self._ours(sid):
+                self.load_event.set()
+        elif method == 'Page.frameRequestedNavigation':
+            if self._ours(sid):
+                nav_url = params.get('url') or ''
+                if nav_url and nav_url != self.canvas_url and nav_url != 'about:blank':
+                    self._emit_url_event('blocked', nav_url, resourceType='Document',
+                                         reason=str(params.get('reason') or 'navigation')[:32])
+        elif method == 'Page.windowOpen':
+            if self._ours(sid):
+                open_url = params.get('url') or ''
+                if open_url:
+                    self._emit_url_event('blocked', open_url, resourceType='Document', reason='windowOpen')
+
     async def ws_reader_loop(self):
         try:
             while True:
@@ -24181,32 +24412,19 @@ class _CanvasHost:
                     continue
                 method = msg.get('method')
                 params = msg.get('params') or {}
+                if not isinstance(params, dict):
+                    continue
                 sid = msg.get('sessionId')
                 if method == 'Fetch.requestPaused':
                     await self.on_request_paused(params, sid)
-                elif method == 'Runtime.bindingCalled':
-                    self.on_binding_called(params, sid)
-                elif method == 'Page.frameNavigated':
-                    self.on_frame_navigated(params, sid)
-                elif method == 'Page.frameRequestedNavigation':
-                    if not sid or not self.session_id or sid == self.session_id:
-                        nav_url = params.get('url') or ''
-                        if nav_url and nav_url != self.canvas_url and nav_url != 'about:blank':
-                            self._emit_host_event('blocked', {
-                                'url': nav_url[:256],
-                                'resourceType': 'Document',
-                                'reason': params.get('reason') or 'navigation',
-                            })
-                elif method == 'Page.windowOpen':
-                    if not sid or not self.session_id or sid == self.session_id:
-                        open_url = params.get('url') or ''
-                        if open_url:
-                            self._emit_host_event('blocked', {
-                                'url': open_url[:256],
-                                'resourceType': 'Document',
-                                'reason': 'windowOpen',
-                            })
-                elif method == 'Target.targetDestroyed':
+                    continue
+                try:
+                    self._dispatch_event(method, params, sid)
+                except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+                    # A malformed event never ends the host (B2 D3); the guard state stays.
+                    self.dropped += 1
+                    continue
+                if method == 'Target.targetDestroyed':
                     if params.get('targetId') == self.target_id:
                         self._emit_host_event('closed', {'reason': 'targetDestroyed'})
                         self.stop_event.set()
@@ -24232,7 +24450,8 @@ class _CanvasHost:
             self.pending.clear()
 
     async def setup(self):
-        """C1 + K8 setup order: createBrowserContext -> createTarget -> attachToTarget -> session setup."""
+        """C1 + K8 setup order: createBrowserContext -> createTarget -> attachToTarget -> session
+        setup (WebRTC removal before any document, B2 ORTA-2c) -> navigate -> proof -> history reset."""
         ctx_res = await self.call('Target.createBrowserContext', {'disposeOnDetach': True})
         self.browser_context_id = ctx_res.get('browserContextId')
         if not self.browser_context_id:
@@ -24254,54 +24473,103 @@ class _CanvasHost:
         sid = self.session_id
         await self.call('Page.enable', {}, session=sid)
         await self.call('Runtime.enable', {}, session=sid)
+        await self.call('Page.addScriptToEvaluateOnNewDocument', {
+            'source': _CANVAS_NO_WEBRTC_JS,
+            'runImmediately': True,
+        }, session=sid)
         await self.call('Runtime.addBinding', {'name': CANVAS_BINDING}, session=sid)
         await self.call('Fetch.enable', {
             'patterns': [{'urlPattern': '*', 'requestStage': 'Request'}],
         }, session=sid)
         await self.call('Emulation.setFocusEmulationEnabled', {'enabled': True}, session=sid)
-        self._init_nav_task = asyncio.create_task(
-            self.call('Page.navigate', {'url': self.canvas_url}, session=sid, timeout=45.0)
-        )
-        try:
-            nav_res = await asyncio.wait_for(asyncio.shield(self._init_nav_task), timeout=1.2)
-            if isinstance(nav_res, dict) and nav_res.get('frameId'):
-                self.frame_id = nav_res['frameId']
-            self._init_nav_task = None
-        except asyncio.TimeoutError:
-            pass
-        self.frame_url = self.canvas_url
+        await self._navigate_and_prove(timeout=25.0)
 
-    async def _ensure_canvas_document(self, need_frame_id=False):
-        """K4: check main-frame URL via Page.frameNavigated / Page.getFrameTree; re-navigate if lost."""
+    async def _navigate_and_prove(self, timeout=20.0):
+        """Navigate to the canvas URL, wait for its load, prove it, then drop the navigation
+        history (B2 ORTA-1b/c, D1). `errorText` or a failed proof -> CanvasError(code 1)."""
         sid = self.session_id
-        if self._init_nav_task is not None:
-            try:
-                nav_res = await self._init_nav_task
-                if isinstance(nav_res, dict) and nav_res.get('frameId'):
-                    self.frame_id = nav_res['frameId']
-            finally:
-                self._init_nav_task = None
-        if self.frame_id is None:
-            ft_res = await self.call('Page.getFrameTree', {}, session=sid)
-            frame = ((ft_res or {}).get('frameTree') or {}).get('frame') or {}
-            if frame.get('id'):
-                self.frame_id = frame['id']
-            if frame.get('url') and self.frame_url == self.canvas_url:
-                self.frame_url = frame['url']
-        if self.frame_url != self.canvas_url:
-            lost_url = self.frame_url or ''
-            self._emit_host_event('nav', {'url': lost_url[:256]})
-            nav_res = await self.call('Page.navigate', {'url': self.canvas_url}, session=sid, timeout=20.0)
-            if isinstance(nav_res, dict) and nav_res.get('frameId'):
-                self.frame_id = nav_res['frameId']
-            self.frame_url = self.canvas_url
+        self.frame_url = None
+        self.ctx_unique_id = None
+        self.load_event.clear()
+        nav = await self.call('Page.navigate', {'url': self.canvas_url}, session=sid, timeout=timeout)
+        if not isinstance(nav, dict):
+            raise CanvasError('Page.navigate returned no result', 1)
+        if nav.get('errorText'):
+            raise CanvasError(f"canvas navigation failed: {str(nav.get('errorText'))[:200]}", 1)
+        if isinstance(nav.get('frameId'), str):
+            self.frame_id = nav['frameId']
+        try:
+            await asyncio.wait_for(self.load_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise CanvasError('canvas document did not load', 1)
+        deadline = time.monotonic() + 5.0
+        while not await self._prove_document():
+            if time.monotonic() >= deadline:
+                raise CanvasError('canvas document could not be proven (Page.getFrameTree)', 1)
+            await asyncio.sleep(0.05)
+        # D1: history.back() must have no CSP-less about:blank entry to return to.
+        await self.call('Page.resetNavigationHistory', {}, session=sid)
+        if not await self._prove_document():
+            raise CanvasError('canvas document changed while it was being proven', 1)
+
+    async def _prove_document(self):
+        """True when Page.getFrameTree shows the canvas URL in the main frame and the default
+        context of exactly that document is known; writes are then bound to that context.
+        Anything else (other URL, a navigation or context change during the check) -> False,
+        and frame_url / ctx_unique_id stay None (K4: browser truth, never window fields)."""
+        epoch0 = self.doc_epoch
+        ft = await self.call('Page.getFrameTree', {}, session=self.session_id)
+        frame = ((ft or {}).get('frameTree') or {}).get('frame') or {}
+        fid, url = frame.get('id'), frame.get('url')
+        ctx = self._main_ctx.get(fid) if isinstance(fid, str) else None
+        if (self.doc_epoch != epoch0 or url != self.canvas_url or not ctx or ctx[1] != epoch0):
+            self.frame_url = None
+            self.ctx_unique_id = None
+            if isinstance(url, str) and url != self.canvas_url:
+                self._last_nav_url = url
+            return False
+        self.frame_id = fid
+        self.frame_url = url
+        self.ctx_unique_id = ctx[0]
+        return True
+
+    def _doc_changed(self, ctx0, epoch0):
+        return self.doc_epoch != epoch0 or self.ctx_unique_id is None or self.ctx_unique_id != ctx0
+
+    async def _refuse_and_reload(self, why='canvas document was replaced'):
+        """Fail closed: emit `nav`, re-navigate to the canvas (and prove it again) and refuse
+        the current write with code 1. Never write into another document (B2 ORTA-1c)."""
+        self.frame_url = None
+        self.ctx_unique_id = None
+        self._emit_url_event('nav', self._last_nav_url or '')
+        try:
+            await self._navigate_and_prove()
+        except (CanvasError, asyncio.TimeoutError):
+            pass
+        raise CanvasError(f'{why}; write refused and the canvas reloaded', 1)
+
+    async def _ensure_canvas_document(self):
+        """Before every set/patch: prove the document again; not proven -> refuse + reload."""
+        if not await self._prove_document():
+            await self._refuse_and_reload()
+
+    async def _bound_eval(self, expression, await_promise=False, timeout=10.0):
+        """Runtime.evaluate bound to the proven document's context (uniqueContextId). A
+        missing context is a protocol error -> CanvasError (the write is refused)."""
+        if not self.ctx_unique_id:
+            raise CanvasError('canvas document is not proven', 1)
+        params = {'expression': expression, 'uniqueContextId': self.ctx_unique_id}
+        if await_promise:
+            params['awaitPromise'] = True
+            params['returnByValue'] = True
+        return await self.call('Runtime.evaluate', params, session=self.session_id, timeout=timeout)
 
     async def handle_op(self, req):
         if not isinstance(req, dict):
             return {'ok': False, 'error': 'invalid request', 'code': 2}
         op = req.get('op')
-        if op not in CANVAS_OPS:
-            return {'ok': False, 'error': f'unknown canvas op: {op!r}', 'code': 2}
+        if not isinstance(op, str) or op not in CANVAS_OPS:
+            return {'ok': False, 'error': f'unknown canvas op: {str(op)[:64]!r}', 'code': 2}
         self.last_activity = time.monotonic()
         if op == 'ping':
             return {
@@ -24317,7 +24585,7 @@ class _CanvasHost:
                 after = max(0, int(req.get('after') or 0))
                 max_n = min(100, max(1, int(req.get('max') if req.get('max') is not None else 100)))
                 wait_ms = min(25000, max(0, int(req.get('wait_ms') or 0)))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return {'ok': False, 'error': 'invalid events parameters', 'code': 2}
             avail = [ev for ev, _ in self.events if ev['seq'] > after]
             if not avail and wait_ms > 0:
@@ -24342,95 +24610,85 @@ class _CanvasHost:
                 if len(html.encode('utf-8')) > CANVAS_HTML_MAX:
                     return {'ok': False, 'error': f'HTML is over {CANVAS_HTML_MAX} bytes', 'code': 2}
                 t0 = time.monotonic()
-                sid = self.session_id
                 try:
                     if op == 'set':
-                        await self._ensure_canvas_document(need_frame_id=(self.frame_id is None))
-                        with contextlib.suppress(CanvasError):
-                            await self.call('Runtime.evaluate', {
-                                'expression': (
-                                    'if (window.__cdpilotCanvas && typeof window.__cdpilotCanvas.reset === "function") '
-                                    'window.__cdpilotCanvas.reset();'
-                                ),
-                            }, session=sid)
-                        await self.call('Page.setDocumentContent', {
-                            'frameId': self.frame_id or 'F1',
-                            'html': html,
-                        }, session=sid)
-                        val = None
-                        with contextlib.suppress(CanvasError):
-                            raf_res = await self.call('Runtime.evaluate', {
-                                'expression': (
-                                    'new Promise(r => { const t = setTimeout(() => r(Date.now()), 50); '
-                                    'requestAnimationFrame(() => requestAnimationFrame(() => '
-                                    '{ clearTimeout(t); r(Date.now()); })); })'
-                                ),
-                                'awaitPromise': True,
-                                'returnByValue': True,
-                            }, session=sid, timeout=2.0)
-                            val = ((raf_res or {}).get('result') or {}).get('value')
-                        t_paint = int(val) if isinstance(val, (int, float)) else int(time.time() * 1000)
-                        ms = round((time.monotonic() - t0) * 1000.0, 1)
-                        return {'ok': True, 'ms': ms, 't_paint': t_paint}
-                    # op == 'patch' (K4: HTML enters only through json.dumps)
-                    final = bool(req.get('final', True))
-                    await self._ensure_canvas_document(need_frame_id=False)
-                    expr = (
-                        '__cdpilotCanvas.patch('
-                        + json.dumps(html)
-                        + ', {final: '
-                        + ('true' if final else 'false')
-                        + '})'
-                    )
-                    ev_res = await self.call('Runtime.evaluate', {
-                        'expression': expr,
-                        'awaitPromise': True,
-                        'returnByValue': True,
-                    }, session=sid)
-                    res_obj = (ev_res or {}).get('result') or {}
-                    val = res_obj.get('value') if res_obj.get('type') == 'object' else None
-                    if not isinstance(val, dict) and CANVAS_RUNTIME_JS:
-                        await self.call('Runtime.evaluate', {
-                            'expression': CANVAS_RUNTIME_JS,
-                        }, session=sid)
-                        ev_res = await self.call('Runtime.evaluate', {
-                            'expression': expr,
-                            'awaitPromise': True,
-                            'returnByValue': True,
-                        }, session=sid)
-                        res_obj = (ev_res or {}).get('result') or {}
-                        val = res_obj.get('value') if res_obj.get('type') == 'object' else None
-                    if not isinstance(val, dict):
-                        return {'ok': False, 'error': 'runtime missing', 'code': 1}
-                    if not val.get('ok', True):
-                        return {
-                            'ok': False,
-                            'error': str(val.get('error') or 'patch failed'),
-                            'code': int(val.get('code') or 1),
-                        }
-                    ops = val.get('ops') if isinstance(val.get('ops'), dict) else {}
-                    return {
-                        'ok': True,
-                        'ops': {
-                            'add': int(ops.get('add', 0)),
-                            'del': int(ops.get('del', 0)),
-                            'move': int(ops.get('move', 0)),
-                            'upd': int(ops.get('upd', 0)),
-                        },
-                        'ms': val.get('ms', round((time.monotonic() - t0) * 1000.0, 1)),
-                        't_paint': int(val.get('t_paint') or int(time.time() * 1000)),
-                    }
+                        return await self._op_set(html, t0)
+                    return await self._op_patch(html, bool(req.get('final', True)), t0)
                 except CanvasError as e:
-                    return {'ok': False, 'error': str(e), 'code': e.code}
+                    return {'ok': False, 'error': str(e)[:300], 'code': e.code if e.code in (1, 2) else 1}
                 except Exception as e:
-                    return {'ok': False, 'error': str(e) or type(e).__name__, 'code': 1}
+                    return {'ok': False, 'error': (str(e) or type(e).__name__)[:300], 'code': 1}
+        return {'ok': False, 'error': f'unknown canvas op: {op!r}', 'code': 2}
+
+    async def _op_set(self, html, t0):
+        """`set`: sanitised HTML (D2) into the proven document only (ORTA-1c)."""
+        await self._ensure_canvas_document()
+        ctx0, epoch0 = self.ctx_unique_id, self.doc_epoch
+        safe_html = _canvas_sanitize_set_html(html, self.allow_net)
+        try:
+            await self._bound_eval(
+                'if (window.__cdpilotCanvas && typeof window.__cdpilotCanvas.reset === "function") '
+                'window.__cdpilotCanvas.reset();'
+            )
+        except CanvasError:
+            await self._refuse_and_reload('canvas context changed before set')
+        if self._doc_changed(ctx0, epoch0):
+            await self._refuse_and_reload('canvas context changed before set')
+        await self.call('Page.setDocumentContent', {
+            'frameId': self.frame_id,
+            'html': safe_html,
+        }, session=self.session_id)
+        if self._doc_changed(ctx0, epoch0) or not await self._prove_document() \
+                or self.ctx_unique_id != ctx0:
+            await self._refuse_and_reload('canvas document changed during set')
+        val = None
+        with contextlib.suppress(CanvasError, asyncio.TimeoutError):
+            raf_res = await self._bound_eval(
+                'new Promise(r => { const t = setTimeout(() => r(Date.now()), 50); '
+                'requestAnimationFrame(() => requestAnimationFrame(() => '
+                '{ clearTimeout(t); r(Date.now()); })); })',
+                await_promise=True, timeout=2.0)
+            val = ((raf_res or {}).get('result') or {}).get('value')
+        return {
+            'ok': True,
+            'ms': round((time.monotonic() - t0) * 1000.0, 1),
+            't_paint': _canvas_page_epoch_ms(val),
+        }
+
+    async def _op_patch(self, html, final, t0):
+        """`patch` (K4: HTML enters only through json.dumps), bound to the proven context."""
+        await self._ensure_canvas_document()
+        ctx0, epoch0 = self.ctx_unique_id, self.doc_epoch
+        expr = (
+            '__cdpilotCanvas.patch('
+            + json.dumps(html)
+            + ', {final: '
+            + ('true' if final else 'false')
+            + '})'
+        )
+
+        async def _run():
+            try:
+                ev = await self._bound_eval(expr, await_promise=True)
+            except CanvasError:
+                await self._refuse_and_reload('canvas context changed before patch')
+            if self._doc_changed(ctx0, epoch0):
+                await self._refuse_and_reload('canvas document changed during patch')
+            ro = (ev or {}).get('result') or {}
+            return ro.get('value') if ro.get('type') == 'object' else None
+
+        val = await _run()
+        if not isinstance(val, dict) and CANVAS_RUNTIME_JS:
+            try:
+                await self._bound_eval(CANVAS_RUNTIME_JS)
+            except CanvasError:
+                await self._refuse_and_reload('canvas context changed before patch')
+            val = await _run()
+        if not isinstance(val, dict):
+            return {'ok': False, 'error': 'runtime missing', 'code': 1}
+        return _canvas_page_patch_reply(val, t0)
 
     async def close_cdp(self):
-        if self._init_nav_task is not None and not self._init_nav_task.done():
-            self._init_nav_task.cancel()
-            with contextlib.suppress(BaseException):
-                await self._init_nav_task
-        self._init_nav_task = None
         if self.target_id:
             try:
                 await self.call('Target.closeTarget', {'targetId': self.target_id}, timeout=2.0)
@@ -24453,6 +24711,27 @@ def _canvas_cleanup_files(paths):
                 os.unlink(p)
             except OSError:
                 pass
+
+
+def _canvas_live_host_pid(name, paths):
+    """pid from <name>.json when that process is alive AND `ps -o command=` shows it is the
+    canvas host of `name` (B2 D8); otherwise None. A reused pid is never signalled and a live
+    host's files are never deleted on the strength of a slow ping."""
+    try:
+        with open(paths['reg'], 'r', encoding='utf-8') as f:
+            reg = json.load(f) or {}
+        pid = int(reg.get('pid') or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    if pid <= 0 or pid == os.getpid() or not _pid_alive(pid):
+        return None
+    try:
+        out = subprocess.run(['ps', '-o', 'command=', '-p', str(pid)], capture_output=True,
+                             text=True, timeout=5).stdout or ''
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pat = r'(?:^|\s)' + _re.escape(CANVAS_HOST_FLAG) + r'\s+' + _re.escape(name) + r'(?:\s|$)'
+    return pid if _re.search(pat, out) else None
 
 
 def _canvas_parse_host_args(args):
@@ -24479,7 +24758,7 @@ def _canvas_parse_host_args(args):
 
 def _canvas_host_entry(args):
     """Hidden `--_canvas-host <name> [--allow-net <host>]...` process (lane B)."""
-    if not hasattr(socket, 'AF_UNIX'):
+    if _canvas_unsupported_os():
         print('canvas is not supported on Windows', file=sys.stderr)
         sys.exit(1)
     try:
@@ -24507,6 +24786,9 @@ def _canvas_host_entry(args):
                 sys.exit(0)
         except CanvasError:
             pass
+        if _canvas_live_host_pid(name, paths):
+            # A live (slow) host owns this socket: never take it over (D8).
+            sys.exit(1)
         try:
             os.unlink(sock_path)
         except OSError:
@@ -24573,9 +24855,12 @@ def _canvas_host_entry(args):
                             line = bytes(buf).split(b'\n', 1)[0]
                             try:
                                 req = json.loads(line.decode('utf-8'))
-                            except (ValueError, UnicodeDecodeError):
+                            except (ValueError, UnicodeDecodeError, RecursionError):
                                 req = None
-                            resp = await host.handle_op(req)
+                            try:
+                                resp = await host.handle_op(req)
+                            except Exception as e:   # never a silent socket (D4)
+                                resp = {'ok': False, 'error': (str(e) or type(e).__name__)[:200], 'code': 1}
                         if host.closed_by_op:
                             _canvas_cleanup_files(paths)
                         writer.write((json.dumps(resp, ensure_ascii=False) + '\n').encode('utf-8'))
@@ -24669,6 +24954,18 @@ def cmd_canvas_open(args):
         if e.code == 2:
             raise
         pong = None
+    if not (isinstance(pong, dict) and pong.get('ok')):
+        live_pid = _canvas_live_host_pid(name, paths)
+        if live_pid:
+            # D8: a live host that is slow to answer keeps its files; ask it once more.
+            try:
+                pong = _canvas_request(name, {'op': 'ping'}, timeout=10.0)
+            except CanvasError:
+                pong = None
+            if not (isinstance(pong, dict) and pong.get('ok') and pong.get('targetId')):
+                raise CanvasError(
+                    f'canvas {name!r} host (pid {live_pid}) is running but does not answer; '
+                    f'close it with: cdpilot canvas close --name {name}', 1)
     if isinstance(pong, dict) and pong.get('ok') and pong.get('targetId'):
         print(f"canvas: {name} {pong['targetId']}")
         return
@@ -24720,7 +25017,7 @@ def cmd_canvas_open(args):
         proc = subprocess.Popen(cmd, **kwargs)
     except OSError as e:
         raise CanvasError(f'cannot spawn canvas host: {e.strerror or e}', 1)
-    deadline = time.time() + 5.0
+    deadline = time.time() + 60.0   # setup waits for load + proof (B2, <= ~55 s); a loaded machine needs it
     while time.time() < deadline:
         if os.path.exists(paths['ready']):
             break
@@ -24743,12 +25040,26 @@ def cmd_canvas_open(args):
         if target_id:
             print(f'canvas: {name} {target_id}')
             return
+    exited = proc.poll()
     try:
         proc.kill()
     except OSError:
         pass
-    _canvas_cleanup_files(paths)
-    raise CanvasError(f'canvas {name!r} host did not become ready within 5 s', 1)
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=2.0)
+    if not _canvas_live_host_pid(name, paths):
+        _canvas_cleanup_files(paths)
+    if exited is not None:
+        raise CanvasError(f'canvas {name!r} host failed to start (exit {exited}): '
+                          'navigation, proof or CDP setup failed; tab and context were closed', 1)
+    raise CanvasError(f'canvas {name!r} host did not become ready within 60 s', 1)
+
+
+def _canvas_cli_ms(ms):
+    """ms for CLI output: a number, or '?' when the page returned none (D6)."""
+    if isinstance(ms, bool) or not isinstance(ms, (int, float)):
+        return '?'
+    return ms
 
 
 def cmd_canvas_set(args):
@@ -24759,8 +25070,8 @@ def cmd_canvas_set(args):
     html = _canvas_read_html(rest[0])
     reply = _canvas_request(name, {'op': 'set', 'html': html, 't_cli': time.time_ns()}, timeout=45.0)
     if not reply.get('ok'):
-        raise CanvasError(reply.get('error') or 'canvas set failed', int(reply.get('code') or 1))
-    print(f"ok {reply.get('ms', 0)} ms")
+        raise CanvasError(str(reply.get('error') or 'canvas set failed'), 2 if reply.get('code') == 2 else 1)
+    print(f"ok {_canvas_cli_ms(reply.get('ms'))} ms")
 
 
 def cmd_canvas_patch(args):
@@ -24776,13 +25087,11 @@ def cmd_canvas_patch(args):
         't_cli': time.time_ns(),
     }, timeout=45.0)
     if not reply.get('ok'):
-        raise CanvasError(reply.get('error') or 'canvas patch failed', int(reply.get('code') or 1))
+        raise CanvasError(str(reply.get('error') or 'canvas patch failed'), 2 if reply.get('code') == 2 else 1)
     ops = reply.get('ops') or {}
-    add = int(ops.get('add', 0))
-    dl = int(ops.get('del', 0))
-    upd = int(ops.get('upd', 0))
-    move = int(ops.get('move', 0))
-    print(f"ok +{add} -{dl} ~{upd} \u2195{move} {reply.get('ms', 0)} ms")
+    add, dl, upd, move = (ops.get(k, 0) if isinstance(ops.get(k, 0), int) else 0
+                          for k in ('add', 'del', 'upd', 'move'))
+    print(f"ok +{add} -{dl} ~{upd} \u2195{move} {_canvas_cli_ms(reply.get('ms'))} ms")
 
 
 def _canvas_close_one(name, require_open=False):
@@ -24796,18 +25105,18 @@ def _canvas_close_one(name, require_open=False):
         if e.code == 2:
             raise
     if not closed_ok and os.path.exists(paths['reg']):
-        try:
-            with open(paths['reg'], 'r', encoding='utf-8') as f:
-                reg = json.load(f) or {}
-            pid = int(reg.get('pid') or 0)
-            if pid > 0 and _pid_alive(pid):
+        # D8: signal only a live process whose command line is this canvas's host;
+        # a reused pid (any other program) is left alone and only the stale files go.
+        pid = _canvas_live_host_pid(name, paths)
+        if pid:
+            try:
                 os.kill(pid, signal.SIGTERM)
                 deadline = time.time() + 1.5
                 while _pid_alive(pid) and time.time() < deadline:
                     time.sleep(0.05)
                 closed_ok = True
-        except (OSError, ValueError):
-            pass
+            except OSError:
+                pass
     _canvas_cleanup_files(paths)
     if require_open and not (closed_ok or had_any):
         raise CanvasError(f"no canvas named {name!r} is open (cdpilot canvas open --name {name})", 1)
@@ -24824,7 +25133,7 @@ def _canvas_close_all(quiet=False):
             for ext in ('.json', '.sock', '.ready'):
                 if fn.endswith(ext):
                     cand = fn[:-len(ext)]
-                    if CANVAS_NAME_RE.match(cand):
+                    if CANVAS_NAME_RE.fullmatch(cand):
                         names.add(cand)
     except OSError:
         return []
@@ -24865,7 +25174,7 @@ def cmd_canvas_list(args):
         for fn in os.listdir(cdir):
             if fn.endswith('.json'):
                 cand = fn[:-5]
-                if CANVAS_NAME_RE.match(cand):
+                if CANVAS_NAME_RE.fullmatch(cand):
                     names.add(cand)
     except OSError:
         pass
@@ -24904,7 +25213,7 @@ def _canvas_call_lane(fn_name, sub, call_args):
 def cmd_canvas_dispatch(args):
     """`cdpilot canvas <open|set|patch|stream|watch|events|close|list> ...` (lane B routes C and D)."""
     try:
-        if not hasattr(socket, 'AF_UNIX'):
+        if _canvas_unsupported_os():
             raise CanvasError('canvas is not supported on Windows', 1)
         args = list(args or [])
         if not args:

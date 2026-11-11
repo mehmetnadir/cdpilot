@@ -121,3 +121,27 @@ oturumunda, `requestStage:"Request"`; tarayıcı düzeyi `setAutoAttach` YASAK �
 
 gün 0 (bu commit) → A ‖ B → C ‖ D (B'nin `_canvas_request` + host `patch/events` hazır) → güvenlik incelemesi
 (A, B, C, D; `canvas stream` ve `canvas patch` uçtan uca) → jüri (yayın).
+
+## v0.1 değişiklikleri (11.11, B2 güvenlik turu)
+
+Kaynak: şerit B güvenlik incelemesi (ORTA-1, ORTA-2, DÜŞÜK D2–D9), lider kararı. Önceki bölümler yerinde kalır; bu
+bölüm onları daraltır.
+
+| Konu | v0.1 kuralı |
+|---|---|
+| Ad ve beyaz listeler | `CANVAS_NAME_RE` = `^[a-z0-9_-]{1,32}\Z`, her yerde `.fullmatch`. `--allow-net` ad deseni ve `data-action` deseni de `fullmatch` + `\Z`. Sebep: `$` sondaki `\n`'den önce de eşleşir; `'main\n'` geçiyordu. |
+| Belge kanıtı (K4) | Host, yüklemeden sonra ve her `set`/`patch`'ten önce `Page.getFrameTree` ana çerçeve URL'sini tuval adresiyle karşılaştırır. Yazım, kanıtlanan belgenin varsayılan bağlamına (`uniqueContextId`) bağlanır. URL ya da bağlam değişmişse yazım `{ok:false, code:1}` ile reddedilir, host tuvali yeniden açar, `nav` olayı yazar. Başka belgeye yazım yok. |
+| Açılış hatası | `Page.navigate` `errorText` döndürürse `canvas open` çıkış 1 verir; host sekmeyi ve bağlamı kapatıp çıkar. Hazır bekleme 5 sn → 60 sn (yükleme + kanıt; yüklü makinede 20 sn yetmedi). |
+| Geçmiş (D1) | Her tuval yüklemesinden sonra `Page.resetNavigationHistory`: `history.back()` CSP'siz `about:blank` girdisine dönemez. |
+| `set` temizliği (§3.3) | `set` HTML'inden `<base>`, `<meta http-equiv=refresh\|content-security-policy>` ve sayfanın `data-cdpilot-csp` meta'sı atılır; host CSP meta'sı başa (doctype varsa ondan sonra) eklenir. |
+| WebRTC | CSP ve sandbox `RTCPeerConnection`'ı durdurmaz. Host, tuval oturumunda gezinmeden önce `Page.addScriptToEvaluateOnNewDocument{runImmediately:true}` ile 12 kurucuyu (`RTCPeerConnection` … `RTCCertificate`) `window` üstünde yapılandırılamaz `undefined` yapar. |
+| Yanıt başlığı | Tuval yanıtı `X-DNS-Prefetch-Control: off` taşır. |
+| `--allow-net` | `continueRequest` yalnız `https` ve port yok ya da 443 için. |
+| Olay `data.url` | `blocked`/`nav` olaylarındaki `data.url` sayfa denetimindedir (page-controlled), en çok 256 karakter. İki tür ortak sınır: 100/sn, aşım `dropped`. |
+| Sayfa dönüş alanları | Güvenilmez: `ms` sayı ya da `null` (CLI `?` yazar); `error` `"page: "` önekli, en çok 200 karakter; `code` {1, 2} değilse 1; `ops` yalnız tamsayı `add/del/move/upd`; geçersiz `t_paint` → host saati. |
+| Soket | `op` dize değilse `{ok:false, code:2}`. Bozuk binding yükü (JSON hatası, `RecursionError`, biçim) düşer, `dropped`'a sayılır; host sürer. Hız sınırı ayrıştırmadan önce. |
+| Süreç güvenliği | Kayıttaki pid'e SIGTERM yalnız `ps -o command=` `--_canvas-host <ad>` gösterirse; yoksa yalnız bayat dosyalar silinir. `canvas open` canlı ama yavaş hostun dosyalarını silmez (çıkış 1, `close` önerisi). |
+| Windows | `os.name == 'nt'` ya da `AF_UNIX` yok → "not supported on Windows", çıkış 1 (Python 3.13+ Windows'ta `AF_UNIX` verebilir). |
+| `project-stop` | Tuvalleri yalnız durdurulan proje geçerli proje ise kapatır (tuval dizini `PROFILE_DIR`'e aittir); `stop-all` geçerli projenin tuvallerini kapatmayı sürdürür. |
+| e2e tarayıcısı | `CDPILOT_CANVAS_E2E_CDP=127.0.0.1:<port>` → o tarayıcı (yerelde ortak Chrome 9333; başlatma yok). Tanımsız ve `CDPILOT_E2E=1` → test kendi headless Chrome'unu boş portta, geçici `CDPILOT_HOME` ile `cdpilot launch` eder, sonunda `stop` eder. Dinleyici IP'si: loopback dışı IPv4 (macOS'ta loopback; `CDPILOT_CANVAS_E2E_LISTEN` ile değişir). |
+| K9 karşı deneyi | Fixture'daki her vektörün adı ve kendi dinleyici kanalı var. Korumasız koşuda her vektör > 0 olmalı ya da testteki `UNMEASURABLE` haritasında gerekçesiyle durmalı; korumalı koşuda hepsi 0. |
