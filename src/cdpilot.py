@@ -14190,6 +14190,13 @@ def cmd_disconnect():
 
     port = entry.get("port", "?")
     browser_name = entry.get("browser_name", "browser")
+    # The session tab (about:blank) cdpilot opened in that browser is its own:
+    # close it before the record naming it is dropped, or it stays behind.
+    # Only _external_own_tabs ids are closed, never a user tab.
+    try:
+        _external_close_own_tabs()
+    except Exception:
+        pass
     with _registry_lock():
         registry = _load_registry()
         registry.pop(PROJECT_ID, None)
