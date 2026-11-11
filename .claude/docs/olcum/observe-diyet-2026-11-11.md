@@ -161,3 +161,41 @@ Yeniden kayıt: kaynakta uygulanıp bir akış saptıysa kullanıcı `agent obse
 - C'nin gerçek sürümü (AX `childIds`) ölçülmedi; sıra tabanlı sezgi alt sınır.
 - Modelin eylem seçme doğruluğu ölçülmedi; yalnız token. A+E2 için karar başarısı (aynı görev, eski ve yeni biçim, N tekrar) ayrı ölçüm gerektirir, yayın kapısı olmalı.
 - Beş sayfa. Form ağırlıklı sayfa (checkout) ve SPA ölçülmedi.
+
+## Uygulama (lane/obsdiyet)
+
+Süzgeç, ad kırpma (B), kap düşürme (C) ve satır biçimi (E2) `src/cdpilot.py` içinde. Tasarım jürisi 3/3 (D-0100). Süzgeç yalnız çıktıya uygulanır: `actions_map`, `ref_counter` ve `agent run` ankraj listesi tam kalır; `agent-state.json` yeni `hidden_refs` listesini tutar (`--diff` için).
+
+### Kural
+| Girdi | Karar |
+|---|---|
+| Etkileşimli rol (`AGENT_INTERACTIVE_ROLES`) | Tut |
+| Landmark (heading, region, navigation) | Tut |
+| Diğer (StaticText, cell, ListMarker …) | Tut yalnız tıklanabilirse: etkin öğede `cursor:pointer` başlıyor (üstü pointer değil) ya da DOMSnapshot `isClickable`; ve ata zincirinde yerel etkileşimli öğe yok (a[href], button, input, select, textarea, summary, label, [role=etkileşimli]) |
+| Kap girdisi (etkileşimsiz) adı = tutulan alt girdilerin adlarının birleşimi (boşluksuz karşılaştırma) | Gizle (C) |
+| Ad > 80 karakter | Çıktıda 79 + `…` (B); ankraj tam adı kullanır |
+| `DOMSnapshot.captureSnapshot` hata verir, 2 sn aşar ya da belge dönmez | Hiçbir şey gizlenmez (fail open) |
+
+`--full` (observe, act, run; MCP `browser_agent_observe {full:true}`) eski listeyi basar, ad kırpmaz. `--rows` / `CDPILOT_OBSERVE_FORMAT=rows`: `[ref, role, name]`, değer varsa 4. eleman (boş dize dahil; nesne biçimiyle aynı kural). `--diff` ve `act` çıktısında `added`, `removed`, `value_changed` aynı görünümden geçer: modelin görmediği ref "removed" olmaz.
+
+### Canlı ölçüm (paylaşılan tarayıcı 127.0.0.1:9333, her sayfa kendi sekmesi, o200k, tüm JSON çıktısı)
+Yük yüksekti (load 170+); ilk tur sıralı koşuda HN süreleri 6–32 sn gürültülüydü ve atıldı. Süre tablosu aynı sayfada `--full` ve varsayılan koşuyu dönüşümlü (3'er) koşan ikinci turdan.
+
+| Sayfa | `--full` token | Varsayılan token | Fark | `--rows` token (aynı turun varsayılanı) | Girdi (full → varsayılan) | Süre medyan (full → varsayılan) |
+|---|---|---|---|---|---|---|
+| news.ycombinator.com | 7.192 | 4.495 | −%37 | 2.860 (4.274 → 2.860, −%33) | 348 → 230 | 388 → 364 ms |
+| excalidraw.com | 890 | 630 | −%29 | 404 (598 → 404, −%32) | 46 → 32 | 305 → 301 ms |
+| en.wikipedia.org/wiki/Web_browser | 17.821 | 8.450 | −%53 | 5.315 (−%37) | 961 → 521 | 696 → 698 ms (sıralı tur) |
+
+- HN `text` alanı puan ve yorum sayısını taşıyor: örnekler "292 points", "126 points", "651 points", "210 comments", "43 comments", "150 comments" (2000 karakter sınırı içinde; `cell` girdileri artık `text` üzerinden okunur). Başlık metni `text` içinde yok: başlıklar bağlantıdır ve `actions` içinde kalır.
+- Beklenen düşüş (diyet belgesi §4.3: hn −%42, enwiki −%56) ile uyumlu; HN'de ad kırpma ve C neredeyse 0 kazandırır (§4.1 notu).
+- Ek maliyet: 1 `DOMSnapshot.captureSnapshot` (computedStyles cursor, DOM kutusu yok). Gözlenen süre farkı gürültü içinde; çıktı küçüldüğü için varsayılan koşu eşit ya da biraz hızlı.
+- `browser_agent_observe` MCP şeması: 157 → 212 token (+55: `full` parametresi + `rows` alan sırası açıklaması), o200k.
+
+### Test kanıtı
+Yeni birim ve sahte-tarayıcı testleri (`agent observe view (unit|fake browser)`, `agent run view`, `mcp: browser_agent_observe takes …`) adım-1 kodunda düşer: varsayılan görünüm "3 unread messages" girdisini gizlemez, `full` şeması yok, `_agent_clickable_bids` yok. Gizli girdiye ankrajlı kayıtlı akış `agent run` ile sapmasız (0 drift) koşar.
+
+### Açık kalanlar
+- `tokens_avoided_full` (§5 adım 7) eklenmedi: `saved_vs_full` ve `tokens_avoided` artık görünümlü çıktıya göre.
+- `agent run` her adımda 1 ek CDP çağrısı yapar (görünüm hesabı); `tokens_avoided` modelin göreceği listeyi sayar.
+- iframe içi belge: DOMSnapshot tüm belgeleri döner, bid eşleşmesi belgeler arası; ölçülmedi.
