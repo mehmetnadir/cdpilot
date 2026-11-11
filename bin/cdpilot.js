@@ -90,7 +90,8 @@ const DAEMON_SPAWN_CMDS = new Set([
   'tls-proxy', 'captcha-wait', 'help', '--help', '-h']);
 // "cmd sub" pairs that run fresh while the command itself is served warm
 // (agent observe/act are page steps; agent twitter logs in and posts).
-const DAEMON_SPAWN_SUBCMDS = new Set(['agent twitter']);
+const DAEMON_SPAWN_SUBCMDS = new Set(['agent twitter', 'canvas open', 'canvas stream',
+  'canvas watch', 'canvas events']);
 
 function daemonEnabled() {
   return process.env.CDPILOT_DAEMON === '1' && process.platform !== 'win32';
@@ -1202,6 +1203,25 @@ function spawnPython(python, args, env) {
     console.error(`cdpilot: could not start ${python}: ${err.message}`);
     process.exit(1);
   });
+
+  // A signal sent to the launcher alone (an agent harness, `kill <pid>`) used
+  // to end the launcher and leave the Python child running (`canvas events
+  // --follow` kept polling). Forward it. A terminal Ctrl+C or hangup reaches
+  // the child itself through the process group, so SIGINT and SIGHUP go on
+  // only if the child still runs 300 ms later (a second SIGINT would cut its
+  // cleanup short). On Windows the console signals the child; nothing is sent.
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(sig, () => {
+      if (process.platform === 'win32') return;
+      const forward = () => {
+        if (child.exitCode === null && child.signalCode === null) {
+          try { child.kill(sig); } catch { /* already gone */ }
+        }
+      };
+      if (sig === 'SIGTERM') forward();
+      else setTimeout(forward, 300).unref();
+    });
+  }
 
   // A child killed by a signal reports code === null. `code || 0` turned that
   // into success, so an OOM-killed or SIGKILLed run looked fine to scripts
