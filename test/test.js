@@ -15977,6 +15977,91 @@ print(json.dumps({"r1": r1["result"], "r2": r2["result"]}))
       sb.cleanup();
     }
   });
+
+  test('canvas log: event values (a typed password) never reach the session log, CLI or MCP, nor `log --md`', () => {
+    const sb = makeSandbox();
+    const PW = 'Summer2026!';
+    const evt = { t: 3001, src: 'page', type: 'input', action: 'login', id: 'password', data: { value: PW } };
+    const host = startFakeHost(sb, { script: [{ event: evt }] });
+    const env = {
+      ...process.env, CDPILOT_HOME: sb.home, CDPILOT_PROFILE: sb.profile, CDPILOT_PYTHON: PYB,
+      CDPILOT_PROJECT_ID: 'cvd-evlog-test', CDPILOT_LOG: '1', CDPILOT_WEBMCP: '0',
+      CDPILOT_MCP_TOOLS: '', CDPILOT_NO_AUTOLAUNCH: '1',
+    };
+    try {
+      // a) CLI `canvas events` through the real session-log path.
+      const cli = spawnSync(process.execPath, [CLI, 'canvas', 'events', '--max', '10'], {
+        encoding: 'utf8', timeout: 25000, env,
+      });
+      assert.strictEqual(cli.status, 0, cli.stderr);
+      assert(cli.stdout.includes(PW), 'the agent itself still gets the value on stdout');
+      // b) MCP browser_canvas_events.
+      const mcp = spawnSync(process.execPath, [CLI, 'mcp'], {
+        input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call',
+          params: { name: 'browser_canvas_events', arguments: { after: 0, max: 10 } } }) + '\n',
+        encoding: 'utf8', timeout: 25000, env,
+      });
+      assert.strictEqual(mcp.status, 0, mcp.stderr);
+      assert(mcp.stdout.includes(PW), 'the MCP result still carries the value');
+      const logDir = path.join(sb.home, 'projects', fs.readdirSync(path.join(sb.home, 'projects'))[0], 'log');
+      const rawLog = fs.readdirSync(logDir).filter((f) => f.endsWith('.jsonl'))
+        .map((f) => fs.readFileSync(path.join(logDir, f), 'utf8')).join('');
+      assert(!rawLog.includes(PW), `session log leaked the typed value: ${rawLog}`);
+      const entries = rawLog.trim().split('\n').map((l) => JSON.parse(l));
+      const cliEnt = entries.find((e) => e.cmd === 'canvas' && !e.via);
+      const mcpEnt = entries.find((e) => e.via === 'mcp:browser_canvas_events');
+      assert(cliEnt && cliEnt.summary.startsWith('«output not logged'), JSON.stringify(cliEnt));
+      assert(/\(1 events\)/.test(cliEnt.summary), cliEnt.summary);
+      assert.strictEqual(mcpEnt.summary, 'events=1 next=1 dropped=0');
+      // c) `log --md`.
+      const md = spawnSync(process.execPath, [CLI, 'log', '--md'], { encoding: 'utf8', timeout: 25000, env });
+      assert.strictEqual(md.status, 0, md.stderr);
+      assert(!md.stdout.includes(PW), 'log --md leaked the typed value');
+      assert(/output not logged/.test(md.stdout), md.stdout);
+    } finally {
+      host.stop();
+      sb.cleanup();
+    }
+  });
+
+  test('canvas log: set/patch/stream/watch/open/list results carry no HTML or values (summary stays numeric)', () => {
+    const script = `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("cdpilot", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+HTML = "SECRET_HTML_MARKER_77"
+out = {
+  "events_cli": m._slog_summary("canvas", ["events"], '{"seq":1,"id":"password","data":{"value":"Summer2026!"}}\\n{"seq":2}\\n', []),
+  "events_follow": m._slog_summary("canvas", ["events", "--follow", "--name", "x"], '{"seq":1,"data":{"value":"Summer2026!"}}\\n', []),
+  "events_empty": m._slog_summary("canvas", ["events"], "", []),
+  "mcp_counts": m._canvas_events_counts('{"events":[{"data":{"value":"Summer2026!"}}],"next":4,"dropped":2}'),
+  "mcp_bad": m._canvas_events_counts("not json"),
+  "set": m._slog_summary("canvas", ["set", "page.html"], "ok 4 ms\\n", []),
+  "patch": m._slog_summary("canvas", ["patch", "-"], "ok +2 -1 ~3 \\u21950 5 ms\\n", []),
+  "stream": m._slog_summary("canvas", ["stream", "-"], "ok 3 patches (1 coalesced) 5 ms 120 bytes\\n", []),
+  "watch": m._slog_summary("canvas", ["watch", "page.html"], "ok 4 ms\\n", []),
+  "open": m._slog_summary("canvas", ["open", "--allow-net", "api.example.com"], "canvas: main TARGET-1\\n", []),
+  "list": m._slog_summary("canvas", ["list"], "main TARGET-1\\n", []),
+  "set_args": m._slog_redact_args("canvas", ["set", "-", "--name", "x"])[0],
+}
+print(json.dumps(out))
+`;
+    const r = spawnSync(PYB, ['-I', '-c', script, PY_SRC], { encoding: 'utf8', timeout: 20000 });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const o = JSON.parse(r.stdout.trim());
+    assert(o.events_cli.startsWith('«output not logged') && !o.events_cli.includes('Summer'), o.events_cli);
+    assert(/\(2 events\)/.test(o.events_cli), o.events_cli);
+    assert(o.events_follow.startsWith('«output not logged') && !o.events_follow.includes('Summer'));
+    assert.strictEqual(o.events_empty, null);
+    assert.strictEqual(o.mcp_counts, 'events=1 next=4 dropped=2');
+    assert.strictEqual(o.mcp_bad, null);
+    assert.strictEqual(o.set, 'ok 4 ms');
+    assert(/^ok \+2 -1 ~3/.test(o.patch), o.patch);
+    assert(/^ok 3 patches/.test(o.stream), o.stream);
+    assert.strictEqual(o.watch, 'ok 4 ms');
+    assert(!JSON.stringify(o).includes('SECRET_HTML_MARKER'));
+    assert.deepStrictEqual(o.set_args, ['set', '-', '--name', 'x']);
+  });
 })();
 // ═══ CANVAS-D TESTS END ═══
 
