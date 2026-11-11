@@ -9,6 +9,11 @@
   <link rel="prefetch" href="http://__HOST__:__HTTP_PORT__/prefetch_static">
   <link rel="preconnect" href="http://__HOST__:__PCS_PORT__/">
   <link rel="dns-prefetch" href="//cdpilot-dns-prefetch-static.invalid">
+  <!-- B3 O-1: speculation rules leave from the browser process (no renderer request). -->
+  <script type="speculationrules">
+    {"prefetch": [{"source": "list", "urls": ["http://__HOST__:__HTTP_PORT__/specrules"]}],
+     "prerender": [{"source": "list", "urls": ["http://__HOST__:__HTTP_PORT__/specrules_prerender"]}]}
+  </script>
 </head>
 <body>
   <div id="status">running</div>
@@ -35,6 +40,53 @@
           rep('csp:' + e.effectiveDirective, String(e.blockedURI).slice(0, 120));
         });
       } catch (e) {}
+      try {
+        window.addEventListener('message', function (e) {
+          var m = String(e.data || '');
+          var i = m.indexOf('|');
+          if (i > 0 && /^(webrtc_srcdoc|srcdoc_popup)/.test(m)) rep(m.slice(0, i), m.slice(i + 1));
+        });
+      } catch (e) {}
+
+      // B3 D-4: a derived document (blob:, javascript:, about:srcdoc) with one full-page
+      // button. The e2e clicks it with Input.dispatchMouseEvent (real user activation); the
+      // button calls window.open toward the listener. The result goes out as a page event.
+      var mode = typeof window.__EXFIL_MODE__ === 'string' ? window.__EXFIL_MODE__ : 'main';
+      if (mode === 'srcdoc_popup') {
+        try {
+          var pf = document.createElement('iframe');
+          pf.style.cssText = 'position:fixed;left:0;top:0;width:100vw;height:100vh;border:0';
+          pf.srcdoc = '<!doctype html><body style="margin:0"><button id="b" ' +
+            'style="position:fixed;left:0;top:0;width:100vw;height:100vh">open</button><scr' + 'ipt>' +
+            'document.getElementById("b").onclick=function(){var w=null;try{w=window.open(' +
+            JSON.stringify(base + '/srcdoc_popup') + ');}catch(e){}' +
+            'parent.postMessage("srcdoc_popup|"+(w===null?"null":"opened"),"*");};</scr' + 'ipt></body>';
+          document.body.appendChild(pf);
+          rep(mode, 'derived');
+        } catch (e) { rep(mode, 'err:' + e); }
+        return;
+      }
+      if (mode === 'blob_popup' || mode === 'jsurl_popup') {
+        var target = base + '/' + mode;
+        var report = 'try{if(typeof window.__cdpilotCanvasEmit==="function")window.__cdpilotCanvasEmit(' +
+          'JSON.stringify({type:"input",action:"exfil",id:"' + mode + '",data:String(w===null?"null":"opened")}))}catch(e){}';
+        var btn = '<button id="b" style="position:fixed;left:0;top:0;width:100vw;height:100vh">open</button>';
+        var handler = 'document.getElementById("b").onclick=function(){var w=null;try{w=window.open(' +
+          JSON.stringify(target) + ');}catch(e){}' + report + '};';
+        setTimeout(function () {
+          try {
+            if (mode === 'blob_popup') {
+              var bh = '<!doctype html><html><body>' + btn + '<scr' + 'ipt>' + handler + '</scr' + 'ipt></body></html>';
+              location.href = URL.createObjectURL(new Blob([bh], { type: 'text/html' }));
+            } else {
+              var jh = '<!doctype html><html><body>' + btn + '<scr' + 'ipt>' + handler + '</scr' + 'ipt></body></html>';
+              location.href = 'javascript:' + encodeURIComponent(JSON.stringify(jh));
+            }
+            rep(mode, 'derived');
+          } catch (e) { rep(mode, 'err:' + e); }
+        }, 50);
+        return;
+      }
 
       // fetch
       try {
@@ -127,6 +179,28 @@
         var IPC = fr.contentWindow.RTCPeerConnection;
         rtc('webrtc_iframe', IPC, [{ urls: 'stun:' + host + ':__UDP_IFRAME__' }]);
       } catch (e) { rep('webrtc_iframe', 'err:' + (e && e.name ? e.name : e)); }
+
+      // B3 D-3: srcdoc frames run their own script in their own realm. Three variants:
+      // plain, sandbox="allow-scripts", csp="sandbox allow-scripts"; each has its own UDP port.
+      [['webrtc_srcdoc', '__UDP_SRCDOC__', null, null],
+       ['webrtc_srcdoc_sandbox', '__UDP_SRCDOC_SB__', 'allow-scripts', null],
+       ['webrtc_srcdoc_csp', '__UDP_SRCDOC_CSP__', null, 'sandbox allow-scripts']].forEach(function (v) {
+        try {
+          var name = v[0];
+          var code = 'var n=' + JSON.stringify(name) + ';try{if(typeof RTCPeerConnection!=="function"){' +
+            'parent.postMessage(n+"|no-constructor:"+typeof RTCPeerConnection,"*");}else{' +
+            'var pc=new RTCPeerConnection({iceServers:[{urls:"stun:' + host + ':' + v[1] + '"}]});' +
+            'pc.createDataChannel("x");pc.createOffer().then(function(o){return pc.setLocalDescription(o);})' +
+            '.then(function(){parent.postMessage(n+"|gathering","*");},function(e){parent.postMessage(n+"|err:"+e,"*");});}' +
+            '}catch(e){parent.postMessage(n+"|err:"+e,"*");}';
+          var sf = document.createElement('iframe');
+          if (v[2] !== null) sf.setAttribute('sandbox', v[2]);
+          if (v[3] !== null) sf.setAttribute('csp', v[3]);
+          sf.srcdoc = '<!doctype html><scr' + 'ipt>' + code + '</scr' + 'ipt>';
+          document.body.appendChild(sf);
+          rep(name, 'appended');
+        } catch (e) { rep(v[0], 'err:' + e); }
+      });
 
       // window.open
       try {
