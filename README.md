@@ -472,6 +472,28 @@ cdpilot a11y summary          # Quick summary
 cdpilot a11y find <role>      # Find elements by ARIA role
 ```
 
+### Choosing a page view
+
+Tokens are o200k_base counts of each command's stdout on Hacker News and the Wikipedia "Web browser" article
+(median of 3 runs, rounded to hundreds, 2026-11-11; pages drift, so expect a few percent).
+
+| View | What it gives | Can act on it | HN / Wikipedia |
+|---|---|---|---|
+| `content` | the page's plain text | no | 1,200 / 4,700 |
+| `agent observe` | numbered `@refs` for actionable entries and headings/landmarks, plus a short text | yes (`agent act --ref`) | 4,300 / 8,300 |
+| `agent observe --rows` | the same entries as arrays | yes | 2,900 / 5,200 |
+| `agent observe --full` | every entry, nothing hidden | yes | 6,900 / 17,300 |
+| `a11y-snapshot` | one `@ref` line per interactive or structural node | yes (`click-ref @N`) | 8,100 / 13,100 |
+| `a11y` | the full tree with roles and names, no refs | no | 9,800 / 31,400 |
+| `describe` | `a11y-snapshot` + page text, and it writes a screenshot file | yes (`click-ref @N`) | 8,800 / 13,600 |
+
+To act on a page under a token budget, start with `agent observe`; `--rows` prints the same entries in about a
+third fewer tokens (opt-in: `[ref, role, name(, value)]`). After a click or a fill, read the `agent act` result: it
+already holds the change (142–496 tokens on Wikipedia, MDN and react.dev), and `agent observe --diff` right after
+it returned 45–60. Use `a11y-snapshot` or
+`observe --full` when you need a ref for every node, and `content` when you only read. The ranking is
+page-dependent: on react.dev `a11y-snapshot` (1,200) is smaller than `content` (1,500).
+
 ### Agent mode: numbered refs and diffs (token budget)
 
 ```bash
@@ -526,9 +548,10 @@ position among equals (`{"role":"button","name":"Archive","nth":0}`), never a `@
 belong to one session. `agent flow save` writes the trail as a flow; `agent run` finds each anchor on the live
 page (exact name, then case-insensitive, then a longer name containing it when that is unambiguous) and acts,
 with no model in the loop. The result's `tokens_avoided` is an upper bound — a full observation before each step;
-an agent that reads diffs reads less. On three real sites the model loop read
-2,292–18,331 tokens, the `agent run` result 90–136 (HN 18,331 → 90, Wikipedia 15,474 → 136,
-httpbin 2,292 → 119). When a site has a flow, `agent observe` lists it under `known_flows`.
+an agent that reads diffs reads less. On three real sites (measured on 2026-11-10, before `observe` hid text that
+cannot be acted on) the model loop read 2,292–18,331 tokens, the `agent run` result 90–136 (HN 18,331 → 90,
+Wikipedia 15,474 → 136, httpbin 2,292 → 119). A default `observe` now prints about 4,300 tokens on HN and 8,300
+on Wikipedia, still far above the `agent run` result. When a site has a flow, `agent observe` lists it under `known_flows`.
 
 **Drift stops, never guesses.** If a step's anchor is gone, or the step lands on another host than it did
 when recorded, `agent run` exits 4 and prints that page's full observation (`status:"drift"`, `step`,
