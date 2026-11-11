@@ -317,3 +317,69 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
 - Tutanak bekçisi 2 sa boş bekledi: `yuk-dengeleyici` ölü pid biriktiriyordu → conductor 21dbcb7 (K-0091).
 - Sonraki: lane/098 → main + CI; tuval 2. güvenlik incelemesi → D-canvas-mcp B → README tuval bölümü → lane/098; observe
   süzgeci (D-0100, lane/obsdiyet) → lane/098; 0.9.8 tutanak + jüri. Enjeksiyon: desen turu kapandı (D-0099), yöntem değişikliği.
+
+
+## 17. Delta 11.11 04:20– — 0.9.8 adayı: tuval + görünüm main'de, soak sınıflaması, T1 Medium kapandı
+
+| İş | Durum | Kanıt |
+|---|---|---|
+| Main tutanağı (098b) | KALDI 678/679 | tek düşen `replay: --delay none` 5,2 sn (yük 88) → test 10 sn boşluk / 9,5 sn sınırla (e563427) |
+| lane/canvas + lane/gorunum | ✅ main | 112803f (CHANGELOG çatışması: tuval satırı Added'e), ddffd2d |
+| Tutanak 098c | KALDI 740/742 | tripwire tuvalin 4 + connect'in 1 kapatma yerini tanımıyordu → şekil denetimli liste aa8020c; tuval örneği çıktısızdı → lane/canvasex (connect 9333 ile gerçek çıktı, click/shot tuval sekmesine `CDPILOT_TARGET`) 603c7f3 |
+| Soak 2000/2000/600 | sınıflandı | eski düzenek (olcum3 4084e49): ürün hatası 5/4.600 (connect "Could not open a tab", 30 dk duraklama sonrası) · cli_fresh 23 = düzenek (ortak cwd) · 00:15Z kümesi ortam · CLI warm RSS ölçülmedi (örnekleyici başka daemon anahtarını sordu) → 4af70b1 |
+| lane/tabfix | ✅ 5d48d78 | H1 boş `/json` → yeni sekme, H2 tek okumada oturum silinip sekme sızıyor, H3 sabit 3 sn bekleme, H5 `_cleanup_idle_sessions` boş okumada siliyordu; connect 53/53 |
+| lane/utc | ✅ 547acec | `datetime.utcnow()` DeprecationWarning stderr'e düşüyordu (soak click hatası); `_utcnow()` |
+| lane/olcum4 | ⏳ koşu | örnekleyici düzeltmesi a19f2fd (bulunamayan = null, düz sayılmaz); duman 60/60/20 hata 0, daemon 33,8 → 45,0 MB; tam koşu 04:41 başladı (`soak-4/kosu.log`) |
+| T0 | ✅ OK | ihlal 0 |
+| T1 0.9.8 | 1 Medium → ✅ | tuval `input` olay değeri (parola) oturum günlüğüne düz metin, `log --md` basıyordu → lane/canvaslog 530e4d8; B3 (068a0ef) + MCP listeleme (7ab3a47) ilk inceleme: bulgu yok |
+| Vaat denetimi | ✅ lane/docs098 c1e6499 | Breaking etiketleri, `--help` tuval + `CDPILOT_OBSERVE_FORMAT`, eksik Fixed maddeleri |
+| agy | kota | Gemini kanadı 04:31–05:57 kapalı (D-0104); şeritler native Claude ile sürdü |
+| lane/blanktab | ✅ 21d7a75 | `disconnect` kaydı silip kendi `about:blank` sekmesini bırakıyordu → önce `_external_close_own_tabs()` |
+| lane/tagchars | ✅ d18f7a3 | 0.9.8 kompakt JSON (`ensure_ascii=False`) U+E00xx etiket karakterlerini modele ham taşıyordu → `_agent_json` çıkarır, `invisible_tags` kaydı |
+| lane/obsdogrula | ✅ 1e152ba | D-0100 koşulu: 7 site / 8 sayfa, ince listede eylem kaybı 0 |
+| lane/navcanvas | ✅ e0e8fc1 | connect kipinde ihlal yok; kayıtsız home + CDP_PORT yolu "ilk sayfa" ile tuval sekmesini benimsiyordu → `_is_canvas_page` |
+| Tutanak 4b6d932 | KALDI 749/750 → düzeldi | daemon testlerinin `daemon stop`'u paylaşılan runtime dizinindeki soak daemon'unu öldürüyordu; soak'un yenisi testin `status`'unda göründü → test özel `XDG_RUNTIME_DIR` (966e561); sürüm uyuşmazlığı testi kendi açtığı daemon'u bekleyip durdurur (8645ae2) |
+| CI 42941183328 | 2 iş kırmızı | (1) `agent flow list|show|delete`, `stats`, `reset` tarayıcı istiyordu (0.9.7'de de); yerel test o porttaki canlı tarayıcı yüzünden geçiyordu → lane/flowfree f304ef0 · (2) tuval e2e: Node 20'de global WebSocket yok → e2e işi Node 22; CI Chrome'unda ping/specrules karşı deneyde 0 → "ortama bağlı" liste (korumalı 0 zorunlu kalır) lane/cie2e 2874ba1 |
+| Tutanak f62252b (ölü CDP_PORT) | ✅ GEÇERLİ 759/759 | TT-20261111-051216-a38acd |
+| Soak-5 | ✅ kapı 2 DÜZ | 2000/2000/600 hata 0; daemon pid sabit, RSS +0,17 MB/100 (891b918). soak-4: aynı sonuç ama RSS test paketinin `daemon stop`'uyla kesilmişti |
+| T1 delta | 2 Medium | etiket karakteri bayrak istisnası 6'lık parçalarla atlatılıyor + dry-run ham çapa; `run` günlüğü adım çıktısını (tuval olayı, storage) kopyalıyor → lane/t1delta |
+| CI 42943518260 | macOS 1 test | `canvas stream: coalescing` 180 ms zamanlayıcıya bağlı (4 patch) → lane/coalesce |
+| Enjeksiyon yöntemi | J1 B, J2 B | tasarım `juri-098/enjeksiyon-yontem-tasarim.md`; J3 agy kotası açılınca |
+| CI 42944… (ab2cdc2) | Windows 20 test | tuval/sıcak süreç testleri Windows'ta yok + yol/ayraç farkları → lane/wintest (c5caf1d tabanı) |
+| c5caf1d | ✅ main | `run` günlük satırı yalnız koşucunun kendi `Result: N passed, …` satırı (çerçeve eval'i "Result: …" yazamaz); log 48/48, run 67/67 |
+| Site surum-098 | ✅ 026b9eb | `/examples` tuval örneği (examples/canvas transcript birebir, ekran görüntüsü); site testleri 10/10 (node 26), build OK; dağıtım npm 0.9.8 sonrası |
+| X kuyruğu | ✅ | 11.11 16:37 learned-flows: takip metni 10.11 16:10'da "shipped in 0.9.6" diye düzeltilmiş; editör 09:17 turu |
+| lane/tagpage | ⏳ 0.9.9 | `content`/`a11y-snapshot` etiket karakterlerini ham basıyor → temizlik + stderr satırı; kelime içi U+E0001 enjeksiyon ölçümü (K-0097) |
+| Rakip token araştırması | ⏳ | `.claude/docs/rakip-token-2026-11-11.md` (0.9.9 planı girdisi) |
+| lane/wintest | ✅ 8264ee3 | 20 Windows hatası test tarafı: tuval/sıcak süreç senaryoları Windows'ta görünür "skipped" satırıyla atlanır (17 + 2), a11y CRLF bölmesi (1); ürün hatası 0 |
+| Tutanak 8264ee3 | KALDI 763/764 | `canvas stream: coalescing` yarışı (yük ~25): host bekletmesi EOF'tan önce bırakılıyordu → 3 patch; macOS CI'da aynı + watch 304 ms > 300 ms → ebf44ec (EOF'tan 1 sn sonra bırak; watch bütçesi sabitlerle, duvar saati 1 sn takılma bekçisi) |
+| settle-t0 yeniden | ✅ 3172a8a | 10.11 raporu 0 geçerli koşuyla "şart sağlandı" diyordu (GEÇERSİZ işaretli); yeni: 20 site × 5, 80 geçerli, B 32/80, B koşularında (30,100] ms değişim 0 → D1-B jürisi (J1 opus, J2 sonnet, J3 agy) |
+| J3 enjeksiyon | ⏳ agy | 05:58'de başladı (Gemini kotası açıldı) |
+| D-0105 enjeksiyon yöntemi | ✅ B 3/3 | J1 opus 4, J2 sonnet 4, J3 gemini 4; desen listesi dondu; sıra M0 (lane/enjm0, envanter) → B1 (görünürlük + guard warn) → M1 kör küme (ayrı şerit) + M2 |
+| D-0106 `go` 30 ms kısayolu | ✅ B şartlı 2/3 | J1 B, J3 B, J2 C (opt-in); şart 4: 0.9.9 öncesi boş makinede yeniden ölçüm, kaçak > 0 → C. lane/gofast (K-0098) |
+| Tutanak 3172a8a | ✅ GEÇERLİ 764/764 | TT-20261111-060516-26a624 |
+| CI 42949411128 (3172a8a) | 12/13 | Windows ve macOS yeşil (wintest + coalesce/watch düzeltmeleri tuttu); e2e 10 connect testi: /json başlığı gecikmeli (data: URL), kurulum testi düştü, 9'u ona bağlı → 7876977 (bayat kayıt testindeki bekleme kalıbı) |
+| Tutanak 7876977 | ✅ GEÇERLİ 764/764 | TT-20261111-062210-37c12f; CI 42951092799 13/13 yeşil → 0.9.8 adayı, jüri J1 opus / J2 sonnet / J3 gemini |
+| lane/tagpage | ✅ 7ff4487 | tam paket 772/772; 0.9.8 sonrası birleşir (CHANGELOG'da 0.9.8 metnine dokunulmaz) |
+| lane/gofast | ✅ f207256 | tam paket 765/0; 0.9.8 sonrası; şart 4 (boş makinede ölçüm) bekliyor |
+| M1 kör küme | ✅ mühürlü | `~/01dev/cdpilot-olcum-ham/kor-kume/m1` 60+60, SHA256SUMS sha256 9e186bd7…; B1 uygulanınca bir kez |
+| Gözlem boyutu (K-0099) | ölçüldü | 13 sayfa: varsayılan 2,5k–85k token, `--rows` ~%33 küçük, ilk 100 eylem ~2k; hedef sırası ölçümü koşuyor → tasarım + jüri §8 |
+| 0.9.8 jürisi | ✅ 3/3 YAYINLA (D-0107) | J1 opus, J2 sonnet, J3 gemini; engel yok; belge notları f153481'de (inceleme cümlesi, ölçülemeyen vektör, heldout-4, kendine atıf, README platform, package-lock 0.5.0 → 0.9.8) |
+| f153481 (sürüm commit'i) | CI 1 kırmızı | `log warm` testi CHANGELOG'da yalnız [Unreleased]'i okuyordu; sürüm geçişi maddeyi [0.9.8]'e taşıyınca düştü (CI + tutanak 763/764) → 0bfa48f `changelogFor('0.9.8')`. Ders: sürüm commit'inde tutanak push'tan önce |
+| M0 (lane/enjm0) | ✅ 726a443 | 29 teknik, 15'i observe'a ulaşıyor; opacity:0/font-size:0 AX'te ignored değil; iframe içeriği observe'a hiç girmiyor. Ajan connect'siz koşunca 9222'de kendi Brave'ini açtı (kapattı, sonuç attı) → anı + spec satırı |
+| lane/b1 | ⏳ Opus | görünürlük sinyali + guard warn, jüri şartları (J2-3 içerik kaybı yok, J1-1 transparent/camouflage text'te kalır, strict yok) |
+
+### 0.9.8 yayını (11.11 07:15)
+
+- Aday 7876977: tutanak TT-20261111-062210-37c12f GEÇERLİ 764/764, CI 42951092799 13/13, T0 OK. Jüri 3/3 YAYINLA (D-0107; J1 opus,
+  J2 sonnet yerel; J3 agy `ikinci` → gemini-3.8-flash-high; agy Ultra Claude kotası 17.11 13:25'e kadar kapalı). Engel yok.
+- Sürüm commit'i f153481: 7 sürüm dizgisi + package-lock 0.5.0 → 0.9.8 + jüri belge notları. CI'da `log warm` testi düştü
+  (yalnız [Unreleased] okuyordu) → 0bfa48f `changelogFor('0.9.8')`. Tutanak TT-20261111-064753-79a482 GEÇERLİ 764/764 (ağaç = 0bfa48f).
+  CI 42954239063: e2e 1. denemede 21 frames e2e testi CI Chrome başlatma zaman aşımıyla düştü; 2. deneme 13/13.
+- Release `v0.9.8` (hedef 0bfa48f tam SHA) → publish.yml 42957055137 yeşil: npm 0.9.8 (açık 1,40 MB), `cdpilot.mcpb` 419 KB,
+  MCP Registry 0.9.8 isLatest.
+- Site: cdpilot-site surum-098 → main 026b9eb (rozet + tuval örneği), deploy. Smoke ilk koşuda GET / ve /examples 502 (pm2
+  yeniden başlatma ısınması), 30 sn sonra yeniden koşu tamamen yeşil → deploy.sh smoke'tan önce 200 bekler (25d0f99).
+- Ders: sürüm commit'inde tutanak push'tan ÖNCE koşulur ([Unreleased]'e bağlı testler sürüm geçişinde düşer).
+- Sonraki (0.9.9): lane/tagpage + lane/gofast birleşimi (CHANGELOG'da 0.9.8 metnine dokunulmaz), gofast şart 4 (boş makinede
+  settle ölçümü), lane/b1 → M1 (mühürlü küme, bir kez) + M2, observe eylem bütçesi tasarımı + jüri (K-0099), c5caf1d hızlı T1.
