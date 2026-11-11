@@ -8223,9 +8223,35 @@ assert got == '{"n":"\\\\u015f"}\\n', repr(got)
 print("ok")
 `;
     const r = spawnSync(PY_BIN, ['-I', '-c', script],
-      { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0', CDPILOT_JSON: '' } });
+      { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0', CDPILOT_JSON: '', CDP_PORT: '19555', CDPILOT_NO_AUTOLAUNCH: '1' } });
     assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`);
     assert(/^ok/m.test(r.stdout), r.stdout);
+  });
+
+  test('agent browserless: flow list/show/delete, stats and reset run with no browser; observe still needs one', () => {
+    const { spawnSync } = require('child_process');
+    const home = mkHome();
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0', CDP_PORT: '19555', CDPILOT_NO_AUTOLAUNCH: '1' };
+    const run = (...a) => spawnSync(process.execPath, [CLI, 'agent', ...a], { env, encoding: 'utf8', timeout: 30000 });
+    const noBrowser = (r) => /CDP connection error|browser running/i.test(`${r.stdout}${r.stderr}`);
+    let r = run('flow', 'list');
+    assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.deepStrictEqual(JSON.parse(r.stdout), [], 'empty flow list');
+    r = run('flow', 'show', 'nope');
+    assert.strictEqual(r.status, 2, `${r.stdout}${r.stderr}`);
+    assert(/unknown flow/.test(r.stderr) && !noBrowser(r), r.stderr);
+    r = run('flow', 'delete', 'nope');
+    assert.strictEqual(r.status, 2, `${r.stdout}${r.stderr}`);
+    assert(/unknown flow/.test(r.stderr) && !noBrowser(r), r.stderr);
+    r = run('stats');
+    assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert(JSON.parse(r.stdout).flows === 0, r.stdout);
+    r = run('reset');
+    assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.strictEqual(JSON.parse(r.stdout).status, 'reset');
+    r = run('observe');
+    assert.notStrictEqual(r.status, 0, 'observe has no browser to read');
+    assert(noBrowser(r), `${r.stdout}${r.stderr}`);
   });
 
   test('agent JSON format (mcp, fake browser): browser_agent_observe result text is compact UTF-8', () => {
