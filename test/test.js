@@ -8440,6 +8440,119 @@ print(json.dumps(out))
     } finally { fake.stop(); }
   });
 
+  // ── eval: a missing or failed browser reply is an error, not `{}` (11.11, cdpilot-site smoke) ──
+
+  test('eval reply (fake browser): a CDP error reply exits 1 with the reason; a real {} value still prints {}', () => {
+    // On aee8d38 the error reply printed `{}` with exit 0: the assertions on status 1 and the stderr text fail there.
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const err = cli(['eval', 'FAKE_EVAL_ERROR'], env);
+      assert.strictEqual(err.status, 1, err.stdout + err.stderr);
+      assert.strictEqual(err.stdout, '');
+      assert(err.stderr.includes('Error: Cannot find context with specified id (CDP -32000)'), err.stderr);
+      const empty = cli(['eval', 'FAKE_EVAL_EMPTY'], env);
+      assert.strictEqual(empty.status, 0, empty.stderr);
+      assert.strictEqual(empty.stdout.trim(), '{}');
+      const bErr = cli(['eval-batch', JSON.stringify(['FAKE_EVAL_ERROR'])], env);
+      assert.strictEqual(bErr.status, 1, bErr.stdout + bErr.stderr);
+      assert(bErr.stderr.includes('(CDP -32000)'), bErr.stderr);
+      const bEmpty = cli(['eval-batch', JSON.stringify(['FAKE_EVAL_EMPTY'])], env);
+      assert.strictEqual(bEmpty.status, 0, bEmpty.stderr);
+      assert.strictEqual(bEmpty.stdout.trim(), '{}');
+    } finally { fake.stop(); }
+  });
+
+  test('mcp: browser_eval / browser_eval_batch on a failed browser reply is isError, a real {} is not (fake browser)', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const call = (id, name, args) => ({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } });
+      const lines = [
+        { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+        { jsonrpc: '2.0', method: 'notifications/initialized' },
+        call(10, 'browser_eval', { expression: 'FAKE_EVAL_ERROR' }),
+        call(11, 'browser_eval', { expression: 'FAKE_EVAL_EMPTY' }),
+        call(12, 'browser_eval_batch', { expressions: ['FAKE_EVAL_ERROR'] }),
+      ].map((m) => JSON.stringify(m)).join('\n') + '\n';
+      const r = spawnSync(process.execPath, [CLI, 'mcp'], {
+        input: lines, encoding: 'utf-8', timeout: 60000,
+        env: { ...env, CDPILOT_WEBMCP: '0', CDPILOT_MCP_TOOLS: '' },
+      });
+      assert.strictEqual(r.status, 0, r.stderr);
+      const msgs = r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+      const res = (id) => msgs.find((m) => m.id === id).result;
+      const text = (id) => res(id).content.map((c) => c.text).join('\n');
+      assert.strictEqual(res(10).isError, true, text(10));
+      assert(text(10).includes('Error: Cannot find context with specified id (CDP -32000)'), text(10));
+      assert.strictEqual(res(11).isError, false, text(11));
+      assert.strictEqual(text(11), '{}');
+      assert.strictEqual(res(12).isError, true, text(12));
+    } finally { fake.stop(); }
+  });
+
+  test('eval reply (fake CDP, in-process): dropped reply, CDP error, real {} for eval / eval-batch / content / html / storage / observe / cookies / frame eval; helper; daemon + MCP warm paths', () => {
+    // Fails on aee8d38: _cdp_reply does not exist (helper scenario), a dropped reply printed `{}` / `(empty)` and exited 0.
+    const out = execFileSync(PY_BIN, [path.join(__dirname, 'eval_reply_fake.py'), path.join(__dirname, '..', 'src', 'cdpilot.py')],
+      { encoding: 'utf-8', timeout: 120000 });
+    const all = JSON.parse(out.trim().split('\n').pop());
+    for (const k of Object.keys(all)) assert(typeof all[k].error !== 'string', `${k} crashed:\n${all[k].error}`);
+    const noReply = (secs) => `Error: no reply from the browser to Runtime.evaluate within ${secs} s\n`;
+    const cdpErr = 'Error: Cannot find context with specified id (CDP -32000)\n';
+    for (const tag of ['pooled', 'unpooled']) {
+      const e = all.eval[tag];
+      assert.deepStrictEqual([e.drop.res, e.drop.stdout, e.drop.stderr], [['exit', 1], '', noReply(15)], `${tag} eval drop`);
+      assert.deepStrictEqual([e.error.res, e.error.stdout, e.error.stderr], [['exit', 1], '', cdpErr], `${tag} eval error`);
+      assert.deepStrictEqual([e.empty.res, e.empty.stdout, e.empty.stderr], [['ok', null], '{}\n', ''], `${tag} eval {}`);
+      assert.deepStrictEqual([e.value.res, e.value.stdout], [['ok', null], 'ok:1+1\n'], `${tag} eval value`);
+      assert.deepStrictEqual([e.batch_drop.res, e.batch_drop.stdout, e.batch_drop.stderr], [['exit', 1], '', noReply(30)]);
+      assert.deepStrictEqual([e.batch_error.res, e.batch_error.stdout, e.batch_error.stderr], [['exit', 1], '', cdpErr]);
+      assert.deepStrictEqual([e.batch_empty.res, e.batch_empty.stdout], [['ok', null], '{}\n'], `${tag} batch {}`);
+      assert.deepStrictEqual(e.batch_value.res, ['ok', null]);
+    }
+    const h = all.helper;
+    assert.deepStrictEqual([h.missing.res, h.missing.stderr], [['exit', 1], noReply(15)]);
+    assert.deepStrictEqual([h.missing_other_id.res, h.missing_other_id.stderr],
+      [['exit', 1], 'Error: no reply from the browser to Page.captureScreenshot within 30 s\n']);
+    assert.deepStrictEqual([h.error.res, h.error.stderr], [['exit', 1], "Error: 'Foo.bar' wasn't found (CDP -32601)\n"]);
+    assert.deepStrictEqual(h.empty_result.res, ['ok', {}], 'an empty reply object (Page.enable) is a reply');
+    assert.deepStrictEqual(h.value.res, ['ok', { result: { type: 'string', value: 'x' } }]);
+    assert.deepStrictEqual(h.code_only.res, ['ok', { code: 5 }], 'code without message is no CDP error');
+    assert.strictEqual(h.result_with_message.res[0], 'ok', 'a result that carries "result" is never an error');
+    const c = all.commands;
+    for (const name of ['content', 'html', 'storage', 'observe']) {
+      assert.deepStrictEqual([c[`${name}_drop`].res, c[`${name}_drop`].stdout, c[`${name}_drop`].stderr],
+        [['exit', 1], '', noReply(15)], `${name} drop`);
+      assert.deepStrictEqual([c[`${name}_error`].res, c[`${name}_error`].stdout, c[`${name}_error`].stderr],
+        [['exit', 1], '', cdpErr], `${name} error`);
+    }
+    const cookieDrop = 'Error: no reply from the browser to Network.getCookies within 15 s\n';
+    for (const k of ['cookies_list_drop', 'cookies_save_all_drop', 'cookies_save_host_drop']) {
+      assert.deepStrictEqual([c[k].res, c[k].stdout, c[k].stderr], [['exit', 1], '', cookieDrop], k);
+    }
+    assert.strictEqual(c.saved_file_exists, false, 'no empty cookie file written for a dropped reply');
+    assert(c.content_ok.stdout.startsWith('ok:'), 'a normal reply still prints');
+    assert(c.cookies_ok.stdout.includes('1 cookies'), c.cookies_ok.stdout);
+    assert.deepStrictEqual([all.frame_eval.drop.res, all.frame_eval.drop.stderr], [['exit', 1], noReply(15)]);
+    assert.deepStrictEqual([all.frame_eval.error.res, all.frame_eval.error.stderr], [['exit', 1], cdpErr]);
+    assert.deepStrictEqual([all.frame_eval.value.res, all.frame_eval.value.stdout], [['ok', null], 'Result: ok:1+1\n']);
+    // warm paths: the exit code and streams as for any other command error
+    const d = all.daemon;
+    assert.deepStrictEqual([d.drop.code, d.drop.stdout, d.drop.stderr], [1, '', noReply(15)], 'daemon drop');
+    assert.deepStrictEqual([d.error.code, d.error.stdout, d.error.stderr], [1, '', cdpErr], 'daemon error');
+    assert.deepStrictEqual([d.empty.code, d.empty.stdout], [0, '{}\n'], 'daemon {}');
+    assert.deepStrictEqual(d.mcp.drop, { content: [{ type: 'text', text: `stderr: ${noReply(15).trim()}` }], isError: true });
+    assert.deepStrictEqual(d.mcp.error, { content: [{ type: 'text', text: `stderr: ${cdpErr.trim()}` }], isError: true });
+    assert.deepStrictEqual(d.mcp.empty, { content: [{ type: 'text', text: '{}' }], isError: false });
+    assert.strictEqual(d.mcp.value.isError, false);
+    assert.strictEqual(d.mcp_batch.drop.isError, true);
+    assert.strictEqual(d.mcp_batch.error.isError, true);
+  });
+
   test('external guard: connect refuses over a live cdpilot-launched browser (no orphan)', () => {
     const fake = startFake();
     try {
