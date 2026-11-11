@@ -247,6 +247,17 @@ def answer(msg, path):
     result = {}
     if method == "Runtime.evaluate":
         expr = p.get("expression", "")
+        if "FAKE_EVAL_ERROR" in expr:
+            # a CDP error reply (what a page that navigated mid-call sends)
+            return {"id": msg.get("id"), "error": {"code": -32000, "message": "Cannot find context with specified id"}}, events
+        if "FAKE_EVAL_THROW" in expr:
+            # a page-side exception: a normal reply that carries exceptionDetails
+            return {"id": msg.get("id"), "result": {"result": {"type": "object", "subtype": "error"},
+                    "exceptionDetails": {"text": "Uncaught", "exception": {
+                        "description": "ReferenceError: nope is not defined"}}}}, events
+        if "FAKE_EVAL_EMPTY" in expr:
+            # a real empty object value: returnByValue of `({})`
+            return {"id": msg.get("id"), "result": {"result": {"type": "object", "value": {}}}}, events
         if "cdpilot-var-find" in expr:
             # the field a strict fill/smart-fill resolves: an object, not a value
             kind = "IFRAME" if '"iframe' in expr else "INPUT"
