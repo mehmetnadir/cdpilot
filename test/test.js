@@ -8215,6 +8215,133 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert.strictEqual(plain.bid, '103');
   });
 
+  test('scroll-into-view (fake browser): click-ref and agent act (click, hover) send DOM.scrollIntoViewIfNeeded before DOM.getBoxModel', () => {
+    const fake = startFake('full', 'guid-user');
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+
+      // 1. click-ref
+      const snap = cli(['a11y-snapshot'], env);
+      assert.strictEqual(snap.status, 0, snap.stderr);
+      const btn = /@(\d+) \[button\] "Archive"/.exec(snap.stdout);
+      assert(btn, `snapshot lists Archive: ${snap.stdout}`);
+      const click = cli(['click-ref', `@${btn[1]}`], env);
+      assert.strictEqual(click.status, 0, click.stderr);
+
+      let entries = fake.entries();
+      let scrollIdx = entries.findLastIndex((e) => e.method === 'DOM.scrollIntoViewIfNeeded');
+      let boxIdx = entries.findLastIndex((e) => e.method === 'DOM.getBoxModel');
+      assert(scrollIdx !== -1, 'click-ref must send DOM.scrollIntoViewIfNeeded');
+      assert(boxIdx !== -1, 'click-ref must send DOM.getBoxModel');
+      assert(scrollIdx < boxIdx, `click-ref: scrollIntoViewIfNeeded (${scrollIdx}) must precede getBoxModel (${boxIdx})`);
+
+      // 2. agent act click
+      const obs = cli(['agent', 'observe'], env);
+      assert.strictEqual(obs.status, 0, obs.stderr);
+      const actClick = cli(['agent', 'act', '--ref', `@${btn[1]}`, '--action', 'click'], env);
+      assert.strictEqual(actClick.status, 0, actClick.stderr);
+      entries = fake.entries();
+      scrollIdx = entries.findLastIndex((e) => e.method === 'DOM.scrollIntoViewIfNeeded');
+      boxIdx = entries.findLastIndex((e) => e.method === 'DOM.getBoxModel');
+      assert(scrollIdx !== -1 && boxIdx !== -1 && scrollIdx < boxIdx,
+        `agent act click: scrollIntoViewIfNeeded (${scrollIdx}) must precede getBoxModel (${boxIdx})`);
+
+      // 3. agent act hover
+      const actHover = cli(['agent', 'act', '--ref', `@${btn[1]}`, '--action', 'hover'], env);
+      assert.strictEqual(actHover.status, 0, actHover.stderr);
+      entries = fake.entries();
+      scrollIdx = entries.findLastIndex((e) => e.method === 'DOM.scrollIntoViewIfNeeded');
+      boxIdx = entries.findLastIndex((e) => e.method === 'DOM.getBoxModel');
+      assert(scrollIdx !== -1 && boxIdx !== -1 && scrollIdx < boxIdx,
+        `agent act hover: scrollIntoViewIfNeeded (${scrollIdx}) must precede getBoxModel (${boxIdx})`);
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test('scroll-into-view (fake browser): element outside viewport after scrolling exits 1 without dispatching mouse event', () => {
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_OUTSIDE_VIEWPORT: '1' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+
+      const snap = cli(['a11y-snapshot'], env);
+      assert.strictEqual(snap.status, 0, snap.stderr);
+      const btn = /@(\d+) \[button\] "Archive"/.exec(snap.stdout);
+      assert(btn, `snapshot lists Archive: ${snap.stdout}`);
+
+      // (a) click-ref outside viewport: exit 1, message, no mouse event
+      const click = cli(['click-ref', `@${btn[1]}`], env);
+      assert.strictEqual(click.status, 1, `click-ref should exit 1, got ${click.status}: ${click.stdout}`);
+      assert(click.stderr.includes(`Element @${btn[1]} is outside the viewport after scrolling`),
+        `expected viewport error message on stderr: ${click.stderr}`);
+      let entries = fake.entries();
+      assert(!entries.some((e) => e.method === 'Input.dispatchMouseEvent'),
+        'click-ref must not dispatch mouse event when outside viewport');
+
+      // (b) agent act hover outside viewport: exit 1, message, no mouse event
+      const obs = cli(['agent', 'observe'], env);
+      assert.strictEqual(obs.status, 0, obs.stderr);
+      const hover = cli(['agent', 'act', '--ref', `@${btn[1]}`, '--action', 'hover'], env);
+      assert.strictEqual(hover.status, 1, `agent act hover should exit 1, got ${hover.status}: ${hover.stdout}`);
+      assert(hover.stderr.includes(`Element @${btn[1]} is outside the viewport after scrolling`),
+        `expected viewport error message on stderr: ${hover.stderr}`);
+      entries = fake.entries();
+      assert(!entries.some((e) => e.method === 'Input.dispatchMouseEvent'),
+        'agent act hover must not dispatch mouse event when outside viewport');
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test('scroll-into-view e2e: agent act clicks link at top:3000px and updates location.hash (gated by CDPILOT_E2E=1)', () => {
+    if (process.env.CDPILOT_E2E !== '1') {
+      console.log('  - skipped: scroll-into-view e2e (set CDPILOT_E2E=1 to run it against a headless browser)');
+      return;
+    }
+    const home = mkHome();
+    const userDataDir = path.join(home, 'chrome-profile');
+    fs.mkdirSync(userDataDir, { recursive: true });
+    const cdpPort = freePort();
+    const browserBin = findBrowserBin();
+    assert(browserBin, 'No browser found for scroll-into-view e2e test');
+    const htmlFile = path.join(home, 'page.html');
+    fs.writeFileSync(htmlFile, '<!DOCTYPE html><html><body style="margin:0"><div style="height:3000px">spacer</div><a id="target" href="#hedef">Target Link</a><div id="hedef" style="height:500px">Destination</div></body></html>');
+    const targetUrl = `file://${htmlFile}`;
+    const browser = startHeadless(browserBin, cdpPort, userDataDir, targetUrl);
+    try {
+      const env = isoEnv(home, cdpPort, 'scroll-e2e', { CDPILOT_PROFILE: path.join(home, 'cdpilot-profile') });
+      const c = (...cArgs) => spawnSync(process.execPath, [CLI, ...cArgs], {
+        encoding: 'utf-8', timeout: 60000, env,
+      });
+
+      const conn = c('connect', String(cdpPort));
+      assert.strictEqual(conn.status, 0, `connect failed: ${conn.stderr}`);
+
+      const g = c('go', targetUrl);
+      assert.strictEqual(g.status, 0, `go failed: ${g.stderr}`);
+
+      const obs = c('agent', 'observe');
+      assert.strictEqual(obs.status, 0, `agent observe failed: ${obs.stderr}`);
+      const obsJson = JSON.parse(obs.stdout);
+      const linkAction = (obsJson.actions || []).find((a) => a.name === 'Target Link');
+      assert(linkAction, `observe did not find Target Link: ${obs.stdout}`);
+
+      const act = c('agent', 'act', '--ref', linkAction.ref, '--action', 'click');
+      assert.strictEqual(act.status, 0, `agent act failed: ${act.stderr}`);
+
+      const hashRes = c('eval', 'location.hash');
+      assert.strictEqual(hashRes.status, 0, `eval failed: ${hashRes.stderr}`);
+      assert(hashRes.stdout.includes('#hedef'), `location.hash must be #hedef, got: ${hashRes.stdout}`);
+      c('disconnect');
+    } finally {
+      browser.stop();
+    }
+  });
+
   test('agent output (fake browser): invisible tags: stripped and flagged, a flag emoji is kept', () => {
     const tag = (t) => [...t].map((c) => String.fromCodePoint(0xE0000 + c.charCodeAt(0))).join('');
     const anyTag = /[\u{E0000}-\u{E007F}]/u;
