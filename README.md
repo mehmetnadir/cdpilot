@@ -596,8 +596,11 @@ mostly pass when phrased differently. Treat the mark as a hint, not a filter: a 
 Text the layout hides from a person — outside the page or its clipping box (`offscreen`), under 4 px (`tiny`),
 almost fully transparent (`transparent`), the color of its CSS background (`camouflage`), or an `aria-label` that
 differs from what is shown (`name_attr`) — is detected on every observation: a marked block that is such text
-carries `why: ["pattern", "hidden:<how>"]`, and only an `offscreen` or `tiny` part that is also marked leaves `text`
-(its `injection_suspect` record still shows it); everything else stays where it was. With `CDPILOT_AGENT_HIDDEN=1`
+carries `why: ["pattern", "hidden:<how>"]` (also when the record comes from the heading, link or button that holds
+it), and only the marked text node itself of an `offscreen` or `tiny` part leaves `text`: the rest of the part, a
+visible copy of the same words and every other node stay. `hidden_removed: N` counts the nodes left out whenever
+there are any; `injection_suspect` (at most 5 records) usually shows them, but on a page with more marks it may not.
+With `CDPILOT_AGENT_HIDDEN=1`
 the output also lists `hidden_text: [{text, how, words}]` (parts of 8 words or more, at most 5) and
 `hidden_check: "unavailable"` when the layout probe failed and the text was not checked. The list is opt-in until a
 rule that separates screen-reader text and clipped carousels passes a new blind set: on a blind set it caught 42 of
@@ -605,9 +608,13 @@ rule that separates screen-reader text and clipped carousels passes a new blind 
 (long screen-reader descriptions, clipped carousel slides).
 Before `agent act --url` and each `go` step of `agent run`, a guard (`CDPILOT_AGENT_GUARD=off|warn`, default
 `warn`) adds `guard: {rule, host, mode}` when the URL carries a cookie value of another site (`secret_in_url`),
-goes to a host the last 3 observations named only in hidden or marked text (`url_from_hidden`), or leaves
-`CDPILOT_AGENT_ORIGINS` (`outside_origins`). The navigation still runs; cookie values never appear in the output
-or the session log.
+goes to a host the last 3 observations named only in hidden or marked text and no shown link points to (a link
+whose text is hidden, or that has none, does not count; `url_from_hidden`), or leaves `CDPILOT_AGENT_ORIGINS`
+(`outside_origins`). The navigation still runs. A cookie value the guard found is replaced by `«redacted:N chars»`
+in that result (`url`), in `agent-state.json` (`last_url`, the trail) and in the session log line (also as the URL
+percent-encodes it); the browser's own URL still carries it, so a later `agent observe` of that page shows it. The
+guard compares strings: a value sent base64-encoded, with letters changed, split, encoded twice, a cookie shorter
+than 16 characters, or a shared suffix missing from its short list (`s3.amazonaws.com`, `myshopify.com`) passes.
 
 ### Live canvas (experimental)
 
