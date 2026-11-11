@@ -14333,6 +14333,11 @@ print(json.dumps(res))
         'uses that browser, unset launches an own headless Chrome)');
       return;
     }
+    if (typeof WebSocket === 'undefined') {
+      // Node < 22 has no global WebSocket; the zero-dependency rule forbids adding `ws`.
+      console.log('  - skipped: canvas morph e2e (Node 22+ needed: no global WebSocket on Node ' + process.versions.node + ')');
+      return;
+    }
     const { canvasE2ECdp } = require('./canvas_e2e.js');
     const cdp = canvasE2ECdp('morph');
     let out;
@@ -14990,7 +14995,10 @@ print(json.dumps(res))
       if (v.unmeasurable) console.log(`    ölçülemedi: ${name} — ${v.unmeasurable}`);
       if (v.unmeasurable && v.counter > 0) console.log(`    not: ${name} karşı deneyde ölçüldü; UNMEASURABLE satırı bayat`);
       assert.strictEqual(v.guarded, 0, `K9: guarded hits for ${name}: ${JSON.stringify(v)}`);
-      if (!v.unmeasurable && v.counter === 0) zeroBoth.push(name);
+      if (v.env_dependent && v.counter === 0) {
+        // Environment-dependent vector (not core): reported, never counted as passed-by-measurement.
+        console.log(`    bu ortamda ölçülemedi: ${name} — ${v.env_dependent}`);
+      } else if (!v.unmeasurable && v.counter === 0) zeroBoth.push(name);
     }
     assert.deepStrictEqual(zeroBoth, [],
       `counter-experiment: these vectors hit 0 in both runs and are not in UNMEASURABLE: ${zeroBoth.join(', ')}`);
