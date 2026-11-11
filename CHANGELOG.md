@@ -26,6 +26,7 @@ All notable changes to cdpilot will be documented in this file.
 - smart-click matches an input's value only on submit/button/reset inputs, not on a text field's typed value.
 
 ### Changed
+- **Breaking for replay flows that use `CDPILOT_VAR_*` (see Security).** An environment value now fills only an input step on an https page of a host listed in `CDPILOT_VAR_HOSTS`, in a flow without script steps. A flow that used an environment value anywhere else (go/eval arguments, a host not listed, http) is refused as a whole; pass such values with `--var` or list the host. (Added after release, from the release jury's note.)
 - **`injection_suspect` second pass.** Page text is matched on a normalised copy (zero-width characters, NFKC, case, spaced-out letters); new marks `fake_system`, `tool_call`, `navigate_order`; the "ignore previous instructions" family covers six more languages. On two held-out sets never used for tuning: 8 of 30 caught (was 4) with 1 of 30 false alarms, and 7 of 40 (was 2) with 2 of 40. Still a hint, not a filter.
 - **CLI help documents agent mode and `CDPILOT_VAR_HOSTS`.** `cdpilot --help` adds `agent observe`, `agent act`, `agent flow` and `agent run` to the AI AGENT section; environment options list `CDPILOT_VAR_HOSTS`.
 - **README clarifies tool-call cancellation in warm MCP mode.** A tool call stuck in synchronous code (not waiting on the browser) is not interrupted by the 30 s cancel, unlike the fresh path's kill.
