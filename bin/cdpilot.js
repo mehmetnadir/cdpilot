@@ -924,17 +924,19 @@ function showHelp() {
     stop-all           Stop all browser instances
 
   AI AGENT
-    agent observe [--diff]
+    agent observe [--diff] [--full] [--rows]
                        Page state as numbered @refs (+text); --diff = only
-                       changes since last
+                       changes since last; --full = every entry (default
+                       hides text that cannot be acted on); --rows =
+                       [ref, role, name, value?] arrays
     agent act --ref @N [--action click|type|fill|hover|submit] [--text X]
-                       Acts, prints the diff
+                       Acts, prints the diff (also --full, --rows)
     agent act --url URL
                        Navigates silently, prints the diff
     agent flow save <name> [--last N] | list | show <name> | delete <name>
                        Save the acts since the last navigation as a replayable
                        flow
-    agent run <name> [--var k=v] [--dry-run]
+    agent run <name> [--var k=v] [--dry-run] [--full] [--rows]
                        Replay by anchors, no model; exit 4 on drift with the
                        page, 2 for a missing or refused variable
     mcp                Start MCP server (stdin/stdout JSON-RPC)

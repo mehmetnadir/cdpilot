@@ -153,7 +153,7 @@ picks tools by name; `all` (default) is unchanged. Schema size of `tools/list`
 
 ### Agent mode over MCP
 
-`browser_agent_observe` (`diff`), `browser_agent_act` (`ref`/`url`, `action`, `text`), `browser_agent_flow_save`
+`browser_agent_observe` (`diff`, `full`), `browser_agent_act` (`ref`/`url`, `action`, `text`), `browser_agent_flow_save`
 (`name`, `last`) and `browser_agent_run` (`flow`, `vars`, `dry_run`) wrap the agent commands below, so a model
 on MCP works from numbered refs, gets diffs, and replays a learned flow with no page read at all. They are
 outside the `core` profile; `browser_tools enable` adds them. A drift or a missing variable comes back as
@@ -480,6 +480,8 @@ cdpilot agent act --ref @3 --action click
 cdpilot agent act --ref @4 --action fill --text "cdpilot"
 cdpilot agent act --url https://example.com/   # navigates silently, prints the diff
 cdpilot agent observe --diff          # only what changed since the last observe/act
+cdpilot agent observe --full          # every entry, nothing hidden (also on act and run)
+cdpilot agent observe --rows          # entries as [ref, role, name, value?] arrays
 cdpilot agent stats | agent reset
 ```
 
@@ -495,6 +497,18 @@ on a new element without another observe), `changed.removed` (refs), `changed.va
 when it changed (`text_changed`). Refs are stable while the element exists (keyed by the DOM node, not by
 position); a navigation starts a new set. `token_estimate` is `len(json)/4`; `saved_vs_full` compares the diff
 with a full observe of the same page. State lives in `~/.cdpilot/projects/<id>/agent-state.json`.
+
+**What the printed list leaves out.** By default `actions` keeps every interactive entry, headings, regions
+and navigation landmarks, and text that is clickable although the accessibility tree calls it text (a
+`<div onclick>`: `cursor:pointer` starts there, or Chrome marks it clickable, and no link or button sits
+above it). It leaves out plain text, table cells and list markers, entries whose name is only the sum of
+their own kept children, and cuts names over 80 characters to 79 + `…` (output only). The text is still in
+`text`. Only the printed list is thinned: refs, saved flows (`agent run` anchors on the full list) and
+`act --ref` of a hidden ref are unchanged. One extra `DOMSnapshot.captureSnapshot` call (2 s limit) decides
+"clickable"; if it fails nothing is hidden. `--full` (CLI `observe`/`act`/`run`, MCP `full: true`) prints the
+unfiltered list. `--rows` (or `CDPILOT_OBSERVE_FORMAT=rows`) prints `actions` and `changed.added` as arrays
+`[ref, role, name]`, with the field value as a 4th element only for entries that have one; objects stay
+the default.
 
 #### Learned flows: drive a site once, replay it with no model
 
