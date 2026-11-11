@@ -1069,8 +1069,64 @@ def scenario_hardening(mod):
     return asyncio.run(_run())
 
 
+def _canvas_windows_checks(mod):
+    """Test 16 + B2 D9: canvas is unsupported on Windows (runs on every OS)."""
+    # 16. Windows check (simulate missing socket.AF_UNIX for every subcommand)
+    win_results = {}
+    saved_af = getattr(mod.socket, "AF_UNIX", None)
+    try:
+        if hasattr(mod.socket, "AF_UNIX"):
+            delattr(mod.socket, "AF_UNIX")
+        for sub in ("open", "set", "patch", "close", "list", "stream", "watch", "events"):
+            err_buf = io.StringIO()
+            code = 0
+            with contextlib.redirect_stderr(err_buf):
+                try:
+                    mod.cmd_canvas_dispatch([sub])
+                except SystemExit as e:
+                    code = e.code
+            win_results[sub] = {"code": code, "stderr": err_buf.getvalue().strip()}
+    finally:
+        if saved_af is not None:
+            setattr(mod.socket, "AF_UNIX", saved_af)
+    # B2 D9: os.name == 'nt' with AF_UNIX present (Python 3.13+ on Windows) is still unsupported
+    win_nt = {}
+    saved_os_name = mod.os.name
+    try:
+        mod.os.name = "nt"
+        for sub in ("open", "set", "list"):
+            err_buf = io.StringIO()
+            code = 0
+            with contextlib.redirect_stderr(err_buf):
+                try:
+                    mod.cmd_canvas_dispatch([sub])
+                except SystemExit as e:
+                    code = e.code
+            win_nt[sub] = {"code": code, "stderr": err_buf.getvalue().strip()}
+        err_buf = io.StringIO()
+        code = 0
+        with contextlib.redirect_stderr(err_buf):
+            try:
+                mod._canvas_host_entry(["main"])
+            except SystemExit as e:
+                code = e.code
+        win_nt["host"] = {"code": code, "stderr": err_buf.getvalue().strip()}
+    finally:
+        mod.os.name = saved_os_name
+    return win_results, win_nt
+
+
 def scenario_cli_and_socket_integration(mod):
     """Test 10, 11, 12, 13, 15, 16: real detached host over fake CDP server, perms 0700/0600, bad names, slog, Windows."""
+    if os.name == "nt":
+        # Windows: no AF_UNIX host, no 0700/0600 modes, no detached host. Only the part that
+        # is meaningful there runs: every canvas subcommand exits 1 "not supported on Windows".
+        slog_pos, _ = mod._slog_redact_args("canvas", ["set", "  <div>secret token</div>", "--name", "main"])
+        slog_flag, _ = mod._slog_redact_args("canvas", ["patch", "--html=<p>hello</p>", "--html", "<span>world</span>"])
+        slog_file, _ = mod._slog_redact_args("canvas", ["set", "page.html", "--name", "main"])
+        win_results, win_nt = _canvas_windows_checks(mod)
+        return {"windows_only": True, "windows": win_results, "windows_nt": win_nt,
+                "slog": {"pos": slog_pos, "flag": slog_flag, "file": slog_file}}
     fake_cdp = FakeCDPServer()
     tmp_home = tempfile.mkdtemp(prefix="cdpilot-canvas-b-")
     tmp_profile = os.path.join(tmp_home, "profile")
@@ -1265,48 +1321,7 @@ def scenario_cli_and_socket_integration(mod):
         slog_flag, _ = mod._slog_redact_args("canvas", ["patch", "--html=<p>hello</p>", "--html", "<span>world</span>"])
         slog_file, _ = mod._slog_redact_args("canvas", ["set", "page.html", "--name", "main"])
 
-        # 16. Windows check (simulate missing socket.AF_UNIX for every subcommand)
-        win_results = {}
-        saved_af = getattr(mod.socket, "AF_UNIX", None)
-        try:
-            if hasattr(mod.socket, "AF_UNIX"):
-                delattr(mod.socket, "AF_UNIX")
-            for sub in ("open", "set", "patch", "close", "list", "stream", "watch", "events"):
-                err_buf = io.StringIO()
-                code = 0
-                with contextlib.redirect_stderr(err_buf):
-                    try:
-                        mod.cmd_canvas_dispatch([sub])
-                    except SystemExit as e:
-                        code = e.code
-                win_results[sub] = {"code": code, "stderr": err_buf.getvalue().strip()}
-        finally:
-            if saved_af is not None:
-                setattr(mod.socket, "AF_UNIX", saved_af)
-        # B2 D9: os.name == 'nt' with AF_UNIX present (Python 3.13+ on Windows) is still unsupported
-        win_nt = {}
-        saved_os_name = mod.os.name
-        try:
-            mod.os.name = "nt"
-            for sub in ("open", "set", "list"):
-                err_buf = io.StringIO()
-                code = 0
-                with contextlib.redirect_stderr(err_buf):
-                    try:
-                        mod.cmd_canvas_dispatch([sub])
-                    except SystemExit as e:
-                        code = e.code
-                win_nt[sub] = {"code": code, "stderr": err_buf.getvalue().strip()}
-            err_buf = io.StringIO()
-            code = 0
-            with contextlib.redirect_stderr(err_buf):
-                try:
-                    mod._canvas_host_entry(["main"])
-                except SystemExit as e:
-                    code = e.code
-            win_nt["host"] = {"code": code, "stderr": err_buf.getvalue().strip()}
-        finally:
-            mod.os.name = saved_os_name
+        win_results, win_nt = _canvas_windows_checks(mod)
 
         return {
             "bad_names": bad_names,

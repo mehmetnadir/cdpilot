@@ -31,6 +31,15 @@ function test(name, fn) {
   }
 }
 
+// Windows has no canvas host (AF_UNIX socket, detached host) and no warm process; those
+// scenarios are skipped there with a visible line. The "unsupported on Windows" checks use
+// plain test() and run on every OS.
+function testUnix(name, fn) {
+  if (process.platform !== 'win32') return test(name, fn);
+  if (ONLY && !name.includes(ONLY)) return;
+  console.log(`  - skipped (Windows: canvas host and warm process are Unix-only): ${name}`);
+}
+
 // One private home for run(): without it every run() wrote last-activity (and
 // a profile dir) under the real ~/.cdpilot/projects/<cwd project>/. The Node
 // launcher ignores CDPILOT_HOME when it derives the profile path, so
@@ -8068,7 +8077,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       const env = isoEnv(home, fake.port, 'proj');
       const r = cli(['a11y'], env);
       assert.strictEqual(r.status, 0, r.stderr);
-      const lines = r.stdout.split('\n');
+      const lines = r.stdout.split(/\r?\n/);
       const roleCount = (role) => lines.filter((l) => l.startsWith(`  [${role}]`)).length;
       assert(lines.includes("  [heading] 'Inbox'"), 'the heading prints its name: ' + r.stdout);
       assert(lines.includes("  [link] 'Compose'"), 'the link prints its name: ' + r.stdout);
@@ -9130,12 +9139,16 @@ print(json.dumps(out))
     assert.deepStrictEqual([d.drop.code, d.drop.stdout, d.drop.stderr], [1, '', noReply(15)], 'daemon drop');
     assert.deepStrictEqual([d.error.code, d.error.stdout, d.error.stderr], [1, '', cdpErr], 'daemon error');
     assert.deepStrictEqual([d.empty.code, d.empty.stdout], [0, '{}\n'], 'daemon {}');
-    assert.deepStrictEqual(d.mcp.drop, { content: [{ type: 'text', text: `stderr: ${noReply(15).trim()}` }], isError: true });
-    assert.deepStrictEqual(d.mcp.error, { content: [{ type: 'text', text: `stderr: ${cdpErr.trim()}` }], isError: true });
-    assert.deepStrictEqual(d.mcp.empty, { content: [{ type: 'text', text: '{}' }], isError: false });
-    assert.strictEqual(d.mcp.value.isError, false);
-    assert.strictEqual(d.mcp_batch.drop.isError, true);
-    assert.strictEqual(d.mcp_batch.error.isError, true);
+    if (process.platform === 'win32') {
+      console.log('  - skipped (Windows: no warm process, MCPServer._run_warm returns None): eval reply MCP warm path');
+    } else {
+      assert.deepStrictEqual(d.mcp.drop, { content: [{ type: 'text', text: `stderr: ${noReply(15).trim()}` }], isError: true });
+      assert.deepStrictEqual(d.mcp.error, { content: [{ type: 'text', text: `stderr: ${cdpErr.trim()}` }], isError: true });
+      assert.deepStrictEqual(d.mcp.empty, { content: [{ type: 'text', text: '{}' }], isError: false });
+      assert.strictEqual(d.mcp.value.isError, false);
+      assert.strictEqual(d.mcp_batch.drop.isError, true);
+      assert.strictEqual(d.mcp_batch.error.isError, true);
+    }
   });
 
   test('eval failures (fake browser): a page-side JS exception exits 1 with the same text; shot / pdf without data exit 1; MCP isError', () => {
@@ -9190,8 +9203,12 @@ print(json.dumps(out))
     assert.deepStrictEqual([f.annotated_nodata.res, f.annotated_nodata.stderr], [['exit', 1], 'Screenshot failed\n']);
     assert.deepStrictEqual([f.pdf_nodata.res, f.pdf_nodata.stderr], [['exit', 1], 'PDF generation failed\n']);
     assert.deepStrictEqual([f.daemon_throw.code, f.daemon_throw.stdout], [1, text]);
-    assert.deepStrictEqual(f.mcp_throw, { content: [{ type: 'text', text: text.trim() }], isError: true });
-    assert.deepStrictEqual(f.mcp_shot, { content: [{ type: 'text', text: 'stderr: Screenshot failed' }], isError: true });
+    if (process.platform === 'win32') {
+      console.log('  - skipped (Windows: no warm process, MCPServer._run_warm returns None): eval failures MCP warm path');
+    } else {
+      assert.deepStrictEqual(f.mcp_throw, { content: [{ type: 'text', text: text.trim() }], isError: true });
+      assert.deepStrictEqual(f.mcp_shot, { content: [{ type: 'text', text: 'stderr: Screenshot failed' }], isError: true });
+    }
   });
 
   test('external guard: connect refuses over a live cdpilot-launched browser (no orphan)', () => {
@@ -14741,7 +14758,7 @@ print(json.dumps(res))
     assert.strictEqual(s.over_patch.code, 2);
   });
 
-  test('canvas host: bad name, non-hostname allow-net, unsafe dir mode, and socket permissions', () => {
+  testUnix('canvas host: bad name, non-hostname allow-net, unsafe dir mode, and socket permissions', () => {
     const s = getFakeCdpSuite().cli_and_socket;
     for (const item of s.bad_names) {
       assert.strictEqual(item.code, 2, `bad canvas name ${JSON.stringify(item.name)} must exit 2`);
@@ -14759,26 +14776,29 @@ print(json.dumps(res))
 
   test('canvas host: CLI open, set, patch, list, close, unknown op, slog redaction, and Windows exit 1', () => {
     const s = getFakeCdpSuite().cli_and_socket;
-    assert.strictEqual(s.open1.code, 0);
-    assert(/^canvas: main TARGET-\d+$/.test(s.open1.out), `unexpected open1 output: ${s.open1.out}`);
-    assert.strictEqual(s.open2.code, 0);
-    assert.strictEqual(s.open2.out, s.open1.out);
-    assert.strictEqual(s.raw_unknown.ok, false);
-    assert.strictEqual(s.raw_unknown.code, 2);
-    assert.strictEqual(s.set.code, 0);
-    assert(/^ok \d+(\.\d+)? ms$/.test(s.set.out), `unexpected set output: ${s.set.out}`);
-    assert.strictEqual(s.patch.code, 0);
-    assert(
-      /^ok \+\d+ -\d+ ~\d+ ↕\d+ \d+(\.\d+)? ms$/.test(s.patch.out),
-      `unexpected patch output: ${s.patch.out}`
-    );
-    assert.strictEqual(s.list.code, 0);
-    assert(s.list.out.includes('main\tTARGET-'), `unexpected list output: ${s.list.out}`);
-    assert.strictEqual(s.close.code, 0);
-    assert.strictEqual(s.close.out, 'closed main');
-    assert.deepStrictEqual(s.files_after_close, []);
-    assert.strictEqual(s.stop_all.cleaned, true, 'stop-all must close project canvas hosts');
-
+    if (s.windows_only) {
+      console.log('  - skipped (Windows: no canvas host): canvas CLI open/set/patch/list/close; the slog and Windows exit 1 checks below run');
+    } else {
+      assert.strictEqual(s.open1.code, 0);
+      assert(/^canvas: main TARGET-\d+$/.test(s.open1.out), `unexpected open1 output: ${s.open1.out}`);
+      assert.strictEqual(s.open2.code, 0);
+      assert.strictEqual(s.open2.out, s.open1.out);
+      assert.strictEqual(s.raw_unknown.ok, false);
+      assert.strictEqual(s.raw_unknown.code, 2);
+      assert.strictEqual(s.set.code, 0);
+      assert(/^ok \d+(\.\d+)? ms$/.test(s.set.out), `unexpected set output: ${s.set.out}`);
+      assert.strictEqual(s.patch.code, 0);
+      assert(
+        /^ok \+\d+ -\d+ ~\d+ ↕\d+ \d+(\.\d+)? ms$/.test(s.patch.out),
+        `unexpected patch output: ${s.patch.out}`
+      );
+      assert.strictEqual(s.list.code, 0);
+      assert(s.list.out.includes('main\tTARGET-'), `unexpected list output: ${s.list.out}`);
+      assert.strictEqual(s.close.code, 0);
+      assert.strictEqual(s.close.out, 'closed main');
+      assert.deepStrictEqual(s.files_after_close, []);
+      assert.strictEqual(s.stop_all.cleaned, true, 'stop-all must close project canvas hosts');
+    }
     assert(
       s.slog.pos.some((a) => /^«html:\d+ chars»$/.test(a)),
       'slog must redact positional HTML argument'
@@ -14797,7 +14817,7 @@ print(json.dumps(res))
 
   // ── B2 security round (11.11): one test per finding ──
 
-  test('canvas host: ORTA-1a whitelist fullmatch — main\\n, main\\r, " main", MAIN exit 2 and never reach a path or URL', () => {
+  testUnix('canvas host: ORTA-1a whitelist fullmatch — main\\n, main\\r, " main", MAIN exit 2 and never reach a path or URL', () => {
     const c = getFakeCdpSuite().cli_and_socket;
     const h = getFakeCdpSuite().hardening;
     for (const item of c.nl_names) {
@@ -14821,7 +14841,7 @@ print(json.dumps(res))
     assert(nlHost && nlHost.code === 2, 'CLI --allow-net "api.example.com\\n" must exit 2');
   });
 
-  test('canvas host: ORTA-1b Page.navigate errorText fails closed — open exit 1, host exits, tab and context closed', () => {
+  testUnix('canvas host: ORTA-1b Page.navigate errorText fails closed — open exit 1, host exits, tab and context closed', () => {
     const p = getFakeCdpSuite().proof_and_binding;
     assert.strictEqual(p.err_setup.code, 1, `setup must fail with code 1: ${JSON.stringify(p.err_setup)}`);
     assert(/navigation failed/.test(p.err_setup.msg));
@@ -14950,7 +14970,7 @@ print(json.dumps(res))
     assert.strictEqual(getFakeCdpSuite().hardening.d3_ping.ok, true);
   });
 
-  test('canvas host: D4 non-string op gets {ok:false, code:2} (never a silent socket)', () => {
+  testUnix('canvas host: D4 non-string op gets {ok:false, code:2} (never a silent socket)', () => {
     const h = getFakeCdpSuite().hardening;
     for (const r of h.d4) assert.deepStrictEqual([r.ok, r.code], [false, 2], JSON.stringify(r));
     assert.deepStrictEqual([h.d4_events_overflow.ok, h.d4_events_overflow.code], [false, 2]);
@@ -14985,7 +15005,7 @@ print(json.dumps(res))
     assert.strictEqual(d.max_url_len, 256);
   });
 
-  test('canvas host: D8 SIGTERM only to a proven canvas host; open never deletes a live host files', () => {
+  testUnix('canvas host: D8 SIGTERM only to a proven canvas host; open never deletes a live host files', () => {
     const d = getFakeCdpSuite().cli_and_socket.d8;
     assert.strictEqual(d.close_stranger_code, 0);
     assert.strictEqual(d.stranger_alive, true, 'a reused pid (not a canvas host) must never be signalled');
@@ -15005,7 +15025,7 @@ print(json.dumps(res))
     }
   });
 
-  test('canvas host: project-stop closes canvases only for the current project; stop-all still closes them', () => {
+  testUnix('canvas host: project-stop closes canvases only for the current project; stop-all still closes them', () => {
     const c = getFakeCdpSuite().cli_and_socket;
     const ps = c.project_stop;
     assert.strictEqual(ps.open_code, 0);
@@ -15775,7 +15795,7 @@ except mod.CanvasError as e:
     });
   }
 
-  test('canvas events: cursor after/max/next/dropped and >= 1 KB data cut against fake host', () => {
+  testUnix('canvas events: cursor after/max/next/dropped and >= 1 KB data cut against fake host', () => {
     const sb = makeSandbox();
     const bigPayload = 'D'.repeat(1500);
     const script = [
@@ -15820,7 +15840,7 @@ except mod.CanvasError as e:
     }
   });
 
-  test('canvas events: arg validation exits 2 for out-of-range --max, --wait-ms, --after, and bad flags', () => {
+  testUnix('canvas events: arg validation exits 2 for out-of-range --max, --wait-ms, --after, and bad flags', () => {
     const sb = makeSandbox();
     try {
       const badCases = [
@@ -15867,7 +15887,7 @@ print(json.dumps(out))
     }
   });
 
-  test('canvas events: --follow streams new events with advancing cursor and exits 0 on SIGINT', () => {
+  testUnix('canvas events: --follow streams new events with advancing cursor and exits 0 on SIGINT', () => {
     const sb = makeSandbox();
     const script = [
       { event: { t: 2001, src: 'page', type: 'click', action: 'first', id: 'k1', data: {} } },
@@ -15921,7 +15941,7 @@ print(json.dumps({"rc": rc, "events": got, "stderr": err}))
     }
   });
 
-  test('canvas events: MCP tools/list lists the 3 canvas tools only while a canvas is open, never under --tools core', () => {
+  testUnix('canvas events: MCP tools/list lists the 3 canvas tools only while a canvas is open, never under --tools core', () => {
     const sb = makeSandbox();
     try {
       const runMcp = (mcpArgs, calls, extraEnv = {}) => {
@@ -16014,7 +16034,7 @@ print(json.dumps({"rc": rc, "events": got, "stderr": err}))
     }
   });
 
-  test('canvas events: MCP server sends tools/list_changed when the open-canvas set goes empty -> non-empty -> empty; a call with none open still answers with the canvas error', () => {
+  testUnix('canvas events: MCP server sends tools/list_changed when the open-canvas set goes empty -> non-empty -> empty; a call with none open still answers with the canvas error', () => {
     const sb = makeSandbox();
     try {
       const cdir = path.join(sb.profile, 'canvas');
@@ -16072,7 +16092,7 @@ print(json.dumps({"rc": rc, "events": got, "stderr": err}))
     }
   });
 
-  test('canvas events: MCP 256 KB limit, set/patch/events round-trip, wait_ms cap, no argv, and redacted session log', () => {
+  testUnix('canvas events: MCP 256 KB limit, set/patch/events round-trip, wait_ms cap, no argv, and redacted session log', () => {
     const sb = makeSandbox();
     const script = [
       { event: { t: 3001, src: 'page', type: 'click', action: 'buy_now', id: 'btn-buy', data: { sku: 'X1' } } },
@@ -16202,7 +16222,7 @@ print(json.dumps({"r1": r1["result"], "r2": r2["result"]}))
     }
   });
 
-  test('canvas log: event values (a typed password) never reach the session log, CLI or MCP, nor `log --md`', () => {
+  testUnix('canvas log: event values (a typed password) never reach the session log, CLI or MCP, nor `log --md`', () => {
     const sb = makeSandbox();
     const PW = 'Summer2026!';
     const evt = { t: 3001, src: 'page', type: 'input', action: 'login', id: 'password', data: { value: PW } };
@@ -16248,7 +16268,7 @@ print(json.dumps({"r1": r1["result"], "r2": r2["result"]}))
     }
   });
 
-  test('canvas log: a `run` script keeps no step output in the session log or `log --md` (canvas events value)', () => {
+  testUnix('canvas log: a `run` script keeps no step output in the session log or `log --md` (canvas events value)', () => {
     const sb = makeSandbox();
     const PW = 'Summer2026!';
     const evt = { t: 3001, src: 'page', type: 'input', action: 'login', id: 'password', data: { value: PW } };
