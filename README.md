@@ -150,6 +150,7 @@ tools, or `enable` to add some (the server sends `tools/list_changed`). `--tools
 picks tools by name; `all` (default) is unchanged. Schema size of `tools/list`
 (tiktoken `o200k_base`): 45 tools = 5,769 tokens, `core` = 11 tools = 1,342 tokens; the four
 `browser_agent_*` tools add ~11% of schema (49 tools ≈ 6,400 tokens, scaled from the measurement).
+The three `browser_canvas_*` tools are listed only while a live canvas is open (`cdpilot canvas open`), and never under `core`; `tools/list_changed` follows when the first canvas opens or the last one closes.
 
 ### Agent mode over MCP
 

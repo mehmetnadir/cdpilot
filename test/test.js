@@ -9123,18 +9123,18 @@ print(json.dumps(out))
     return { names: res.find((x) => x.id === 1).result.tools.map((t) => t.name), call: res.find((x) => x.id === 2) };
   }
 
-  test('webmcp: MCP tools/list is 52 tools with WebMCP off (43 + browser_connect/browser_disconnect + 4 browser_agent_* + 3 browser_canvas_*), 54 with it on', () => {
+  test('webmcp: MCP tools/list is 49 tools with WebMCP off (43 + browser_connect/browser_disconnect + 4 browser_agent_*; the 3 browser_canvas_* appear only while a canvas is open), 51 with it on', () => {
     const off = mcpTools({});
-    assert.strictEqual(off.names.length, 52, `off: ${off.names.length}`);
+    assert.strictEqual(off.names.length, 49, `off: ${off.names.length}`);
     assert(!off.names.some((n) => n.startsWith('browser_site_')), 'off: no browser_site_* tools');
     assert(off.names.includes('browser_connect') && off.names.includes('browser_disconnect'), 'connect tools');
     assert(/Unknown tool: browser_site_tools/.test(JSON.stringify(off.call)), 'off: not callable');
     const offByFile = mcpTools({}, false);
-    assert.strictEqual(offByFile.names.length, 52);
+    assert.strictEqual(offByFile.names.length, 49);
     for (const on of [mcpTools({ CDPILOT_WEBMCP: '1' }), mcpTools({}, true)]) {
-      assert.strictEqual(on.names.length, 54, `on: ${on.names.length}`);
-      assert.deepStrictEqual(on.names.slice(0, 52), off.names, 'the 52 base tools are unchanged');
-      assert.deepStrictEqual(on.names.slice(52), ['browser_site_tools', 'browser_site_tool_call']);
+      assert.strictEqual(on.names.length, 51, `on: ${on.names.length}`);
+      assert.deepStrictEqual(on.names.slice(0, 49), off.names, 'the 49 base tools are unchanged');
+      assert.deepStrictEqual(on.names.slice(49), ['browser_site_tools', 'browser_site_tool_call']);
       assert(!/Unknown tool/.test(JSON.stringify(on.call)), 'on: browser_site_tools routes to the CLI');
     }
   });
@@ -10584,15 +10584,15 @@ test('mcp profile: CDPILOT_MCP_TOOLS=core lists the 10 core tools plus browser_t
 
 test('mcp profile: --tools flag beats the env var', () => {
   const msgs = mcpSession(['--tools', 'all'], { CDPILOT_MCP_TOOLS: 'core' }, []);
-  assert.strictEqual(names(byId(msgs, 2)).length, 52);
+  assert.strictEqual(names(byId(msgs, 2)).length, 49);
 });
 
-test('mcp profile: default stays all 52 tools, no browser_tools, no listChanged', () => {
+test('mcp profile: default lists all 49 tools (canvas tools only while a canvas is open), no browser_tools, listChanged on', () => {
   const msgs = mcpSession([], {}, []);
   const list = names(byId(msgs, 2));
-  assert.strictEqual(list.length, 52);
+  assert.strictEqual(list.length, 49);
   assert(!list.includes('browser_tools'));
-  assert.deepStrictEqual(byId(msgs, 1).result.capabilities, { tools: {} });
+  assert.deepStrictEqual(byId(msgs, 1).result.capabilities, { tools: { listChanged: true } });
 });
 
 test('mcp profile: a comma list picks exactly those tools', () => {
@@ -13663,7 +13663,7 @@ print(json.dumps({"rc": rc, "events": got, "stderr": err}))
     }
   });
 
-  test('canvas events: MCP tools/list exposes the 3 canvas tools by default and hides them under --tools core', () => {
+  test('canvas events: MCP tools/list lists the 3 canvas tools only while a canvas is open, never under --tools core', () => {
     const sb = makeSandbox();
     try {
       const runMcp = (mcpArgs, calls, extraEnv = {}) => {
@@ -13692,12 +13692,26 @@ print(json.dumps({"rc": rc, "events": got, "stderr": err}))
       };
 
       const canvasNames = ['browser_canvas_set', 'browser_canvas_patch', 'browser_canvas_events'];
+      const noneMsgs = runMcp([], []);
+      const noneNames = noneMsgs.find((m) => m.id === 2).result.tools.map((t) => t.name);
+      for (const n of canvasNames) {
+        assert(!noneNames.includes(n), `no canvas open: tools/list must not include ${n}`);
+      }
+      assert.strictEqual(noneNames.length, 49);
+      assert.strictEqual(noneMsgs.find((m) => m.id === 1).result.capabilities.tools.listChanged, true);
+
+      const cdir = path.join(sb.profile, 'canvas');
+      fs.mkdirSync(cdir, { recursive: true });
+      fs.writeFileSync(path.join(cdir, 'main.json'), '{}');
       const defMsgs = runMcp([], []);
       const defTools = defMsgs.find((m) => m.id === 2).result.tools;
       const defNames = defTools.map((t) => t.name);
       for (const n of canvasNames) {
-        assert(defNames.includes(n), `default tools/list must include ${n}`);
+        assert(defNames.includes(n), `canvas open: tools/list must include ${n}`);
       }
+      assert.strictEqual(defNames.length, 52);
+      const setDesc = defTools.find((t) => t.name === 'browser_canvas_set').description;
+      assert(/cdpilot canvas open/.test(setDesc) && /no MCP open tool/.test(setDesc), setDesc);
       const evTool = defTools.find((t) => t.name === 'browser_canvas_events');
       assert.strictEqual(evTool.inputSchema.properties.max.maximum, 100);
       assert.strictEqual(evTool.inputSchema.properties.wait_ms.maximum, 25000);
@@ -13723,6 +13737,75 @@ print(json.dumps({"rc": rc, "events": got, "stderr": err}))
       for (const n of canvasNames) {
         assert(enabledNames.includes(n), `enabled tools/list must include ${n}`);
       }
+      // --tools core hides them even with a canvas open (the coreMsgs run above had one).
+      // Enable fallback with NO canvas open: they are listed regardless.
+      fs.rmSync(path.join(cdir, 'main.json'));
+      const fbMsgs = runMcp(['--tools', 'core'], [
+        { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'browser_tools', arguments: { action: 'enable', names: canvasNames } } },
+        { jsonrpc: '2.0', id: 6, method: 'tools/list' },
+      ]);
+      const fbNames = fbMsgs.find((m) => m.id === 6).result.tools.map((t) => t.name);
+      for (const n of canvasNames) {
+        assert(fbNames.includes(n), `enable fallback without an open canvas must list ${n}`);
+      }
+    } finally {
+      sb.cleanup();
+    }
+  });
+
+  test('canvas events: MCP server sends tools/list_changed when the open-canvas set goes empty -> non-empty -> empty; a call with none open still answers with the canvas error', () => {
+    const sb = makeSandbox();
+    try {
+      const cdir = path.join(sb.profile, 'canvas');
+      const reg = path.join(cdir, 'main.json');
+      const req = (o) => JSON.stringify(o);
+      const sh = [
+        `printf '%s\\n' '${req({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}'`,
+        `printf '%s\\n' '${req({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}'`,
+        'sleep 1',
+        `mkdir -p '${cdir}'; : > '${reg}'`,
+        'sleep 1',
+        `printf '%s\\n' '${req({ jsonrpc: '2.0', id: 31, method: 'ping' })}'`,
+        'sleep 1',
+        `printf '%s\\n' '${req({ jsonrpc: '2.0', id: 3, method: 'tools/list' })}'`,
+        'sleep 1',
+        `rm '${reg}'`,
+        'sleep 1',
+        `printf '%s\\n' '${req({ jsonrpc: '2.0', id: 41, method: 'ping' })}'`,
+        'sleep 1',
+        `printf '%s\\n' '${req({ jsonrpc: '2.0', id: 4, method: 'tools/list' })}'`,
+        `printf '%s\\n' '${req({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'browser_canvas_set', arguments: { html: '<p>x</p>' } } })}'`,
+        'sleep 1',
+      ].join('; ');
+      const r = spawnSync('/bin/sh', ['-c', `( ${sh} ) | '${process.execPath}' '${CLI}' mcp`], {
+        encoding: 'utf8',
+        timeout: 30000,
+        env: {
+          ...process.env,
+          CDPILOT_HOME: sb.home,
+          CDPILOT_PROFILE: sb.profile,
+          CDPILOT_PYTHON: PYB,
+          CDPILOT_LOG: '0',
+          CDPILOT_WEBMCP: '0',
+          CDPILOT_MCP_TOOLS: '',
+        },
+      });
+      assert.strictEqual(r.status, 0, r.stderr);
+      const msgs = r.stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      const changed = msgs.filter((m) => m.method === 'notifications/tools/list_changed');
+      assert.strictEqual(changed.length, 2, `two list_changed (open, close): ${JSON.stringify(msgs.map((m) => m.method || m.id))}`);
+      const idx = (m) => msgs.indexOf(m);
+      const n = (id) => msgs.find((m) => m.id === id).result.tools.length;
+      assert.strictEqual(n(2), 49);
+      assert.strictEqual(n(3), 52);
+      assert.strictEqual(n(4), 49);
+      assert(idx(changed[0]) > idx(msgs.find((m) => m.id === 31)) && idx(changed[0]) < idx(msgs.find((m) => m.id === 3)),
+        'first list_changed follows the first request after the canvas opened');
+      assert(idx(changed[1]) > idx(msgs.find((m) => m.id === 41)) && idx(changed[1]) < idx(msgs.find((m) => m.id === 4)),
+        'second list_changed follows the first request after the canvas closed');
+      const call = msgs.find((m) => m.id === 5).result;
+      assert.strictEqual(call.isError, true);
+      assert(!/Unknown tool|not enabled/.test(call.content[0].text), call.content[0].text);
     } finally {
       sb.cleanup();
     }

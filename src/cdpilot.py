@@ -18778,6 +18778,7 @@ class MCPServer:
         self.profiled = spec != "all"
         self.enabled = set(self.CORE_TOOLS if spec == "core" else spec.split(","))
         self.pending_notifications = []
+        self._canvas_open = _canvas_any_open()  # what the last tools/list could show
         # A tool call that runs in this process (CDPILOT_DAEMON=1, _run_warm)
         # must see what its own process saw with CDPILOT_MCP_SESSION=1 set.
         global IS_MCP_SESSION
@@ -18832,9 +18833,25 @@ class MCPServer:
         while the mode is on."""
         webmcp = self.WEBMCP_TOOLS if get_webmcp_config() else []
         if not self.profiled:
-            return self.tools + webmcp
+            # The canvas tools (CANVAS_TOOLS) are listed only while a canvas of this
+            # project is open; a profiled server lists them only once enabled.
+            show_canvas = _canvas_any_open()
+            self._canvas_open = show_canvas
+            return [t for t in self.tools
+                    if t["name"] not in _CANVAS_TOOL_NAMES or show_canvas] + webmcp
         base = [t for t in self.tools if t["name"] in self.enabled]
         return base + [self.DISCOVERY_TOOL] + webmcp
+
+    def _canvas_listing_changed(self):
+        """Queue notifications/tools/list_changed when the set of open canvases went
+        from empty to non-empty or back (checked after each request; `run` flushes).
+        Profiled servers never list canvas tools by open state, so they stay quiet."""
+        if self.profiled:
+            return
+        now = _canvas_any_open()
+        if now != self._canvas_open:
+            self._canvas_open = now
+            self.pending_notifications.append("notifications/tools/list_changed")
 
     def _browser_tools(self, req_id, args):
         """browser_tools: list the tools the profile left out, or enable some."""
@@ -18978,7 +18995,7 @@ class MCPServer:
         if method == "initialize":
             return {"jsonrpc": "2.0", "id": req_id, "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {"listChanged": True} if self.profiled else {}},
+                "capabilities": {"tools": {"listChanged": True}},
                 "serverInfo": {"name": "cdpilot", "version": __version__}
             }}
         elif method == "notifications/initialized":
@@ -19150,6 +19167,7 @@ class MCPServer:
                 response = self._handle_request(request)
                 if response is not None:
                     sys.stdout.write(json_mod.dumps(response) + "\n")
+                self._canvas_listing_changed()
                 for method in self.pending_notifications:
                     sys.stdout.write(json_mod.dumps(
                         {"jsonrpc": "2.0", "method": method}) + "\n")
@@ -25695,8 +25713,9 @@ CANVAS_TOOLS = [
     {
         "name": "browser_canvas_set",
         "description": (
-            "Replace the document of an open live canvas (`cdpilot canvas open`) with `html` "
-            "(<= 256 KB). Runs inline scripts in a sandboxed, network-off tab; prefer "
+            "Replace the document of an open live canvas with `html` (<= 256 KB). A canvas is "
+            "opened from the CLI with `cdpilot canvas open` (there is no MCP open tool); "
+            "the canvas tools are listed only while one is open. Runs inline scripts in a sandboxed, network-off tab; prefer "
             "browser_canvas_patch for updates that preserve focus, scroll, and form state."
         ),
         "inputSchema": {
@@ -25757,6 +25776,19 @@ CANVAS_TOOLS = [
     },
 ]
 _CANVAS_TOOL_NAMES = frozenset(t["name"] for t in CANVAS_TOOLS)
+
+
+def _canvas_any_open():
+    """True while a canvas of this project is open: a <name>.json registry file in
+    <PROFILE_DIR>/canvas. Read-only (no directory is created), cheap enough to run
+    after every MCP request."""
+    try:
+        for fn in os.listdir(os.path.join(PROFILE_DIR, 'canvas')):
+            if fn.endswith('.json') and CANVAS_NAME_RE.fullmatch(fn[:-5]):
+                return True
+    except OSError:
+        pass
+    return False
 
 
 def _canvas_parse_int_opt(flag, raw, lo, hi=None):
