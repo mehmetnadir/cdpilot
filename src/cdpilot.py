@@ -44,6 +44,8 @@ Environment:
   CDPILOT_TIMEOUT      Default for --timeout (the flag wins)
   CDPILOT_JSON         pretty|compact: agent command JSON (default: indented on a
                        terminal, compact UTF-8 when stdout is not a terminal)
+  CDPILOT_OBSERVE_FORMAT  rows: agent observe/act/run print actions as
+                       [ref, role, name, value?] arrays (same as --rows)
   CDPILOT_DAEMON=1     Keep one warm Python process per project and send page
                        commands to it over a local socket (fresh process when
                        it is missing or busy; `cdpilot daemon status|stop`;

@@ -528,8 +528,8 @@ above it). It leaves out plain text, table cells and list markers, entries whose
 their own kept children, and cuts names over 80 characters to 79 + `…` (output only). The text is still in
 `text`. Only the printed list is thinned: refs, saved flows (`agent run` anchors on the full list) and
 `act --ref` of a hidden ref are unchanged. One extra `DOMSnapshot.captureSnapshot` call (2 s limit) decides
-"clickable"; if it fails nothing is hidden. `--full` (CLI `observe`/`act`/`run`, MCP `full: true`) prints the
-unfiltered list. `--rows` (or `CDPILOT_OBSERVE_FORMAT=rows`) prints `actions` and `changed.added` as arrays
+"clickable"; if it fails nothing is hidden. `--full` (CLI `observe`/`act`/`run`; over MCP only `browser_agent_observe` takes `full: true`,
+`browser_agent_act` and `browser_agent_run` have no `full`) prints the unfiltered list. `--rows` (or `CDPILOT_OBSERVE_FORMAT=rows`) prints `actions` and `changed.added` as arrays
 `[ref, role, name]`, with the field value as a 4th element only for entries that have one; objects stay
 the default.
 
@@ -1461,6 +1461,7 @@ print(result.stdout)
 | `CDPILOT_NO_AUTOLAUNCH` | `0` | `1` = page commands fail with the old "Is the browser running?" error instead of launching the browser |
 | `CDPILOT_IDLE_CLOSE` | `15` | Minutes without a cdpilot command or page change before a browser cdpilot launched closes itself (fractions allowed, `0` = never; read at launch). Default applies to auto-launch and MCP launches; an explicit CLI `launch` is off unless this is set or `--idle-close <min>` is given |
 | `CDPILOT_JSON` | auto | `pretty` = indented, `compact` = one line; default: agent command JSON is indented in a terminal and compact UTF-8 otherwise |
+| `CDPILOT_OBSERVE_FORMAT` | unset | `rows` = `agent observe/act/run` print `actions` as `[ref, role, name(, value)]` arrays (same as `--rows`); MCP has no per-call switch |
 | `CDPILOT_LOG` | `1` | `0` = do not write the session log (`cdpilot log`) |
 | `CDPILOT_LOG_DAYS` | `14` | Days of session log to keep; older day files are deleted on the first write of a day (`0` keeps all) |
 
