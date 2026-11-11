@@ -103,7 +103,13 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
   const VERSION = require('../package.json').version;
   const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   const home = fs.mkdtempSync(path.join(osmod.tmpdir(), 'cdpilot-daemon-'));
+  // A private runtime dir (short, for the socket length limit): `daemon stop` and `status`
+  // list every socket there, and the shared per-user one holds the daemons of other cdpilot
+  // runs on this machine (11.11: this suite's `daemon stop` ended a soak run's daemon, and a
+  // daemon that run started showed up in this suite's `status`).
+  const runDir = fs.mkdtempSync('/tmp/cdpd-');
   const baseEnv = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+    XDG_RUNTIME_DIR: runDir,
     CDPILOT_DAEMON: '1', CDPILOT_NO_AUTOLAUNCH: '1', CDP_PORT: '19779',
     CHROME_BIN: path.join(home, 'no-such-browser'), CDPILOT_DAEMON_IDLE: '90' };
   for (const k of ['CDPILOT_TIMEOUT', 'CDPILOT_LOG']) delete baseEnv[k];
