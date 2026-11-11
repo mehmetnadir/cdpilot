@@ -14221,18 +14221,42 @@ async def cmd_a11y(subcmd=""):
     visible = [n for n in nodes if not n.get("ignored")]
 
     def get_prop(node, prop_name):
+        # name / value / description are top-level fields of an AX node
+        # ({"value": ...}); the other properties are entries of "properties".
+        top = node.get(prop_name)
+        if isinstance(top, dict) and top.get("value") not in (None, ""):
+            return top["value"]
         for p in node.get("properties", []):
             if p.get("name") == prop_name:
                 return p.get("value", {}).get("value", "")
         return ""
+
+    # InlineTextBox and LineBreak are always dropped: an InlineTextBox repeats the
+    # name of its parent StaticText (which stays, with its name), a LineBreak is
+    # layout only. A node with no name, value or description is dropped when it is
+    # an empty text leaf, or a generic wrapper without children. A generic WITH
+    # children stays; so does every other role (a nameless textbox is a control).
+    ALWAYS_SKIP_ROLES = {"InlineTextBox", "LineBreak"}
+    EMPTY_TEXT_ROLES = {"StaticText", "staticText", "text"}
+
+    def is_empty_leaf(node):
+        role = node.get("role", {}).get("value", "")
+        if role in ALWAYS_SKIP_ROLES:
+            return True
+        if get_prop(node, "name") or get_prop(node, "value") or get_prop(node, "description"):
+            return False
+        if role in EMPTY_TEXT_ROLES:
+            return True
+        return role == "generic" and not node.get("childIds")
 
     parts = subcmd.strip().split(None, 1)
     sub = parts[0] if parts else ""
     arg = parts[1] if len(parts) > 1 else ""
 
     if sub == "" or sub == "full":
-        print(f"Accessibility tree ({len(visible)} visible nodes):")
-        for n in visible:
+        shown = [n for n in visible if not is_empty_leaf(n)]
+        print(f"Accessibility tree ({len(shown)} nodes, {len(visible) - len(shown)} skipped):")
+        for n in shown:
             role = n.get("role", {}).get("value", "?")
             name = get_prop(n, "name")
             val = get_prop(n, "value")
@@ -14347,7 +14371,7 @@ async def cmd_describe():
             continue
         if not backend_node_id:
             continue
-        if not name and not description and role in {"staticText", "text", "paragraph"}:
+        if not name and not description and role in {"StaticText", "staticText", "text", "paragraph"}:
             continue
 
         normalized = ROLE_NORMALIZE.get(role, role)
@@ -15824,7 +15848,7 @@ async def cmd_a11y_snapshot():
             continue
         if not backend_node_id:
             continue
-        if not name and not description and role in {"staticText", "text", "paragraph"}:
+        if not name and not description and role in {"StaticText", "staticText", "text", "paragraph"}:
             continue
 
         normalized = ROLE_NORMALIZE.get(role, role)
