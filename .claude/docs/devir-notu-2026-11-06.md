@@ -269,3 +269,51 @@ alanı), **canlı tuval** PRD'de park. PRD + ölçüm: `.claude/docs/plan-ogrene
   ajanlarında (CLAUDE-GEREKÇE güvenlik), kod şeritleri Gemini 4 Argon/Carbon'da (Nadir 10.11: "gerekirse gemini argon").
 - Kural: iki cdpilot test paketi aynı anda koşmaz (9222 port testleri). Şeritlere yalnız hedefli `CDPILOT_TEST_ONLY`.
 - Sıradaki: replay2 bitince şef diff'i okur → T1 2. tur (taze Claude) → tutanak → CI → jüri (J1/J2 yerel Claude, J3 agy `ikinci`) → yayın.
+
+
+## 16. Delta 11.11 01:00–03:30 — 0.9.7 yayında, tuval 4 şerit + B2 güvenlik turu, agy açlığı, kör enjeksiyon ölçümleri
+
+| İş | Durum | Kanıt |
+|---|---|---|
+| replay2 (T1 YÜKSEK düzeltmesi) | ✅ main'de | f3ca85f, c5f35fd; T1 2. tur "yayınlanabilir" |
+| CI | Windows 2 test düzeldi | 88dbee4 windows: CRLF + cp1252 (yalnız test koşum kodu) → eea73f6; e2e'de WebMCP `--timeout` testi bir kez "sayfadan cevap yok" (yeniden koşu) |
+| 0.9.7 tutanağı | yük altında | iki koşu `git rev-parse` 120 sn zaman aşımıyla düştü; sebep açlık (aşağıda) |
+| Tuval A/C/D | ✅ lane/canvas | 70c8920 (A), 2e583e4 (C), 0569395 (D), araç sayısı 52/54 114c6af |
+| Tuval B | ⏸ B2 güvenlik turu | 4df5fb4 → c45244e; şef: `canvas` 39/39 + e2e 40/40 (sızıntı 0, karşı deney, SIGKILL). Claude güvenlik incelemesi BİRLEŞME HAYIR: ORTA-1 `^…$` + `.match` `'main\n'` kabul eder → CSP'siz `about:blank`'a yazma; ORTA-2 e2e CI'da 9333 yok, karşı deney vektör başına değil, WebRTC açık. B2 şeridi (Claude Opus) düzeltiyor |
+| Başlatıcı | ✅ lane/canvas 9507580 | node SIGINT/SIGTERM alınca Python çocuğu yetim kalıyordu (`canvas events --follow`, `mcp`); artık iletir. Negatif kontrol: eski başlatıcıda rc -15/-2, çocuk yaşıyor |
+| fill/click | ✅ lane/fill 72ce196 + 12ef299 | textarea atayıcısı, başarısız fill/click çıkış 1 (CHANGELOG'da açık); `fill` 22/22 |
+| Soak 2.000 | 950'de durdu | sıcak `content` çağrısı 68 dk dönmedi: açlık, takılma değil (PRI 4, CPU 0,5 sn) |
+| Koordinat hatası | ✅ düzenek hatası | üç kip aynı sekme/ref dosyası; soak.js kip başına cwd; ürün "stale ref" der (8e02f7b) |
+| Bayat ref | ✅ 9fbffe7 | hover/submit sessiz geçiyordu, fill/type odaktaki başka alana yazıyordu → hepsi çıkış 1 |
+| WebMCP kararsız | ✅ 76ad25c | hiç çözülmeyen `getTools()` listeyi 30 sn kilitliyordu → belge başına 5 sn |
+| lane/098 | hazır | fill + koord + staleref + webmcp + gunluk; hedefli süzgeçler yeşil; 0.9.7 sonrası main'e |
+| Tasarım jürisi | ✅ 3/3 B (D-0094, D-0095) | D-json B (lane/djson), D-warm B (taban 987 çağrı / 25 oturum / sıcak 0), D-canvas-mcp B (B2 sonrası). J1/J2 kanıt belgelerini açmadı → yayın jürisinde kanıt alıntısı şartı |
+| Enjeksiyon 3. tur | ✅ lane/098 (74f4e73, 40da2f9) | kör heldout-3 (şef ölçtü) 7 → 11/40, yanlış alarm 2/40 sabit; heldout-2 8 → 27/30 örneklem içi. Kör artış çok dilli/kodlanmış/aciliyet ailesinde; sahte tur ve sahte sistem ailesinde 0 → aşırı uyum. README yalnız kör sayıyı söyler. 4. tur için heldout-4 (50+50, kör yazar) yazılıyor |
+
+- **Açlık:** yük 200 iken (Android öykünücüsü + başka oturumlar) `yuk-dengeleyici` agir yuva ağaçlarını, agy -p ve başsız
+  Chrome'u `PRIO_DARWIN_BG`'ye aldı. Arka plan görevlerim PRI 4, ön plan kabuğu PRI 31. agy CLI akışı bu kısıtta
+  "subscriber fell behind updates, stalled for 5s" ile koptu: 3/3 şerit (fill 66 dk, enj3 ve koord 14 dk) değişiklik
+  yazmadan düştü. Aynı işler Claude alt ajanlarında (CLAUDE-GEREKÇE araç/güvenlik/tarayıcı) koştu; fill 3 dk'da bitti.
+  Anı: `agir-yuva-darwin-bg-aclik-tutanak-soak-1111.md`.
+- Sıradaki: tutanak + CI yeşil → 0.9.7 jürisi (J1/J2 yerel Claude, J3 agy `ikinci`, D-json/D-warm/D-canvas-mcp) →
+  yayın. 0.9.8: B2 + fill + başlatıcı + enj3 + koord birleşimi, CI'da tuval e2e (kendi Chrome'u), jüri.
+
+### 11.11 02:45–03:05 ek
+
+| İş | Durum | Kanıt |
+|---|---|---|
+| Kör heldout-4 | ✅ taban | 50+50, 8 dil, yazar dedektörü görmedi; depo dışı `~/01dev/cdpilot-olcum-ham/kor-kume/` (sha256 40310967ae9e165b). main 13/50, 3. tur 19/50, yanlış alarm 2 → 3/50; sahte sohbet turu iki kör kümede 0/11 (a308550, D-0097) |
+| Tutanak bekçisi | 🔧 düzeldi | `bg_pidler_etkin` ölü pid biriktiriyordu (681 kayıt, 20 canlı) → "liste boş" koşulu hiç gelmedi, 2 sa boş bekleme. conductor 21dbcb7 (her turda ölü pid atılır; test eski kodda düşer), daemon 02:54 yeniden başladı; bekçi "rahat ≥ 120 sn" koşuluyla yeniden kuruldu (K-0091) |
+| Enjeksiyon 4. tur | ⏳ lane/enj4 (Sonnet) | yapısal sahte tur + otorite/aciliyet; aşırı uyum kuralları (pattern başına h2/h3 sayısı, kendi yazımı ≥3); kör ölçüm şefte (K-0092) |
+| Observe diyeti | ⏳ tasarım | 2832ba9: çıktının %41–61'i etkileşimsiz rol; `text_roles` harf hatası (`'staticText'`); öneri R −%56…−70 (A süzgeci + E2 satır). Şeritler: lane/obsdiyet (harf düzeltmesi), SPA tıklanabilir ölçümü → tasarım jürisi D-observe (K-0093) |
+
+### 0.9.7 yayını (11.11 03:2x)
+
+- Tutanak TT-20261111-031710-14b83c GEÇERLİ 648/648 (aday eea73f6), CI 42919366892 yeşil, T0 OK, T1 2. tur YÜKSEK yok.
+- Jüri 3/3 YAYINLA (J1 Claude opus yerel, J2 Claude sonnet yerel — agy Ultra Claude kotası 17.11 13:25'e kadar kapalı; J3 agy
+  `ikinci` → gemini-3.8-flash-high). Ortak not: replay `CDPILOT_VAR_*` kuralı kırıcı → release notuna Changed satırı eklendi
+  (depo CHANGELOG'una 0.9.8 ile girer). D-0101.
+- npm 0.9.7, release ekinde `cdpilot.mcpb`, MCP Registry 0.9.7 isLatest. Site 0.9.7 (cdpilot-site 1bc3254, deploy + smoke).
+- Tutanak bekçisi 2 sa boş bekledi: `yuk-dengeleyici` ölü pid biriktiriyordu → conductor 21dbcb7 (K-0091).
+- Sonraki: lane/098 → main + CI; tuval 2. güvenlik incelemesi → D-canvas-mcp B → README tuval bölümü → lane/098; observe
+  süzgeci (D-0100, lane/obsdiyet) → lane/098; 0.9.8 tutanak + jüri. Enjeksiyon: desen turu kapandı (D-0099), yöntem değişikliği.
