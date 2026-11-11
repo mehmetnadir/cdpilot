@@ -16242,6 +16242,54 @@ print(json.dumps({"r1": r1["result"], "r2": r2["result"]}))
     }
   });
 
+  test('canvas log: a `run` script keeps no step output in the session log or `log --md` (canvas events value)', () => {
+    const sb = makeSandbox();
+    const PW = 'Summer2026!';
+    const evt = { t: 3001, src: 'page', type: 'input', action: 'login', id: 'password', data: { value: PW } };
+    const host = startFakeHost(sb, { script: [{ event: evt }] });
+    const env = {
+      ...process.env, CDPILOT_HOME: sb.home, CDPILOT_PROFILE: sb.profile, CDPILOT_PYTHON: PYB,
+      CDPILOT_PROJECT_ID: 'cvd-runlog-test', CDPILOT_LOG: '1', CDPILOT_WEBMCP: '0',
+      CDPILOT_MCP_TOOLS: '', CDPILOT_NO_AUTOLAUNCH: '1',
+    };
+    try {
+      const scriptPath = path.join(sb.home, 'ask.cdp');
+      fs.writeFileSync(scriptPath, 'canvas events --max 10\n');
+      const r = spawnSync(process.execPath, [CLI, 'run', scriptPath], { encoding: 'utf8', timeout: 30000, env });
+      assert.strictEqual(r.status, 0, r.stderr + r.stdout);
+      assert(r.stdout.includes(PW), 'the agent itself still sees the step output');
+      const logDir = path.join(sb.home, 'projects', fs.readdirSync(path.join(sb.home, 'projects'))[0], 'log');
+      const rawLog = fs.readdirSync(logDir).filter((f) => f.endsWith('.jsonl'))
+        .map((f) => fs.readFileSync(path.join(logDir, f), 'utf8')).join('');
+      assert(!rawLog.includes(PW), `session log leaked the typed value: ${rawLog}`);
+      const runEnt = rawLog.trim().split('\n').map((l) => JSON.parse(l)).find((e) => e.cmd === 'run');
+      assert(runEnt && /^Result: 1 passed/.test(runEnt.summary), JSON.stringify(runEnt));
+      const md = spawnSync(process.execPath, [CLI, 'log', '--md'], { encoding: 'utf8', timeout: 25000, env });
+      assert.strictEqual(md.status, 0, md.stderr);
+      assert(!md.stdout.includes(PW), 'log --md leaked the typed value');
+    } finally {
+      host.stop();
+      sb.cleanup();
+    }
+  });
+
+  test('canvas log: `run` summary is only the Result line, whatever a step printed (storage, cookies, eval)', () => {
+    const script = `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("cdpilot", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+steps = "[1] storage local\\n     {\\"session\\":\\"Summer2026!\\"}\\n[2] canvas events\\n     {\\"data\\":{\\"value\\":\\"Summer2026!\\"}}\\n" + "-" * 40 + "\\nScript: x.cdp\\nResult: 2 passed, 0 failed, 2 total\\n"
+out = {"run": m._slog_summary("run", ["x.cdp"], steps, []),
+       "run_none": m._slog_summary("run", ["x.cdp"], "[1] storage local\\n     secret=Summer2026!\\n", [])}
+print(json.dumps(out))
+`;
+    const r = spawnSync(PYB, ['-I', '-c', script, PY_SRC], { encoding: 'utf8', timeout: 20000 });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const o = JSON.parse(r.stdout.trim());
+    assert.strictEqual(o.run, 'Result: 2 passed, 0 failed, 2 total');
+    assert.strictEqual(o.run_none, null, 'no Result line, nothing logged');
+  });
+
   test('canvas log: set/patch/stream/watch/open/list results carry no HTML or values (summary stays numeric)', () => {
     const script = `
 import importlib.util, json, sys
