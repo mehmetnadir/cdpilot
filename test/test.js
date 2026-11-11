@@ -7968,6 +7968,66 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     } finally { fake.stop(); }
   });
 
+  test('a11y (fake browser): names, values and descriptions print; InlineTextBox and LineBreak and empty leaves are skipped; find shows names (2026-11-11)', () => {
+    // name / value / description are top-level AX fields; get_prop read only "properties", so
+    // since v0.1.1 every line was bare ("[link]"), InlineTextBox lines doubled the text, and
+    // `a11y find` printed "(unnamed)" for every node. On aee8d38 every assertion below on
+    // names, on InlineTextBox/LineBreak and on find fails.
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_AX_NOISE: '1', FAKE_CDP_AX_FIELD: '1' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const r = cli(['a11y'], env);
+      assert.strictEqual(r.status, 0, r.stderr);
+      const lines = r.stdout.split('\n');
+      const roleCount = (role) => lines.filter((l) => l.startsWith(`  [${role}]`)).length;
+      assert(lines.includes("  [heading] 'Inbox'"), 'the heading prints its name: ' + r.stdout);
+      assert(lines.includes("  [link] 'Compose'"), 'the link prints its name: ' + r.stdout);
+      assert(lines.includes("  [StaticText] 'Welcome back'"), 'a named StaticText stays with its name: ' + r.stdout);
+      assert(lines.includes("  [textbox] 'To' value='alice' description='Recipient'"), 'name, value, description: ' + r.stdout);
+      assert.strictEqual(roleCount('InlineTextBox'), 0, 'InlineTextBox (named or not) is gone: ' + r.stdout);
+      assert.strictEqual(roleCount('LineBreak'), 0, 'LineBreak is gone: ' + r.stdout);
+      assert.strictEqual(roleCount('StaticText'), 1, 'the empty StaticText is skipped: ' + r.stdout);
+      assert.strictEqual(roleCount('generic'), 1, 'generic with a child stays, the generic leaf goes: ' + r.stdout);
+      assert(/\(\d+ nodes, 5 skipped\)/.test(lines[0]), `header counts the skipped nodes: ${lines[0]}`);
+      const find = cli(['a11y', 'find', 'link'], env).stdout;
+      assert(/1 elements with role 'link'/.test(find) && /- 'Compose'/.test(find) && !/unnamed/.test(find), find);
+      assert(/- 'To'/.test(cli(['a11y', 'find', 'textbox'], env).stdout), 'find textbox shows the name');
+      // summary still counts every node
+      assert(/StaticText: 2/.test(cli(['a11y', 'summary'], env).stdout), 'summary still counts every node');
+    } finally { fake.stop(); }
+  });
+
+  test('a11y-snapshot and describe (fake browser): empty text nodes do not shift @N refs, click @N still hits the same backend node (2026-11-11)', () => {
+    const run = (extraEnv) => {
+      const fake = startFake('full', 'guid-user', extraEnv);
+      try {
+        const home = mkHome();
+        writeRegistry(home, { proj: externalEntry(fake.port) });
+        const env = isoEnv(home, fake.port, 'proj');
+        const snap = cli(['a11y-snapshot'], env);
+        assert.strictEqual(snap.status, 0, snap.stderr);
+        const btn = /@(\d+) \[button\] "Archive"/.exec(snap.stdout);
+        assert(btn, `snapshot lists the button: ${snap.stdout}`);
+        const click = cli(['click-ref', `@${btn[1]}`], env);
+        assert.strictEqual(click.status, 0, click.stderr);
+        const bid = /backendNodeId=(\d+)/.exec(click.stdout)[1];
+        const desc = cli(['describe'], env).stdout;
+        const dbtn = /@(\d+) \[button\] "Archive"/.exec(desc);
+        assert(dbtn, `describe lists the button: ${desc}`);
+        return { snapLines: snap.stdout.split('\n').filter((l) => l.startsWith('@')), ref: btn[1], bid, dref: dbtn[1] };
+      } finally { fake.stop(); }
+    };
+    const plain = run({});
+    const noisy = run({ FAKE_CDP_AX_NOISE: '1' });
+    assert.deepStrictEqual(noisy.snapLines, plain.snapLines, 'noise nodes add no snapshot line and move no ref');
+    assert.strictEqual(noisy.ref, plain.ref);
+    assert.strictEqual(noisy.dref, plain.dref);
+    assert.strictEqual(noisy.bid, '103', 'click @N targets the Archive button (backend node 103)');
+    assert.strictEqual(plain.bid, '103');
+  });
+
   test('agent JSON format (fake browser): compact UTF-8 when piped, CDPILOT_JSON=pretty indents, =compact forces one line, a bogus value notes on stderr and follows the TTY rule', () => {
     const fake = startFake('full', 'guid-user', { FAKE_CDP_BUTTON: 'Arşivle ✓' });
     try {
