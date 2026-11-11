@@ -22725,6 +22725,12 @@ def _slog_summary(cmd, args, stdout, secrets):
     sub = args[0].lower() if args else ""
     if cmd == "storage" or (cmd == "cookies" and sub not in SLOG_COOKIE_SAFE_SUBS):
         return SLOG_OUTPUT_WITHHELD
+    if cmd == "run":
+        # The script runner echoes every step's stdout (canvas events, storage, cookies, eval): the
+        # children log their own lines with their own rules; this line keeps the final count only.
+        last = next((ln.strip() for ln in reversed(stdout.splitlines())
+                     if ln.strip().startswith("Result:")), None)
+        return _slog_clip(last, SLOG_SUMMARY_CHARS) if last else None
     if cmd == "canvas" and sub == "events":
         # Page-written events carry what the user typed (input/change/submit values).
         n = sum(1 for ln in stdout.splitlines() if ln.lstrip().startswith("{"))
