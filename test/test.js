@@ -9620,8 +9620,46 @@ print(json.dumps(out))
       if (/^\s*#/.test(line)) continue;
       if (PAT.test(line)) (hits[cur] = hits[cur] || []).push(line.trim());
     }
+    // Each of these touches only what the same code created; the shape checks below pin how.
+    // Live canvas (experimental): the host closes page targets of the browser context it created
+    // (a popup, B3 D-4) and its own canvas tab, then disposes that context; the host entry sets
+    // its own signal handlers; `canvas open` kills only the host it just spawned; `canvas close`
+    // signals only a pid whose command line is this canvas's host (B2 D8).
+    // Connect: _external_abandon_own_tab closes the tab get_page_ws opened a moment earlier.
+    const OWN_BY_CONSTRUCTION = ['_CanvasHost', '_canvas_host_entry', 'cmd_canvas_open',
+      '_canvas_close_one', '_external_abandon_own_tab'];
     const known = new Set([...GUARDED, ...Object.keys(VIA_GUARDED_HELPER), ...NOT_A_BROWSER,
-      ...OWN_CONTEXT_ONLY]);
+      ...OWN_CONTEXT_ONLY, ...OWN_BY_CONSTRUCTION]);
+    for (const h of hits._CanvasHost || []) {
+      assert(/'Target\.closeTarget', \{'targetId': (tid|self\.target_id)\}|'Target\.disposeBrowserContext'/.test(h),
+        `_CanvasHost may close only a popup of its own context or its own tab: ${h}`);
+    }
+    const canvasHost = bodies._CanvasHost || '';
+    const ctxCheck = canvasHost.search(/info\.get\('browserContextId'\) != self\.browser_context_id/);
+    const popupClose = canvasHost.search(/'Target\.closeTarget', \{'targetId': tid\}/);
+    assert(/'Target\.createBrowserContext'/.test(canvasHost) && ctxCheck > 0 && ctxCheck < popupClose,
+      '_CanvasHost closes a popup only after checking it is in the context the host created');
+    for (const h of hits._canvas_host_entry || []) {
+      assert(/signal\.SIG/.test(h) && !/os\.kill|closeTarget|\.kill\(/.test(h),
+        `_canvas_host_entry may only install its own signal handlers: ${h}`);
+    }
+    for (const h of hits.cmd_canvas_open || []) {
+      assert(/^proc\.kill\(\)$/.test(h), `cmd_canvas_open may only kill the host it spawned: ${h}`);
+    }
+    assert(/proc = subprocess\.Popen\(/.test(bodies.cmd_canvas_open || ''), 'cmd_canvas_open spawns the proc it kills');
+    assert(/pid = _canvas_live_host_pid\(name, paths\)\s*\n\s*if pid:[\s\S]*?os\.kill\(pid, signal\.SIGTERM\)/
+      .test(bodies._canvas_close_one || ''), '_canvas_close_one signals only a proven canvas host');
+    assert(/ps', '-o', 'command='[\s\S]*CANVAS_HOST_FLAG/.test(bodies._canvas_live_host_pid || ''),
+      '_canvas_live_host_pid checks the command line of the pid');
+    for (const h of hits._external_abandon_own_tab || []) {
+      assert(/^_browser_ws_call\("Target\.closeTarget", \{"targetId": target_id\}|never Browser\.close\)$/.test(h),
+        `_external_abandon_own_tab may only close the target it is given: ${h}`);
+    }
+    const abandonCallers = Object.keys(bodies).filter((f) => f !== '_external_abandon_own_tab'
+      && /_external_abandon_own_tab\(/.test(bodies[f]));
+    assert.deepStrictEqual(abandonCallers, ['get_page_ws'], `_external_abandon_own_tab callers: ${abandonCallers}`);
+    assert(/new_target_id = _create_session_window\(\) if version else None[\s\S]*?_external_abandon_own_tab\(new_target_id\)/
+      .test(bodies.get_page_ws), 'get_page_ws abandons only the tab it just created');
     for (const f of OWN_CONTEXT_ONLY) {
       for (const h of hits[f] || []) {
         assert(/Target\.disposeBrowserContext/.test(h), `${f} may only dispose its own context: ${h}`);
