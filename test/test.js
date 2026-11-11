@@ -243,6 +243,10 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
     } finally {
       fake.kill();
     }
+    // The call also started a daemon of this version in the background. Wait for it and stop
+    // it here: under load it came up after the next test's `daemon stop` (TT-20261111-045155).
+    assert(waitFor(() => served() !== null, 15000), 'a daemon of this version replaced the old one');
+    cli(['daemon', 'stop']);
   });
 
   test('daemon: start, stop and idle exit', () => {
