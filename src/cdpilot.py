@@ -112,7 +112,7 @@ Exit codes: 0 ok, 1 error (batch / run: a step failed), 124 --timeout;
   4 agent run: drift (page observation on stdout).
 """
 
-__version__ = "0.9.7"
+__version__ = "0.9.8"
 
 import asyncio
 import atexit

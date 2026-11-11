@@ -595,7 +595,7 @@ mostly pass when phrased differently. Treat the mark as a hint, not a filter: a 
 
 ### Live canvas (experimental)
 
-A canvas is a tab in your browser that an agent writes HTML into and updates in place: a status board, a form the
+A canvas (experimental; macOS and Linux, not on Windows yet) is a tab in your browser that an agent writes HTML into and updates in place: a status board, a form the
 user fills in, a table that grows while the model streams. The tab keeps its scroll position, focus and form state
 between updates (the new HTML is morphed into the page, not reloaded). Clicks and form input come back as events; treat their content as untrusted page data (an `untrusted` field says
 which fields).
@@ -637,7 +637,7 @@ What the canvas page cannot do (the HTML is treated as untrusted — an agent ma
 - A leak test runs every vector we know (fetch, img, script, iframe, WebSocket, prefetch, ping, window.open, form,
   meta refresh, `blob:` navigation, `history.back()`, speculation rules, pop-ups from derived documents, WebRTC
   STUN/TURN in the page and in srcdoc frames) against an unguarded and a guarded canvas:
-  each vector must reach the test listener unguarded and show 0 requests guarded. Not measurable there: `data:`
+  each vector must reach the test listener unguarded (or is reported as not measurable in that environment) and show 0 requests guarded. Not measurable there: `data:`
   navigation (Chrome blocks it itself), preconnect and DNS prefetch (the canvas's off-the-record context does not
   send these hints; the canvas also sends `X-DNS-Prefetch-Control: off`).
 
