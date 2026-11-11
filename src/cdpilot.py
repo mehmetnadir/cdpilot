@@ -7823,13 +7823,13 @@ async def cmd_html():
 
 
 async def cmd_shot(output=None, quality=None, element=None, fmt=None):
-    """Take screenshot. Supports --quality, --element, --format for token savings.
+    """Take screenshot. Supports --element (crops pixels to save visual tokens) and --quality/--format (reduces file size).
 
     Args:
         output: File path (auto-detects format from extension)
-        quality: JPEG quality 1-100 (only for jpeg format, saves ~5-7x tokens)
-        element: CSS selector to capture only that element (crop)
-        fmt: Force format: 'png', 'jpeg', or 'webp'
+        quality: JPEG quality 1-100 (only for jpeg format, reduces file size; vision tokens depend on pixel dimensions, not compression)
+        element: CSS selector to capture only that element (crop reduces pixel dimensions to save vision tokens)
+        fmt: Force format: 'png', 'jpeg', or 'webp' (reduces file size, vision tokens unchanged)
     """
     if not output:
         output = f"{SCREENSHOT_DIR}/screenshot.png"
@@ -20378,8 +20378,8 @@ class MCPServer:
         return [
             {"name": "browser_navigate", "description": "Navigate the browser to a URL and return the page text content. Use this to open websites, follow links, or load web applications. Waits for page load before returning. Returns first 10000 chars of visible text.",
              "inputSchema": {"type": "object", "properties": {"url": {"type": "string", "description": "Full URL to navigate to (must include https://)"}}, "required": ["url"]}},
-            {"name": "browser_screenshot", "description": "Capture a screenshot of the current browser viewport. Supports element-level cropping to save tokens (capture only a specific element instead of full page). Use JPEG format with quality parameter for smaller files (~5x smaller than PNG). Prefer element cropping + JPEG for token-efficient AI workflows.",
-             "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Output file path (e.g. /tmp/screenshot.png). Extension determines format: .png, .jpg, .webp", "default": "screenshot.png"}, "element": {"type": "string", "description": "CSS selector to capture only that element (crops to bounding box). Saves ~3-7x tokens vs full page."}, "quality": {"type": "number", "description": "JPEG quality 1-100 (only for .jpg files). Lower = smaller file = fewer tokens. Default: 80"}}}},
+            {"name": "browser_screenshot", "description": "Save a screenshot of the viewport and return the file path (the image enters context only if the file is read). A w x h pixel image costs ceil(w/28)*ceil(h/28) vision tokens: crop with element to cut them; format and quality change only the file size.",
+             "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Output file path (e.g. /tmp/screenshot.png). Extension determines format: .png, .jpg, .webp", "default": "screenshot.png"}, "element": {"type": "string", "description": "CSS selector to capture only that element (crops to its bounding box: fewer pixels, fewer vision tokens; 800x600 = 638, an h1 = 34-56)"}, "quality": {"type": "number", "description": "JPEG quality 1-100 (.jpg only): smaller file, same vision tokens. Default: 80"}}}},
             {"name": "browser_click", "description": "Click an element on the page identified by CSS selector. Auto-waits up to 5 seconds for the element to appear (MutationObserver). Scrolls the element into view before clicking. Returns the tag name and text of the clicked element. When a real mouse click (inside a frame, or with entropy) was pressed but the page changed under the press so the release missed the target, nothing is clicked again by script and the first line is JSON {\"clicked\": false, \"reason\": \"moved\"|\"gone\"|\"unknown\"} (isError stays false): the page may already have reacted to the press, so check it before retrying.",
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element to click (e.g. '#submit-btn', '.nav a', 'button[type=submit]'). Inside an iframe or shadow root: 'iframe#card >>> button#pay' or 'my-card >>> button.inner'"}}, "required": ["selector"]}},
             {"name": "browser_type", "description": "Type text into an input or textarea element. Uses React-compatible value setting (native setter + input/change events). Auto-waits up to 5 seconds for the element. Use browser_fill as an alias.",

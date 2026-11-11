@@ -4686,6 +4686,37 @@ test('metadata: dependency and superiority claims stay corrected (0.9.6 audit)',
   }
 });
 
+test('metadata: screenshot token claims stay corrected (vision token formula, format/quality file size only)', () => {
+  const root = path.join(__dirname, '..');
+  const py = fs.readFileSync(path.join(root, 'src', 'cdpilot.py'), 'utf8');
+  const js = fs.readFileSync(path.join(root, 'bin', 'cdpilot.js'), 'utf8');
+  const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+
+  const bannedPatterns = /fewer tokens|5-7x|~5x smaller|Saves ~3-7x/i;
+
+  // the multipliers anywhere; 'fewer tokens' only in the screenshot tool and shot docstring (rows and
+  // other views may honestly say fewer tokens)
+  assert(!/5-7x|~5x smaller|Saves ~3-7x/i.test(py), 'src/cdpilot.py contains banned screenshot multipliers');
+  assert(!bannedPatterns.test(js), 'bin/cdpilot.js contains banned screenshot claims');
+  const shotDoc = py.slice(py.indexOf('async def cmd_shot('), py.indexOf('async def cmd_shot_annotated('));
+  assert(shotDoc && !/(quality|fmt):[^\n]*(saves?|fewer)[^\n]*tokens/i.test(shotDoc.split('"""')[1] || ''), 'cmd_shot docstring says quality/format saves tokens');
+
+  // README.md: screenshot claims must not contain banned patterns, and no ungrounded multipliers anywhere
+  assert(!/5-7x|~5x smaller|Saves ~3-7x/i.test(readme), 'README.md contains banned multiplier claims');
+  const readmeScreenshotLines = readme.split('\n').filter((l) => /screenshot|shot/i.test(l));
+  for (const line of readmeScreenshotLines) {
+    assert(!bannedPatterns.test(line), `README.md screenshot line has banned claim: ${line}`);
+  }
+
+  // MCP browser_screenshot description must anchor the 28x28 pixel formula
+  const shotToolMatch = py.match(/"name":\s*"browser_screenshot",\s*"description":\s*"([^"]+)"/);
+  assert(shotToolMatch && !/fewer tokens|smaller files? .*tokens|token-efficient/i.test(shotToolMatch[1]), 'browser_screenshot description repeats a token claim');
+  assert(shotToolMatch, 'browser_screenshot MCP tool definition found in src/cdpilot.py');
+  const desc = shotToolMatch[1];
+  assert(desc.includes('28'), 'browser_screenshot description must mention 28 (pixel patch grid)');
+  assert(/pixel/i.test(desc), 'browser_screenshot description must mention pixel');
+});
+
 // ── iframe targeting (#1) ──
 // `click "iframe#card >>> input"` / `--frame <f>` for element commands, over
 // CDP (flat sessions for out-of-process frames), never contentDocument.
