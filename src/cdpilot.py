@@ -28120,11 +28120,15 @@ def _cli_main():
                        'profile',
                        'tools',  # WebMCP: leaves the page as the tool call leaves it
                        'cookies'}  # v0.6.1: cookies auto-config doesn't need browser
+    # `agent` subcommands that only read or write local state (flow files, the
+    # agent state file) never touch a page: no indicator, no browser needed.
+    AGENT_BROWSERLESS_SUBS = {'flow', 'reset', 'stats'}
+    _agent_browserless = (cmd == 'agent' and bool(args) and args[0] in AGENT_BROWSERLESS_SUBS)
     # Clean up idle sessions before running any command
     _cleanup_idle_sessions()
 
     if cmd in async_map:
-        if cmd in NO_CONTROL_CMDS:
+        if cmd in NO_CONTROL_CMDS or _agent_browserless:
             asyncio.run(async_map[cmd]())
             _update_session_timestamp()
             _enforce_tab_budget()
