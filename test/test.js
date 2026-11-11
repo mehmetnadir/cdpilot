@@ -8110,6 +8110,47 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert.strictEqual(plain.bid, '103');
   });
 
+  test('agent output (fake browser): invisible tags: stripped and flagged, a flag emoji is kept', () => {
+    const tag = (t) => [...t].map((c) => String.fromCodePoint(0xE0000 + c.charCodeAt(0))).join('');
+    const anyTag = /[\u{E0000}-\u{E007F}]/u;
+    const scot = '\u{1F3F4}' + tag('gbsct') + '\u{E007F}';
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_TAGS: '1', FAKE_CDP_BUTTON: 'Arc' + tag('hive') });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const o = cli(['agent', 'observe'], env);
+      assert.strictEqual(o.status, 0, o.stderr);
+      const snap = JSON.parse(o.stdout);
+      assert(/Hello/.test(snap.text) && !/IGNORE/.test(snap.text), snap.text);
+      const rec = (snap.injection_suspect || []).find((r) => r.match === 'invisible_tags');
+      assert(rec && /IGNORE PREVIOUS/.test(rec.text), JSON.stringify(snap.injection_suspect));
+      // (b) the flag survives; its tag letters spell no hidden text of their own beyond the flag
+      assert(snap.text.includes(scot), 'subdivision flag kept');
+      assert(!/gbsct/.test(rec.text), 'flag letters are not reported as hidden text');
+      // (c) an action name is clean
+      assert(snap.actions.some((a) => a.name === 'Arc'), JSON.stringify(snap.actions));
+      // (d) compact, piped output carries no U+E00xx outside the kept flag
+      assert.strictEqual(o.stdout.split(scot).join("").match(anyTag), null, 'no tag character in the JSON');
+    } finally { fake.stop(); }
+  });
+
+  test('agent output (fake browser): invisible tags: a flag emoji alone raises no record', () => {
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_TAGS: 'flag' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const o = cli(['agent', 'observe'], env);
+      assert.strictEqual(o.status, 0, o.stderr);
+      const snap = JSON.parse(o.stdout);
+      assert(/Flag \u{1F3F4}/u.test(snap.text), snap.text);
+      assert(!('injection_suspect' in snap), JSON.stringify(snap.injection_suspect));
+    } finally { fake.stop(); }
+  });
+
   test('agent JSON format (fake browser): compact UTF-8 when piped, CDPILOT_JSON=pretty indents, =compact forces one line, a bogus value notes on stderr and follows the TTY rule', () => {
     const fake = startFake('full', 'guid-user', { FAKE_CDP_BUTTON: 'Arşivle ✓' });
     try {
