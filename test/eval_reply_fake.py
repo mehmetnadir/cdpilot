@@ -214,6 +214,8 @@ def scenario_daemon(mod):
             code = mod._daemon_execute({"argv": ["eval", js], "cwd": os.getcwd(), "env": dict(os.environ),
                                         "stdin": ""}, o, e, refused.append)
             out[tag] = {"code": code, "stdout": o.getvalue(), "stderr": e.getvalue(), "refused": refused}
+        if sys.platform == "win32":  # no warm process: MCPServer._run_warm returns None
+            return out
         server = mod.MCPServer()
         mcp = {}
         for tag, js in (("drop", "DROP"), ("error", "ERROR"), ("empty", "EMPTY"), ("value", "1+1")):
@@ -250,6 +252,8 @@ def scenario_failures(mod):
         code = mod._daemon_execute({"argv": ["eval", "THROW"], "cwd": os.getcwd(), "env": dict(os.environ),
                                     "stdin": ""}, o, e, lambda r: None)
         out["daemon_throw"] = {"code": code, "stdout": o.getvalue(), "stderr": e.getvalue()}
+        if sys.platform == "win32":  # no warm process: MCPServer._run_warm returns None
+            return out
         server = mod.MCPServer()
         with contextlib.redirect_stderr(io.StringIO()):
             out["mcp_throw"] = server._execute_tool(1, "browser_eval", {"expression": "THROW"})["result"]
