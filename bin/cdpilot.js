@@ -780,6 +780,9 @@ function showHelp() {
                        [ref, role, name, value?] arrays (same as --rows)
     CDPILOT_VAR_HOSTS  Hosts (comma-separated, host:port for another port)
                        an agent flow or replay step may type CDPILOT_VAR_* on
+    CDPILOT_AGENT_HIDDEN
+                       1: agent observe/act/run also print hidden_text and
+                       hidden_check (page text the layout hides; opt-in)
     CDPILOT_AGENT_GUARD
                        off|warn (default warn): agent act --url / agent run go
                        steps report a guard when the URL carries another site's

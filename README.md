@@ -595,10 +595,14 @@ mostly pass when phrased differently. Treat the mark as a hint, not a filter: a 
 
 Text the layout hides from a person — outside the page or its clipping box (`offscreen`), under 4 px (`tiny`),
 almost fully transparent (`transparent`), the color of its CSS background (`camouflage`), or an `aria-label` that
-differs from what is shown (`name_attr`) — is listed under `hidden_text: [{text, how, words}]` (parts of 8 words
-or more, at most 5), and a marked block that is such text carries `why: ["pattern", "hidden:<how>"]`. Only an
-`offscreen` or `tiny` part that is also marked leaves `text` (it is in `hidden_text`); everything else stays where
-it was. `hidden_check: "unavailable"` means the layout probe failed and the text was not checked.
+differs from what is shown (`name_attr`) — is detected on every observation: a marked block that is such text
+carries `why: ["pattern", "hidden:<how>"]`, and only an `offscreen` or `tiny` part that is also marked leaves `text`
+(its `injection_suspect` record still shows it); everything else stays where it was. With `CDPILOT_AGENT_HIDDEN=1`
+the output also lists `hidden_text: [{text, how, words}]` (parts of 8 words or more, at most 5) and
+`hidden_check: "unavailable"` when the layout probe failed and the text was not checked. The list is opt-in until a
+rule that separates screen-reader text and clipped carousels passes a new blind set: on a blind set it caught 42 of
+50 hidden injections, with no `injection_suspect` false alarm in 60 clean pages, but listed text on 10 of those 60
+(long screen-reader descriptions, clipped carousel slides).
 Before `agent act --url` and each `go` step of `agent run`, a guard (`CDPILOT_AGENT_GUARD=off|warn`, default
 `warn`) adds `guard: {rule, host, mode}` when the URL carries a cookie value of another site (`secret_in_url`),
 goes to a host the last 3 observations named only in hidden or marked text (`url_from_hidden`), or leaves
@@ -1475,6 +1479,7 @@ print(result.stdout)
 | `CDPILOT_IDLE_CLOSE` | `15` | Minutes without a cdpilot command or page change before a browser cdpilot launched closes itself (fractions allowed, `0` = never; read at launch). Default applies to auto-launch and MCP launches; an explicit CLI `launch` is off unless this is set or `--idle-close <min>` is given |
 | `CDPILOT_JSON` | auto | `pretty` = indented, `compact` = one line; default: agent command JSON is indented in a terminal and compact UTF-8 otherwise |
 | `CDPILOT_OBSERVE_FORMAT` | unset | `rows` = `agent observe/act/run` print `actions` as `[ref, role, name(, value)]` arrays (same as `--rows`); MCP has no per-call switch |
+| `CDPILOT_AGENT_HIDDEN` | unset | `1` = `agent observe/act/run` also print `hidden_text` and `hidden_check` (detection, `why` and the guard run either way) |
 | `CDPILOT_AGENT_GUARD` | `warn` | `off` = no guard before `agent act --url` / `agent run` go steps; `warn` = report `guard` and let the navigation run |
 | `CDPILOT_AGENT_ORIGINS` | unset | Hosts an agent may navigate to (comma-separated, subdomains included, `host:port` for another port); a target outside gets `guard` `outside_origins` |
 | `CDPILOT_LOG` | `1` | `0` = do not write the session log (`cdpilot log`) |
