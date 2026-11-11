@@ -4,6 +4,13 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`agent observe` / `act` / `run`: `hidden_text`, `injection_suspect[].why`, `hidden_check`.** The one DOMSnapshot call of the view also reads the layout (only on a page with 8 words of text or more) and labels text a person does not see: `offscreen` (outside the content area, or wholly outside the box of the ancestor that clips it — a carousel slide), `tiny` (font-size under 4 px or a box of 4 px² or less, `scale(0)` included), `transparent` (color alpha × opacity under 0.1), `camouflage` (contrast under 1.2 with the CSS background, never over an image), `name_attr` (an `aria-label` name that differs from the element's content; images excluded). Parts of 8 words or more are listed as `hidden_text: [{text, how, words}]` (at most 5); a marked block that is such text gets `why: ["pattern", "hidden:<how>"]`; `hidden_check: "unavailable"` when the probe fails (nothing is hidden then). Not labelled in this version: `clip-path`, `title`, `aria-description`, transforms other than `scale(0)`, sr-only clips. Patterns are unchanged.
+- **Agent guard, warn only: `guard: {rule, host, mode}`** in the result of `agent act --url` and of `agent run` (with `step`) when the target URL carries a cookie value (16 characters or more) of another site than its own (`secret_in_url`, same site = same eTLD+1), goes to a host the last 3 observations named only in `hidden_text` or `injection_suspect` and no shown link points to (`url_from_hidden`), or is outside `CDPILOT_AGENT_ORIGINS` when that is set (`outside_origins`). The navigation still runs; the session log line carries the records and none of the cookie values (they are scrubbed from its args and URL too). `CDPILOT_AGENT_GUARD=off` turns it off; a blocking mode is not offered yet.
+
+### Changed
+- **`text` of `agent observe` / `act` / `run`:** a hidden part (`offscreen` or `tiny`) that also matches an injection pattern is no longer in `text`; it is in `hidden_text`, cut to 160 characters. Nothing else in `text` changes: hidden parts without a pattern, `transparent`, `camouflage` and `name_attr` text stay. `text_changed` also turns true when only the listed hidden parts changed.
+
 ## [0.9.8] - 2026-11-11
 
 ### Added

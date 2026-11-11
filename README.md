@@ -593,6 +593,18 @@ with 2 of 40 false alarms (a quoted security report and a recipe line); the gain
 came from multilingual, encoded and urgency lines, not from fake chat turns or fake system notices, which still
 mostly pass when phrased differently. Treat the mark as a hint, not a filter: a page without it can still carry an injection.
 
+Text the layout hides from a person — outside the page or its clipping box (`offscreen`), under 4 px (`tiny`),
+almost fully transparent (`transparent`), the color of its CSS background (`camouflage`), or an `aria-label` that
+differs from what is shown (`name_attr`) — is listed under `hidden_text: [{text, how, words}]` (parts of 8 words
+or more, at most 5), and a marked block that is such text carries `why: ["pattern", "hidden:<how>"]`. Only an
+`offscreen` or `tiny` part that is also marked leaves `text` (it is in `hidden_text`); everything else stays where
+it was. `hidden_check: "unavailable"` means the layout probe failed and the text was not checked.
+Before `agent act --url` and each `go` step of `agent run`, a guard (`CDPILOT_AGENT_GUARD=off|warn`, default
+`warn`) adds `guard: {rule, host, mode}` when the URL carries a cookie value of another site (`secret_in_url`),
+goes to a host the last 3 observations named only in hidden or marked text (`url_from_hidden`), or leaves
+`CDPILOT_AGENT_ORIGINS` (`outside_origins`). The navigation still runs; cookie values never appear in the output
+or the session log.
+
 ### Live canvas (experimental)
 
 A canvas (experimental; macOS and Linux, not on Windows yet) is a tab in your browser that an agent writes HTML into and updates in place: a status board, a form the
@@ -1463,6 +1475,8 @@ print(result.stdout)
 | `CDPILOT_IDLE_CLOSE` | `15` | Minutes without a cdpilot command or page change before a browser cdpilot launched closes itself (fractions allowed, `0` = never; read at launch). Default applies to auto-launch and MCP launches; an explicit CLI `launch` is off unless this is set or `--idle-close <min>` is given |
 | `CDPILOT_JSON` | auto | `pretty` = indented, `compact` = one line; default: agent command JSON is indented in a terminal and compact UTF-8 otherwise |
 | `CDPILOT_OBSERVE_FORMAT` | unset | `rows` = `agent observe/act/run` print `actions` as `[ref, role, name(, value)]` arrays (same as `--rows`); MCP has no per-call switch |
+| `CDPILOT_AGENT_GUARD` | `warn` | `off` = no guard before `agent act --url` / `agent run` go steps; `warn` = report `guard` and let the navigation run |
+| `CDPILOT_AGENT_ORIGINS` | unset | Hosts an agent may navigate to (comma-separated, subdomains included, `host:port` for another port); a target outside gets `guard` `outside_origins` |
 | `CDPILOT_LOG` | `1` | `0` = do not write the session log (`cdpilot log`) |
 | `CDPILOT_LOG_DAYS` | `14` | Days of session log to keep; older day files are deleted on the first write of a day (`0` keeps all) |
 
