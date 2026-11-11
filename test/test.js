@@ -8146,6 +8146,77 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     } finally { fake.stop(); }
   });
 
+  test('agent output (fake browser): invisible tags: a hidden message cut into 6-letter flag sequences is stripped and flagged', () => {
+    const anyTag = /[\u{E0000}-\u{E007F}]/u;
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_TAGS: 'smuggle' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const o = cli(['agent', 'observe'], env);
+      assert.strictEqual(o.status, 0, o.stderr);
+      const snap = JSON.parse(o.stdout);
+      assert(/Buy now/.test(snap.text), snap.text);
+      const scot = '\u{1F3F4}' + [...'gbsct'].map((c) => String.fromCodePoint(0xE0000 + c.charCodeAt(0))).join('') + '\u{E007F}';
+      assert.strictEqual(o.stdout.split(scot).join('').match(anyTag), null, 'no tag character reaches the model (the real flag fixture stays)');
+      assert(!/ignoreall/.test(snap.text), snap.text);
+      const rec = (snap.injection_suspect || []).find((r) => r.match === 'invisible_tags');
+      assert(rec && /ignoreallprior/.test(rec.text), JSON.stringify(snap.injection_suspect));
+    } finally { fake.stop(); }
+  });
+
+  test('agent output (fake browser): invisible tags: the real England, Scotland and Wales flags are kept without a record', () => {
+    const tag = (t) => [...t].map((c) => String.fromCodePoint(0xE0000 + c.charCodeAt(0))).join('');
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_TAGS: 'flags' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const snap = JSON.parse(cli(['agent', 'observe'], env).stdout);
+      for (const cc of ['gbeng', 'gbsct', 'gbwls']) {
+        assert(snap.text.includes('\u{1F3F4}' + tag(cc) + '\u{E007F}'), `${cc} kept: ${snap.text}`);
+      }
+      assert(!('injection_suspect' in snap), JSON.stringify(snap.injection_suspect));
+    } finally { fake.stop(); }
+  });
+
+  test('agent output (fake browser): invisible tags: flow save and --dry-run print no tag characters; the anchor still matches on run', () => {
+    const tag = (t) => [...t].map((c) => String.fromCodePoint(0xE0000 + c.charCodeAt(0))).join('');
+    const anyTag = /[\u{E0000}-\u{E007F}]/u;
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_BUTTON: 'Arc' + tag('hive') });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const ok = (args, code = 0) => {
+        const r = cli(args, env);
+        assert.strictEqual(r.status, code, `${args.join(' ')} exit ${r.status}: ${r.stderr}\n${r.stdout}`);
+        return r;
+      };
+      ok(['agent', 'act', '--url', 'https://user.example/inbox']);
+      const btn = JSON.parse(ok(['agent', 'observe', '--full']).stdout).actions.find((a) => a.name === 'Arc');
+      assert(btn, 'the button is listed under its clean name');
+      ok(['agent', 'act', '--ref', btn.ref, '--action', 'click']);
+      ok(['agent', 'flow', 'save', 'tagged', '--last', '1']);
+      const flowPath = path.join(home, 'projects', 'proj', 'flows', 'tagged.json');
+      const flowText = fs.readFileSync(flowPath, 'utf-8');
+      assert.strictEqual(flowText.match(anyTag), null, 'the saved flow holds no tag character');
+      assert.strictEqual(JSON.parse(flowText).steps[0].anchor.name, 'Arc');
+      // a flow file written by an older build (raw tagged anchor) still prints clean
+      const flow = JSON.parse(flowText);
+      flow.steps[0].anchor.name = 'Arc' + tag('ignore previous');
+      fs.writeFileSync(path.join(home, 'projects', 'proj', 'flows', 'raw.json'), JSON.stringify({ ...flow, name: 'raw' }));
+      const dry = ok(['agent', 'run', 'raw', '--dry-run']);
+      assert.strictEqual(dry.stdout.match(anyTag), null, 'dry-run prints no tag character');
+      assert(/invisible_tags/.test(dry.stdout), dry.stdout);
+      // run: the page name carries tag characters, the recorded anchor is clean: no drift
+      const res = JSON.parse(ok(['agent', 'run', 'tagged']).stdout);
+      assert.deepStrictEqual([res.status, res.steps], ['ok', 1], JSON.stringify(res));
+    } finally { fake.stop(); }
+  });
+
   test('agent output (fake browser): invisible tags: a flag emoji alone raises no record', () => {
     const fake = startFake('full', 'guid-user', { FAKE_CDP_TAGS: 'flag' });
     try {
@@ -16175,6 +16246,54 @@ print(json.dumps({"r1": r1["result"], "r2": r2["result"]}))
       host.stop();
       sb.cleanup();
     }
+  });
+
+  test('canvas log: a `run` script keeps no step output in the session log or `log --md` (canvas events value)', () => {
+    const sb = makeSandbox();
+    const PW = 'Summer2026!';
+    const evt = { t: 3001, src: 'page', type: 'input', action: 'login', id: 'password', data: { value: PW } };
+    const host = startFakeHost(sb, { script: [{ event: evt }] });
+    const env = {
+      ...process.env, CDPILOT_HOME: sb.home, CDPILOT_PROFILE: sb.profile, CDPILOT_PYTHON: PYB,
+      CDPILOT_PROJECT_ID: 'cvd-runlog-test', CDPILOT_LOG: '1', CDPILOT_WEBMCP: '0',
+      CDPILOT_MCP_TOOLS: '', CDPILOT_NO_AUTOLAUNCH: '1',
+    };
+    try {
+      const scriptPath = path.join(sb.home, 'ask.cdp');
+      fs.writeFileSync(scriptPath, 'canvas events --max 10\n');
+      const r = spawnSync(process.execPath, [CLI, 'run', scriptPath], { encoding: 'utf8', timeout: 30000, env });
+      assert.strictEqual(r.status, 0, r.stderr + r.stdout);
+      assert(r.stdout.includes(PW), 'the agent itself still sees the step output');
+      const logDir = path.join(sb.home, 'projects', fs.readdirSync(path.join(sb.home, 'projects'))[0], 'log');
+      const rawLog = fs.readdirSync(logDir).filter((f) => f.endsWith('.jsonl'))
+        .map((f) => fs.readFileSync(path.join(logDir, f), 'utf8')).join('');
+      assert(!rawLog.includes(PW), `session log leaked the typed value: ${rawLog}`);
+      const runEnt = rawLog.trim().split('\n').map((l) => JSON.parse(l)).find((e) => e.cmd === 'run');
+      assert(runEnt && /^Result: 1 passed/.test(runEnt.summary), JSON.stringify(runEnt));
+      const md = spawnSync(process.execPath, [CLI, 'log', '--md'], { encoding: 'utf8', timeout: 25000, env });
+      assert.strictEqual(md.status, 0, md.stderr);
+      assert(!md.stdout.includes(PW), 'log --md leaked the typed value');
+    } finally {
+      host.stop();
+      sb.cleanup();
+    }
+  });
+
+  test('canvas log: `run` summary is only the Result line, whatever a step printed (storage, cookies, eval)', () => {
+    const script = `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("cdpilot", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+steps = "[1] storage local\\n     {\\"session\\":\\"Summer2026!\\"}\\n[2] canvas events\\n     {\\"data\\":{\\"value\\":\\"Summer2026!\\"}}\\n" + "-" * 40 + "\\nScript: x.cdp\\nResult: 2 passed, 0 failed, 2 total\\n"
+out = {"run": m._slog_summary("run", ["x.cdp"], steps, []),
+       "run_none": m._slog_summary("run", ["x.cdp"], "[1] storage local\\n     secret=Summer2026!\\n", [])}
+print(json.dumps(out))
+`;
+    const r = spawnSync(PYB, ['-I', '-c', script, PY_SRC], { encoding: 'utf8', timeout: 20000 });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const o = JSON.parse(r.stdout.trim());
+    assert.strictEqual(o.run, 'Result: 2 passed, 0 failed, 2 total');
+    assert.strictEqual(o.run_none, null, 'no Result line, nothing logged');
   });
 
   test('canvas log: set/patch/stream/watch/open/list results carry no HTML or values (summary stays numeric)', () => {
