@@ -415,6 +415,9 @@ def answer(msg, path):
     elif method == "DOMSnapshot.captureSnapshot" and os.environ.get("FAKE_CDP_SNAPSHOT") == "ok":
         pg = page_for(path)
         result = snapshot_reply(pg["url"] if pg else "")
+    elif method == "Network.getCookies" and os.environ.get("FAKE_CDP_COOKIES"):
+        # cookies the guard reads (agent act --url): a JSON list of {name, value, domain}
+        result = {"cookies": json.loads(os.environ["FAKE_CDP_COOKIES"])}
     elif method == "Accessibility.getFullAXTree":
         pg = page_for(path)
         result = {"nodes": ax_tree_for(pg["url"] if pg else "", (pg or {}).get("values"))}

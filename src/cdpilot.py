@@ -17239,15 +17239,18 @@ def _agent_text_view(nodes, vis=None):
 
 def _agent_text_fields(view, nodes, state, out):
     """Write one observation's text side into `out`: text, then injection_suspect, hidden_text and
-    hidden_check, each only when it has something."""
+    hidden_check, each only when it has something; push the hosts they name for the guard
+    (_agent_taint_push, url_from_hidden)."""
     out['text'] = view['text']
-    suspects = _agent_injection_scan(nodes, why=view.get('why'))
+    names = []
+    suspects = _agent_injection_scan(nodes, why=view.get('why'), names=names)
     if suspects:
         out['injection_suspect'] = suspects
     if view.get('hidden_text'):
         out['hidden_text'] = view['hidden_text']
     if view.get('hidden_check'):
         out['hidden_check'] = view['hidden_check']
+    _agent_taint_push(state, nodes, list(view.get('parts') or ()) + names)
     return out
 
 
@@ -17525,7 +17528,10 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None, full=Fals
     old_map = dict(state.get('actions_map', {}))
     url_before = state.get('last_url')
 
+    guard, guard_found = [], []
     if url:
+        guard, guard_found = await _agent_guard(url, state)  # warn only: the navigation runs anyway
+        _slog_note_guard(guard, guard_found)
         await _agent_go_silent(url)
     elif ref:
         await _agent_perform(ref, action, text, old_map)
@@ -17539,8 +17545,8 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None, full=Fals
     page, nodes, new_actions, new_state, view = await _agent_full_snapshot()
     # The trail: what a flow is saved from. Anchors, never refs or node ids;
     # a typed secret is a {{placeholder}} before it reaches agent-state.json.
-    if url:
-        entry = {'kind': 'go', 'url': _slog_mask_url(url)}
+    if url:  # a cookie value the guard found never reaches agent-state.json (nor a flow saved from it)
+        entry = {'kind': 'go', 'url': _slog_scrub_values(_slog_mask_url(url), guard_found)}
     else:
         anchor = _agent_anchor(old_map[ref], old_map)
         entry = {'kind': 'act', 'action': action, 'anchor': anchor}
@@ -17561,6 +17567,8 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None, full=Fals
     }
     if result['text_changed']:
         _agent_text_fields(view, nodes, new_state, result)
+    if guard:
+        result['guard'] = _agent_guard_field(guard)
     diff_tok = _estimate_tokens(result)
     out_actions = _agent_out_actions(new_actions, new_state.get('hidden_refs', ()), full, rows)
     full_tok = _estimate_tokens({'actions': out_actions, 'text': new_text})
@@ -17766,6 +17774,162 @@ def _agent_env_var_hosts():
 def _agent_host_allowed(host, allowed):
     host = (host or '').lower()
     return bool(host) and any(host == a or host.endswith('.' + a.lstrip('.')) for a in allowed)
+
+
+# ── Action guard (2026-11-11, B1: warn only; design .claude/docs/enjeksiyon-yontem-tasarim.md §4.2, D-0105) ──
+# Before an agent navigates (agent act --url, a go step of agent run) three rules look at the target URL:
+#   secret_in_url    it carries the value (>= 16 characters) of a cookie whose site (eTLD+1) is not the
+#                    target's; the cookies are those of the pages this agent has been on (J1-4)
+#   url_from_hidden  its host was named in the last 3 observations only in hidden_text / injection_suspect,
+#                    not as the href of a link the AX tree shows (J1-5)
+#   outside_origins  CDPILOT_AGENT_ORIGINS is set and does not name its host
+# CDPILOT_AGENT_GUARD=off|warn (default warn): the action runs anyway; the result carries `guard` and the
+# session log line its records. `strict` (stop before the action) is not available: it waits for a week of
+# warn data, M3 and a new jury (J2-1). Cookie values stay inside the process: no output or log line carries
+# one, and the log scrubs any that the guard found in the command's own args and URL.
+AGENT_GUARD_ENV = 'CDPILOT_AGENT_GUARD'
+AGENT_ORIGINS_ENV = 'CDPILOT_AGENT_ORIGINS'
+AGENT_GUARD_SECRET_MIN = 16
+AGENT_TAINT_OBS = 3
+AGENT_TAINT_MAX = 20
+# eTLD+1 without a dependency: the last two labels, three under one of these suffixes (a short list, not the PSL)
+_AGENT_SUFFIX2 = frozenset({
+    'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'me.uk', 'ltd.uk', 'plc.uk', 'com.au', 'net.au', 'org.au', 'edu.au',
+    'gov.au', 'co.nz', 'org.nz', 'co.jp', 'ne.jp', 'or.jp', 'ac.jp', 'go.jp', 'co.kr', 'or.kr', 'com.br', 'net.br',
+    'org.br', 'com.cn', 'net.cn', 'org.cn', 'com.hk', 'com.sg', 'com.mx', 'com.ar', 'com.co', 'co.in', 'net.in',
+    'org.in', 'co.za', 'co.il', 'com.tr', 'net.tr', 'org.tr', 'edu.tr', 'gov.tr', 'k12.tr', 'gen.tr', 'web.tr',
+    'bel.tr', 'av.tr', 'biz.tr', 'info.tr', 'com.ua', 'com.pl', 'com.tw', 'co.id', 'com.my', 'com.ph', 'com.vn',
+    'github.io', 'gitlab.io', 'pages.dev', 'workers.dev', 'vercel.app', 'netlify.app', 'web.app',
+    'firebaseapp.com', 'herokuapp.com', 'appspot.com', 'blogspot.com', 'azurewebsites.net', 'cloudfront.net',
+})
+_AGENT_HOST_RE = _re.compile(r'(?<![\w.-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9])'
+                             r'(?![\w-])|://(\d{1,3}(?:\.\d{1,3}){3})', _re.I)
+
+
+def _agent_guard_mode():
+    """off | warn from CDPILOT_AGENT_GUARD (default warn; any other value, strict included, is warn)."""
+    raw = os.environ.get(AGENT_GUARD_ENV, '').strip().lower()
+    if raw in ('', 'warn'):
+        return 'warn'
+    if raw == 'off':
+        return 'off'
+    print(f"cdpilot: {AGENT_GUARD_ENV}={raw!r} is not available (off|warn; strict comes after the warn period); "
+          "using warn", file=sys.stderr)
+    return 'warn'
+
+
+def _agent_site(host):
+    """eTLD+1 of a host (see _AGENT_SUFFIX2); an IP address or a single label as it is."""
+    host = (host or '').lower().strip('.')
+    if not host or ':' in host or _re.fullmatch(r'[\d.]+', host):
+        return host
+    labels = host.split('.')
+    n = 3 if len(labels) >= 3 and '.'.join(labels[-2:]) in _AGENT_SUFFIX2 else 2
+    return '.'.join(labels[-n:])
+
+
+def _agent_text_hosts(texts, limit=AGENT_TAINT_MAX):
+    """Host names written in `texts` (bare or in a URL; an IPv4 address only in a URL), lower-case, at most `limit`."""
+    out = []
+    for t in texts:
+        for m in _AGENT_HOST_RE.finditer(t or ''):
+            h = (m.group(1) or m.group(2) or '').lower().rstrip('.')
+            if h and h not in out:
+                out.append(h)
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def _agent_link_hosts(nodes):
+    """Hosts of the links the AX tree shows (role link, not ignored, its url property): what counts as a
+    page link for url_from_hidden (D-0105 J1-5)."""
+    hosts = set()
+    for n in nodes:
+        if n.get('ignored') or (n.get('role') or {}).get('value') != 'link':
+            continue
+        for p in n.get('properties') or ():
+            if isinstance(p, dict) and p.get('name') == 'url':
+                h = _agent_host_path(str((p.get('value') or {}).get('value') or ''))[0]
+                if h:
+                    hosts.add(h)
+    return hosts
+
+
+def _agent_taint_push(state, nodes, texts):
+    """state['taint_hosts']: per observation (the last AGENT_TAINT_OBS) the hosts its hidden_text and
+    injection_suspect texts name that no shown link points to; <= AGENT_TAINT_MAX in all, oldest dropped
+    first. A host this page links to leaves the older entries too."""
+    links = _agent_link_hosts(nodes)
+    new = [h for h in _agent_text_hosts(texts) if h not in links]
+    entries = [[h for h in e if h not in links] for e in (state.get('taint_hosts') or []) if isinstance(e, list)]
+    entries = entries[-(AGENT_TAINT_OBS - 1):] + [new]
+    while sum(len(e) for e in entries) > AGENT_TAINT_MAX:
+        next(e for e in entries if e).pop(0)
+    state['taint_hosts'] = entries
+
+
+def _agent_guard_target(url):
+    """(host, port or None for the scheme's default) of a navigation target; ('', None) without a host."""
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(url or '')
+        host, port = (u.hostname or '').lower(), u.port
+    except ValueError:
+        return '', None
+    if port is not None and port == {'http': 80, 'https': 443}.get(u.scheme.lower()):
+        port = None
+    return host, port
+
+
+async def _agent_guard(url, state):
+    """([{rule, host, mode}], [cookie values found in the URL]) for navigating to `url`; ([], []) when the
+    guard is off or the URL names no host. The values are for the log scrub only: never printed."""
+    mode = _agent_guard_mode()
+    host, port = _agent_guard_target(url)
+    if mode == 'off' or not host:
+        return [], []
+    from urllib.parse import unquote, unquote_plus
+    recs, found = [], []
+    ws_url, page = get_page_ws()
+    urls = []
+    for u in [(page or {}).get('url'), state.get('last_url')] + [
+            t.get('url_after') for t in reversed(state.get('trail') or []) if isinstance(t, dict)]:
+        if isinstance(u, str) and u.startswith(('http://', 'https://')) and u not in urls and len(urls) < 10:
+            urls.append(u)
+    cookies = []
+    if urls:
+        try:
+            r = await cdp_send(ws_url, [(1, 'Network.getCookies', {'urls': urls})], timeout=3)
+            cookies = (r.get(1) or {}).get('cookies') or []
+        except Exception:
+            cookies = []  # the other rules still run
+    variants = {url, unquote(url), unquote_plus(url)}
+    site = _agent_site(host)
+    for c in cookies if isinstance(cookies, list) else ():
+        if not isinstance(c, dict) or _agent_site(str(c.get('domain') or '')) == site:
+            continue  # a site's own cookie in its own URL is not a leak
+        v = str(c.get('value') or '')
+        for vv in {v, unquote(v)}:
+            if len(vv) >= AGENT_GUARD_SECRET_MIN and vv not in found and any(vv in x for x in variants):
+                found.append(vv)
+    if found:
+        recs.append({'rule': 'secret_in_url', 'host': host, 'mode': mode})
+    taint = {h for e in (state.get('taint_hosts') or []) if isinstance(e, list) for h in e}
+    if any(host == t or host.endswith('.' + t) for t in taint):
+        recs.append({'rule': 'url_from_hidden', 'host': host, 'mode': mode})
+    raw = os.environ.get(AGENT_ORIGINS_ENV, '').strip()
+    if raw and not any((host == h or host.endswith('.' + h)) and p == port for h, p in _var_host_entries(raw)):
+        recs.append({'rule': 'outside_origins', 'host': host, 'mode': mode})
+    return recs, found
+
+
+def _agent_guard_field(recs):
+    """The `guard` field of a result: the first record, `also` naming any other rule that fired."""
+    out = dict(recs[0])
+    if len(recs) > 1:
+        out['also'] = [r['rule'] for r in recs[1:]]
+    return out
 
 
 _VAR_LOOPBACK_HOSTS = frozenset({'localhost', '127.0.0.1', '::1'})
@@ -18227,6 +18391,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
     tokens_avoided = 0
     done = []
     state = None
+    run_guard = []  # guard records of the go steps (warn only), with the step number
 
     last_nodes, last_view = [], {}
 
@@ -18248,6 +18413,8 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
                'actions': out_actions, 'text': text,
                'hint': f"act on a ref (agent act --ref @N …), finish the task, then: agent flow save {slug}"}
         _agent_text_fields(last_view, last_nodes, st, res)
+        if run_guard:
+            res['guard'] = _agent_guard_field(run_guard)
         st['last_url'] = page.get('url', '')
         st['last_text_hash'] = last_view.get('text_hash') or hashlib.md5(text.encode()).hexdigest()[:8]
         st['step'] = st.get('step', 0) + 1
@@ -18261,7 +18428,12 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
     for step in flow['steps']:
         if step.get('kind') == 'go':
             url_before = (state or {}).get('last_url') if state else None
-            await _agent_go_silent(subst(step.get('url', '')))
+            go_url = subst(step.get('url', ''))
+            g, g_found = await _agent_guard(go_url, state or _load_agent_state())
+            g = [dict(rec, step=step['n']) for rec in g]
+            _slog_note_guard(g, g_found)
+            run_guard.extend(g)
+            await _agent_go_silent(go_url)
             page, actions, out_actions, text, state = await snapshot()
             tokens_avoided += _estimate_tokens({'actions': out_actions, 'text': text})
             _agent_trail_push(state, {'kind': 'go', 'url': step.get('url', ''), 'url_after': page.get('url', ''),
@@ -18333,6 +18505,8 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
     res = {'status': 'ok', 'flow': slug, 'steps': len(done), 'done': done,
            'url': page.get('url', ''), 'title': page.get('title', ''),
            'ms': ms, 'tokens_avoided': tokens_avoided}
+    if run_guard:
+        res['guard'] = _agent_guard_field(run_guard)
     res['token_estimate'] = _estimate_tokens(res)
     _agent_json(res)
 
@@ -23107,9 +23281,15 @@ def _slog_files(texts, since):
 
 
 def _slog_build_entry(cmd, args, code, duration_ms, started, url=None, title=None,
-                      stdout="", stderr="", error=None, files=(), via=None, warm=False):
-    """The JSON object written for one command. All free text goes through redaction."""
+                      stdout="", stderr="", error=None, files=(), via=None, warm=False,
+                      guard=None, extra_secrets=()):
+    """The JSON object written for one command. All free text goes through redaction.
+    `guard`: the agent guard's records (rule, host, mode, step); `extra_secrets`: values the
+    guard found (cookie values), scrubbed from every field, args included."""
     red_args, secrets = _slog_redact_args(cmd, args)
+    if extra_secrets:
+        red_args = [_slog_scrub_values(a, extra_secrets) for a in red_args]
+        secrets = list(secrets) + list(extra_secrets)
     if error is None and code not in (0, None):
         # The headline, not a trailing hint ("Available commands: ...") or a
         # notice printed before the failure: first error-looking line, else last.
@@ -23132,6 +23312,9 @@ def _slog_build_entry(cmd, args, code, duration_ms, started, url=None, title=Non
         entry["via"] = via
     if warm:
         entry["warm"] = True
+    if guard:
+        entry["guard"] = [{k: g[k] for k in ("rule", "host", "mode", "step") if k in g}
+                          for g in guard if isinstance(g, dict)][:10]
     return entry
 
 
@@ -23313,6 +23496,13 @@ def _slog_begin(argv):
         _slog_warn(e)
 
 
+def _slog_note_guard(records, secrets=()):
+    """Keep this command's guard records for its log line, and the values to scrub from it."""
+    if _SLOG.get("active") and (records or secrets):
+        _SLOG.setdefault("guard", []).extend(records)
+        _SLOG.setdefault("guard_secrets", []).extend(secrets)
+
+
 def _slog_note_page(page):
     """Remember the page the dispatcher resolved anyway (no extra round-trip)."""
     if _SLOG.get("active") and isinstance(page, dict):
@@ -23340,7 +23530,8 @@ def _slog_finish(forced_code=None, forced_error=None):
                 st["cmd"], st["args"], code, int((time.monotonic() - st["t0"]) * 1000),
                 st["started"], url=st.get("url"), title=st.get("title"), stdout=out, stderr=err,
                 error=forced_error or st.get("error"), files=_slog_files((out, err), st["t0_wall"]),
-                via=st.get("via"), warm=bool(st.get("warm"))))
+                via=st.get("via"), warm=bool(st.get("warm")), guard=st.get("guard"),
+                extra_secrets=st.get("guard_secrets") or ()))
         if st.get("rec_wants"):
             _record_hook_step(st["cmd"], st["args"], code)
     except Exception as e:
