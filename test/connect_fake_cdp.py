@@ -278,6 +278,9 @@ def answer(msg, path):
                                 "captcha": json.dumps({"detected": False, "types": [], "details": []})})
         elif DOM and expr.startswith("!!document.querySelector("):
             value = True
+        elif DOM and "__cdpilot_setValue(el," in expr:
+            # a plain (non-strict) fill: since 72ce196 fill exits 1 unless the page answers with a string
+            value = "Filled: INPUT = (fake)"
         elif "readyState" in expr:
             value = "complete"
         elif "location.href" in expr:
