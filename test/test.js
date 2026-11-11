@@ -10168,6 +10168,49 @@ print(json.dumps(out))
     assert(entries.every((e) => !(e.ws || e.ws_open || '').endsWith('/PAGE1')
       && !(e.http || '').includes('PAGE1')), 'the user tab must not be touched');
   });
+
+  // 11.11 field report: `go` after another run's `canvas open` loaded a page into the
+  // canvas tab (listed first, as the newest tab). A home that lacks the connect record
+  // (CDP_PORT set, nothing registered) takes the adopt-the-first-page path.
+  const touchedCanvas = (entries) => entries.some((e) =>
+    (e.ws || e.ws_open || '').endsWith('/CANVAS1') || (e.http || '').includes('CANVAS1'));
+
+  test('connect never a canvas tab: a home without the connect record does not adopt the canvas tab', () => {
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_CANVAS_PAGE: 'CANVAS1' });
+    try {
+      const home = mkHome();
+      fs.mkdirSync(path.join(home, 'profile'), { recursive: true });
+      const r = cli(['go', 'https://example.com'], isoEnv(home, fake.port, 'proj'), 60000);
+      assert(!touchedCanvas(fake.entries()),
+        `the canvas tab was used (exit ${r.status}): ${JSON.stringify(fake.entries())}`);
+    } finally { fake.stop(); }
+  });
+
+  test('connect never a canvas tab: a stale session record naming the canvas tab is dropped', () => {
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_CANVAS_PAGE: 'CANVAS1' });
+    try {
+      const home = mkHome();
+      fs.mkdirSync(path.join(home, 'profile'), { recursive: true });
+      fs.writeFileSync(path.join(home, 'profile', 'sessions.json'), JSON.stringify({
+        'cdpilot-default': { target_id: 'CANVAS1', created: 'x', last_used: Date.now() / 1000 } }));
+      const r = cli(['go', 'https://example.com'], isoEnv(home, fake.port, 'proj'), 60000);
+      assert(!touchedCanvas(fake.entries()),
+        `the canvas tab was used (exit ${r.status}): ${JSON.stringify(fake.entries())}`);
+    } finally { fake.stop(); }
+  });
+
+  test('connect never a canvas tab: a connected browser opens its own tab, the canvas tab stays untouched', () => {
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_CANVAS_PAGE: 'CANVAS1' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      fs.mkdirSync(path.join(home, 'profile'), { recursive: true });
+      const r = cli(['go', 'https://example.com'], isoEnv(home, fake.port, 'proj'), 60000);
+      const entries = fake.entries();
+      assert(!touchedCanvas(entries), `the canvas tab was used (exit ${r.status}): ${JSON.stringify(entries)}`);
+      assert(entries.some((e) => e.method === 'Target.createTarget'), 'the session opens a tab of its own');
+    } finally { fake.stop(); }
+  });
 })();
 
 // ── WebMCP tests ──

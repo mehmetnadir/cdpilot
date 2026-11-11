@@ -54,9 +54,14 @@ DOM = os.environ.get("FAKE_CDP_DOM") == "1"
 #                          the /json listing for that long (the socket and getTargets know it).
 #   FAKE_CDP_HIDE_FOREVER=1  such a tab never shows in /json and not in Target.getTargets.
 #   FAKE_CDP_EXTRA_PAGE=ID adds one more page of the user's browser at start.
+#   FAKE_CDP_CANVAS_PAGE=ID adds a canvas tab (cdpilot-canvas.invalid) FIRST in the
+#                          listing, where a real browser puts the newest tab.
 LIST_EMPTY = [int(os.environ.get("FAKE_CDP_LIST_EMPTY", "0") or 0)]
 HIDE_MS = float(os.environ.get("FAKE_CDP_HIDE_MS", "0") or 0)
 HIDE_FOREVER = os.environ.get("FAKE_CDP_HIDE_FOREVER") == "1"
+if os.environ.get("FAKE_CDP_CANVAS_PAGE"):
+    PAGES.insert(0, {"id": os.environ["FAKE_CDP_CANVAS_PAGE"], "type": "page",
+                     "url": "http://cdpilot-canvas.invalid/demo/", "title": ""})
 if os.environ.get("FAKE_CDP_EXTRA_PAGE"):
     PAGES.append({"id": os.environ["FAKE_CDP_EXTRA_PAGE"], "type": "page",
                   "url": "about:blank", "title": ""})
