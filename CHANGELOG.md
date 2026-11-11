@@ -15,6 +15,10 @@ All notable changes to cdpilot will be documented in this file.
 ### Fixed
 - **`actions_map` in `agent-state.json` keeps the first 8,000 refs** (it dropped the first 200 refs of any page over 1,000 entries, so `agent act --ref @1` failed there).
 
+### Security
+- **Page-text commands strip invisible tag characters too.** `content`, `a11y`, `a11y-snapshot`, `describe` and `agent twitter analytics` removed nothing before, so a page could hide an instruction in U+E0000-E007F and the model read it. They now print the text without tag characters (the three real subdivision flags stay) and, when the hidden text spelled something, write one line to stderr: `cdpilot: removed N invisible tag characters (they spelled: "...")` (first 160 characters; stdout gets no extra line; MCP tool results carry it). `injection_suspect` now matches on text without tag characters: an instruction split by a tag character (`ig<U+E0001>nore previous instructions`) was not flagged before.
+- **Bidi controls and supplementary variation selectors are stripped too.** Agent command JSON and the page-text commands (`content`, `a11y`, `a11y-snapshot`, `describe`, `agent twitter analytics`) remove direction controls (U+202A-202E, U+2066-2069, they reorder text visually) and supplementary variation selectors (U+E0100-E01EF, one hidden byte each); a run of 2 or more selectors adds an `injection_suspect` record `match: invisible_selectors` with `text` = the byte count (never decoded; plain-text commands print one stderr line). Emoji presentation selectors U+FE00-FE0F stay in the output (a red heart keeps its heart). The `injection_suspect` scan ignores bidi controls and U+FE00-FE0F in the copy it matches, so an instruction broken by one of them is flagged; before, it was not.
+
 ## [0.9.8] - 2026-11-11
 
 ### Added

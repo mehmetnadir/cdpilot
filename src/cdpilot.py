@@ -7802,7 +7802,10 @@ async def cmd_content():
         "returnByValue": True,
     })])
     content = _cdp_reply(r, 1, "Runtime.evaluate", 15).get("result", {}).get("value", "(empty)")
-    print(content)
+    acc = [0, [], 0]
+    shown = _tag_clean_text(content, acc)
+    print(shown)
+    _tag_clean_notice(acc)
     if len(content) >= 1048576:
         print("[Output truncated at 1MB]")
 
@@ -14467,6 +14470,7 @@ async def cmd_a11y(subcmd=""):
     if sub == "" or sub == "full":
         shown = [n for n in visible if not is_empty_leaf(n)]
         print(f"Accessibility tree ({len(shown)} nodes, {len(visible) - len(shown)} skipped):")
+        acc = [0, [], 0]
         for n in shown:
             role = n.get("role", {}).get("value", "?")
             name = get_prop(n, "name")
@@ -14479,7 +14483,8 @@ async def cmd_a11y(subcmd=""):
                 out += f" value='{val}'"
             if desc:
                 out += f" description='{desc}'"
-            print(out)
+            print(_tag_clean_text(out, acc))
+        _tag_clean_notice(acc)
 
     elif sub == "summary":
         counts = {}
@@ -14501,9 +14506,11 @@ async def cmd_a11y(subcmd=""):
             print(f"No elements with role '{arg}'.")
         else:
             print(f"{len(found)} elements with role '{arg}':")
+            acc = [0, [], 0]
             for n in found:
-                name = get_prop(n, "name")
+                name = _tag_clean_text(get_prop(n, "name"), acc)
                 print(f"  - '{name or '(unnamed)'}'")
+            _tag_clean_notice(acc)
     else:
         print("Usage: a11y [full|summary|find <role>]")
         sys.exit(1)
@@ -14639,9 +14646,11 @@ async def cmd_describe():
 
     _save_a11y_refs(_A11Y_REF_MAP)
 
+    acc = [0, [], 0]
     for line in output_lines:
-        print(line)
+        print(_tag_clean_text(line, acc))
     print(f"\n[{interactive_count} interactive, {ref_count} total shown]")
+    _tag_clean_notice(acc)
     print()
 
     # ── Screenshot ─────────────────────────────────────────────────────────
@@ -16119,9 +16128,11 @@ async def cmd_a11y_snapshot():
 
     _save_a11y_refs(_A11Y_REF_MAP)
 
+    acc = [0, [], 0]
     for line in output_lines:
-        print(line)
+        print(_tag_clean_text(line, acc))
     print(f"\n[{interactive_count} interactive, {ref_count} total shown]")
+    _tag_clean_notice(acc)
 
 
 def _stale_ref_exit(ref, what="Could not get coordinates for"):
@@ -16292,6 +16303,11 @@ def _agent_json_pretty():
 # agent JSON is raw UTF-8, so they would reach the model. _agent_json strips them from every string
 # it prints and reports what they spelled as an injection_suspect record.
 _AGENT_TAG_RE = _re.compile('[\U000e0000-\U000e007f]')
+# bidi controls reorder text visually and the supplementary variation selectors (U+E0100-E01EF) can
+# carry a byte each ("emoji smuggling"): both are invisible, so they are removed like tag characters.
+# U+FE00-FE0F stay (emoji presentation, e.g. a red heart).
+_AGENT_HIDE_RE = _re.compile('[\U000e0000-\U000e007f\U000e0100-\U000e01ef\u202a-\u202e\u2066-\u2069]')
+_AGENT_SELECTORS_RE = _re.compile('[\U000e0100-\U000e01ef]{2,}')
 # only the three RGI subdivision flags (England gbeng, Scotland gbsct, Wales gbwls) are U+1F3F4 + tag
 # letters + U+E007F and stay; any other black-flag + tag sequence is a message channel and is stripped
 _AGENT_TAG_FLAG_RE = _re.compile(
@@ -16301,7 +16317,7 @@ _AGENT_TAG_FLAG_RE = _re.compile(
 
 def _strip_tag_chars(s):
     """(clean text, hidden ASCII): tag characters removed, the ASCII they spell collected."""
-    if not _AGENT_TAG_RE.search(s):
+    if not _AGENT_HIDE_RE.search(s):
         return s, ''
     hidden, out, pos = [], [], 0
     for m in list(_AGENT_TAG_FLAG_RE.finditer(s)) + [None]:
@@ -16311,7 +16327,7 @@ def _strip_tag_chars(s):
             if 0xE0000 <= c <= 0xE007F:
                 if 0xE0020 <= c <= 0xE007E:
                     hidden.append(chr(c - 0xE0000))
-            else:
+            elif not _AGENT_HIDE_RE.match(ch):
                 out.append(ch)
         if m:
             out.append(m.group(0))
@@ -16319,26 +16335,57 @@ def _strip_tag_chars(s):
     return ''.join(out), ''.join(hidden)
 
 
-def _agent_strip_tags(obj, hidden):
+def _tag_clean_text(s, acc):
+    """s without tag characters (the three real subdivision flags stay). acc = [removed count,
+    [hidden ASCII pieces]] collects what plain-text commands (content, a11y) report in one stderr line."""
+    if not isinstance(s, str) or not _AGENT_HIDE_RE.search(s):
+        return s
+    clean, hidden = _strip_tag_chars(s)
+    acc[0] += len(_AGENT_HIDE_RE.findall(s)) - len(_AGENT_HIDE_RE.findall(clean))
+    if hidden:
+        acc[1].append(hidden)
+    acc[2] += sum(len(m) for m in _AGENT_SELECTORS_RE.findall(s))
+    return clean
+
+
+def _tag_clean_notice(acc):
+    """One stderr line when invisible tag characters spelled something; stdout stays untouched."""
+    if acc[1]:
+        spelled = ' | '.join(dict.fromkeys(acc[1]))[:160]
+        print(f'cdpilot: removed {acc[0]} invisible tag characters (they spelled: "{spelled}")',
+              file=sys.stderr)
+    elif acc[2]:
+        print(f'cdpilot: removed {acc[2]} invisible variation selectors (a hidden payload)', file=sys.stderr)
+
+
+def _agent_strip_tags(obj, hidden, sels):
     if isinstance(obj, str):
         clean, h = _strip_tag_chars(obj)
         if h:
             hidden.append(h)
+        if clean != obj:
+            sels.update(_AGENT_SELECTORS_RE.findall(obj))
         return clean
     if isinstance(obj, list):
-        return [_agent_strip_tags(v, hidden) for v in obj]
+        return [_agent_strip_tags(v, hidden, sels) for v in obj]
     if isinstance(obj, dict):
-        return {_agent_strip_tags(k, hidden): _agent_strip_tags(v, hidden) for k, v in obj.items()}
+        return {_agent_strip_tags(k, hidden, sels): _agent_strip_tags(v, hidden, sels) for k, v in obj.items()}
     return obj
 
 
 def _agent_clean_tags(obj):
     """obj without tag characters; a dict also gets the invisible_tags injection_suspect record."""
-    hidden = []
-    obj = _agent_strip_tags(obj, hidden)
-    if hidden and isinstance(obj, dict):
-        rec = {'text': ' | '.join(dict.fromkeys(hidden))[:160], 'match': 'invisible_tags'}
-        obj['injection_suspect'] = list(obj.get('injection_suspect') or []) + [rec]
+    hidden, sels = [], set()   # sels: the distinct selector runs (a text repeats in actions and text: count once)
+    obj = _agent_strip_tags(obj, hidden, sels)
+    if isinstance(obj, dict):
+        recs = []
+        if hidden:
+            recs.append({'text': ' | '.join(dict.fromkeys(hidden))[:160], 'match': 'invisible_tags'})
+        n = sum(len(m) for m in sels)
+        if n:
+            recs.append({'text': f'{n} bytes', 'match': 'invisible_selectors'})
+        if recs:
+            obj['injection_suspect'] = list(obj.get('injection_suspect') or []) + recs
     return obj
 
 
@@ -16633,7 +16680,7 @@ _AGENT_INJECTION_RES_3 = (
      ('decode', 'decrypt', 'deobfuscate', 'unscramble')),
 )
 _AGENT_INJECTION_LATER = _AGENT_INJECTION_RES_2 + _AGENT_INJECTION_RES_3
-_AGENT_ZW_RE = _re.compile('[\u200b-\u200d\u2060\ufeff\u00ad]')
+_AGENT_ZW_RE = _re.compile('[\u200b-\u200d\u2060\ufeff\u00ad\ufe00-\ufe0f\u202a-\u202e\u2066-\u2069]')
 
 
 def _agent_keys_re(keys):
@@ -16734,7 +16781,8 @@ def _agent_injection_scan(nodes, limit=5):
         name = node.get('name', {}).get('value', '') or ''
         if len(name) < 12 or name in seen:
             continue
-        norm = _agent_injection_norm(name)
+        # tag characters inside a word ("ig<U+E0001>nore") would split it: match on the clean text
+        norm = _agent_injection_norm(_strip_tag_chars(name)[0])
         tag = next((t for t, rx in _AGENT_INJECTION_RES if rx.search(norm)), None)
         asc = norm.isascii()
         if tag is None and (_AGENT_KEYS_ASCII_RE if asc else _AGENT_KEYS_RE).search(norm):
@@ -18830,7 +18878,8 @@ async def cmd_twitter_analytics(days=7):
         'posts': [],  # tweet-level scraping ayrı flow gerektirir; ileride genişlet
         '_raw': metrics.get('_raw_metrics', [])[:5],
     }
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    # raw page text (_raw, counts): the same tag-character cleaning as the agent JSON
+    print(json.dumps(_agent_clean_tags(out), indent=2, ensure_ascii=False))
 
 
 def datetime_now_iso_date():
