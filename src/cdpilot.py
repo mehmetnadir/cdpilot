@@ -3393,6 +3393,13 @@ def cmd_bot_auth(subcmd=None, *args):
         sys.exit(2)
 
 
+def _is_canvas_page(page):
+    """True for a canvas tab (`cdpilot canvas open`): its own browser context,
+    owned by the canvas host. No page command may adopt or navigate it as a
+    session tab, whatever the registry says about the browser."""
+    return str((page or {}).get("url") or "").startswith(CANVAS_URL_FMT.split("{", 1)[0])
+
+
 def get_tabs():
     """Retrieve all CDP targets, auto-launching the browser once if allowed."""
     result = cdp_get("/json")
@@ -3499,7 +3506,7 @@ def _create_session_window():
     # Check existing tabs — reuse if already open
     tabs = cdp_get("/json")
     if tabs:
-        pages = [t for t in tabs if t.get("type") == "page"]
+        pages = [t for t in tabs if t.get("type") == "page" and not _is_canvas_page(t)]
         if pages:
             # A page is already open, no need to create a new tab
             target_id = pages[0].get("id")
@@ -3755,6 +3762,9 @@ def get_page_ws(prefer_url=None):
         print(f"CDPILOT_TARGET={pin} but no such tab. Did the context get destroyed?",
               file=sys.stderr)
         sys.exit(1)
+
+    # A canvas tab is never a session or fallback tab (only a CDPILOT_TARGET pin names it).
+    pages = [p for p in pages if not _is_canvas_page(p)]
 
     # Get target ID for the current session window
     session_target_id = _get_session_window_target_id()
