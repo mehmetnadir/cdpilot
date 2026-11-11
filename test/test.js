@@ -8146,6 +8146,77 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     } finally { fake.stop(); }
   });
 
+  test('agent output (fake browser): invisible tags: a hidden message cut into 6-letter flag sequences is stripped and flagged', () => {
+    const anyTag = /[\u{E0000}-\u{E007F}]/u;
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_TAGS: 'smuggle' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const o = cli(['agent', 'observe'], env);
+      assert.strictEqual(o.status, 0, o.stderr);
+      const snap = JSON.parse(o.stdout);
+      assert(/Buy now/.test(snap.text), snap.text);
+      const scot = '\u{1F3F4}' + [...'gbsct'].map((c) => String.fromCodePoint(0xE0000 + c.charCodeAt(0))).join('') + '\u{E007F}';
+      assert.strictEqual(o.stdout.split(scot).join('').match(anyTag), null, 'no tag character reaches the model (the real flag fixture stays)');
+      assert(!/ignoreall/.test(snap.text), snap.text);
+      const rec = (snap.injection_suspect || []).find((r) => r.match === 'invisible_tags');
+      assert(rec && /ignoreallprior/.test(rec.text), JSON.stringify(snap.injection_suspect));
+    } finally { fake.stop(); }
+  });
+
+  test('agent output (fake browser): invisible tags: the real England, Scotland and Wales flags are kept without a record', () => {
+    const tag = (t) => [...t].map((c) => String.fromCodePoint(0xE0000 + c.charCodeAt(0))).join('');
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_TAGS: 'flags' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const snap = JSON.parse(cli(['agent', 'observe'], env).stdout);
+      for (const cc of ['gbeng', 'gbsct', 'gbwls']) {
+        assert(snap.text.includes('\u{1F3F4}' + tag(cc) + '\u{E007F}'), `${cc} kept: ${snap.text}`);
+      }
+      assert(!('injection_suspect' in snap), JSON.stringify(snap.injection_suspect));
+    } finally { fake.stop(); }
+  });
+
+  test('agent output (fake browser): invisible tags: flow save and --dry-run print no tag characters; the anchor still matches on run', () => {
+    const tag = (t) => [...t].map((c) => String.fromCodePoint(0xE0000 + c.charCodeAt(0))).join('');
+    const anyTag = /[\u{E0000}-\u{E007F}]/u;
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_BUTTON: 'Arc' + tag('hive') });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const ok = (args, code = 0) => {
+        const r = cli(args, env);
+        assert.strictEqual(r.status, code, `${args.join(' ')} exit ${r.status}: ${r.stderr}\n${r.stdout}`);
+        return r;
+      };
+      ok(['agent', 'act', '--url', 'https://user.example/inbox']);
+      const btn = JSON.parse(ok(['agent', 'observe', '--full']).stdout).actions.find((a) => a.name === 'Arc');
+      assert(btn, 'the button is listed under its clean name');
+      ok(['agent', 'act', '--ref', btn.ref, '--action', 'click']);
+      ok(['agent', 'flow', 'save', 'tagged', '--last', '1']);
+      const flowPath = path.join(home, 'projects', 'proj', 'flows', 'tagged.json');
+      const flowText = fs.readFileSync(flowPath, 'utf-8');
+      assert.strictEqual(flowText.match(anyTag), null, 'the saved flow holds no tag character');
+      assert.strictEqual(JSON.parse(flowText).steps[0].anchor.name, 'Arc');
+      // a flow file written by an older build (raw tagged anchor) still prints clean
+      const flow = JSON.parse(flowText);
+      flow.steps[0].anchor.name = 'Arc' + tag('ignore previous');
+      fs.writeFileSync(path.join(home, 'projects', 'proj', 'flows', 'raw.json'), JSON.stringify({ ...flow, name: 'raw' }));
+      const dry = ok(['agent', 'run', 'raw', '--dry-run']);
+      assert.strictEqual(dry.stdout.match(anyTag), null, 'dry-run prints no tag character');
+      assert(/invisible_tags/.test(dry.stdout), dry.stdout);
+      // run: the page name carries tag characters, the recorded anchor is clean: no drift
+      const res = JSON.parse(ok(['agent', 'run', 'tagged']).stdout);
+      assert.deepStrictEqual([res.status, res.steps], ['ok', 1], JSON.stringify(res));
+    } finally { fake.stop(); }
+  });
+
   test('agent output (fake browser): invisible tags: a flag emoji alone raises no record', () => {
     const fake = startFake('full', 'guid-user', { FAKE_CDP_TAGS: 'flag' });
     try {

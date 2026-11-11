@@ -16251,8 +16251,11 @@ def _agent_json_pretty():
 # agent JSON is raw UTF-8, so they would reach the model. _agent_json strips them from every string
 # it prints and reports what they spelled as an injection_suspect record.
 _AGENT_TAG_RE = _re.compile('[\U000e0000-\U000e007f]')
-# a subdivision flag (England, Scotland, Wales) is U+1F3F4 + tag letters/digits + U+E007F: it stays
-_AGENT_TAG_FLAG_RE = _re.compile('\U0001f3f4[\U000e0030-\U000e0039\U000e0061-\U000e007a]{1,6}\U000e007f')
+# only the three RGI subdivision flags (England gbeng, Scotland gbsct, Wales gbwls) are U+1F3F4 + tag
+# letters + U+E007F and stay; any other black-flag + tag sequence is a message channel and is stripped
+_AGENT_TAG_FLAG_RE = _re.compile(
+    '\U0001f3f4\U000e0067\U000e0062(?:\U000e0065\U000e006e\U000e0067|\U000e0073\U000e0063\U000e0074'
+    '|\U000e0077\U000e006c\U000e0073)\U000e007f')
 
 
 def _strip_tag_chars(s):
@@ -16288,13 +16291,19 @@ def _agent_strip_tags(obj, hidden):
     return obj
 
 
-def _agent_json(obj):
-    """Print obj as agent-command JSON (see _agent_json_pretty)."""
+def _agent_clean_tags(obj):
+    """obj without tag characters; a dict also gets the invisible_tags injection_suspect record."""
     hidden = []
     obj = _agent_strip_tags(obj, hidden)
     if hidden and isinstance(obj, dict):
         rec = {'text': ' | '.join(dict.fromkeys(hidden))[:160], 'match': 'invisible_tags'}
         obj['injection_suspect'] = list(obj.get('injection_suspect') or []) + [rec]
+    return obj
+
+
+def _agent_json(obj):
+    """Print obj as agent-command JSON (see _agent_json_pretty)."""
+    obj = _agent_clean_tags(obj)
     kw = {'indent': 2} if _agent_json_pretty() else {'separators': (',', ':')}
     try:
         text = json.dumps(obj, ensure_ascii=False, **kw)
@@ -17671,10 +17680,10 @@ def _agent_trail_push(state, entry):
 def _agent_anchor(desc, amap):
     """Session-independent address of a descriptor: role + accessible name +
     position among the elements sharing both, in AX order."""
-    role, name = desc.get('role', ''), desc.get('name', '') or ''
+    role, name = desc.get('role', ''), _strip_tag_chars(desc.get('name', '') or '')[0]
     by_num = lambda r: int(r.lstrip('@')) if r.lstrip('@').isdigit() else 0
     same = [r for r in sorted(amap, key=by_num)
-            if amap[r].get('role') == role and (amap[r].get('name') or '') == name]
+            if amap[r].get('role') == role and _strip_tag_chars(amap[r].get('name') or '')[0] == name]
     nth = same.index(desc['ref']) if desc.get('ref') in same else 0
     return {'role': role, 'name': name, 'nth': nth}
 
@@ -17694,17 +17703,19 @@ def _agent_find_anchor(anchor, actions):
     """The descriptor an anchor names on this page, or None (drift).
     Exact name, then case-insensitive, then — only when unambiguous — the
     recorded name contained in a longer one ("Archive" → "Archive all")."""
-    role, name = anchor.get('role'), anchor.get('name') or ''
+    role, name = anchor.get('role'), _strip_tag_chars(anchor.get('name') or '')[0]
     nth = int(anchor.get('nth') or 0)
+    # names compare without tag characters: a flow saved clean still finds a page name that carries them
+    nm = lambda a: _strip_tag_chars(a.get('name') or '')[0]
     same_role = [a for a in actions if a.get('role') == role]
-    exact = [a for a in same_role if (a.get('name') or '') == name]
+    exact = [a for a in same_role if nm(a) == name]
     if exact:
         return exact[nth] if nth < len(exact) else exact[-1], 'exact'
-    folded = [a for a in same_role if (a.get('name') or '').lower() == name.lower()]
+    folded = [a for a in same_role if nm(a).lower() == name.lower()]
     if folded:
         return folded[nth] if nth < len(folded) else folded[-1], 'case'
     if name:
-        partial = [a for a in same_role if name.lower() in (a.get('name') or '').lower()]
+        partial = [a for a in same_role if name.lower() in nm(a).lower()]
         if len(partial) == 1:
             return partial[0], 'partial'
     return None, None
@@ -17742,7 +17753,8 @@ async def cmd_agent_flow_save(name, last=None):
         if e.get('kind') == 'go':
             step = {'n': n, 'kind': 'go', 'url': e.get('url', '')}
         else:
-            step = {'n': n, 'kind': 'act', 'action': e.get('action', 'click'), 'anchor': e.get('anchor', {})}
+            step = {'n': n, 'kind': 'act', 'action': e.get('action', 'click'),
+                    'anchor': _agent_clean_tags(dict(e.get('anchor') or {}))}
             if e.get('text') is not None:
                 step['text'] = e['text']
             h, p = _agent_host_path(e.get('url_after'))
@@ -17871,8 +17883,9 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
         return _AGENT_VAR_RE.sub(lambda m: cli_values.get(m.group(1), env_here.get(m.group(1), m.group(0))), s or '')
     if dry_run:
         # Placeholders stay placeholders: a dry run never prints a value.
-        print(json.dumps({'flow': slug, 'dry_run': True, 'host': flow.get('host', ''),
-                          'steps': flow['steps'], 'vars': sorted(needed)}, indent=2, ensure_ascii=False))
+        print(json.dumps(_agent_clean_tags({'flow': slug, 'dry_run': True, 'host': flow.get('host', ''),
+                                            'steps': flow['steps'], 'vars': sorted(needed)}),
+                         indent=2, ensure_ascii=False))
         return
 
     t0 = time.monotonic()
