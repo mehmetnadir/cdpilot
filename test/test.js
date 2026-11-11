@@ -9329,6 +9329,25 @@ print(json.dumps(out))
     } finally { fake.stop(); }
   });
 
+  test('connect blank tab: disconnect closes the about:blank tab cdpilot opened, never a user tab', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      const env = isoEnv(home, fake.port, 'blank');
+      assert.strictEqual(cli(['connect', String(fake.port)], env).status, 0);
+      const g = cli(['go', 'https://example.org/'], env);
+      assert.strictEqual(g.status, 0, g.stdout + g.stderr);
+      const mark = fake.entries().length;
+      const d = cli(['disconnect'], env);
+      assert.strictEqual(d.status, 0, `disconnect exit: ${d.status}\n${d.stdout}${d.stderr}`);
+      const after = fake.entries().slice(mark);
+      const closed = after.filter((e) => e.method === 'Target.closeTarget');
+      assert.strictEqual(closed.length, 1, `exactly one tab closed (the own tab): ${JSON.stringify(after)}`);
+      assert(!JSON.stringify(closed).includes('PAGE1'), 'the user tab is never closed');
+      assert(after.every((e) => e.method !== 'Browser.close'), 'no Browser.close');
+    } finally { fake.stop(); }
+  });
+
   test('connect: CDP_PORT in environment overriding connected browser warns on connect and explains probe failure', () => {
     const fake = startFake();
     try {
