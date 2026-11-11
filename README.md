@@ -154,7 +154,7 @@ The three `browser_canvas_*` tools are listed only while a live canvas is open (
 
 ### Agent mode over MCP
 
-`browser_agent_observe` (`diff`, `full`), `browser_agent_act` (`ref`/`url`, `action`, `text`), `browser_agent_flow_save`
+`browser_agent_observe` (`diff`, `full`, `all`), `browser_agent_find` (`text`, `role`, `max`), `browser_agent_act` (`ref`/`url`, `action`, `text`), `browser_agent_flow_save`
 (`name`, `last`) and `browser_agent_run` (`flow`, `vars`, `dry_run`) wrap the agent commands below, so a model
 on MCP works from numbered refs, gets diffs, and replays a learned flow with no page read at all. They are
 outside the `core` profile; `browser_tools enable` adds them. A drift or a missing variable comes back as
@@ -483,7 +483,8 @@ Tokens are o200k_base counts of each command's stdout on Hacker News and the Wik
 | `content` | the page's plain text | no | 1,200 / 4,700 |
 | `agent observe` | numbered `@refs` for actionable entries and headings/landmarks, plus a short text | yes (`agent act --ref`) | 4,300 / 8,300 |
 | `agent observe --rows` | the same entries as arrays | yes | 2,900 / 5,200 |
-| `agent observe --full` | every entry, nothing hidden | yes | 6,900 / 17,300 |
+| `agent observe --full` | every entry, nothing hidden, no size limit | yes | 6,900 / 17,300 |
+| `agent find "<text>"` | the entries whose name contains the text, from the whole page (at most 20) | yes | a few hundred |
 | `a11y-snapshot` | one `@ref` line per interactive or structural node | yes (`click-ref @N`) | 8,100 / 13,100 |
 | `a11y` | the full tree with roles and names, no refs | no | 9,800 / 31,400 |
 | `describe` | `a11y-snapshot` + page text, and it writes a screenshot file | yes (`click-ref @N`) | 8,800 / 13,600 |
@@ -495,6 +496,12 @@ it returned 45–60. Use `a11y-snapshot` or
 `observe --full` when you need a ref for every node, and `content` when you only read. The ranking is
 page-dependent: on react.dev `a11y-snapshot` (1,200) is smaller than `content` (1,500).
 
+`agent observe` (and the lists in `agent act` and `agent run`) print at most 400 entries, in accessibility-tree
+order, and say so in a `truncated` note (`{shown, total, hint}`). Of 13 measured pages 7 have more than 400
+entries; a long page costs 17,000-85,000 tokens uncut. Refs past the cut still work: `agent act --ref @N` takes
+any ref, and `agent find "<text>" [--role r]` lists the ones you need. `--all` (or `CDPILOT_OBSERVE_MAX=0`)
+prints everything in the default view; `--full` also shows the hidden entries.
+
 ### Agent mode: numbered refs and diffs (token budget)
 
 ```bash
@@ -503,7 +510,9 @@ cdpilot agent act --ref @3 --action click
 cdpilot agent act --ref @4 --action fill --text "cdpilot"
 cdpilot agent act --url https://example.com/   # navigates silently, prints the diff
 cdpilot agent observe --diff          # only what changed since the last observe/act
-cdpilot agent observe --full          # every entry, nothing hidden (also on act and run)
+cdpilot agent observe --full          # every entry, nothing hidden, no size limit (also on act and run)
+cdpilot agent observe --all           # default view without the 400-entry limit (CDPILOT_OBSERVE_MAX=N sets it, 0 = none)
+cdpilot agent find "Stalingrad" --role link   # {ref, role, name} of up to 20 matches + total_matches; refs work with act
 cdpilot agent observe --rows          # entries as [ref, role, name, value?] arrays
 cdpilot agent stats | agent reset
 ```
