@@ -7711,6 +7711,7 @@ async def cmd_shot(output=None, quality=None, element=None, fmt=None):
         print(f"{output} ({size_kb:.1f}KB)")
     else:
         print("Screenshot failed", file=sys.stderr)
+        sys.exit(1)
 
 
 async def cmd_shot_annotated(output=None):
@@ -7792,6 +7793,7 @@ async def cmd_shot_annotated(output=None):
         print(f"{output} ({badge_count} badge)")
     else:
         print("Screenshot failed", file=sys.stderr)
+        sys.exit(1)
 
 
 async def cmd_eval(js_code):
@@ -7805,6 +7807,7 @@ async def cmd_eval(js_code):
     if "exceptionDetails" in result:
         exc = result["exceptionDetails"]
         print(f"Error: {exc.get('text', '')} — {exc.get('exception', {}).get('description', '')}")
+        sys.exit(1)  # a page-side exception is a failure (stdout text kept for compatibility)
     else:
         val = result.get("result", {})
         if val.get("type") == "undefined":
@@ -10694,6 +10697,7 @@ async def cmd_pdf(output=None):
         print(f'PDF saved: {output}')
     else:
         print('PDF generation failed', file=sys.stderr)
+        sys.exit(1)
 
 async def cmd_upload(selector, file_path):
     """Upload a file to a file input element."""
@@ -18737,6 +18741,7 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
         val = _cdp_reply(res, 1, "Runtime.evaluate", 15)
         if "error" in val or val.get("exceptionDetails"):
             print(f"Error: {val}", file=sys.stderr)
+            sys.exit(1)
         else:
             print(f"Result: {val.get('result', {}).get('value', val)}")
 
