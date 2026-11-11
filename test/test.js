@@ -7296,10 +7296,9 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   });
 
   test('log warm: warm CLI and warm MCP calls set warm:true, fresh calls omit warm, and cdpilot log marks (warm)', () => {
-    const unreleased = fs.readFileSync(path.join(__dirname, '..', 'CHANGELOG.md'), 'utf8')
-      .split(/^## \[/m).find((s) => s.startsWith('Unreleased]')) || '';
+    const unreleased = changelogFor('0.9.8');
     assert(unreleased.includes('Session log marks warm calls (`warm: true`)'),
-      'CHANGELOG [Unreleased] must record warm session-log marker');
+      'CHANGELOG [Unreleased]/[0.9.8] must record warm session-log marker');
     if (process.platform === 'win32') return;
     const home = newHome();
     try {
