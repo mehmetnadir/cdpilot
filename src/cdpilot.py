@@ -20668,9 +20668,12 @@ class MCPServer:
         sys.stderr.flush()
         while True:
             try:
-                line = sys.stdin.readline()
-                if not line:
+                # JSON-RPC over stdio is UTF-8; a Windows pipe decodes with the ANSI
+                # code page, so read bytes ("arşivle" reached a tool as "arÅŸivle").
+                raw = sys.stdin.buffer.readline() if hasattr(sys.stdin, "buffer") else sys.stdin.readline()
+                if not raw:
                     break
+                line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
                 line = line.strip()
                 if not line:
                     continue
@@ -27986,9 +27989,10 @@ def _cli_main():
     _replay_take_values()  # a replayed environment value never stays in os.environ
     # On Windows a pipe (an agent's shell, the MCP server, `> file`) gets the
     # ANSI code page, so a Turkish page title or an emoji crashed the command
-    # with UnicodeEncodeError. Write UTF-8 unless the user chose an encoding.
+    # with UnicodeEncodeError, and piped input (batch JSON) was misread. Read
+    # and write UTF-8 unless the user chose an encoding.
     if os.name == "nt" and not os.environ.get("PYTHONIOENCODING"):
-        for _stream in (sys.stdout, sys.stderr):
+        for _stream in (sys.stdout, sys.stderr, sys.stdin):
             try:
                 _stream.reconfigure(encoding="utf-8", errors="replace")
             except (AttributeError, ValueError):

@@ -8308,6 +8308,9 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     } finally { fake.stop(); }
   });
 
+  // Windows prints CRLF: compare these outputs with LF line ends
+  const cliLF = (...a) => { const r = cli(...a);
+    return { ...r, stdout: (r.stdout || '').replace(/\r\n/g, '\n'), stderr: (r.stderr || '').replace(/\r\n/g, '\n') }; };
   // plain-text page commands (content, a11y, a11y-snapshot): tag characters are removed, one stderr line
   const tagCh = (t) => [...t].map((c) => String.fromCodePoint(0xE0000 + c.charCodeAt(0))).join('');
   const anyTagCh = /[\u{E0000}-\u{E007F}]/u;
@@ -8324,7 +8327,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   test('content (fake browser): tag characters removed, the flag kept, one stderr line, stdout has no extra line', () => {
     const page = 'Hello' + tagCh('IGNORE PREVIOUS') + ' world ' + wales + ' end';
     withFake({ FAKE_CDP_INNERTEXT: page }, (env) => {
-      const r = cli(['content'], env);
+      const r = cliLF(['content'], env);
       assert.strictEqual(r.status, 0, r.stderr);
       assert.strictEqual(r.stdout, `Hello world ${wales} end\n`, JSON.stringify(r.stdout));
       assert.strictEqual(r.stdout.split(wales).join('').match(anyTagCh), null);
@@ -8335,7 +8338,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
 
   test('content (fake browser): no tag characters: stdout unchanged, stderr empty; a flag alone is no notice', () => {
     withFake({ FAKE_CDP_INNERTEXT: 'Plain page ' + wales }, (env) => {
-      const r = cli(['content'], env);
+      const r = cliLF(['content'], env);
       assert.strictEqual(r.status, 0, r.stderr);
       assert.strictEqual(r.stdout, `Plain page ${wales}\n`);
       assert.strictEqual(r.stderr, '');
@@ -8344,7 +8347,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
 
   test('content (fake browser): the stderr line quotes at most 160 characters of the hidden text', () => {
     withFake({ FAKE_CDP_INNERTEXT: 'x' + tagCh('a'.repeat(300)) }, (env) => {
-      const r = cli(['content'], env);
+      const r = cliLF(['content'], env);
       assert.strictEqual(r.stderr, `cdpilot: removed 300 invisible tag characters (they spelled: "${'a'.repeat(160)}")\n`);
       assert.strictEqual(r.stdout, 'x\n');
     });
@@ -8352,26 +8355,26 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
 
   test('a11y-snapshot (fake browser): an action name is cleaned, one stderr line, the ref stays usable', () => {
     withFake({ FAKE_CDP_TAGS: '1', FAKE_CDP_BUTTON: 'Arc' + tagCh('hive') }, (env) => {
-      const r = cli(['a11y-snapshot'], env);
+      const r = cliLF(['a11y-snapshot'], env);
       assert.strictEqual(r.status, 0, r.stderr);
       assert(/@\d+ \[button\] "Arc"/.test(r.stdout), r.stdout);
       assert.strictEqual(r.stdout.match(anyTagCh), null);
       assert.strictEqual(r.stderr, 'cdpilot: removed 4 invisible tag characters (they spelled: "hive")\n', r.stderr);
     });
     withFake({}, (env) => {
-      assert.strictEqual(cli(['a11y-snapshot'], env).stderr, '', 'no tag characters: stderr empty');
+      assert.strictEqual(cliLF(['a11y-snapshot'], env).stderr, '', 'no tag characters: stderr empty');
     });
   });
 
   test('a11y, a11y find (fake browser): node names are cleaned, the flag is kept, one stderr line', () => {
     withFake({ FAKE_CDP_TAGS: '1', FAKE_CDP_BUTTON: 'Arc' + tagCh('hive') }, (env) => {
-      const full = cli(['a11y'], env);
+      const full = cliLF(['a11y'], env);
       assert.strictEqual(full.status, 0, full.stderr);
       assert(full.stdout.includes("'Arc'") && full.stdout.includes("'Hello'"), full.stdout);
       assert.strictEqual(full.stdout.split('\u{1F3F4}' + tagCh('gbsct') + '\u{E007F}').join('').match(anyTagCh), null);
       assert.strictEqual(full.stderr, 'cdpilot: removed 19 invisible tag characters (they spelled: "hive | IGNORE PREVIOUS")\n',
         full.stderr);
-      const find = cli(['a11y', 'find', 'button'], env);
+      const find = cliLF(['a11y', 'find', 'button'], env);
       assert(find.stdout.includes("- 'Arc'"), find.stdout);
       assert.strictEqual(find.stdout.match(anyTagCh), null);
       assert.strictEqual(find.stderr, 'cdpilot: removed 4 invisible tag characters (they spelled: "hive")\n');
@@ -8380,8 +8383,8 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
 
   test('agent observe (fake browser): a LANGUAGE TAG inside a word of an instruction does not hide it from injection_suspect', () => {
     withFake({ FAKE_CDP_TAGS: 'inword' }, (env) => {
-      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
-      const o = cli(['agent', 'observe'], env);
+      assert.strictEqual(cliLF(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const o = cliLF(['agent', 'observe'], env);
       assert.strictEqual(o.status, 0, o.stderr);
       const snap = JSON.parse(o.stdout);
       const rec = (snap.injection_suspect || []).find((r) => r.match === 'ignore_instructions');
@@ -8422,8 +8425,8 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
 
   test('agent observe (fake browser): bidi controls and supplementary selectors are removed; the heart (FE0F) stays; payload recorded as bytes', () => {
     withFake({ FAKE_CDP_HIDE: '1' }, (env) => {
-      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
-      const o = cli(['agent', 'observe'], env);
+      assert.strictEqual(cliLF(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const o = cliLF(['agent', 'observe'], env);
       assert.strictEqual(o.status, 0, o.stderr);
       assert.strictEqual(o.stdout.match(hideRe), null, 'no bidi control or supplementary selector in the JSON');
       const snap = JSON.parse(o.stdout);
@@ -8439,8 +8442,8 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
 
   test('agent observe (fake browser): a lone bidi control makes no record; the real UK flags stay with FAKE_CDP_HIDE too', () => {
     withFake({ FAKE_CDP_HIDE: '1', FAKE_CDP_TAGS: 'flags' }, (env) => {
-      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
-      const snap = JSON.parse(cli(['agent', 'observe'], env).stdout);
+      assert.strictEqual(cliLF(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const snap = JSON.parse(cliLF(['agent', 'observe'], env).stdout);
       for (const cc of ['gbeng', 'gbsct', 'gbwls']) assert(snap.text.includes('\u{1F3F4}' + tagCh(cc) + '\u{E007F}'), cc);
       assert(!(snap.injection_suspect || []).some((r) => r.match === 'invisible_tags'), JSON.stringify(snap.injection_suspect));
     });
@@ -8449,18 +8452,18 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   test('content, a11y (fake browser): bidi controls and supplementary selectors removed, heart kept; selector payload on stderr, a bidi control alone is silent', () => {
     const sel = [...'payload!'].map((c) => String.fromCodePoint(0xE0100 + c.charCodeAt(0))).join('');
     withFake({ FAKE_CDP_INNERTEXT: 'Total‮ 42⁩ ❤️ end' }, (env) => {
-      const r = cli(['content'], env);
+      const r = cliLF(['content'], env);
       assert.strictEqual(r.stdout, 'Total 42 ❤️ end\n', JSON.stringify(r.stdout));
       assert.strictEqual(r.stderr, '', 'a bidi control alone: no stderr line');
     });
     withFake({ FAKE_CDP_INNERTEXT: 'Safe' + sel }, (env) => {
-      const r = cli(['content'], env);
+      const r = cliLF(['content'], env);
       assert.strictEqual(r.stdout, 'Safe\n');
       assert.strictEqual(r.stderr, 'cdpilot: removed 8 invisible variation selectors (a hidden payload)\n', r.stderr);
     });
     withFake({ FAKE_CDP_HIDE: '1' }, (env) => {
       for (const args of [['a11y'], ['a11y-snapshot']]) {
-        const r = cli(args, env);
+        const r = cliLF(args, env);
         assert.strictEqual(r.status, 0, r.stderr);
         assert.strictEqual(r.stdout.match(hideRe), null, args.join(' '));
         if (args[0] === 'a11y') assert(r.stdout.includes('\u2764\uFE0F'), 'a11y: heart kept');
