@@ -1414,6 +1414,24 @@ UNMEASURABLE = {
                          "her koşuda 0); X-DNS-Prefetch-Control: off ek katman",
 }
 
+# Vectors that a browser/headless mode/version may not deliver even with no guard. Not the same as
+# UNMEASURABLE (never measurable anywhere). Counter 0 here prints "not measurable in this
+# environment" and does not fail; the guarded run must still be 0 (unchanged). Everything else
+# (fetch, img, script, ws, iframe, form, WebRTC, popups, ...) is CORE: counter > 0 is mandatory.
+# Evidence: CI run 42941183328 (ubuntu, Chrome/156.0.8078.79 headless, OTR counter context, listener
+# on the runner LAN IP 10.1.0.126): these three were 0 unguarded, while local macOS (loopback
+# listener, Chrome 152-156) measured them > 0 (B3 report). Cause not isolated; no extra Chrome
+# feature flag was identified that is known to enable them, so none is added.
+ENV_DEPENDENT = {
+    "ping": "<a ping> (hyperlink auditing) is a Chrome preference/feature that is not delivered in "
+            "every headless/OTR/Linux setup (CI 42941183328: 0 unguarded)",
+    "specrules": "speculation-rules prefetch needs Preloading to be enabled and eligible for the "
+                 "context; not triggered in CI headless OTR (Chrome 156, run 42941183328: 0 unguarded)",
+    "specrules_prerender": "speculation-rules prerender additionally needs memory/hardware "
+                           "eligibility and a visible tab; not triggered in CI headless OTR "
+                           "(Chrome 156, run 42941183328: 0 unguarded)",
+}
+
 
 def e2e_listen_ip():
     """(ip, why). Non-loopback IPv4 when one exists (WebRTC and Chrome treat loopback
@@ -1724,7 +1742,7 @@ def run_e2e(py_path, cli_js_path, cdp_hostport):
     for k in ("CDPILOT_HOME", "CDPILOT_PROFILE", "CDP_PORT", "CDPILOT_NO_AUTOLAUNCH", "CDPILOT_LOG"):
         os.environ[k] = env[k]
     out = {"browser": ver.get("Browser", "unknown"), "listen_ip": listen_ip, "listen_why": listen_why,
-           "unmeasurable": UNMEASURABLE}
+           "unmeasurable": UNMEASURABLE, "env_dependent": ENV_DEPENDENT}
     try:
         r_conn = cli("connect", cdp_port)
         if r_conn.returncode != 0:
@@ -1969,6 +1987,7 @@ def run_e2e(py_path, cli_js_path, cdp_hostport):
                 "counter": counter.get(v, 0),
                 "guarded": guarded.get(v, 0),
                 "unmeasurable": UNMEASURABLE.get(v),
+                "env_dependent": ENV_DEPENDENT.get(v),
                 "page_counter": (counter_res.get("page") or {}).get(v),
                 "page_guarded": page_guarded.get(v),
             }

@@ -95,6 +95,10 @@ function fetchJsonVersion() {
 
 function connectCDP(wsUrl) {
   return new Promise((resolve, reject) => {
+    if (typeof WebSocket === 'undefined') {
+      reject(new Error('skipped: canvas e2e needs Node 22+ (no global WebSocket on Node ' + process.versions.node + ')'));
+      return;
+    }
     const ws = new WebSocket(wsUrl);
     let seq = 1;
     const pending = new Map();
