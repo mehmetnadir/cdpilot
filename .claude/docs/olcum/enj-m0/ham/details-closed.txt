@@ -1,0 +1,30 @@
+=== observe
+{"url":"http://127.0.0.1:3470/details-closed.html","title":"m0 details-closed","actions":[{"ref":"@89","role":"button","name":"Gönder"}],"text":"Görünür paragraf: kargo ve iade koşulları bu sayfada anlatılır. Gönder Daha fazla","token_estimate":71}
+
+=== observe_full
+{"url":"http://127.0.0.1:3470/details-closed.html","title":"m0 details-closed","actions":[{"ref":"@89","role":"button","name":"Gönder"},{"ref":"@84","role":"StaticText","name":"Görünür paragraf: kargo ve iade koşulları bu sayfada anlatılır."},{"ref":"@88","role":"DisclosureTriangle","name":"Daha fazla"}],"text":"Görünür paragraf: kargo ve iade koşulları bu sayfada anlatılır. Gönder Daha fazla","token_estimate":125}
+
+=== content
+Görünür paragraf: kargo ve iade koşulları bu sayfada anlatılır.
+
+Daha fazla
+Gönder
+
+=== a11y
+Accessibility tree (8 nodes, 3 skipped):
+  [RootWebArea] 'm0 details-closed'
+  [paragraph]
+  [group]
+  [button] 'Gönder'
+  [StaticText] 'Görünür paragraf: kargo ve iade koşulları bu sayfada anlatılır.'
+  [DisclosureTriangle] 'Daha fazla'
+  [StaticText] 'Gönder'
+  [StaticText] 'Daha fazla'
+
+=== a11y_snapshot
+@1 [button] "Gönder"
+
+[1 interactive, 1 total shown]
+
+=== domsnapshot
+{"viewport": [800, 600], "hits": [{"doc": 0, "kind": "node3", "nodeName": "#text", "layout": false, "styles": {"display": "block", "visibility": "visible", "opacity": "1", "font-size": "16px", "color": "rgb(0, 0, 0)", "background-color": "rgba(0, 0, 0, 0)", "transform": "none", "clip-path": "none", "position": "static", "overflow": "visible", "text-indent": "0px"}, "style_bounds": [8, 50, 784, 18], "bg_eff": "rgb(255, 255, 255)"}]}
