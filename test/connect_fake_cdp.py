@@ -48,6 +48,28 @@ WATCH = os.environ.get("FAKE_CDP_WATCH", "")
 # FAKE_CDP_DOM=1: every CSS selector exists (`!!document.querySelector(…)` is true),
 # so a fill resolves its selector and reaches the field check.
 DOM = os.environ.get("FAKE_CDP_DOM") == "1"
+# Load simulation (a busy machine answers /json late or not at all):
+#   FAKE_CDP_LIST_EMPTY=N  the first N /json (and /json/list) answers are an empty list.
+#   FAKE_CDP_HIDE_MS=ms    a tab made by Target.createTarget / PUT /json/new stays out of
+#                          the /json listing for that long (the socket and getTargets know it).
+#   FAKE_CDP_HIDE_FOREVER=1  such a tab never shows in /json and not in Target.getTargets.
+#   FAKE_CDP_EXTRA_PAGE=ID adds one more page of the user's browser at start.
+LIST_EMPTY = [int(os.environ.get("FAKE_CDP_LIST_EMPTY", "0") or 0)]
+HIDE_MS = float(os.environ.get("FAKE_CDP_HIDE_MS", "0") or 0)
+HIDE_FOREVER = os.environ.get("FAKE_CDP_HIDE_FOREVER") == "1"
+if os.environ.get("FAKE_CDP_EXTRA_PAGE"):
+    PAGES.append({"id": os.environ["FAKE_CDP_EXTRA_PAGE"], "type": "page",
+                  "url": "about:blank", "title": ""})
+
+
+def listed(p, targets=False):
+    """Is page p visible in /json (or, with targets, in Target.getTargets)?"""
+    born = p.get("_born")
+    if born is None:
+        return True
+    if HIDE_FOREVER:
+        return False
+    return targets or (time.time() - born) * 1000 >= HIDE_MS
 
 
 def log(entry):
@@ -57,6 +79,7 @@ def log(entry):
 
 
 def page_json(p):
+    p = {k: v for k, v in p.items() if not k.startswith("_")}
     return dict(p, webSocketDebuggerUrl=f"ws://127.0.0.1:{PORT}/devtools/page/{p['id']}",
                 devtoolsFrontendUrl="")
 
@@ -80,13 +103,20 @@ def handle_http(conn, path, verb="GET"):
             "webSocketDebuggerUrl": f"ws://127.0.0.1:{PORT}/devtools/browser/{GUID}"})
     if base in ("/json", "/json/list"):
         with LOCK:
-            return http_reply(conn, 200, [page_json(p) for p in PAGES])
+            empty = LIST_EMPTY[0] > 0
+            if empty:
+                LIST_EMPTY[0] -= 1
+            body = [] if empty else [page_json(p) for p in PAGES if listed(p)]
+        if empty:
+            log({"http": path, "empty": True})
+        return http_reply(conn, 200, body)
     if base == "/json/new":
         if verb != "PUT":  # current Chrome: "Using unsafe HTTP verb GET to invoke /json/new"
             return http_reply(conn, 405, None)
         with LOCK:
             SEQ[0] += 1
-            p = {"id": f"PAGE{SEQ[0]}", "type": "page", "url": "about:blank", "title": ""}
+            p = {"id": f"PAGE{SEQ[0]}", "type": "page", "url": "about:blank", "title": "",
+                 "_born": time.time()}
             PAGES.append(p)
         return http_reply(conn, 200, page_json(p))
     if base.startswith("/json/close/"):
@@ -307,7 +337,7 @@ def answer(msg, path):
             SEQ[0] += 1
             new = {"id": f"PAGE{SEQ[0]}", "type": "page", "url": p.get("url") or "about:blank",
                    "title": "", "background": bool(p.get("background")),
-                   "newWindow": bool(p.get("newWindow"))}
+                   "newWindow": bool(p.get("newWindow")), "_born": time.time()}
             PAGES.append(new)
         result = {"targetId": new["id"]}
     elif method == "Target.closeTarget":
@@ -320,7 +350,7 @@ def answer(msg, path):
         with LOCK:
             result = {"targetInfos": [{"targetId": x["id"], "type": "page", "url": x["url"],
                                        "title": x["title"], "attached": False}
-                                      for x in PAGES]}
+                                      for x in PAGES if listed(x, targets=True)]}
     elif method == "Page.getFrameTree":
         result = {"frameTree": {"frame": {"id": "F1", "url": "https://user.example/inbox"}}}
     elif method == "DOM.getDocument":
