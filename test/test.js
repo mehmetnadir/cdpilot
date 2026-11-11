@@ -2252,7 +2252,7 @@ test('_snapshot_to_actions reuses existing ref for same backend_node_id', () => 
 });
 
 test('cmd_agent_observe is async and outputs JSON with required fields', () => {
-  assert(/async def cmd_agent_observe\(diff=False\)/.test(PY_CONTENT),
+  assert(/async def cmd_agent_observe\(diff=False(?:, full=False, rows=False)?\)/.test(PY_CONTENT),
     "cmd_agent_observe must be async def, with the --diff switch");
   const m = PY_CONTENT.match(/cmd_agent_observe[\s\S]{0,2500}?token_estimate/);  // the function grew a --diff branch
   assert(m, "cmd_agent_observe output must include token_estimate");
@@ -2305,7 +2305,7 @@ test('_dispatch_agent_cmd is synchronous and returns coroutine', () => {
   assert(/def _dispatch_agent_cmd\(args\):/.test(PY_CONTENT),
     "_dispatch_agent_cmd must be a sync function");
   // It returns coroutines from async fns, not calls asyncio.run
-  const m = PY_CONTENT.match(/_dispatch_agent_cmd[\s\S]{0,800}?return cmd_agent_observe\(diff=\('--diff' in rest\)\)/);
+  const m = PY_CONTENT.match(/_dispatch_agent_cmd[\s\S]{0,800}?return cmd_agent_observe\(diff=\('--diff' in rest\)/);
   assert(m, "_dispatch_agent_cmd must return the observe coroutine, passing --diff");
 });
 
@@ -2322,9 +2322,9 @@ test("'agent' command registered in main() async_map dispatch", () => {
 });
 
 test('_agent_full_snapshot syncs _A11Y_REF_MAP for click-ref compatibility', () => {
-  const m = PY_CONTENT.match(/_agent_full_snapshot[\s\S]{0,600}?_A11Y_REF_MAP/);
+  const m = PY_CONTENT.match(/_agent_full_snapshot[\s\S]{0,800}?_A11Y_REF_MAP/);
   assert(m, "_agent_full_snapshot must update global _A11Y_REF_MAP");
-  const m2 = PY_CONTENT.match(/_agent_full_snapshot[\s\S]{0,700}?_save_a11y_refs/);
+  const m2 = PY_CONTENT.match(/_agent_full_snapshot[\s\S]{0,900}?_save_a11y_refs/);
   assert(m2, "_agent_full_snapshot must call _save_a11y_refs for click-ref compat");
 });
 
@@ -8112,6 +8112,294 @@ print("ok")
     });
   }
 
+  test('agent observe view (fake browser): default hides text that cannot be acted on, keeps clickable <div> text, cuts long names in the output only, --full is the old list, hidden refs still act, fail open when DOMSnapshot errors', () => {
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_SNAPSHOT: 'ok', FAKE_CDP_EXTRA: '1' });
+    const plain = startFake('full', 'guid-user', { FAKE_CDP_EXTRA: '1' });   // the fake has no DOMSnapshot: the call fails
+    const broken = startFake('full', 'guid-user', { FAKE_CDP_SNAPSHOT: 'error', FAKE_CDP_EXTRA: '1' });
+    try {
+      const run = (f, args, extra = {}) => {
+        const home = run.homes.get(f) || (() => { const h = mkHome(); writeRegistry(h, { proj: externalEntry(f.port) }); run.homes.set(f, h); return h; })();
+        const r = cli(args, isoEnv(home, f.port, 'proj', extra));
+        assert.strictEqual(r.status, 0, `${args.join(' ')} exit ${r.status}: ${r.stderr}`);
+        return JSON.parse(r.stdout);
+      };
+      run.homes = new Map();
+      const URL = 'https://user.example/inbox';
+      run(fake, ['agent', 'act', '--url', URL]);
+      const view = run(fake, ['agent', 'observe']);
+      const names = view.actions.map((a) => a.name);
+      for (const n of ['Inbox', 'Compose', 'Archive', 'Search', 'Password', 'Open menu']) assert(names.includes(n), `${n} kept: ${names}`);
+      assert(!names.includes('3 unread messages'), `plain StaticText is hidden: ${names}`);
+      assert(!names.includes('Inside link'), `text inside a native link is hidden (the link is its own entry): ${names}`);
+      assert(/3 unread/.test(view.text), `the hidden text is still in text: ${view.text}`);
+      const longE = view.actions.find((a) => a.name.startsWith('Very long clickable name'));
+      assert(longE && longE.name.length === 80 && longE.name.endsWith('…'), `name cut to 79 + …: ${longE && longE.name.length}`);
+      const full = run(fake, ['agent', 'observe', '--full']);
+      const fullNames = full.actions.map((a) => a.name);
+      assert(fullNames.includes('3 unread messages') && fullNames.includes('Inside link'), `--full lists every entry: ${fullNames}`);
+      const fullLong = full.actions.find((a) => a.name.startsWith('Very long clickable name'));
+      assert(fullLong.name.length > 80, '--full does not cut names');
+      // refs are the same in both views: the view only thins the printed list
+      for (const a of view.actions) assert.strictEqual(full.actions.find((b) => b.name === a.name || b.ref === a.ref).ref, a.ref);
+      assert(view.token_estimate < full.token_estimate, `${view.token_estimate} < ${full.token_estimate}`);
+      // --full equals the pre-view list: on a fake whose snapshot call fails, default = --full = what step 1 printed
+      run(plain, ['agent', 'act', '--url', URL]);
+      const failOpen = run(plain, ['agent', 'observe']);
+      const cut = (a) => ({ ...a, name: a.name.length > 80 ? a.name.slice(0, 79) + '…' : a.name });
+      assert.deepStrictEqual(failOpen.actions, full.actions.map(cut), 'no usable DOMSnapshot: nothing is hidden (only the output name cut applies)');
+      const failErr = run(broken, ['agent', 'act', '--url', URL]) && run(broken, ['agent', 'observe']);
+      assert(failErr.actions.some((a) => a.name === '3 unread messages') && failErr.actions.some((a) => a.name === 'Inside link'),
+        'a CDP error from DOMSnapshot keeps every entry (fail open)');
+      // a hidden ref still works with act
+      const hidden = full.actions.find((a) => a.name === '3 unread messages');
+      const acted = run(fake, ['agent', 'act', '--ref', hidden.ref, '--action', 'click']);
+      assert(acted.url && 'changed' in acted, JSON.stringify(acted));
+      // rows format: [ref, role, name(, value)], opt-in by flag or env, objects by default
+      const rows = run(fake, ['agent', 'observe', '--rows']);
+      assert(rows.actions.every(Array.isArray), JSON.stringify(rows.actions[0]));
+      assert.deepStrictEqual(rows.actions.find((r) => r[2] === 'Compose'), [view.actions.find((a) => a.name === 'Compose').ref, 'link', 'Compose']);
+      const search = rows.actions.find((r) => r[2] === 'Search');
+      assert.deepStrictEqual([search.length, search[3]], [4, ''], 'a field with a value carries it as the 4th element');
+      assert.strictEqual(rows.actions.find((r) => r[2] === 'Archive').length, 3, 'no value: three elements');
+      const envRows = run(fake, ['agent', 'observe'], { CDPILOT_OBSERVE_FORMAT: 'rows' });
+      assert.deepStrictEqual(envRows.actions, rows.actions);
+      assert(!run(fake, ['agent', 'observe']).actions.some(Array.isArray), 'objects stay the default');
+      // --diff: added AND removed go through the view; a hidden ref is never listed as removed
+      run(fake, ['agent', 'reset']);
+      const before = run(fake, ['agent', 'observe']);
+      const hiddenRef = full.actions.find((a) => a.name === '3 unread messages').ref;
+      const act2 = run(fake, ['agent', 'act', '--url', 'https://example.com/']);
+      assert(act2.changed.added.every((a) => a.role !== 'StaticText'), `example.com text is hidden in added: ${JSON.stringify(act2.changed.added)}`);
+      assert(act2.changed.added.some((a) => a.name === 'More information...'), JSON.stringify(act2.changed.added));
+      assert(!act2.changed.removed.includes(hiddenRef), `a ref the model never saw is not "removed": ${JSON.stringify(act2.changed.removed)}`);
+      assert(act2.changed.removed.includes(before.actions.find((a) => a.name === 'Compose').ref), JSON.stringify(act2.changed.removed));
+      const act3 = run(fake, ['agent', 'act', '--url', URL, '--full']);
+      assert(act3.changed.added.some((a) => a.name === '3 unread messages') && act3.changed.removed.length >= 2,
+        `--full diff is unfiltered: ${JSON.stringify(act3.changed)}`);
+      const dRows = run(fake, ['agent', 'act', '--url', 'https://example.com/', '--rows']);
+      assert(dRows.changed.added.every(Array.isArray) && dRows.changed.added.some((r) => r[2] === 'More information...'), JSON.stringify(dRows.changed.added));
+    } finally { fake.stop(); plain.stop(); broken.stop(); }
+  });
+
+  test('agent run view (fake browser): a flow anchored on an entry the view hides still runs with 0 drift; drift output is filtered, --full is not', () => {
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_SNAPSHOT: 'ok' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const ok = (args, code = 0) => {
+        const r = cli(args, env);
+        assert.strictEqual(r.status, code, `${args.join(' ')} exit ${r.status}: ${r.stderr}\n${r.stdout}`);
+        return JSON.parse(r.stdout);
+      };
+      ok(['agent', 'act', '--url', 'https://user.example/inbox']);
+      const full = ok(['agent', 'observe', '--full']);
+      const hidden = full.actions.find((a) => a.name === '3 unread messages');
+      assert(!ok(['agent', 'observe']).actions.some((a) => a.name === hidden.name), 'the anchor target is hidden in the default view');
+      ok(['agent', 'act', '--ref', hidden.ref, '--action', 'click']);
+      const saved = ok(['agent', 'flow', 'save', 'hidden_anchor', '--last', '1']);
+      assert.strictEqual(saved.steps, 1);
+      const flowPath = path.join(home, 'projects', 'proj', 'flows', 'hidden_anchor.json');
+      const flow = JSON.parse(fs.readFileSync(flowPath, 'utf-8'));
+      assert.deepStrictEqual(flow.steps[0].anchor, { role: 'StaticText', name: '3 unread messages', nth: 0 });
+      const res = ok(['agent', 'run', 'hidden_anchor']);
+      assert.deepStrictEqual([res.status, res.steps], ['ok', 1], `0 drift: ${JSON.stringify(res)}`);
+      // drift: an anchor that is gone prints the page through the view
+      flow.steps[0].anchor.name = 'gone for good';
+      fs.writeFileSync(path.join(home, 'projects', 'proj', 'flows', 'moved_anchor.json'), JSON.stringify({ ...flow, name: 'moved_anchor' }));
+      const d = ok(['agent', 'run', 'moved_anchor'], 4);
+      assert.strictEqual(d.status, 'drift');
+      assert(d.actions.some((a) => a.name === 'Compose') && !d.actions.some((a) => a.name === '3 unread messages'), JSON.stringify(d.actions));
+      const dFull = ok(['agent', 'run', 'moved_anchor', '--full'], 4);
+      assert(dFull.actions.some((a) => a.name === '3 unread messages'), 'drift --full prints every entry');
+      const dRows = ok(['agent', 'run', 'moved_anchor', '--rows'], 4);
+      assert(dRows.actions.every(Array.isArray));
+    } finally { fake.stop(); }
+  });
+
+  test('mcp: browser_agent_observe takes a boolean full parameter that maps to --full (fake browser)', () => {
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_SNAPSHOT: 'ok' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const lines = [
+        { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+        { jsonrpc: '2.0', method: 'notifications/initialized' },
+        { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+        { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'browser_agent_act', arguments: { url: 'https://user.example/inbox' } } },
+        { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'browser_agent_observe', arguments: {} } },
+        { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'browser_agent_observe', arguments: { full: true } } },
+      ].map((m) => JSON.stringify(m)).join('\n') + '\n';
+      const r = spawnSync(process.execPath, [CLI, 'mcp'], {
+        input: lines, encoding: 'utf-8', timeout: 60000,
+        env: { ...process.env, ...env, CDPILOT_WEBMCP: '0', CDPILOT_MCP_TOOLS: '', CDPILOT_PROFILE: path.join(home, 'profile') },
+      });
+      assert.strictEqual(r.status, 0, r.stderr);
+      const msgs = r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+      const byId = (id) => msgs.find((m) => m.id === id);
+      const tool = byId(2).result.tools.find((t) => t.name === 'browser_agent_observe');
+      assert.strictEqual(tool.inputSchema.properties.full.type, 'boolean');
+      assert(/\[ref, role, name, value\?\]/.test(tool.description), 'the rows field order is documented in the tool description');
+      const json = (id) => JSON.parse(byId(id).result.content.find((c) => c.text.trim().startsWith('{')).text);
+      assert(!json(11).actions.some((a) => a.name === '3 unread messages'), 'default view hides plain text');
+      assert(json(12).actions.some((a) => a.name === '3 unread messages'), 'full:true lists every entry');
+    } finally { fake.stop(); }
+  });
+
+  test('agent observe view (unit): clickable rule, native-ancestor rule, container drop, name cut, view of a diff, fail open on a broken or timed-out DOMSnapshot', () => {
+    const { spawnSync } = require('child_process');
+    const os = require('os');
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-viewunit-'));
+    const script = `
+import asyncio, importlib.util, json
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+def snapshot(rows, clickable=()):
+    # rows: (type, tag, parent, backend id, {attr: value}, cursor)
+    st = []
+    def S(x):
+        if x not in st: st.append(x)
+        return st.index(x)
+    nodes = {"nodeType": [r[0] for r in rows], "nodeName": [S(r[1]) for r in rows], "parentIndex": [r[2] for r in rows],
+             "backendNodeId": [r[3] for r in rows],
+             "attributes": [[S(x) for kv in r[4].items() for x in kv] for r in rows],
+             "isClickable": {"index": list(clickable)}}
+    lay = [(i, r[5]) for i, r in enumerate(rows) if r[5]]
+    return {"documents": [{"nodes": nodes, "layout": {"nodeIndex": [i for i, _ in lay], "styles": [[S(c)] for _, c in lay]}}], "strings": st}
+
+rows = [(9, "#document", -1, 1, {}, None), (1, "BODY", 0, 2, {}, None),
+        (1, "DIV", 1, 10, {}, "pointer"), (3, "#text", 2, 11, {}, None),            # 11: pointer div text -> kept
+        (1, "DIV", 1, 12, {}, "pointer"), (1, "SPAN", 4, 13, {}, "pointer"), (3, "#text", 5, 14, {}, None),  # 14: parent also pointer, not a start -> hidden
+        (1, "A", 1, 15, {"href": "/x"}, "pointer"), (3, "#text", 7, 16, {}, None),  # 16: inside a[href] -> hidden
+        (1, "DIV", 1, 17, {"role": "button"}, "pointer"), (3, "#text", 9, 18, {}, None),  # 18: inside [role=button] -> hidden
+        (1, "DIV", 1, 19, {}, "auto"), (3, "#text", 11, 20, {}, None),              # 20: plain text -> hidden
+        (1, "DIV", 1, 21, {}, "auto"), (3, "#text", 13, 22, {}, None),              # 22: isClickable (no pointer) -> kept
+        (1, "LABEL", 1, 23, {}, "pointer"), (3, "#text", 15, 24, {}, None),         # 24: inside label -> hidden
+        (1, "DIV", 1, 25, {}, "pointer"), (1, "INPUT", 17, 26, {"type": "hidden"}, None), (3, "#text", 17, 27, {}, None)]  # 27: hidden input is not native -> kept
+res = snapshot(rows, clickable=[13])
+got = mod._agent_clickable_bids(res, [11, 14, 16, 18, 20, 22, 24, 27, 999])
+assert got == {11, 22, 27}, sorted(got)
+
+# the view: actions of an AX tree, hidden refs, fail open
+def node(i, role, name, bid, children=()):
+    return {"nodeId": str(i), "ignored": False, "role": {"value": role}, "name": {"value": name},
+            "backendDOMNodeId": bid, "childIds": [str(c) for c in children]}
+nodes = [node(1, "RootWebArea", "Page", 1, [2, 3, 5, 7]),
+         node(2, "heading", "Pricing", 2, [3]), node(3, "link", "Pricing", 3),       # heading's name = its kept child link -> heading dropped (C)
+         node(4, "StaticText", "Plain text", 20), node(5, "StaticText", "Open menu", 11),
+         node(6, "StaticText", "x" * 100, 22), node(7, "paragraph", "Alpha Beta", 40, [8, 9]),
+         node(8, "link", "Alpha", 41), node(9, "link", "Beta", 42), node(10, "paragraph", "Alpha Gamma", 43, [8, 11]),
+         node(11, "link", "Gamma", 44)]
+state = {"actions_map": {}, "ref_counter": 0}
+actions = mod._snapshot_to_actions(nodes, state)
+by = {a["name"]: a["ref"] for a in actions}
+calls = []
+async def fake_send(ws, cmds, timeout=15):
+    calls.append((cmds[0][1], timeout))
+    return {1: res}
+mod.cdp_send = fake_send
+hidden = asyncio.run(mod._agent_hidden_refs("ws://x", nodes, actions))
+assert by["Plain text"] in hidden, "plain text hidden"
+assert by["Open menu"] not in hidden and by["x" * 100] not in hidden, "clickable kept"
+heads = [a for a in actions if a["role"] == "heading"]
+assert heads[0]["ref"] in hidden, "C: heading whose name is its kept child's name is dropped"
+paras = {a["name"]: a["ref"] for a in actions if a["role"] == "paragraph"}
+assert paras["Alpha Beta"] in hidden, "C: container named after the concatenation of its kept children"
+assert paras["Alpha Gamma"] in hidden
+assert calls == [("DOMSnapshot.captureSnapshot", 2)], calls                           # one call, 2 s limit
+# fail open: an error reply, no reply, an exception, a reply without documents
+for bad in ({}, None, {"documents": "x", "strings": []}):
+    async def bad_send(ws, cmds, timeout=15, bad=bad): return {1: bad}
+    mod.cdp_send = bad_send
+    h = asyncio.run(mod._agent_hidden_refs("ws://x", nodes, actions))
+    assert by["Plain text"] not in h and by["Open menu"] not in h, ("fail open", bad)
+async def boom(ws, cmds, timeout=15): raise asyncio.TimeoutError()
+mod.cdp_send = boom
+h = asyncio.run(mod._agent_hidden_refs("ws://x", nodes, actions))
+assert by["Plain text"] not in h, "an exception keeps every non-container entry"
+
+# output entries: name cut in the output only, rows with and without value, no node id
+a = {"ref": "@1", "role": "textbox", "name": "n" * 90, "backend_node_id": 5, "value": ""}
+o = mod._agent_out_entry(a)
+assert len(o["name"]) == 80 and o["name"].endswith("…") and "backend_node_id" not in o and a["name"] == "n" * 90
+assert mod._agent_out_entry(a, full=True)["name"] == "n" * 90
+assert mod._agent_out_entry(a, rows=True) == ["@1", "textbox", "n" * 79 + "…", ""]
+assert mod._agent_out_entry({"ref": "@2", "role": "link", "name": "x", "backend_node_id": 6}, rows=True) == ["@2", "link", "x"]
+assert mod._agent_rows_wanted(False) is False
+# a diff through the view
+old = {"@1": {"ref": "@1", "role": "link", "name": "A", "backend_node_id": 1}, "@2": {"ref": "@2", "role": "StaticText", "name": "hid", "backend_node_id": 2}}
+new = [{"ref": "@1", "role": "link", "name": "A", "backend_node_id": 1, "value": "v"},
+       {"ref": "@3", "role": "StaticText", "name": "newhid", "backend_node_id": 3}, {"ref": "@4", "role": "link", "name": "B", "backend_node_id": 4}]
+base = mod._diff_snapshots(old, new)
+d = mod._agent_out_diff(base, old, ["@2"], new, ["@3"])
+assert d == {"added": [{"ref": "@4", "role": "link", "name": "B"}], "removed": [], "value_changed": ["@1:'v'"]}, d
+f = mod._agent_out_diff(base, old, ["@2"], new, ["@3"], full=True)
+assert [x["ref"] for x in f["added"]] == ["@3", "@4"] and f["removed"] == ["@2"], f
+print("ok")
+`;
+    const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
+      { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
+    assert.strictEqual(r.status, 0, `view unit test failed: ${r.stderr}`);
+    assert(/^ok/m.test(r.stdout), r.stdout);
+  });
+
+  test('agent observe view (unit, scale): _agent_clickable_bids on 19,000 nodes / 17,000 layout entries / 2,000 candidates returns the expected set in < 100 ms (document tables built once, ancestor walks memoised)', () => {
+    const { spawnSync } = require('child_process');
+    const os = require('os');
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-viewscale-'));
+    const script = `
+import importlib.util, time
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+st, idx = [], {}
+def S(x):
+    if x not in idx:
+        idx[x] = len(st); st.append(x)
+    return idx[x]
+nt, nn, par, bid, att, li, ls = [], [], [], [], [], [], []
+def add(t, tag, p, b, attrs=(), cur=None):
+    i = len(nt); nt.append(t); nn.append(S(tag)); par.append(p); bid.append(b)
+    att.append([S(x) for kv in attrs for x in kv])
+    if cur:
+        li.append(i); ls.append([S(cur)])
+    return i
+add(9, "#document", -1, 1); body = add(1, "BODY", 0, 2)
+cands, expected, clk, b = [], set(), [], 100
+for r in range(2000):
+    row = add(1, "DIV", body, b, (), "pointer" if r % 2 == 0 else "auto"); b += 1
+    holder = row
+    if r % 4 in (1, 2):                      # the text sits in a link: hidden
+        holder = add(1, "A", row, b, (("href", "/x"),), "pointer"); b += 1
+    add(3, "#text", holder, b); cands.append(b)
+    if r % 4 == 0 or (r % 4 == 3 and r % 5 == 0):   # pointer starts here / isClickable, not native
+        expected.add(b)
+    b += 1
+    if r % 5 == 0:
+        clk.append(row)
+    for _ in range(7):
+        add(1, "I", row, b, (), "auto"); b += 1
+res = {"documents": [{"nodes": {"nodeType": nt, "nodeName": nn, "parentIndex": par, "backendNodeId": bid,
+                                "attributes": att, "isClickable": {"index": clk}},
+                      "layout": {"nodeIndex": li, "styles": ls}}], "strings": st}
+assert len(nt) >= 19000 and len(li) >= 17000 and len(cands) == 2000, (len(nt), len(li), len(cands))
+best = None
+for _ in range(2):                           # a loaded machine gets one re-run
+    t = time.perf_counter(); got = mod._agent_clickable_bids(res, cands); ms = (time.perf_counter() - t) * 1000
+    best = ms if best is None else min(best, ms)
+    assert got == expected, (len(got), len(expected))
+    if ms < 100:
+        break
+assert best < 100, "%.1f ms" % best
+print("ok %.1f" % best)
+`;
+    const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
+      { encoding: 'utf8', timeout: 60000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
+    assert.strictEqual(r.status, 0, `scale unit test failed: ${r.stderr}`);
+    assert(/^ok/m.test(r.stdout), r.stdout);
+  });
+
   test('learned flows (fake browser): acts leave an anchored trail, flow save, known_flows, run with no model, placeholders, exit 4 on drift with the page', () => {
     // The thing a flow is for: the second time a site is driven, no model
     // reads the page. The fake serves the inbox tree (now with a password
@@ -8426,7 +8714,7 @@ out["observe"] = srv._execute_tool(3, "browser_agent_observe", {})
 out["launch"] = srv._execute_tool(4, "browser_launch", {})  # spawn-only by rule
 out["spawned"] = spawned
 real = mod.cmd_agent_observe
-async def hang(diff=False):
+async def hang(diff=False, full=False, rows=False):
     await asyncio.sleep(30)
 mod.cmd_agent_observe = hang
 srv.TOOL_TIMEOUT_S = 1
