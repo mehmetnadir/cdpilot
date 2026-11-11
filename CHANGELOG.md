@@ -4,7 +4,13 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`agent find "<text>" [--role r] [--max 20]`**: lists the entries of the whole page whose name contains the text (any case), as `{ref, role, name}` plus `total_matches`. It reads the full accessibility snapshot (the cut below does not apply), writes no trail, and its refs work with `agent act`; matched names go through the `injection_suspect` scan like `observe`. MCP: `browser_agent_find` (not in `--tools core`).
+- **`agent observe|act|run --all`** (MCP `browser_agent_observe` `all: true`) and **`CDPILOT_OBSERVE_MAX`** (default 400, `0` = no limit): see Changed.
+
 ### Changed
+- **`agent observe` / `act` / `run` print at most 400 entries.** On a page with more than 400 actionable entries the list is cut to the first 400 in accessibility-tree order (not DOM order: shallow nodes such as the page shell and footer come first) and a `truncated: {shown, total, hint}` note says so; 7 of 13 measured pages are over 400 (Python docs 589, Guardian 445), and the uncut lists cost 17,000-85,000 tokens (WHATWG parsing: 84,923 tokens, 5,111 entries). 37 of 40 measured targets were within the first 400. `--all` (or `CDPILOT_OBSERVE_MAX=0`) lifts the limit and keeps the default view; `--full` shows the hidden entries too and has no limit. The cut is output only: refs, `agent run` anchors and `agent act --ref` of a ref past the limit are unchanged, and the token measures (`saved_vs_full`, `tokens_avoided`) still come from the uncut list. In `agent act` / `observe --diff`, `added` and `removed` are each cut to the limit; after a URL change a `removed` list past the limit becomes `removed_count`. A drifted `agent run` prints the same cut observation.
+- **`actions_map` in `agent-state.json` keeps the first 8,000 refs** (it dropped the first 200 refs of any page over 1,000 entries, so `agent act --ref @1` failed there).
 - **`go` settles after 30 ms on a quiet page.** After `Page.loadEventFired`, if no request is in flight and none starts within 30 ms, the settle ends there instead of waiting for 100 ms of event silence (rule A stays for every other case, and with `network`, `har`, `console` or any WebSocket). Measured on 20 sites x 5: the rule fired on 32 of 80 loads (40 %), saving about 70 ms on those navigations only; in those loads no text changed between 30 and 100 ms ([`settle-t0-2026-11-11.md`](.claude/docs/olcum/settle-t0-2026-11-11.md)). Blind spot: a page that writes text 30-100 ms after load without any network request (0 in the sample); use `--network` or `wait` when that matters.
 
 ## [0.9.8] - 2026-11-11

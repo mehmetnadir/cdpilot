@@ -778,6 +778,10 @@ function showHelp() {
     CDPILOT_OBSERVE_FORMAT
                        rows: agent observe/act/run print actions as
                        [ref, role, name, value?] arrays (same as --rows)
+    CDPILOT_OBSERVE_MAX
+                       Most entries one agent observe/act/run list prints
+                       (default 400, AX order; 0 = no limit; --all / --full
+                       lift it for one call)
     CDPILOT_VAR_HOSTS  Hosts (comma-separated, host:port for another port)
                        an agent flow or replay step may type CDPILOT_VAR_* on
 
@@ -928,19 +932,25 @@ function showHelp() {
     stop-all           Stop all browser instances
 
   AI AGENT
-    agent observe [--diff] [--full] [--rows]
+    agent observe [--diff] [--full] [--all] [--rows]
                        Page state as numbered @refs (+text); --diff = only
-                       changes since last; --full = every entry (default
-                       hides text that cannot be acted on); --rows =
-                       [ref, role, name, value?] arrays
+                       changes since last; --full = every entry, hidden ones
+                       too, no size limit (default hides text that cannot be
+                       acted on and lists at most 400 entries in AX order,
+                       with a "truncated" note); --all = no size limit,
+                       default view; --rows = [ref, role, name, value?] arrays
+    agent find "<text>" [--role <role>] [--max 20]
+                       Entries of the whole page whose name contains <text>
+                       (any case): {ref, role, name} + total_matches; the
+                       refs work with agent act
     agent act --ref @N [--action click|type|fill|hover|submit] [--text X]
-                       Acts, prints the diff (also --full, --rows)
+                       Acts, prints the diff (also --full, --all, --rows)
     agent act --url URL
                        Navigates silently, prints the diff
     agent flow save <name> [--last N] | list | show <name> | delete <name>
                        Save the acts since the last navigation as a replayable
                        flow
-    agent run <name> [--var k=v] [--dry-run] [--full] [--rows]
+    agent run <name> [--var k=v] [--dry-run] [--full] [--all] [--rows]
                        Replay by anchors, no model; exit 4 on drift with the
                        page, 2 for a missing or refused variable
     canvas open|set|patch|stream|watch|events|list|close [--name N] [--allow-net host]
