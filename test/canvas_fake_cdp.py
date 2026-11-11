@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -35,7 +36,7 @@ class FakeWS:
     """In-process fake browser WebSocket recording CDP traffic and emitting events."""
 
     def __init__(self, patch_value=None, patch_missing=False, nav_error_text=None, swap_ctx_on=None,
-                 swap_reply_ok=False):
+                 swap_reply_ok=False, loader_swap_on=None, nav_no_loader=False, fail_child_method=None):
         self.sent = []
         self.q = asyncio.Queue()
         self.closed = False
@@ -54,18 +55,33 @@ class FakeWS:
         self.ctx_seq = 0
         self.cur_ctx = self._new_ctx_id()
         self.ctx_log = []                 # (method, uniqueContextId sent, current ctx at arrival)
+        self.loader_seq = 0
+        self.cur_loader = "LDR-0"
+        self.loader_swap_on = loader_swap_on  # 'reset': same frame + context, new loaderId (B3 D-1)
+        self.nav_no_loader = nav_no_loader    # Page.navigate reply without loaderId
+        self.fail_child_method = fail_child_method  # (method, sessionId) answered with an error
 
     def _new_ctx_id(self):
         self.ctx_seq += 1
         return f"UCTX-{self.ctx_seq}"
 
-    def swap_document(self, url="about:blank"):
-        """The page replaced the document: old context destroyed, new one created (real order)."""
+    def _new_loader(self):
+        self.loader_seq += 1
+        self.cur_loader = f"LDR-{self.loader_seq}"
+        return self.cur_loader
+
+    def swap_document(self, url="about:blank", loader=None, navigated=True):
+        """The page replaced the document: old context destroyed, new one created (real order).
+        navigated=False: a javascript: URL result document (measured 11.11 on Chrome 152: same
+        URL, same loaderId, no Page.frameNavigated; only the contexts are cleared and created)."""
         old = self.cur_ctx
         self.emit_event("Runtime.executionContextDestroyed", {
             "executionContextId": self.ctx_seq, "executionContextUniqueId": old})
         self.emit_event("Runtime.executionContextsCleared", {})
-        self.emit_event("Page.frameNavigated", {"frame": {"id": "FRM-1", "url": url}})
+        if navigated:
+            ldr = loader or self._new_loader()
+            self.cur_loader = ldr
+            self.emit_event("Page.frameNavigated", {"frame": {"id": "FRM-1", "url": url, "loaderId": ldr}})
         self.cur_url = url
         self.cur_ctx = self._new_ctx_id()
         self.emit_event("Runtime.executionContextCreated", {"context": {
@@ -80,6 +96,10 @@ class FakeWS:
         params = msg.get("params") or {}
         sid = msg.get("sessionId")
 
+        if self.fail_child_method and (method, sid) == tuple(self.fail_child_method):
+            self.q.put_nowait(json.dumps({"id": cid, "sessionId": sid, "error": {
+                "code": -32000, "message": "simulated child guard failure"}}))
+            return
         if method == "Target.createBrowserContext":
             self._reply(cid, {"browserContextId": "CTX-1"})
         elif method == "Target.createTarget":
@@ -110,17 +130,23 @@ class FakeWS:
                 "frameId": "FRM-1",
                 "resourceType": "Document",
             }, sid=sid or "SES-1")
-            self._reply(cid, {"frameId": "FRM-1", "loaderId": "LDR-1"}, sid=sid)
-            self.swap_document(url)
+            ldr = self._new_loader()
+            self._reply(cid, {"frameId": "FRM-1"} if self.nav_no_loader else {"frameId": "FRM-1", "loaderId": ldr},
+                        sid=sid)
+            self.swap_document(url, loader=ldr)
             self.emit_event("Page.loadEventFired", {"timestamp": 1.0}, sid=sid or "SES-1")
         elif method == "Page.getFrameTree":
             u = self.frame_tree_url or self.cur_url
-            self._reply(cid, {"frameTree": {"frame": {"id": "FRM-1", "url": u}}}, sid=sid)
+            self._reply(cid, {"frameTree": {"frame": {"id": "FRM-1", "url": u, "loaderId": self.cur_loader}}},
+                        sid=sid)
         elif method == "Runtime.evaluate":
             expr = params.get("expression") or ""
             ucid = params.get("uniqueContextId")
             self.ctx_log.append((expr[:40], ucid, self.cur_ctx))
             kind = "patch" if "__cdpilotCanvas.patch(" in expr else ("reset" if ".reset()" in expr else "")
+            if self.loader_swap_on and kind == self.loader_swap_on:
+                self.loader_swap_on = None
+                self._new_loader()        # another document load in the same frame; context kept
             if self.swap_ctx_on and kind == self.swap_ctx_on:
                 self.swap_ctx_on = None
                 self.swap_document("about:blank")
@@ -250,7 +276,7 @@ class FakeCDPServer:
 
     def _serve_conn(self, conn):
         conn_contexts = set()
-        doc = {"url": "about:blank", "ctx": "UCTX-0", "n": 0}
+        doc = {"url": "about:blank", "ctx": "UCTX-0", "n": 0, "loader": "L-0"}
         try:
             conn.settimeout(30.0)
             head = b""
@@ -340,14 +366,15 @@ class FakeCDPServer:
                             "resourceType": "Document",
                         },
                     })
-                    self._ws_send(conn, {"id": cid, "sessionId": sid,
-                                         "result": {"frameId": "FRAME-1", "loaderId": "L-1"}})
                     doc["n"] += 1
                     doc["url"] = url
                     doc["ctx"] = f"UCTX-{doc['n']}"
+                    doc["loader"] = f"L-{doc['n']}"
+                    self._ws_send(conn, {"id": cid, "sessionId": sid,
+                                         "result": {"frameId": "FRAME-1", "loaderId": doc["loader"]}})
                     for ev, pr in (
                         ("Runtime.executionContextsCleared", {}),
-                        ("Page.frameNavigated", {"frame": {"id": "FRAME-1", "url": url}}),
+                        ("Page.frameNavigated", {"frame": {"id": "FRAME-1", "url": url, "loaderId": doc["loader"]}}),
                         ("Runtime.executionContextCreated", {"context": {
                             "id": doc["n"], "uniqueId": doc["ctx"], "origin": "null",
                             "auxData": {"isDefault": True, "type": "default", "frameId": "FRAME-1"}}}),
@@ -356,7 +383,7 @@ class FakeCDPServer:
                         self._ws_send(conn, {"sessionId": sid, "method": ev, "params": pr})
                     continue
                 elif method == "Page.getFrameTree":
-                    res = {"frameTree": {"frame": {"id": "FRAME-1", "url": doc["url"]}}}
+                    res = {"frameTree": {"frame": {"id": "FRAME-1", "url": doc["url"], "loaderId": doc["loader"]}}}
                 elif method == "Runtime.evaluate":
                     expr = params.get("expression") or ""
                     if params.get("uniqueContextId") not in (None, doc["ctx"]):
@@ -768,6 +795,158 @@ def scenario_proof_and_binding(mod):
                 out["d6_" + label] = await host.handle_op({"op": "patch", "html": "<p>a</p>", "final": True})
             finally:
                 await _stop_reader(reader)
+        return out
+
+    return asyncio.run(_run())
+
+
+def scenario_b3_defense(mod):
+    """B3 (second review): own browser context with a dead proxy (O-1, D-4, D-5), foreign page
+    targets of the canvas context closed (D-4), writes bound to frameId + loaderId +
+    uniqueContextId (D-1, D-2)."""
+
+    class _NoCtxWS(FakeWS):
+        async def send(self, raw):
+            msg = json.loads(raw)
+            if msg.get("method") == "Target.createBrowserContext":
+                self.sent.append(msg)
+                self._reply(msg["id"], {})
+                return
+            await super().send(raw)
+
+    async def _probe(port):
+        try:
+            r, w = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), 0.5)
+        except (OSError, asyncio.TimeoutError) as e:
+            return type(e).__name__
+        w.close()
+        return "connected"
+
+    async def _run():
+        out = {}
+        # (1) own context, dead proxy, discover targets on the browser connection only
+        ws = FakeWS()
+        host, reader = await _start_host(mod, ws, allow_net=("api.example.com", "cdn.example.org"))
+        try:
+            await host.setup()
+            await asyncio.sleep(0.01)
+            out["setup"] = [(m["method"], m.get("sessionId"), m.get("params")) for m in ws.sent
+                            if m["method"].startswith("Target.")]
+            out["proxy_port"] = host.dead_proxy_port
+            out["proxy_probe"] = await _probe(host.dead_proxy_port)
+            out["proven"] = {"loader": host.loader_id, "nav_loader": host.nav_loader_id,
+                             "fake_loader": ws.cur_loader, "frame": host.frame_id}
+
+            # (2) popups: page targets of the canvas context the host did not create are closed
+            ws.sent.clear()
+            for sid, info in (
+                (None, {"targetId": "TGT-POP", "type": "page", "browserContextId": "CTX-1",
+                        "url": "http://127.0.0.1:1/blob_popup"}),
+                (None, {"targetId": "TGT-POP", "type": "page", "browserContextId": "CTX-1",
+                        "url": "http://127.0.0.1:1/blob_popup"}),
+                (None, {"targetId": "TGT-ELSE", "type": "page", "browserContextId": "CTX-OTHER", "url": "x"}),
+                (None, {"targetId": "TGT-1", "type": "page", "browserContextId": "CTX-1",
+                        "url": host.canvas_url}),
+                (None, {"targetId": "TGT-IF", "type": "iframe", "browserContextId": "CTX-1", "url": "y"}),
+                ("SES-1", {"targetId": "TGT-SES", "type": "page", "browserContextId": "CTX-1", "url": "z"}),
+            ):
+                ws.emit_event("Target.targetCreated", {"targetInfo": info}, sid=sid)
+            ws.emit_event("Target.targetInfoChanged", {"targetInfo": {
+                "targetId": "TGT-POP2", "type": "page", "browserContextId": "CTX-1", "url": "about:blank"}},
+                sid=None)
+            await asyncio.sleep(0.05)
+            out["popup_closes"] = [m["params"].get("targetId") for m in ws.sent
+                                   if m["method"] == "Target.closeTarget"]
+            out["popup_events"] = [e for e in _host_events(host) if e["type"] == "blocked"
+                                   and (e.get("data") or {}).get("reason") == "popup"]
+            out["host_alive"] = not host.stop_event.is_set()
+            await host.close_cdp()
+            out["proxy_sock_after_close"] = host.dead_proxy_sock is None
+        finally:
+            await _stop_reader(reader)
+
+        # (3) no browserContextId -> setup fails; createTarget is never sent (no default context)
+        ws = _NoCtxWS()
+        host, reader = await _start_host(mod, ws)
+        try:
+            try:
+                await host.setup()
+                out["noctx"] = {"code": 0}
+            except mod.CanvasError as e:
+                out["noctx"] = {"code": e.code, "msg": str(e)}
+            out["noctx_methods"] = [m["method"] for m in ws.sent]
+        finally:
+            await _stop_reader(reader)
+
+        # (4) Page.navigate without loaderId -> setup fails closed (code 1)
+        ws = FakeWS(nav_no_loader=True)
+        host, reader = await _start_host(mod, ws)
+        try:
+            try:
+                await host.setup()
+                out["noloader"] = {"code": 0}
+            except mod.CanvasError as e:
+                out["noloader"] = {"code": e.code, "msg": str(e)}
+        finally:
+            await _stop_reader(reader)
+
+        # (5) D-1: same frame + same context, new loaderId between the proof and the write
+        ws = FakeWS(loader_swap_on="reset")
+        host, reader = await _start_host(mod, ws)
+        try:
+            await host.setup()
+            await asyncio.sleep(0.01)
+            ws.sent.clear()
+            out["d1_set"] = await host.handle_op({"op": "set", "html": "<p>secret</p>"})
+            out["d1_methods"] = [m["method"] for m in ws.sent]
+            ws.sent.clear()
+            out["d1_set_again"] = await host.handle_op({"op": "set", "html": "<p>ok</p>"})
+            out["d1_again_methods"] = [m["method"] for m in ws.sent]
+            out["d1_nav_event"] = any(e["type"] == "nav" for e in _host_events(host))
+        finally:
+            await _stop_reader(reader)
+
+        # (6) D-2: javascript: URL result document (same URL, same loaderId, new context only)
+        for op in ("set", "patch"):
+            ws = FakeWS()
+            host, reader = await _start_host(mod, ws)
+            try:
+                await host.setup()
+                await asyncio.sleep(0.01)
+                loader0, ctx0 = ws.cur_loader, ws.cur_ctx
+                ws.swap_document(host.canvas_url, navigated=False)
+                await asyncio.sleep(0.01)
+                swap = {"same_url": ws.cur_url == host.canvas_url, "same_loader": ws.cur_loader == loader0,
+                        "new_ctx": ws.cur_ctx != ctx0}
+                ws.sent.clear()
+                res = await host.handle_op({"op": op, "html": "<p>secret</p>", "final": True})
+                methods = [m["method"] for m in ws.sent]
+                ws.sent.clear()
+                again = await host.handle_op({"op": op, "html": "<p>ok</p>", "final": True})
+                out["d2_" + op] = {"res": res, "methods": methods, "swap": swap, "again": again}
+            finally:
+                await _stop_reader(reader)
+
+        # (7) the page navigates itself to the canvas URL: the skeleton, but not the host's load
+        ws = FakeWS()
+        host, reader = await _start_host(mod, ws)
+        try:
+            await host.setup()
+            await asyncio.sleep(0.01)
+            ws.swap_document(host.canvas_url)          # frameNavigated, canvas URL, foreign loaderId
+            await asyncio.sleep(0.01)
+            ws.sent.clear()
+            out["foreign_loader_set"] = await host.handle_op({"op": "set", "html": "<p>secret</p>"})
+            out["foreign_loader_methods"] = [m["method"] for m in ws.sent]
+            ws.sent.clear()
+            out["foreign_loader_again"] = await host.handle_op({"op": "set", "html": "<p>ok</p>"})
+        finally:
+            await _stop_reader(reader)
+
+        out["bypass"] = {
+            "none": mod._canvas_proxy_bypass(()),
+            "two": mod._canvas_proxy_bypass(("api.example.com", "cdn.example.org")),
+        }
         return out
 
     return asyncio.run(_run())
@@ -1206,19 +1385,33 @@ def scenario_cli_and_socket_integration(mod):
 E2E_HTTP_VECTORS = (
     "fetch", "img", "script", "prefetch", "prefetch_static", "iframe", "ws", "window_open",
     "ping", "a_nav", "form", "location", "meta_refresh", "data_nav", "blob_nav", "history_back",
+    # B3 (second review: O-1, D-4)
+    "specrules", "specrules_prerender", "blob_popup", "jsurl_popup", "srcdoc_popup",
 )
 E2E_TCP_VECTORS = ("preconnect", "preconnect_static")
-E2E_UDP_VECTORS = ("webrtc_stun", "webrtc_turn", "webrtc_iframe")
+E2E_UDP_VECTORS = ("webrtc_stun", "webrtc_turn", "webrtc_iframe",
+                   "webrtc_srcdoc", "webrtc_srcdoc_sandbox", "webrtc_srcdoc_csp")   # B3 D-3
+# B3 D-4: each runs as its own fixture mode; the test clicks the derived document's button.
+E2E_POPUP_VECTORS = ("blob_popup", "jsurl_popup", "srcdoc_popup")
 E2E_DNS_VECTORS = ("dns_prefetch", "dns_prefetch_static")
 E2E_VECTORS = E2E_HTTP_VECTORS + E2E_TCP_VECTORS + E2E_UDP_VECTORS + E2E_DNS_VECTORS
 UNMEASURABLE = {
-    "dns_prefetch": "DNS sorgusu sistem çözücüsüne gider; yerel dinleyici onu göremez",
-    "dns_prefetch_static": "DNS sorgusu sistem çözücüsüne gider; yerel dinleyici onu göremez",
+    # B3 D-5: the guard for these hints is the OTR browser context itself. Chrome starts no
+    # LoadingPredictor (preconnect + DNS hints) in an off-the-record profile, and every
+    # Target.createBrowserContext context is OTR: the canvas context and the counter context.
+    # The canvas response header X-DNS-Prefetch-Control: off is an extra layer only.
+    "dns_prefetch": "OTR bağlamı kapatır (LoadingPredictor OTR'de yok); DNS sorgusu zaten sistem "
+                    "çözücüsüne gider, yerel dinleyici göremez; X-DNS-Prefetch-Control: off ek katman",
+    "dns_prefetch_static": "OTR bağlamı kapatır (LoadingPredictor OTR'de yok); DNS sorgusu zaten sistem "
+                           "çözücüsüne gider, yerel dinleyici göremez; X-DNS-Prefetch-Control: off ek katman",
     "data_nav": "Chrome sayfanın başlattığı üst düzey data: gezinmesini kendisi engeller",
-    # Measured 11.11 on the shared Chrome 152 headless: 0 connections in 2 of 2 unguarded runs.
-    # If a CI browser opens them, the test prints the entry as stale and it can be removed.
-    "preconnect": "Chrome 152 headless ipucuna rağmen bağlantı açmadı (karşı deney 2/2 koşuda 0)",
-    "preconnect_static": "Chrome 152 headless ipucuna rağmen bağlantı açmadı (karşı deney 2/2 koşuda 0)",
+    # Measured 11.11 on the shared Chrome 152 headless: 0 connections in every unguarded run,
+    # because the counter context is OTR as well. A non-OTR counter would need the default
+    # context, which the e2e never touches. If a browser opens them, the entry is printed stale.
+    "preconnect": "OTR bağlamı kapatır (LoadingPredictor OTR'de yok; karşı deney de OTR bağlamında, "
+                  "her koşuda 0); X-DNS-Prefetch-Control: off ek katman",
+    "preconnect_static": "OTR bağlamı kapatır (LoadingPredictor OTR'de yok; karşı deney de OTR bağlamında, "
+                         "her koşuda 0); X-DNS-Prefetch-Control: off ek katman",
 }
 
 
@@ -1354,7 +1547,7 @@ class E2EListeners:
                 s.close()
 
 
-def e2e_render_fixture(lst, blob_delay_ms):
+def e2e_render_fixture(lst, blob_delay_ms, mode="main"):
     with open(os.path.join(HERE, "fixtures", "canvas", "exfil.html"), "r", encoding="utf-8") as f:
         html = f.read()
     for k, v in (("__HOST__", lst.ip), ("__HTTP_PORT__", lst.http_port),
@@ -1362,9 +1555,59 @@ def e2e_render_fixture(lst, blob_delay_ms):
                  ("__PCS_PORT__", lst.tcp_ports["preconnect_static"]),
                  ("__UDP_STUN__", lst.udp_ports["webrtc_stun"]),
                  ("__UDP_TURN__", lst.udp_ports["webrtc_turn"]),
-                 ("__UDP_IFRAME__", lst.udp_ports["webrtc_iframe"])):
+                 ("__UDP_IFRAME__", lst.udp_ports["webrtc_iframe"]),
+                 ("__UDP_SRCDOC__", lst.udp_ports["webrtc_srcdoc"]),
+                 ("__UDP_SRCDOC_SB__", lst.udp_ports["webrtc_srcdoc_sandbox"]),
+                 ("__UDP_SRCDOC_CSP__", lst.udp_ports["webrtc_srcdoc_csp"])):
         html = html.replace(k, str(v))
-    return f"<script>window.__EXFIL_BLOB_DELAY__={int(blob_delay_ms)};</script>\n" + html
+    if mode != "main":
+        # A popup mode has only its derived document: no speculation rules in its head.
+        html = _re_specrules.sub("", html)
+    return (f"<script>window.__EXFIL_BLOB_DELAY__={int(blob_delay_ms)};"
+            f"window.__EXFIL_MODE__={json.dumps(mode)};</script>\n" + html)
+
+
+_re_specrules = re.compile(r'<script type="speculationrules">.*?</script>', re.S)
+
+
+async def e2e_popup_click(b, sid, ctx, mode, lst, phase, wait_s):
+    """B3 D-4: wait for the derived document, click its full-page button with a real input
+    event (user activation), then count listener hits and page targets created in ctx."""
+    want = "f" if mode == "srcdoc_popup" else "b"
+    ready, t_end = "", time.monotonic() + 20.0
+    while time.monotonic() < t_end:
+        with contextlib.suppress(Exception):
+            pr = await b.call("Runtime.evaluate", {
+                "expression": 'document.getElementById("b")?"b":(document.querySelector("iframe")?"f":"")',
+                "returnByValue": True}, sid, timeout=5)
+            ready = (pr.get("result") or {}).get("value") or ""
+        if ready == want:
+            break
+        await asyncio.sleep(0.2)
+    if ready == "f":
+        await asyncio.sleep(1.0)          # the srcdoc document installs its own click handler
+    doc_url = None
+    with contextlib.suppress(Exception):
+        doc_url = (await b.call("Page.getFrameTree", {}, sid, timeout=5))["frameTree"]["frame"].get("url")
+    created0 = len(b.created)
+    for typ in ("mouseMoved", "mousePressed", "mouseReleased"):
+        params = {"type": typ, "x": 100, "y": 100}
+        if typ != "mouseMoved":
+            params.update(button="left", clickCount=1)
+        with contextlib.suppress(Exception):
+            await b.call("Input.dispatchMouseEvent", params, sid, timeout=10)
+    t_end = time.monotonic() + max(6.0, wait_s)
+    while time.monotonic() < t_end and not lst.snapshot(phase).get(mode):
+        await asyncio.sleep(0.2)
+    await asyncio.sleep(1.5)
+    new_ids = [t.get("targetId") for t in b.created[created0:]
+               if t.get("browserContextId") == ctx and t.get("type") == "page"]
+    left = 0
+    with contextlib.suppress(Exception):
+        infos = (await b.call("Target.getTargets", {}, timeout=10)).get("targetInfos") or []
+        left = sum(1 for t in infos if t.get("targetId") in new_ids)
+    return {"ready": ready, "doc_url": (doc_url or "")[:60], "targets_created": len(new_ids),
+            "targets_left": left, "hits": lst.snapshot(phase).get(mode, 0)}
 
 
 class E2EBrowser:
@@ -1375,18 +1618,42 @@ class E2EBrowser:
         self.seq = 0
         self.pending = {}
         self.net_failed = []             # diagnostics: Network.loadingFailed of the test's own tabs
+        self.created = []                # Target.targetCreated targetInfo (setDiscoverTargets)
+        self.preload = []                # B3 O-1: Preload.* status events, per session
+        self.counter_sids = set()
         self.reader = asyncio.create_task(self._read())
 
     async def _read(self):
         while True:
-            msg = json.loads(await self.ws.recv())
-            if msg.get("method") == "Network.loadingFailed" and len(self.net_failed) < 50:
-                p = msg.get("params") or {}
-                self.net_failed.append(f"{p.get('type')}: {p.get('errorText')} {p.get('blockedReason') or ''}".strip())
-                continue
-            fut = self.pending.pop(msg.get("id"), None)
-            if fut is not None and not fut.done():
-                fut.set_result(msg)
+            try:
+                msg = json.loads(await self.ws.recv())
+                self._on_msg(msg)
+            except (ValueError, TypeError, AttributeError, KeyError):
+                continue              # a diagnostics bug must never stall the test's CDP calls
+
+    def _on_msg(self, msg):
+        method = msg.get("method") or ""
+        if method == "Network.loadingFailed" and len(self.net_failed) < 50:
+            p = msg.get("params") or {}
+            self.net_failed.append(f"{p.get('type')}: {p.get('errorText')} {p.get('blockedReason') or ''}".strip())
+            return
+        if method == "Target.targetCreated":
+            self.created.append((msg.get("params") or {}).get("targetInfo") or {})
+            return
+        if method in ("Preload.prefetchStatusUpdated", "Preload.prerenderStatusUpdated") \
+                and len(self.preload) < 60:
+            p = msg.get("params") or {}
+            self.preload.append({
+                "session": "counter" if msg.get("sessionId") in self.counter_sids else "canvas",
+                "event": method.split(".", 1)[1],
+                "url": str(p.get("prefetchUrl") or (p.get("key") or {}).get("url") or "")[-40:],
+                "status": p.get("status"),
+                "detail": p.get("prefetchStatus") or p.get("prerenderStatus") or p.get("disallowedMojoInterface"),
+            })
+            return
+        fut = self.pending.pop(msg.get("id"), None)
+        if fut is not None and not fut.done():
+            fut.set_result(msg)
 
     async def call(self, method, params=None, sid=None, timeout=60.0):
         self.seq += 1
@@ -1404,11 +1671,14 @@ class E2EBrowser:
 
     async def grant_local_network(self, ctx):
         """Both runs get the same Local Network Access grant, so a 0 in the guarded run is not
-        Chrome's LNA prompt being denied in headless mode."""
-        with contextlib.suppress(Exception):
+        Chrome's LNA prompt being denied in headless mode. Returns 'ok' or the error (diagnostics)."""
+        try:
             await self.call("Browser.grantPermissions", {
                 "permissions": ["localNetworkAccess", "localNetwork", "loopbackNetwork"],
                 "browserContextId": ctx})
+            return "ok"
+        except Exception as e:
+            return str(e)[:160]
 
 
 def run_e2e(py_path, cli_js_path, cdp_hostport):
@@ -1428,6 +1698,8 @@ def run_e2e(py_path, cli_js_path, cdp_hostport):
                   b"<script>setTimeout(function(){history.back();},50);</script></body></html>")
     lst = E2EListeners(listen_ip, {"/hist_start.html": hist_start})
     lst.pages["/counter.html"] = e2e_render_fixture(lst, 3000).encode("utf-8")
+    for mode in E2E_POPUP_VECTORS:
+        lst.pages[f"/counter_{mode}.html"] = e2e_render_fixture(lst, 60000, mode).encode("utf-8")
     measurable = [v for v in E2E_VECTORS if v not in UNMEASURABLE]
     hist_payload = (f'<script>location.href="http://{listen_ip}:{lst.http_port}/history_back";</script>'
                     "<p>history payload</p>")
@@ -1464,18 +1736,35 @@ def run_e2e(py_path, cli_js_path, cdp_hostport):
             async with websockets.connect(browser_ws, max_size=64 * 1024 * 1024, ping_interval=None) as ws:
                 b = E2EBrowser(ws)
                 ctx = (await b.call("Target.createBrowserContext", {"disposeOnDetach": True}))["browserContextId"]
-                res = {}
+                res = {"grant": [], "navigate_s": []}
+                extra_ctx = []
                 try:
-                    await b.grant_local_network(ctx)
-                    want = [v for v in measurable if v != "history_back"]
-                    # Two attempts: a loaded machine can stall one page load (seen 11.11, load ~100).
-                    for attempt in (1, 2):
-                        tid = (await b.call("Target.createTarget", {"url": "about:blank", "browserContextId": ctx}))["targetId"]
+                    res["grant"].append(await b.grant_local_network(ctx))
+                    await b.call("Target.setDiscoverTargets", {"discover": True})
+                    want = [v for v in measurable if v != "history_back" and v not in E2E_POPUP_VECTORS]
+                    # Three attempts: the shared, loaded browser can stall a page load or its
+                    # WebRTC / blob vectors (seen 11.11 at load ~100-130: navigate held 60 s; the
+                    # same code hit every vector minutes later). The third uses a fresh context.
+                    for attempt in (1, 2, 3):
+                        actx = ctx
+                        if attempt == 3:
+                            actx = (await b.call("Target.createBrowserContext", {"disposeOnDetach": True}))["browserContextId"]
+                            extra_ctx.append(actx)
+                            res["grant"].append(await b.grant_local_network(actx))
+                        tid = (await b.call("Target.createTarget", {"url": "about:blank", "browserContextId": actx}))["targetId"]
                         sid = (await b.call("Target.attachToTarget", {"targetId": tid, "flatten": True}))["sessionId"]
+                        b.counter_sids.add(sid)
                         await b.call("Page.enable", {}, sid)
                         await b.call("Runtime.enable", {}, sid)
                         await b.call("Network.enable", {}, sid)
-                        await b.call("Page.navigate", {"url": f"http://{listen_ip}:{lst.http_port}/counter.html"}, sid)
+                        with contextlib.suppress(Exception):
+                            await b.call("Preload.enable", {}, sid)
+                        # A loaded machine can hold the navigate reply; the poll below decides.
+                        t_nav = time.monotonic()
+                        with contextlib.suppress(Exception):
+                            await b.call("Page.navigate", {"url": f"http://{listen_ip}:{lst.http_port}/counter.html"},
+                                         sid, timeout=45)
+                        res["navigate_s"].append(round(time.monotonic() - t_nav, 1))
                         deadline = time.monotonic() + 45.0
                         while time.monotonic() < deadline:
                             snap = lst.snapshot("counter")
@@ -1510,8 +1799,23 @@ def run_e2e(py_path, cli_js_path, cdp_hostport):
                         t_end = time.monotonic() + 10.0
                         while time.monotonic() < t_end and not lst.snapshot("counter").get("history_back"):
                             await asyncio.sleep(0.2)
+                    # B3 D-4: derived document + real click -> window.open, one tab per mode
+                    res["popup"] = {}
+                    for mode in E2E_POPUP_VECTORS:
+                        tid3 = (await b.call("Target.createTarget", {"url": "about:blank", "browserContextId": ctx}))["targetId"]
+                        sid3 = (await b.call("Target.attachToTarget", {"targetId": tid3, "flatten": True}))["sessionId"]
+                        b.counter_sids.add(sid3)
+                        await b.call("Page.enable", {}, sid3)
+                        with contextlib.suppress(Exception):
+                            await b.call("Page.navigate", {"url": f"http://{listen_ip}:{lst.http_port}/counter_{mode}.html"},
+                                         sid3, timeout=45)
+                        res["popup"][mode] = await e2e_popup_click(b, sid3, ctx, mode, lst, "counter", 6.0)
                 finally:
                     res["net_failed"] = list(b.net_failed)
+                    res["preload"] = list(b.preload)
+                    for c in extra_ctx:
+                        with contextlib.suppress(Exception):
+                            await b.call("Target.disposeBrowserContext", {"browserContextId": c})
                     with contextlib.suppress(Exception):
                         await b.call("Target.disposeBrowserContext", {"browserContextId": ctx})
                     b.reader.cancel()
@@ -1535,30 +1839,52 @@ def run_e2e(py_path, cli_js_path, cdp_hostport):
         with open(reg_path, "r", encoding="utf-8") as f:
             reg = json.load(f)
 
-        async def _grant_canvas():
-            async with websockets.connect(browser_ws, max_size=16 * 1024 * 1024, ping_interval=None) as ws:
-                b = E2EBrowser(ws)
-                try:
-                    await b.grant_local_network(reg["browserContextId"])
-                finally:
-                    b.reader.cancel()
-        asyncio.run(_grant_canvas())
-
         def req(msg, timeout=60.0):
             return mod._canvas_request("e2e", msg, timeout=timeout)
 
-        set1 = req({"op": "set", "html": e2e_render_fixture(lst, 60000)})
-        time.sleep(wait_s)
-        set2 = req({"op": "set", "html": e2e_render_fixture(lst, 10)})
-        time.sleep(wait_s)
-        # D1: history.back() must not leave the canvas; the next write must land in the canvas.
-        benign = req({"op": "set", "html": "<p>benign</p>"})
-        if not benign.get("ok"):
-            benign = req({"op": "set", "html": "<p>benign</p>"})
-        hist_set = req({"op": "set", "html": "<script>setTimeout(function(){history.back();},20);</script>"})
-        time.sleep(2.0)
-        hist_payload_set = req({"op": "set", "html": hist_payload})
-        time.sleep(max(3.0, wait_s / 2))
+        async def _guarded():
+            """The test's own session on the canvas page: Preload log (O-1) and the D-4 clicks.
+            It never enables Fetch or changes the page; the host's guards stay the only guards."""
+            async with websockets.connect(browser_ws, max_size=16 * 1024 * 1024, ping_interval=None) as ws:
+                b = E2EBrowser(ws)
+                g = {}
+                try:
+                    await b.grant_local_network(reg["browserContextId"])
+                    await b.call("Target.setDiscoverTargets", {"discover": True})
+                    csid = (await b.call("Target.attachToTarget", {
+                        "targetId": reg["targetId"], "flatten": True}))["sessionId"]
+                    with contextlib.suppress(Exception):
+                        await b.call("Preload.enable", {}, csid)
+                    g["set1"] = await asyncio.to_thread(req, {"op": "set", "html": e2e_render_fixture(lst, 60000)})
+                    await asyncio.sleep(wait_s)
+                    g["set2"] = await asyncio.to_thread(req, {"op": "set", "html": e2e_render_fixture(lst, 10)})
+                    await asyncio.sleep(wait_s)
+                    g["popup"] = {}
+                    for mode in E2E_POPUP_VECTORS:
+                        html = e2e_render_fixture(lst, 60000, mode)
+                        r = await asyncio.to_thread(req, {"op": "set", "html": html})
+                        if not r.get("ok"):      # the previous derived document: refuse + reload once
+                            r = await asyncio.to_thread(req, {"op": "set", "html": html})
+                        pr = await e2e_popup_click(b, csid, reg["browserContextId"], mode, lst, "guarded", wait_s)
+                        pr["set_ok"] = bool(r.get("ok"))
+                        g["popup"][mode] = pr
+                    # D1: history.back() must not leave the canvas; the next write must land in the canvas.
+                    g["benign"] = await asyncio.to_thread(req, {"op": "set", "html": "<p>benign</p>"})
+                    if not g["benign"].get("ok"):
+                        g["benign"] = await asyncio.to_thread(req, {"op": "set", "html": "<p>benign</p>"})
+                    g["hist_set"] = await asyncio.to_thread(req, {
+                        "op": "set", "html": "<script>setTimeout(function(){history.back();},20);</script>"})
+                    await asyncio.sleep(2.0)
+                    g["hist_payload_set"] = await asyncio.to_thread(req, {"op": "set", "html": hist_payload})
+                    await asyncio.sleep(max(3.0, wait_s / 2))
+                finally:
+                    g["preload"] = list(b.preload)
+                    b.reader.cancel()
+                return g
+
+        g = asyncio.run(_guarded())
+        set1, set2, benign = g["set1"], g["set2"], g["benign"]
+        hist_set, hist_payload_set = g["hist_set"], g["hist_payload_set"]
         ev_reply = req({"op": "events", "after": 0, "max": 100})
         events = ev_reply.get("events") or []
         nxt = ev_reply.get("next") or 0
@@ -1574,6 +1900,38 @@ def run_e2e(py_path, cli_js_path, cdp_hostport):
         for e in events:
             if e.get("src") == "page" and e.get("action") == "exfil":
                 page_guarded[e.get("id")] = e.get("data")
+
+        # (2b) B3: `--allow-net` hosts still reach the network through the dead-proxy context;
+        # any other https host is still blocked.
+        net_probe = {"skipped": None}
+        try:
+            urllib.request.urlopen("https://example.com/", timeout=15).read(64)
+        except Exception as e:
+            net_probe["skipped"] = f"bu makineden https://example.com erişilemiyor ({type(e).__name__})"
+        if not net_probe["skipped"]:
+            with contextlib.redirect_stdout(io.StringIO()):
+                mod.cmd_canvas_open(["--name", "e2enet", "--allow-net", "example.com"])
+            try:
+                probe_html = (
+                    "<script>function r(n,v){try{window.__cdpilotCanvasEmit(JSON.stringify({type:'input',"
+                    "action:'net',id:n,data:String(v)}));}catch(e){}}"
+                    "fetch('https://example.com/',{mode:'no-cors'}).then(function(){r('allowed','ok')},"
+                    "function(e){r('allowed','err:'+e)});"
+                    "fetch('https://www.iana.org/',{mode:'no-cors'}).then(function(){r('other','ok')},"
+                    "function(e){r('other','err:'+e)});</script><p>net</p>")
+                net_probe["set"] = mod._canvas_request("e2enet", {"op": "set", "html": probe_html}, timeout=60)
+                got, after, t_end = {}, 0, time.monotonic() + 40.0
+                while time.monotonic() < t_end and len(got) < 2:
+                    ev = mod._canvas_request("e2enet", {"op": "events", "after": after, "max": 100,
+                                                        "wait_ms": 1000}, timeout=10)
+                    for e in ev.get("events") or []:
+                        if e.get("src") == "page" and e.get("action") == "net":
+                            got[e.get("id")] = e.get("data")
+                    after = ev.get("next") or after
+                net_probe.update(got)
+            finally:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.suppress(BaseException):
+                    mod._canvas_close_one("e2enet")
 
         # (3) C1: SIGKILL the host -> its target and browser context are gone within 5 s
         host_pid, canvas_tid, canvas_ctx = int(reg["pid"]), reg["targetId"], reg["browserContextId"]
@@ -1614,13 +1972,26 @@ def run_e2e(py_path, cli_js_path, cdp_hostport):
                 "page_counter": (counter_res.get("page") or {}).get(v),
                 "page_guarded": page_guarded.get(v),
             }
+            if v in E2E_POPUP_VECTORS:
+                pc = (counter_res.get("popup") or {}).get(v) or {}
+                pg = (g.get("popup") or {}).get(v) or {}
+                vectors[v].update({
+                    "targets_counter": pc.get("targets_created"), "targets_guarded": pg.get("targets_created"),
+                    "targets_left_guarded": pg.get("targets_left"),
+                    "ready_counter": pc.get("ready"), "ready_guarded": pg.get("ready"),
+                    "doc_guarded": pg.get("doc_url"), "set_ok_guarded": pg.get("set_ok"),
+                })
         out.update({
             "vectors": vectors,
             "counter_other": {k: n for k, n in counter.items() if k not in E2E_VECTORS},
             "guarded_other": {k: n for k, n in guarded.items() if k not in E2E_VECTORS},
             "counter_history_back_url": counter_res.get("history_back_url"),
             "counter_attempts": counter_res.get("attempts"),
+            "counter_grant": counter_res.get("grant"),
+            "counter_navigate_s": counter_res.get("navigate_s"),
             "counter_net_failed": counter_res.get("net_failed"),
+            "preload_counter": counter_res.get("preload"),
+            "preload_canvas": g.get("preload"),
             "wait_s": round(wait_s, 1),
             "guarded": {
                 "set1_ok": bool(set1.get("ok")), "set2_ok": bool(set2.get("ok")),
@@ -1630,6 +2001,7 @@ def run_e2e(py_path, cli_js_path, cdp_hostport):
                 "csp_violations": sorted(k for k in page_guarded if k.startswith("csp:")),
             },
             "sigkill": sigkill_res,
+            "allow_net": net_probe,
             "uptime": subprocess.run(["uptime"], capture_output=True, text=True, timeout=5).stdout.strip(),
         })
         return out
@@ -1652,6 +2024,7 @@ SCENARIOS = {
     "bindings_and_limits": scenario_bindings_and_limits,
     "proof_and_binding": scenario_proof_and_binding,
     "hardening": scenario_hardening,
+    "b3_defense": scenario_b3_defense,
     "cli_and_socket": scenario_cli_and_socket_integration,
 }
 
