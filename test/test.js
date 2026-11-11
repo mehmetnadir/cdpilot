@@ -8278,6 +8278,13 @@ print("ok")
       assert(dFull.actions.some((a) => a.name === '3 unread messages'), 'drift --full prints every entry');
       const dRows = ok(['agent', 'run', 'moved_anchor', '--rows'], 4);
       assert(dRows.actions.every(Array.isArray));
+      // CDPILOT_OBSERVE_FORMAT=rows reaches agent run too (2026-11-11 full-suite catch: the line
+      // meant for cmd_agent_run had landed in cmd_agent_flow_show and crashed it)
+      const envRun = cli(['agent', 'run', 'moved_anchor'], { ...env, CDPILOT_OBSERVE_FORMAT: 'rows' });
+      assert.strictEqual(envRun.status, 4, envRun.stderr);
+      assert(JSON.parse(envRun.stdout).actions.every(Array.isArray), 'env rows applies to agent run');
+      const show = cli(['agent', 'flow', 'show', 'hidden_anchor'], env);
+      assert.strictEqual(show.status, 0, `flow show: ${show.stderr}`);
     } finally { fake.stop(); }
   });
 

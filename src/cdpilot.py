@@ -17598,7 +17598,6 @@ async def cmd_agent_flow_list():
 
 
 async def cmd_agent_flow_show(name):
-    rows = _agent_rows_wanted(rows)
     path, slug = _agent_flow_path(name)
     try:
         flow = _agent_flow_load(path)
@@ -17630,6 +17629,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
     so the agent acts with `agent act --ref` and then `agent flow save <name>`
     repairs the flow. Exit 2: unknown flow or a {{variable}} without a value.
     """
+    rows = _agent_rows_wanted(rows)
     path, slug = _agent_flow_path(name)
     try:
         flow = _agent_flow_load(path)
