@@ -25,11 +25,20 @@ const http = require('http');
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
 const CLI = path.join(REPO_ROOT, 'bin', 'cdpilot.js');
-const SAMPLES_DIR = path.join(REPO_ROOT, '.claude', 'docs', 'olcum', 'soak-2');
+// --out <dir> (relative to repo root) and --report <file> keep one run from overwriting another.
+const argv0 = process.argv.slice(2);
+const argVal = (name) => {
+  const i = argv0.indexOf(name);
+  if (i >= 0 && argv0[i + 1]) return argv0[i + 1];
+  const eq = argv0.find((a) => a.startsWith(name + '='));
+  return eq ? eq.slice(name.length + 1) : null;
+};
+const OUT_REL = argVal('--out') || path.join('.claude', 'docs', 'olcum', 'soak-2');
+const SAMPLES_DIR = path.resolve(REPO_ROOT, OUT_REL);
 const SAMPLES_FILE = path.join(SAMPLES_DIR, 'soak-samples.jsonl');
 const ERRORS_FILE = path.join(SAMPLES_DIR, 'soak-errors.jsonl');
 const SUMMARY_FILE = path.join(SAMPLES_DIR, 'soak-summary.json');
-const REPORT_FILE = path.join(REPO_ROOT, '.claude', 'docs', 'olcum', 'soak-2026-11-11.md');
+const REPORT_FILE = path.resolve(REPO_ROOT, argVal('--report') || path.join('.claude', 'docs', 'olcum', 'soak-2026-11-11.md'));
 
 // Ensure sample destination exists
 fs.mkdirSync(SAMPLES_DIR, { recursive: true });
@@ -47,7 +56,7 @@ for (let i = 0; i < args.length; i++) {
 }
 
 const N_WARM = N;
-const N_FRESH = Math.max(150, Math.round(N_WARM * 0.3));
+const N_FRESH = argVal('--fresh') ? parseInt(argVal('--fresh'), 10) : Math.max(150, Math.round(N_WARM * 0.3));
 
 // Helpers for Chrome tabs via raw HTTP on 127.0.0.1:9333
 function getJson(urlPath) {
@@ -82,7 +91,8 @@ function getUptimeLoad() {
 }
 
 function getProcessStats(pid) {
-  if (!pid) return { rssKb: 0, rssMb: 0, fd: 0 };
+  // Not found is "not measured" (null), never 0: a 0 would plot as a flat curve.
+  if (!pid) return { rssKb: null, rssMb: null, fd: null };
   let rssKb = 0;
   let fd = 0;
   try {
@@ -96,10 +106,13 @@ function getProcessStats(pid) {
   return { rssKb, rssMb: parseFloat((rssKb / 1024).toFixed(2)), fd };
 }
 
-function getDaemonPid(homeDir) {
+// The daemon key hashes every CDPILOT_* variable (bin/cdpilot.js daemonKey), so the
+// status query must carry the SAME environment as the warm calls (baseEnv). Asking with
+// only CDPILOT_HOME + CDPILOT_DAEMON hashed to another key and found no daemon (0 -> 0, 11.11).
+function getDaemonPid(env) {
   try {
     const res = spawnSync(process.execPath, [CLI, 'daemon', 'status'], {
-      env: { ...process.env, CDPILOT_HOME: homeDir, CDPILOT_DAEMON: '1' },
+      env: { ...env, CDPILOT_DAEMON: '1' },
       cwd: REPO_ROOT,
       encoding: 'utf8'
     });
@@ -130,7 +143,13 @@ function calcPercentiles(arr) {
 
 // Least squares linear regression over sample checkpoints
 function calcLeastSquaresSlopePer100(checkpoints, valueGetter) {
-  if (!checkpoints || checkpoints.length < 2) return 0;
+  if (checkpoints) {
+    checkpoints = checkpoints.filter((cp) => {
+      const v = typeof valueGetter === 'function' ? valueGetter(cp) : cp[valueGetter];
+      return v !== null && v !== undefined;
+    });
+  }
+  if (!checkpoints || checkpoints.length < 2) return null;
   let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
   const n = checkpoints.length;
   for (const cp of checkpoints) {
@@ -282,7 +301,7 @@ function classifyError(exitCode, isError, text) {
     encoding: 'utf8'
   });
   console.log(`[soak] ${dStart.stdout.trim()}`);
-  let daemonPid = getDaemonPid(cdpilotHome);
+  let daemonPid = getDaemonPid(baseEnv);
   if (!daemonPid) {
     const match = dStart.stdout.match(/pid\s+(\d+)/);
     if (match) daemonPid = parseInt(match[1], 10);
@@ -572,7 +591,7 @@ function classifyError(exitCode, isError, text) {
 
   function recordCheckpoint(modeKey) {
     const s = state[modeKey];
-    const curDaemonPid = getDaemonPid(cdpilotHome) || daemonPid;
+    const curDaemonPid = getDaemonPid(baseEnv) || daemonPid;
     const daemonStats = getProcessStats(curDaemonPid);
 
     const curMcpPythonPid = getChildPid(mcpSrv.pid) || mcpPythonPid;
@@ -606,12 +625,12 @@ function classifyError(exitCode, isError, text) {
     console.log(`[soak] [${modeKey.padEnd(9)}] ${String(s.count).padStart(4)}/${target} | ` +
       `p50: ${String(p50).padStart(4)}ms p95: ${String(p95).padStart(4)}ms | ` +
       `err: ${s.errors.length} | ` +
-      `daemon RSS: ${daemonStats.rssMb.toFixed(1)}MB fd: ${daemonStats.fd} | ` +
-      `mcp RSS: ${mcpStats.rssMb.toFixed(1)}MB fd: ${mcpStats.fd}`);
+      `daemon RSS: ${daemonStats.rssMb === null ? 'n/a' : daemonStats.rssMb.toFixed(1)}MB fd: ${daemonStats.fd} | ` +
+      `mcp RSS: ${mcpStats.rssMb === null ? 'n/a' : mcpStats.rssMb.toFixed(1)}MB fd: ${mcpStats.fd}`);
   }
 
   // Initial cold baseline stats (captured for reference)
-  const initialDaemonPid = getDaemonPid(cdpilotHome) || daemonPid;
+  const initialDaemonPid = getDaemonPid(baseEnv) || daemonPid;
   const coldDaemonStats = getProcessStats(initialDaemonPid);
   const initialMcpPythonPid = getChildPid(mcpSrv.pid) || mcpPythonPid;
   const coldMcpStats = getProcessStats(initialMcpPythonPid);
@@ -668,21 +687,21 @@ function classifyError(exitCode, isError, text) {
     const firstCp = cp[0] || {};
     const lastCp = cp[cp.length - 1] || {};
 
-    let firstRss = 0, lastRss = 0, firstFd = 0, lastFd = 0;
-    let rssSlopePer100 = 0, fdSlopePer100 = 0;
+    let firstRss = null, lastRss = null, firstFd = null, lastFd = null;
+    let rssSlopePer100 = null, fdSlopePer100 = null;
 
     if (mKey === 'cli_warm') {
-      firstRss = firstCp.daemon_rss_mb || 0;
-      lastRss = lastCp.daemon_rss_mb || 0;
-      firstFd = firstCp.daemon_fd || 0;
-      lastFd = lastCp.daemon_fd || 0;
+      firstRss = firstCp.daemon_rss_mb ?? null;
+      lastRss = lastCp.daemon_rss_mb ?? null;
+      firstFd = firstCp.daemon_fd ?? null;
+      lastFd = lastCp.daemon_fd ?? null;
       rssSlopePer100 = calcLeastSquaresSlopePer100(cp, 'daemon_rss_mb');
       fdSlopePer100 = calcLeastSquaresSlopePer100(cp, 'daemon_fd');
     } else if (mKey === 'mcp_warm') {
-      firstRss = firstCp.mcp_rss_mb || 0;
-      lastRss = lastCp.mcp_rss_mb || 0;
-      firstFd = firstCp.mcp_fd || 0;
-      lastFd = lastCp.mcp_fd || 0;
+      firstRss = firstCp.mcp_rss_mb ?? null;
+      lastRss = lastCp.mcp_rss_mb ?? null;
+      firstFd = firstCp.mcp_fd ?? null;
+      lastFd = lastCp.mcp_fd ?? null;
       rssSlopePer100 = calcLeastSquaresSlopePer100(cp, 'mcp_rss_mb');
       fdSlopePer100 = calcLeastSquaresSlopePer100(cp, 'mcp_fd');
     }
@@ -701,12 +720,12 @@ function classifyError(exitCode, isError, text) {
       errorClasses,
       p50,
       p95,
-      firstRssMb: firstRss.toFixed(1),
-      lastRssMb: lastRss.toFixed(1),
-      firstFd,
-      lastFd,
-      rssSlopePer100: rssSlopePer100.toFixed(2),
-      fdSlopePer100: fdSlopePer100.toFixed(2),
+      firstRssMb: firstRss === null ? 'ölçülmedi' : firstRss.toFixed(1),
+      lastRssMb: lastRss === null ? 'ölçülmedi' : lastRss.toFixed(1),
+      firstFd: firstFd === null ? 'ölçülmedi' : firstFd,
+      lastFd: lastFd === null ? 'ölçülmedi' : lastFd,
+      rssSlopePer100: rssSlopePer100 === null ? 'ölçülmedi' : rssSlopePer100.toFixed(2),
+      fdSlopePer100: fdSlopePer100 === null ? 'ölçülmedi' : fdSlopePer100.toFixed(2),
       sampleCount: cp.length
     };
   }
