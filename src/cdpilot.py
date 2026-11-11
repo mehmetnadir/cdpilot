@@ -3390,6 +3390,14 @@ def get_tabs():
     if result is None and _autolaunch_if_down():
         result = cdp_get("/json", no_cache=True)
     if result is None and _is_external():
+        # A busy machine answers /json late (3 s timeout) now and then: ask
+        # twice more before calling a connected browser gone.
+        for delay in (0.4, 1.0):
+            time.sleep(delay)
+            result = cdp_get("/json", no_cache=True)
+            if result is not None:
+                break
+    if result is None and _is_external():
         _external_gone_exit()
     if result is None:
         print("CDP connection error. Is the browser running?", file=sys.stderr)
@@ -3423,11 +3431,19 @@ def _cleanup_idle_sessions():
     for sid, info in sessions.items():
         last_used = info.get("last_used", 0)
         if last_used and (now - last_used) > SESSION_IDLE_TIMEOUT:
-            to_remove.append(sid)
             target_id = info.get("target_id")
             if target_id and external:
+                # The first call after a long pause: a /json answer that is
+                # empty or missing is a bad read, not proof the tab is gone.
+                # Forgetting the session then would leak the tab and (in
+                # _external_close_own_tabs) wipe the own-tab record.
+                if not (cdp_get("/json", no_cache=True) or []):
+                    continue
+                to_remove.append(sid)
                 _external_close_own_tabs({target_id})  # only if cdpilot opened it
-            elif target_id:
+                continue
+            to_remove.append(sid)
+            if target_id:
                 try:
                     urllib.request.urlopen(
                         f"{CDP_BASE}/json/close/{target_id}", timeout=2)
@@ -3603,6 +3619,8 @@ def _external_close_own_tabs(only=None):
     if not own:
         return 0
     pages = [t for t in (cdp_get("/json", no_cache=True) or []) if t.get("type") == "page"]
+    if not pages:
+        return 0  # a failed or empty read: closing and pruning on it would lose own tabs
     left = len(pages)
     closed = set()
     for t in pages:
@@ -3638,6 +3656,64 @@ def _ensure_session_window():
         sessions.pop(sid, None)
         _save_sessions(sessions)
     return _create_session_window()
+
+def _page_via_cdp(target_id):
+    """A page dict for target_id from a CDP answer (Target.getTargets on the
+    browser socket), not from /json: under load a new target reaches the
+    /json listing late, while the browser already knows it. The page socket
+    URL is the standard /devtools/page/<id> form. None if the browser does
+    not list the target."""
+    r = _browser_ws_call("Target.getTargets", {}, timeout=5)
+    for info in (r or {}).get("targetInfos") or []:
+        if info.get("targetId") == target_id and info.get("type") == "page":
+            ws_base = CDP_BASE.replace("http://", "ws://", 1)
+            return {"id": target_id, "type": "page", "url": info.get("url", ""),
+                    "title": info.get("title", ""),
+                    "webSocketDebuggerUrl": f"{ws_base}/devtools/page/{target_id}"}
+    return None
+
+
+def _forget_session_target(target_id):
+    """Drop the session record that names target_id (the current session's)."""
+    sessions = _load_sessions()
+    sid = _get_session_id()
+    if sid in sessions and sessions[sid].get("target_id") == target_id:
+        sessions.pop(sid, None)
+        _save_sessions(sessions)
+
+
+def _external_wait_own_tab(target_id, limit_s=6.0):
+    """Wait for the tab cdpilot just opened to be usable: (ws url, page) or
+    None. Polls /json (fresh, a failed read is not fatal) with growing gaps;
+    from 1 s on it also asks the browser itself, so a slow /json listing does
+    not fail a call whose tab exists."""
+    t0 = time.time()
+    i = 0
+    while True:
+        time.sleep(min(0.3 + 0.1 * i, 0.8))
+        i += 1
+        for t in cdp_get("/json", no_cache=True) or []:
+            if t.get("id") == target_id and t.get("webSocketDebuggerUrl"):
+                return t["webSocketDebuggerUrl"], t
+        if time.time() - t0 >= 1.0:
+            page = _page_via_cdp(target_id)
+            if page:
+                return page["webSocketDebuggerUrl"], page
+        if time.time() - t0 >= limit_s:
+            return None
+
+
+def _external_abandon_own_tab(target_id):
+    """The tab cdpilot opened never became usable: close it (the browser
+    socket, by id, so a /json listing that misses it does not matter; it is
+    our own tab by construction, never a user tab, and never Browser.close)
+    and forget it."""
+    _browser_ws_call("Target.closeTarget", {"targetId": target_id}, timeout=5)
+    _forget_session_target(target_id)
+    guid, tabs = _external_tabs_load()
+    if target_id in tabs:
+        _external_tabs_save(guid, tabs - {target_id})
+
 
 def get_page_ws(prefer_url=None):
     """Find the WebSocket URL for the appropriate page target.
@@ -3677,7 +3753,29 @@ def get_page_ws(prefer_url=None):
     if external and not _session_target_usable(session_target_id):
         session_target_id = None  # never a user tab of a connected browser
 
-    if session_target_id and pages:
+    if external and session_target_id and not any(
+            p.get("id") == session_target_id for p in pages):
+        # Under load /json comes back empty or without the session tab for a
+        # moment. Retiring the session on that one read would open a second
+        # tab and leave the first one behind: read again after a short
+        # back-off, and ask the browser itself, before deciding.
+        for delay in (0.4, 1.0):
+            time.sleep(delay)
+            fresh = [t for t in (cdp_get("/json", no_cache=True) or [])
+                     if t.get("type") == "page"]
+            for p in fresh:
+                if p.get("id") == session_target_id:
+                    return p["webSocketDebuggerUrl"], p
+            if fresh:
+                pages = fresh
+                break  # a good read without the tab; the browser has the last word
+        page = _page_via_cdp(session_target_id)
+        if page:
+            return page["webSocketDebuggerUrl"], page
+        if not pages:
+            session_target_id = None  # every read failed and the browser lists no such tab
+
+    if session_target_id and (pages or external):
         session_page = None
         for p in pages:
             if p.get("id") == session_target_id:
@@ -3694,7 +3792,20 @@ def get_page_ws(prefer_url=None):
             _save_sessions(sessions)
 
     # No session window or no tabs — create one
-    if cdp_get("/json/version"):
+    if external:
+        version = cdp_get("/json/version")
+        for delay in (0.4, 1.0):
+            if version:
+                break
+            time.sleep(delay)
+            version = cdp_get("/json/version", no_cache=True)
+        new_target_id = _create_session_window() if version else None
+        if new_target_id:
+            found = _external_wait_own_tab(new_target_id)
+            if found:
+                return found
+            _external_abandon_own_tab(new_target_id)
+    elif cdp_get("/json/version"):
         new_target_id = _create_session_window()
         if new_target_id:
             # Short wait for CDP to register the new target

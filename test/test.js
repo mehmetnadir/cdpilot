@@ -9971,6 +9971,89 @@ print(json.dumps(out))
       }
     });
   }
+
+  // ── Connect: a slow tab list under load must not fail the call or leak a tab ──
+  // Measured on a loaded machine (soak 11.11): `Could not open a tab of cdpilot's own`
+  // after a late or empty /json answer, and a second tab opened next to a live one.
+  const OWN_MSG = "Could not open a tab of cdpilot's own in the connected browser; "
+    + 'your tabs were left untouched.';
+
+  function ownTabRun(fakeEnv, seedOwn, args = ['content'], timeout = 60000, idleS = 0) {
+    const fake = startFake('full', 'guid-user', fakeEnv);
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      fs.mkdirSync(path.join(home, 'profile'), { recursive: true });
+      if (seedOwn) {
+        fs.writeFileSync(path.join(home, 'profile', 'sessions.json'), JSON.stringify({
+          'cdpilot-default': { target_id: seedOwn, created: 'x', last_used: Date.now() / 1000 - idleS } }));
+        fs.writeFileSync(path.join(home, 'profile', 'external-tabs.json'),
+          JSON.stringify({ guid: fake.guid, tabs: [seedOwn] }));
+      }
+      const r = cli(args, isoEnv(home, fake.port, 'proj'), timeout);
+      let own = null;
+      try { own = JSON.parse(fs.readFileSync(path.join(home, 'profile', 'external-tabs.json'), 'utf-8')).tabs; } catch {}
+      return { r, entries: fake.entries(), fake, own };
+    } finally { fake.stop(); }
+  }
+
+  test('connect own tab: one empty /json answer keeps the session tab, opens no second tab', () => {
+    const { r, entries } = ownTabRun({ FAKE_CDP_EXTRA_PAGE: 'OWN1', FAKE_CDP_LIST_EMPTY: '1' }, 'OWN1');
+    assert.strictEqual(r.status, 0, `content exit ${r.status}: ${r.stdout}${r.stderr}`);
+    assert(entries.some((e) => e.empty), 'the fake must have answered one empty /json');
+    assert.deepStrictEqual(entries.filter((e) => e.method === 'Target.createTarget'), [],
+      'no tab may be opened while the session tab exists');
+    const onPage = entries.filter((e) => e.method && (e.ws || '').includes('/devtools/page/'));
+    assert(onPage.length > 0 && onPage.every((e) => e.ws === '/devtools/page/OWN1'),
+      `commands must run in the session tab: ${JSON.stringify(onPage)}`);
+  });
+
+  test('connect own tab: a new tab that shows in /json after ~4 s is used, one tab opened', () => {
+    const { r, entries } = ownTabRun({ FAKE_CDP_HIDE_MS: '4000' }, null);
+    assert.strictEqual(r.status, 0, `content exit ${r.status}: ${r.stdout}${r.stderr}`);
+    assert.strictEqual(entries.filter((e) => e.method === 'Target.createTarget').length, 1,
+      'exactly one tab opened');
+    assert.deepStrictEqual(entries.filter((e) => e.method === 'Target.closeTarget'), [],
+      'the tab is used, not closed');
+    const onPage = entries.filter((e) => e.method && (e.ws || '').includes('/devtools/page/'));
+    assert(onPage.length > 0 && onPage.every((e) => e.ws === '/devtools/page/PAGE2'),
+      `commands must run in the new tab: ${JSON.stringify(onPage)}`);
+  });
+
+  test('connect own tab: a session tab closed from outside while idle: the next call opens a new one', () => {
+    // 30 min idle, the tab OWN1 is gone from the browser (a sweeper closed it).
+    const { r, entries } = ownTabRun({}, 'OWN1', ['content'], 60000, 1800);
+    assert.strictEqual(r.status, 0, `content exit ${r.status}: ${r.stdout}${r.stderr}`);
+    assert.strictEqual(entries.filter((e) => e.method === 'Target.createTarget').length, 1);
+    const onPage = entries.filter((e) => e.method && (e.ws || '').includes('/devtools/page/'));
+    assert(onPage.length > 0 && onPage.every((e) => e.ws === '/devtools/page/PAGE2'),
+      `commands must run in the new tab: ${JSON.stringify(onPage)}`);
+    assert(entries.every((e) => !(e.ws || e.ws_open || '').endsWith('/PAGE1')), 'user tab untouched');
+  });
+
+  test('connect own tab: idle session tab and an empty /json after a pause: tab kept, none leaked', () => {
+    const { r, entries, own } = ownTabRun({ FAKE_CDP_EXTRA_PAGE: 'OWN1', FAKE_CDP_LIST_EMPTY: '1' },
+      'OWN1', ['content'], 60000, 1800);
+    assert.strictEqual(r.status, 0, `content exit ${r.status}: ${r.stdout}${r.stderr}`);
+    assert(entries.some((e) => e.empty), 'one empty /json answer');
+    assert.deepStrictEqual(entries.filter((e) => e.method === 'Target.createTarget'), [],
+      'no second tab');
+    assert.deepStrictEqual(entries.filter((e) => e.method === 'Target.closeTarget'), [],
+      'the empty read must not close or forget the tab');
+    assert(own && own.includes('OWN1'), `own-tab record must survive: ${JSON.stringify(own)}`);
+  });
+
+  test('connect own tab: a tab that never appears exits 1 with the same message and is closed', () => {
+    const { r, entries } = ownTabRun({ FAKE_CDP_HIDE_FOREVER: '1' }, null);
+    assert.strictEqual(r.status, 1, `exit ${r.status}: ${r.stdout}${r.stderr}`);
+    assert(r.stderr.includes(OWN_MSG), `stderr: ${r.stderr}`);
+    assert.strictEqual(entries.filter((e) => e.method === 'Target.createTarget').length, 1);
+    const closes = entries.filter((e) => e.method === 'Target.closeTarget');
+    assert.strictEqual(closes.length, 1, `one close of our own tab: ${JSON.stringify(closes)}`);
+    assert(entries.every((e) => e.method !== 'Browser.close'), 'Browser.close must never be sent');
+    assert(entries.every((e) => !(e.ws || e.ws_open || '').endsWith('/PAGE1')
+      && !(e.http || '').includes('PAGE1')), 'the user tab must not be touched');
+  });
 })();
 
 // ── WebMCP tests ──
