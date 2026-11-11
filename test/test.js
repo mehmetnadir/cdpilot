@@ -16286,7 +16286,10 @@ spec = importlib.util.spec_from_file_location("cdpilot", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 steps = "[1] storage local\\n     {\\"session\\":\\"Summer2026!\\"}\\n[2] canvas events\\n     {\\"data\\":{\\"value\\":\\"Summer2026!\\"}}\\n" + "-" * 40 + "\\nScript: x.cdp\\nResult: 2 passed, 0 failed, 2 total\\n"
 out = {"run": m._slog_summary("run", ["x.cdp"], steps, []),
-       "run_none": m._slog_summary("run", ["x.cdp"], "[1] storage local\\n     secret=Summer2026!\\n", [])}
+       "run_none": m._slog_summary("run", ["x.cdp"], "[1] storage local\\n     secret=Summer2026!\\n", []),
+       # frame eval prints "Result: <value>"; a cut output (no count line) must not log it (T1 verify Y1)
+       "run_frame": m._slog_summary("run", ["x.cdp"], "[1] frame eval document.cookie\\nResult: sid=Summer2026!\\n  Result: 1 passed, 0 failed, 1 total\\n", []),
+       "run_clicked": m._slog_summary("run", ["x.cdp"], "Result: 1 passed, 0 failed, 1 not clicked, 2 total\\n", [])}
 print(json.dumps(out))
 `;
     const r = spawnSync(PYB, ['-I', '-c', script, PY_SRC], { encoding: 'utf8', timeout: 20000 });
@@ -16294,6 +16297,8 @@ print(json.dumps(out))
     const o = JSON.parse(r.stdout.trim());
     assert.strictEqual(o.run, 'Result: 2 passed, 0 failed, 2 total');
     assert.strictEqual(o.run_none, null, 'no Result line, nothing logged');
+    assert.strictEqual(o.run_frame, null, 'a frame eval Result line or an indented copy is never the summary');
+    assert.strictEqual(o.run_clicked, 'Result: 1 passed, 0 failed, 1 not clicked, 2 total');
   });
 
   test('canvas log: set/patch/stream/watch/open/list results carry no HTML or values (summary stays numeric)', () => {
