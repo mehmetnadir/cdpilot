@@ -1261,9 +1261,59 @@ test('navigate_collect post-load settle: event silence (100 ms), 300 ms cap, no 
   assert(body, 'navigate_collect must exist');
   assert(/loaded_at = time\.time\(\)/.test(body), 'the load event stamps loaded_at');
   assert(/time\.time\(\) - loaded_at < 0\.3/.test(body), 'the settle is capped at 300 ms');
-  assert(/timeout=1 if loaded_at is None else 0\.1/.test(body), 'after load, 100 ms without an event ends the settle');
+  assert(/recv_timeout = 0\.1/.test(body) && /timeout=recv_timeout/.test(body), 'after load, 100 ms without an event ends the settle (rule A)');
   assert(!/asyncio\.sleep\(0\.3\)/.test(body) && !/asyncio\.sleep\(1\.5\)/.test(body),
     'navigate_collect must not regress to a blind post-load sleep');
+});
+
+test('navigate_collect settle rule B (30 ms quiet) vs rule A, by branch not by wall clock', () => {
+  const { spawnSync } = require('child_process');
+  const script = `
+import asyncio, json, sys, types, importlib.util, contextlib, io
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+assert mod.SETTLE_FAST_S == 0.03
+def run(pre, post, **kw):
+    # pre: events delivered before loadEventFired; post: [(delay_s, event)] after it
+    class S:
+        def __init__(self): self.q = asyncio.Queue()
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def send(self, raw):
+            m = json.loads(raw)
+            self.q.put_nowait({"id": m["id"], "result": {"result": {"type": "string", "value": "x"}}})
+            if m["method"] == "Page.navigate":
+                for e in pre: self.q.put_nowait(e)
+                self.q.put_nowait({"method": "Page.loadEventFired", "params": {}})
+                for d, e in post:
+                    asyncio.get_running_loop().call_later(d, self.q.put_nowait, e)
+        async def recv(self): return json.dumps(await self.q.get())
+    fake = types.ModuleType("websockets"); fake.connect = lambda *a, **k: S()
+    real = sys.modules.get("websockets"); sys.modules["websockets"] = fake
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            asyncio.run(mod.navigate_collect("ws://fake/page", "https://example.com/", glow=False, **kw))
+    finally:
+        if real is not None: sys.modules["websockets"] = real
+        else: sys.modules.pop("websockets", None)
+    return mod._LAST_SETTLE_BRANCH
+rq = lambda i: {"method": "Network.requestWillBeSent", "params": {"requestId": i}}
+fin = lambda i: {"method": "Network.loadingFinished", "params": {"requestId": i}}
+assert run([rq("1"), fin("1")], []) == "B"
+assert run([rq("1")], []) == "A"
+assert run([rq("1"), rq("1"), fin("1")], []) == "B"
+assert run([rq("1"), rq("1")], []) == "A"
+assert run([rq("1"), {"method": "Network.loadingFailed", "params": {"requestId": "1"}}], []) == "B"
+assert run([], [(0.001, rq("2"))]) == "A"
+assert run([rq("1"), fin("1")], [], network=True) == "A"
+assert run([rq("1"), fin("1")], [], console=True) == "A"
+assert run([rq("1"), fin("1")], [], har=True) == "A"
+assert run([{"method": "Network.webSocketCreated", "params": {"requestId": "w"}}, rq("1"), fin("1")], []) == "A"
+print("ok")
+`;
+  const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
+    { encoding: 'utf8', timeout: 60000 });
+  assert(r.status === 0 && /ok/.test(r.stdout), 'settle branches: ' + (r.stderr || r.stdout));
 });
 
 test('cmd_go: the post-load probes share one evaluate (probe → host assert, friction, CAPTCHA)', () => {
@@ -7933,12 +7983,14 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert.deepStrictEqual(own.tags, ['glow', 'input-blocker', 'stealth'], `control tags: ${own.tags}`);
   });
 
-  test('go: settles on event silence after load — the page read follows the load event by ~100 ms, not a fixed 300 ms', () => {
+  test('go: settles on event silence after load — the page read follows the load event by 30 ms (quiet page) or ~100 ms, never a fixed 300 ms', () => {
     // 08.11: navigate_collect slept 300 ms after Page.loadEventFired on every
     // go. It now keeps reading events and stops at the first 100 ms without
     // one (300 ms at most). The fake answers Page.navigate with the load event
     // at once and then stays silent, so cdpilot's next call on that socket
-    // (the innerText read) must follow about 100 ms later — never 300.
+    // (the innerText read) must follow soon: this page has no requests, so rule B
+    // (30 ms quiet, D-0106) applies; rule A (100 ms) is pinned by the branch test.
+    // The bound only excludes the old fixed 300 ms.
     const fake = startFake();
     try {
       const home = mkHome();
@@ -7951,7 +8003,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       const read = ws.slice(nav + 1).find((e) => e.ws === ws[nav].ws && e.method === 'Runtime.evaluate');
       assert(read, 'the page is read on the navigation socket after load');
       const gap = read.t - ws[nav].t;
-      assert(gap >= 90 && gap < 260, `settle gap ${gap.toFixed(0)} ms: expected ~100 (the silence window), not the old 300`);
+      assert(gap >= 25 && gap < 260, `settle gap ${gap.toFixed(0)} ms: expected 30-100 (the quiet window), not the old 300`);
       assert(!/await asyncio\.sleep\(0\.3\)\s*\n\s*break/.test(PY_CONTENT), 'the fixed 300 ms sleep after load is gone');
     } finally { fake.stop(); }
   });

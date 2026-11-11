@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **`go` settles after 30 ms on a quiet page.** After `Page.loadEventFired`, if no request is in flight and none starts within 30 ms, the settle ends there instead of waiting for 100 ms of event silence (rule A stays for every other case, and with `network`, `har`, `console` or any WebSocket). Measured on 20 sites x 5: the rule fired on 32 of 80 loads (40 %), saving about 70 ms on those navigations only; in those loads no text changed between 30 and 100 ms ([`settle-t0-2026-11-11.md`](.claude/docs/olcum/settle-t0-2026-11-11.md)). Blind spot: a page that writes text 30-100 ms after load without any network request (0 in the sample); use `--network` or `wait` when that matters.
+
 ## [0.9.8] - 2026-11-11
 
 ### Added
