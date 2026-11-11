@@ -22105,6 +22105,7 @@ SLOG_LABEL_VALUE_CMDS = frozenset({'smart-fill', 'smart-select', 'select'})  # <
 SLOG_JS_CMDS = frozenset({'eval', 'multi-eval'})
 SLOG_COOKIE_SAFE_SUBS = frozenset({'save', 'load', 'clear', 'auto'})  # print no cookie values
 SLOG_OUTPUT_WITHHELD = "«output not logged: may contain cookie or storage values»"
+SLOG_CANVAS_EVENTS_WITHHELD = "«output not logged: canvas events carry user input»"
 SLOG_EVAL_WITHHELD = "«output not logged: the script names a secret-like value»"
 
 # Flag, header and key names that carry secrets.
@@ -22647,6 +22648,10 @@ def _slog_summary(cmd, args, stdout, secrets):
     sub = args[0].lower() if args else ""
     if cmd == "storage" or (cmd == "cookies" and sub not in SLOG_COOKIE_SAFE_SUBS):
         return SLOG_OUTPUT_WITHHELD
+    if cmd == "canvas" and sub == "events":
+        # Page-written events carry what the user typed (input/change/submit values).
+        n = sum(1 for ln in stdout.splitlines() if ln.lstrip().startswith("{"))
+        return f"{SLOG_CANVAS_EVENTS_WITHHELD} ({n} events)"
     if cmd in SLOG_JS_CMDS or cmd == "eval-batch" or (cmd == "frame" and sub == "eval"):
         if _re.search(r"pass|pwd|token|secret|key|cookie|auth|session|credential|storage",
                       " ".join(args), _re.I):
@@ -27514,6 +27519,21 @@ def _canvas_format_ms(ms):
     return str(ms) if isinstance(ms, int) else f"{ms:.1f}".rstrip("0").rstrip(".")
 
 
+def _canvas_events_counts(text):
+    """Numbers only (events, next, dropped) from a canvas events result; never event content."""
+    try:
+        obj = json.loads(text)
+        evs = obj.get("events")
+        parts = [f"events={len(evs) if isinstance(evs, list) else 0}"]
+        for k in ("next", "dropped"):
+            v = obj.get(k)
+            if isinstance(v, int) and not isinstance(v, bool):
+                parts.append(f"{k}={v}")
+        return " ".join(parts)
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
 def _canvas_mcp_log(tool_name, sub, raw_args, code, started, t0, stdout="", error=None):
     """Write one session-log entry for an in-process canvas MCP call; HTML -> «html:N chars»."""
     if not _slog_enabled():
@@ -27543,8 +27563,9 @@ def _canvas_mcp_log(tool_name, sub, raw_args, code, started, t0, stdout="", erro
             ev_args.extend(name_tail)
             entry = _slog_build_entry(
                 "canvas", ev_args, code, dur_ms, started,
-                stdout=stdout, error=error, via=via,
+                stdout="", error=error, via=via,
             )
+            entry["summary"] = _canvas_events_counts(stdout)
         _slog_append(entry)
     except Exception as e:
         _slog_warn(e)
