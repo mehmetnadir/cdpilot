@@ -1,0 +1,59 @@
+{
+  "verdictStatus": "KAPI 2 BAŞARISIZ (DÜZ DEĞİL / NOT FLAT)",
+  "verdictText": "DÜZ DEĞİL (NOT FLAT) / KAPI 2 BAŞARISIZ ❌",
+  "countValid": true,
+  "startTime": "2026-11-11T01:41:58.470Z",
+  "endTime": "2026-11-11T01:53:30.772Z",
+  "startLoad": "111.80 118.87 109.54",
+  "endLoad": "53.03 74.41 90.84",
+  "summary": {
+    "cli_warm": {
+      "name": "CLI warm",
+      "completedCalls": 2000,
+      "errorCount": 0,
+      "errorRate": 0,
+      "errorClasses": {},
+      "p50": 137,
+      "p95": 330,
+      "firstRssMb": "43.8",
+      "lastRssMb": "0.0",
+      "firstFd": 43,
+      "lastFd": 0,
+      "rssSlopePer100": "-2.59",
+      "fdSlopePer100": "-2.42",
+      "sampleCount": 40
+    },
+    "cli_fresh": {
+      "name": "CLI fresh",
+      "completedCalls": 600,
+      "errorCount": 0,
+      "errorRate": 0,
+      "errorClasses": {},
+      "p50": 300,
+      "p95": 502,
+      "firstRssMb": "ölçülmedi",
+      "lastRssMb": "ölçülmedi",
+      "firstFd": "ölçülmedi",
+      "lastFd": "ölçülmedi",
+      "rssSlopePer100": "ölçülmedi",
+      "fdSlopePer100": "ölçülmedi",
+      "sampleCount": 12
+    },
+    "mcp_warm": {
+      "name": "MCP warm",
+      "completedCalls": 2000,
+      "errorCount": 0,
+      "errorRate": 0,
+      "errorClasses": {},
+      "p50": 11,
+      "p95": 204,
+      "firstRssMb": "44.3",
+      "lastRssMb": "43.6",
+      "firstFd": 42,
+      "lastFd": 42,
+      "rssSlopePer100": "-0.23",
+      "fdSlopePer100": "0.00",
+      "sampleCount": 40
+    }
+  }
+}
