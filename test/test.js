@@ -8327,6 +8327,56 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     });
   });
 
+  const hideRe = /[\u{E0100}-\u{E01EF}‪-‮⁦-⁩]/u;
+
+  test('agent observe (fake browser): bidi controls and supplementary selectors are removed; the heart (FE0F) stays; payload recorded as bytes', () => {
+    withFake({ FAKE_CDP_HIDE: '1' }, (env) => {
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const o = cli(['agent', 'observe'], env);
+      assert.strictEqual(o.status, 0, o.stderr);
+      assert.strictEqual(o.stdout.match(hideRe), null, 'no bidi control or supplementary selector in the JSON');
+      const snap = JSON.parse(o.stdout);
+      assert(snap.text.includes('Love ❤️ it'), snap.text);
+      assert(snap.text.includes('Total 42 items'), snap.text);
+      const sel = (snap.injection_suspect || []).find((r) => r.match === 'invisible_selectors');
+      assert(sel && sel.text === '8 bytes', JSON.stringify(snap.injection_suspect));
+      assert(!(snap.injection_suspect || []).some((r) => r.match === 'invisible_tags'), 'no tag record');
+      // a bidi control + a variation selector inside an instruction: the scan matches the cleaned text
+      assert((snap.injection_suspect || []).some((r) => r.match === 'ignore_instructions'), JSON.stringify(snap.injection_suspect));
+    });
+  });
+
+  test('agent observe (fake browser): a lone bidi control makes no record; the real UK flags stay with FAKE_CDP_HIDE too', () => {
+    withFake({ FAKE_CDP_HIDE: '1', FAKE_CDP_TAGS: 'flags' }, (env) => {
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const snap = JSON.parse(cli(['agent', 'observe'], env).stdout);
+      for (const cc of ['gbeng', 'gbsct', 'gbwls']) assert(snap.text.includes('\u{1F3F4}' + tagCh(cc) + '\u{E007F}'), cc);
+      assert(!(snap.injection_suspect || []).some((r) => r.match === 'invisible_tags'), JSON.stringify(snap.injection_suspect));
+    });
+  });
+
+  test('content, a11y (fake browser): bidi controls and supplementary selectors removed, heart kept; selector payload on stderr, a bidi control alone is silent', () => {
+    const sel = [...'payload!'].map((c) => String.fromCodePoint(0xE0100 + c.charCodeAt(0))).join('');
+    withFake({ FAKE_CDP_INNERTEXT: 'Total‮ 42⁩ ❤️ end' }, (env) => {
+      const r = cli(['content'], env);
+      assert.strictEqual(r.stdout, 'Total 42 ❤️ end\n', JSON.stringify(r.stdout));
+      assert.strictEqual(r.stderr, '', 'a bidi control alone: no stderr line');
+    });
+    withFake({ FAKE_CDP_INNERTEXT: 'Safe' + sel }, (env) => {
+      const r = cli(['content'], env);
+      assert.strictEqual(r.stdout, 'Safe\n');
+      assert.strictEqual(r.stderr, 'cdpilot: removed 8 invisible variation selectors (a hidden payload)\n', r.stderr);
+    });
+    withFake({ FAKE_CDP_HIDE: '1' }, (env) => {
+      for (const args of [['a11y'], ['a11y-snapshot']]) {
+        const r = cli(args, env);
+        assert.strictEqual(r.status, 0, r.stderr);
+        assert.strictEqual(r.stdout.match(hideRe), null, args.join(' '));
+        if (args[0] === 'a11y') assert(r.stdout.includes('\u2764\uFE0F'), 'a11y: heart kept');
+      }
+    });
+  });
+
   test('agent output (fake browser): invisible tags: flow save and --dry-run print no tag characters; the anchor still matches on run', () => {
     const tag = (t) => [...t].map((c) => String.fromCodePoint(0xE0000 + c.charCodeAt(0))).join('');
     const anyTag = /[\u{E0000}-\u{E007F}]/u;
