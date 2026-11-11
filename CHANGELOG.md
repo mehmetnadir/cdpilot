@@ -14,6 +14,7 @@ All notable changes to cdpilot will be documented in this file.
 
 ### Fixed
 - **`actions_map` in `agent-state.json` keeps the first 8,000 refs** (it dropped the first 200 refs of any page over 1,000 entries, so `agent act --ref @1` failed there).
+- **Screenshot token claims corrected:** format (PNG/JPEG/WebP) and JPEG quality change file size and network latency, not vision tokens; vision models calculate tokens from pixel dimensions (`⌈width / 28⌉ × ⌈height / 28⌉`, Anthropic Vision docs). Only element-level cropping saves tokens by reducing pixel dimensions (measured: 800×600 viewport is 638 tokens across PNG, JPEG q80, JPEG q30, WebP; h1 crop is 34–56 tokens). MCP `browser_screenshot` returns only the saved file path, so image bytes enter model context only if the file is read.
 
 ## [0.9.8] - 2026-11-11
 
