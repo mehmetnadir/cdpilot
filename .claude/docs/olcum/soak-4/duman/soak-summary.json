@@ -1,0 +1,59 @@
+{
+  "verdictStatus": "GEÇERSİZ (INVALID)",
+  "verdictText": "GEÇERSİZ (INVALID) — Hedef çağrı sayısı tamamlanmadı (Warm ≥ 500, Fresh ≥ 150; CLI warm: 60, MCP warm: 60, CLI fresh: 20)",
+  "countValid": false,
+  "startTime": "2026-11-11T01:41:23.164Z",
+  "endTime": "2026-11-11T01:41:51.328Z",
+  "startLoad": "99.14 117.05 108.50",
+  "endLoad": "116.46 119.97 109.81",
+  "summary": {
+    "cli_warm": {
+      "name": "CLI warm",
+      "completedCalls": 60,
+      "errorCount": 0,
+      "errorRate": 0,
+      "errorClasses": {},
+      "p50": 138,
+      "p95": 376,
+      "firstRssMb": "45.0",
+      "lastRssMb": "45.0",
+      "firstFd": 43,
+      "lastFd": 43,
+      "rssSlopePer100": "0.10",
+      "fdSlopePer100": "0.00",
+      "sampleCount": 2
+    },
+    "cli_fresh": {
+      "name": "CLI fresh",
+      "completedCalls": 20,
+      "errorCount": 0,
+      "errorRate": 0,
+      "errorClasses": {},
+      "p50": 324,
+      "p95": 1009,
+      "firstRssMb": "ölçülmedi",
+      "lastRssMb": "ölçülmedi",
+      "firstFd": "ölçülmedi",
+      "lastFd": "ölçülmedi",
+      "rssSlopePer100": "ölçülmedi",
+      "fdSlopePer100": "ölçülmedi",
+      "sampleCount": 1
+    },
+    "mcp_warm": {
+      "name": "MCP warm",
+      "completedCalls": 60,
+      "errorCount": 0,
+      "errorRate": 0,
+      "errorClasses": {},
+      "p50": 12,
+      "p95": 242,
+      "firstRssMb": "43.2",
+      "lastRssMb": "43.3",
+      "firstFd": 42,
+      "lastFd": 42,
+      "rssSlopePer100": "0.90",
+      "fdSlopePer100": "0.00",
+      "sampleCount": 2
+    }
+  }
+}
