@@ -5828,6 +5828,10 @@ def _process_har_event(data, har_records, har_active, har_page_events):
         har_page_events["loadEventFired"] = params.get("timestamp")
 
 
+SETTLE_FAST_S = 0.03
+_LAST_SETTLE_BRANCH = None  # "A" (100 ms silence) or "B" (30 ms quiet) of the last navigate_collect
+
+
 async def navigate_collect(ws_url, url, network=False, console=False, glow=True, har=False):
     """Navigate to a page and optionally collect network/console events."""
     import websockets
@@ -5893,13 +5897,41 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True,
         # 100 ms pass without an event (a static page: ~100 ms), 300 ms at
         # most. Was a blind 1.5 s, then a blind 0.3 s sleep (measured 08.11:
         # that sleep was most of a warm `go`).
+        #
+        # Rule B (D-0106, measured 11.11): when no request is in flight at the
+        # load event and none starts within SETTLE_FAST_S after it, the page is
+        # quiet and the settle ends at 30 ms. Off with network/har/console
+        # (they want the late events) and after any WebSocket. Rule A otherwise.
         loaded_at = None
+        pending = set()
+        ws_seen = False
+        b_ok = not (network or har or console)
+        b_deadline = None
+        branch = None
         start = time.time()
         while time.time() - start < 20 and (loaded_at is None or time.time() - loaded_at < 0.3):
+            if loaded_at is None:
+                recv_timeout = 1
+            elif b_deadline is not None:
+                recv_timeout = b_deadline - time.monotonic()
+                if recv_timeout <= 0:
+                    branch = "B"
+                    break
+            else:
+                recv_timeout = 0.1
             try:
-                resp = await asyncio.wait_for(ws.recv(), timeout=1 if loaded_at is None else 0.1)
+                resp = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
                 data = json.loads(resp)
                 method = data.get("method", "")
+
+                if method == "Network.requestWillBeSent":
+                    pending.add(data.get("params", {}).get("requestId"))
+                    b_deadline = None
+                elif method in ("Network.loadingFinished", "Network.loadingFailed"):
+                    pending.discard(data.get("params", {}).get("requestId"))
+                elif method == "Network.webSocketCreated":
+                    ws_seen = True
+                    b_deadline = None
 
                 if har:
                     _process_har_event(data, har_records, har_active, har_page_events)
@@ -5930,9 +5962,15 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True,
 
                 if method == "Page.loadEventFired":
                     loaded_at = time.time()
+                    if b_ok and not pending and not ws_seen:
+                        b_deadline = time.monotonic() + SETTLE_FAST_S
             except asyncio.TimeoutError:
                 if loaded_at is not None:
+                    if b_deadline is not None:
+                        branch = "B"
                     break
+        global _LAST_SETTLE_BRANCH
+        _LAST_SETTLE_BRANCH = branch or "A"
 
         # Inject visual indicator (glow overlay + visual feedback).
         # Default OFF since 0.4.4 — the glow/cursor animations made cdpilot
