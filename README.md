@@ -1265,7 +1265,7 @@ google-chrome --remote-debugging-port=9450 --user-data-dir="$HOME/cdpilot-chrome
 cdpilot connect 9450          # or: cdpilot connect ws://127.0.0.1:9450/devtools/browser/<id>
 cdpilot connect --auto        # or: find it via a DevToolsActivePort file
 cdpilot go https://example.com/dashboard
-cdpilot disconnect            # forget it; the browser keeps running
+cdpilot disconnect            # close cdpilot's own tab, forget it; the browser keeps running
 ```
 
 Since Chrome 136, `--remote-debugging-port` is ignored on the default profile,
@@ -1317,7 +1317,8 @@ and exits with code 2 and the start command above instead of half-working.
 - `connect` refuses when this project already has a browser cdpilot launched
   ("stop it first (`cdpilot stop`) or use another project"), and only
   `127.0.0.1` / `localhost` is accepted (anything else exits 2). `disconnect`
-  also stops this project's `watch` daemon.
+  closes cdpilot's own tab in that browser (never yours, never the last one)
+  and stops this project's `watch` daemon.
 - cdpilot treats a browser as its own only with proof: the browser id it
   recorded at `launch` (or, for older entries, a live recorded pid that holds
   the debug port). A busy port is not proof, so a leftover registry entry never
