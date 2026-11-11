@@ -473,6 +473,12 @@ test('bin --help output lists agent run and CDPILOT_VAR_HOSTS', () => {
   assert(out.includes('CDPILOT_VAR_HOSTS'), 'Help should list CDPILOT_VAR_HOSTS');
 });
 
+test('bin --help output lists canvas commands and CDPILOT_OBSERVE_FORMAT', () => {
+  const out = run('--help');
+  assert(out.includes('canvas open|set|patch|stream|watch|events|list|close'), 'Help should list the canvas commands');
+  assert(out.includes('CDPILOT_OBSERVE_FORMAT'), 'Help should list CDPILOT_OBSERVE_FORMAT');
+});
+
 // ── Setup ──
 
 test('setup detects browser', () => {
