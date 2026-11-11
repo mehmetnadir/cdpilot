@@ -10028,7 +10028,13 @@ print(json.dumps(out))
       // a form with text typed but never saved.
       const userUrl = 'data:text/html,<title>USER-MAIL</title><textarea id="draft"></textarea>';
       const browser = startHeadless(browserBin, cdpPort, userDataDir, userUrl);
-      const user = userTab(cdpPort, 'document.getElementById("draft").value = "unsaved draft 42"; document.title');
+      // /json can list the tab before its title is set (CI 42949411128): wait for both, as the
+      // stale-entry test does.
+      let user = null;
+      for (let i = 0; i < 20 && !(user && user.title === 'USER-MAIL'); i++) {
+        if (i) sleep(0.25);
+        user = userTab(cdpPort, 'document.getElementById("draft").value = "unsaved draft 42"; document.title');
+      }
       assert(user && user.title === 'USER-MAIL', `user tab not ready: ${JSON.stringify(user)}`);
       const env = isoEnv(home, cdpPort, 'connect-e2e', { CDPILOT_PROFILE: path.join(home, 'cdpilot-profile') });
       const c = (...cArgs) => spawnSync(process.execPath, [CLI, ...cArgs], {
