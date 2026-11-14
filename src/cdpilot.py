@@ -16135,14 +16135,17 @@ async def cmd_a11y_snapshot():
     _tag_clean_notice(acc)
 
 
-def _stale_ref_exit(ref, what="Could not get coordinates for"):
+def _stale_ref_exit(ref, what="Could not get coordinates for", msg=None):
     """A ref whose node is not in the page any more (the tab navigated or reloaded
     since the snapshot): say so on stderr and exit 1. One wording for every
     ref-taking path; never a silent success."""
     num = str(ref).lstrip("@")
-    print(f"Error: {what} @{num}. The element is not in the "
-          "current page (stale ref: the page changed since the last snapshot). "
-          "Run 'agent observe' (or 'a11y-snapshot') again and use a fresh @ref.", file=sys.stderr)
+    if msg:
+        print(f"Error: @{num}: {msg}", file=sys.stderr)
+    else:
+        print(f"Error: {what} @{num}. The element is not in the "
+              "current page (stale ref: the page changed since the last snapshot). "
+              "Run 'agent observe' (or 'a11y-snapshot') again and use a fresh @ref.", file=sys.stderr)
     sys.exit(1)
 
 
@@ -17348,7 +17351,8 @@ async def cmd_agent_observe_frame(frame, full=False, all_=False):
     origin = _agent_frame_origin(live_url, page.get('url', '')) if live_url \
         else _agent_frame_origin(src, page.get('url', ''))
     state = _load_agent_state()
-    old = {r: a for r, a in (state.get('frame_actions') or {}).items() if a.get('frame_id') == frame_id}
+    old = {r: a for r, a in (state.get('frame_actions') or {}).items()
+           if a.get('frame_id') == frame_id and a.get('loader_id') == loader_id}
     tmp = {'actions_map': old, 'ref_counter': state.get('ref_counter', 0)}
     actions = _snapshot_to_actions(nodes, tmp)
     state['ref_counter'] = tmp['ref_counter']
@@ -17391,7 +17395,9 @@ async def _agent_perform_frame(ref, fa, action, ws_url):
         if route.frame_id != fa.get('frame_id'):
             _stale_ref_exit(ref, what)
         if not _agent_frame_same(fa, *await _agent_frame_identity(route)):
-            _stale_ref_exit(ref, 'The iframe navigated since the snapshot:')
+            fi = fa.get('frame_index')
+            idx = str(fi) if fi is not None else '<i>'
+            _stale_ref_exit(ref, msg=f"the iframe navigated since the snapshot (stale ref). Run `cdpilot agent observe --frame {idx}` again.")
         sid = route.session_id
         await _frame_cdp(route, [(1, 'DOM.enable', {}, sid)])
         r = await _frame_cdp(route, [(2, 'DOM.resolveNode', {'backendNodeId': fa['backend_node_id']}, sid)])

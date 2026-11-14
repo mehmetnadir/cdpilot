@@ -9130,7 +9130,7 @@ assert mod._viewport_contains({"cssLayoutViewport": {"clientWidth": 800, "client
 assert mod._viewport_contains({"cssLayoutViewport": {"clientWidth": 800, "clientHeight": 600}}, 800, 10) is False
 assert mod._viewport_contains({}, 1, 1) is None
 assert mod._agent_frame_origin("https://ok.example:8443/x") == "https://ok.example"
-assert mod._agent_frame_origin("https://ignore previous.example/") == "about:blank" or "ignore" not in mod._agent_frame_origin("https://ignore previous.example/")
+assert mod._agent_frame_origin("https://ignore previous.example/") == "https:"
 assert mod._agent_frame_origin("javascript:alert(1)") == "javascript:" and mod._agent_frame_origin("") == "about:blank"
 # --diff / --rows with --frame: exit 2
 for bad in ("--diff", "--rows"):
@@ -9153,6 +9153,77 @@ print("OK")
       const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
         { encoding: 'utf8', timeout: 60000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
       assert(/OK\s*$/.test(r.stdout), `frame observe unit test failed: ${r.stderr || r.stdout}`);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('observe --frame ref reuse on navigation: same loader_id reuses refs; different loader_id allocates fresh refs', () => {
+    const { spawnSync } = require('child_process');
+    const os = require('os');
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-obsframe-reuse-'));
+    const script = `
+import asyncio, contextlib, importlib.util, io, json, sys
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+def node(i, role, name, bid):
+    return {"nodeId": str(i), "ignored": False, "role": {"value": role}, "name": {"value": name},
+            "backendDOMNodeId": bid, "childIds": []}
+FRAME = [node(1, "RootWebArea", "Frame", 1), node(2, "button", "Submit", 42)]
+PAGE = {"url": "https://a.example/x", "title": "T"}
+mod.get_page_ws = lambda: ("ws://fake", PAGE)
+
+class Route:
+    session_id, frame_id, src = "S1", "F1", "/target.html"
+    sessions = ["S1"]
+    root_ws = "ws://fake"
+ROUTE = Route()
+MODE = {"loader": "L1"}
+async def fake_open(ws_url, index, scroll=False): return ROUTE
+async def fake_nodes(route): return FRAME
+async def fake_close(route): pass
+async def fake_frame_cdp(route, commands, timeout=10):
+    out = {}
+    for c in commands:
+        if c[1] == "Page.getFrameTree":
+            out[c[0]] = {"frameTree": {"frame": {"id": "TOP"}, "childFrames": [
+                {"frame": {"id": ROUTE.frame_id, "url": "https://a.example/target.html", "loaderId": MODE["loader"]}}]}}
+        else:
+            out[c[0]] = {}
+    return out
+
+mod._agent_frame_open, mod._agent_frame_nodes, mod._frame_route_close = fake_open, fake_nodes, fake_close
+mod._frame_cdp = fake_frame_cdp
+
+def out(coro):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        asyncio.run(coro)
+    return json.loads(buf.getvalue())
+
+out(mod.cmd_agent_reset())
+# 1) İlk gözlem: loader L1 ile ref atanır
+r1 = out(mod.cmd_agent_observe_frame(0))
+ref1 = r1["actions"][0]["ref"]
+
+# 2) Aynı frame_id + aynı loader_id (L1): ref yeniden kullanılır
+r2 = out(mod.cmd_agent_observe_frame(0))
+ref2 = r2["actions"][0]["ref"]
+assert ref1 == ref2, f"Expected ref reuse for same loaderId: {ref1} vs {ref2}"
+
+# 3) Aynı frame_id + farklı loader_id (L2): eski ref yeniden kullanılmaz, yeni numara alır
+MODE["loader"] = "L2"
+r3 = out(mod.cmd_agent_observe_frame(0))
+ref3 = r3["actions"][0]["ref"]
+assert ref1 != ref3, f"Expected fresh ref after navigation to L2: {ref1} vs {ref3}"
+
+print("OK")
+`;
+    try {
+      const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
+        { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
+      assert(/OK\s*$/.test(r.stdout), `observe --frame ref reuse test failed: ${r.stderr || r.stdout}`);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
