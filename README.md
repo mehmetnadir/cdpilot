@@ -597,9 +597,11 @@ Text the layout hides from a person — outside the page or its clipping box (`o
 almost fully transparent (`transparent`), the color of its CSS background (`camouflage`), or an `aria-label` that
 differs from what is shown (`name_attr`) — is detected on every observation: a marked block that is such text
 carries `why: ["pattern", "hidden:<how>"]` (also when the record comes from the heading, link or button that holds
-it), and only the marked text node itself of an `offscreen` or `tiny` part leaves `text`: the rest of the part, a
-visible copy of the same words and every other node stay. `hidden_removed: N` counts the nodes left out whenever
-there are any; `injection_suspect` (at most 5 records) usually shows them, but on a page with more marks it may not.
+it, its name containing the cut text), and only the marked text node itself of an `offscreen` or `tiny` part leaves
+`text`: the rest of the part, a visible copy of the same words and every other node stay. `hidden_removed: N` counts
+the nodes left out whenever there are any; `injection_suspect` (at most 5 records) usually shows them, but on a page
+with more marks it may not. The copy in the name of the heading that holds them is cut for the first 64 distinct
+texts; past that, `hidden_note` says the heading may still repeat the rest.
 With `CDPILOT_AGENT_HIDDEN=1`
 the output also lists `hidden_text: [{text, how, words}]` (parts of 8 words or more, at most 5) and
 `hidden_check: "unavailable"` when the layout probe failed and the text was not checked. The list is opt-in until a
@@ -611,8 +613,10 @@ Before `agent act --url` and each `go` step of `agent run`, a guard (`CDPILOT_AG
 goes to a host the last 3 observations named only in hidden or marked text and no shown link points to (a link
 whose text is hidden, or that has none, does not count; `url_from_hidden`), or leaves `CDPILOT_AGENT_ORIGINS`
 (`outside_origins`). The navigation still runs. A cookie value the guard found is replaced by `«redacted:N chars»`
-in that result (`url`), in `agent-state.json` (`last_url`, the trail) and in the session log line (also as the URL
-percent-encodes it); the browser's own URL still carries it, so a later `agent observe` of that page shows it. The
+wherever an agent command prints or stores the page URL — that result and every later `agent observe`, `act`,
+`run` and `stats` (`url`, `last_url`, the trail) — and in their session log lines, however the URL percent-encodes
+it (either hex case); `agent-state.json` keeps a fingerprint for that (its length and 64 bits of its SHA-256, never
+the value; `agent reset` clears it). The browser's own URL still carries it, and so may the page's text. The
 guard compares strings: a value sent base64-encoded, with letters changed, split, encoded twice, a cookie shorter
 than 16 characters, or a shared suffix missing from its short list (`s3.amazonaws.com`, `myshopify.com`) passes.
 

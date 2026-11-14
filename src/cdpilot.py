@@ -16724,14 +16724,15 @@ def _agent_desc_labels(node, cands, by_id):
     return None
 
 
-def _agent_injection_scan(nodes, limit=5, why=None, names=None, why_names=None):
+def _agent_injection_scan(nodes, limit=5, why=None, names=None, why_names=None, why_cut=None):
     """Nodes whose accessible name reads like instructions to an AI agent:
     [{"text": <≤160 chars>, "match": <pattern>}], at most `limit`. `why` (backend node id ->
     visibility labels, see _agent_text_view) adds "why": ["pattern", "hidden:<label>", …] to a
     record whose node the page does not show; `why_names` (name -> {AX node id: labels} of the
     labelled text nodes) does the same for a record of a heading, link or button whose name is
     that of a labelled text node below it (the record comes from the wrapper, which is listed
-    first). `names` (a list) collects the matched names uncut."""
+    first), `why_cut` ({AX node id: {cut text: labels}}) for one whose name contains a text cut
+    from below it ("Welcome <hidden injection>"). `names` (a list) collects the matched names uncut."""
     out, seen, by_id = [], set(), None
     for node in nodes:
         if node.get('ignored'):
@@ -16750,6 +16751,10 @@ def _agent_injection_scan(nodes, limit=5, why=None, names=None, why_names=None):
                     if by_id is None:
                         by_id = {n.get('nodeId'): n for n in nodes}
                     labels = _agent_desc_labels(node, cands, by_id)
+            held = why_cut.get(node.get('nodeId')) if not labels and why_cut else None
+            if held and (node.get('role') or {}).get('value') not in _AGENT_TEXT_ROLES:
+                flat = ' '.join(name.split())
+                labels = next((lab for s, lab in held.items() if lab and s in flat), None)
             if labels:
                 rec['why'] = ['pattern'] + ['hidden:' + lab for lab in labels]
             out.append(rec)
@@ -16763,12 +16768,13 @@ def _agent_injection_scan(nodes, limit=5, why=None, names=None, why_names=None):
 def _extract_text_summary(nodes, max_chars=2000, skip=(), strip=None):
     # Chrome's AX role value is 'StaticText' (capital S); a StaticText child
     # usually repeats its parent's name, so consecutive duplicates are dropped.
-    # skip: backend node ids of text nodes left out; strip: {AX node id: [texts]}
-    # cut out of the name of a heading/paragraph that holds a skipped node (its
-    # name repeats the text nodes below it). A text node's own name is never cut.
-    # Both from _agent_text_view.
+    # skip: backend node ids of text nodes left out; strip: {AX node id: texts
+    # (whitespace collapsed)} cut out of the name of a heading/paragraph that
+    # holds a skipped node (its name repeats the text nodes below it), in one
+    # regex pass per name. A text node's own name is never cut. Both from
+    # _agent_text_view. The walk stops once max_chars are collected.
     text_roles = {'StaticText', 'text', 'paragraph', 'heading'}
-    parts = []
+    parts, size, rxs = [], 0, {}
     for node in nodes:
         if node.get('ignored'):
             continue
@@ -16777,12 +16783,17 @@ def _extract_text_summary(nodes, max_chars=2000, skip=(), strip=None):
             if skip and node.get('backendDOMNodeId') in skip:
                 continue
             name = node.get('name', {}).get('value', '')
-            if strip and name and role not in _AGENT_TEXT_ROLES:
-                for s in strip.get(node.get('nodeId'), ()):
-                    if s in name:
-                        name = ' '.join(name.replace(s, ' ').split())
+            cut = strip.get(node.get('nodeId')) if strip and name and role not in _AGENT_TEXT_ROLES else None
+            key = frozenset(s for s in cut if s) if cut else None
+            if key:
+                if key not in rxs:
+                    rxs[key] = _re.compile('|'.join(_re.escape(s) for s in sorted(key, key=len, reverse=True)))
+                name = ' '.join(rxs[key].sub(' ', ' '.join(name.split())).split())
             if name and (not parts or parts[-1] != name):
                 parts.append(name)
+                size += len(name) + 1
+                if size > max_chars:
+                    break
     summary = ' '.join(parts)
     return summary[:max_chars]
 
@@ -17011,6 +17022,9 @@ def _agent_drop_container_names(nodes, actions, hidden):
 # The rule was fixed before the blind measurements (M1, M2) and is not tuned on them.
 AGENT_HIDDEN_MIN_WORDS = 8
 AGENT_HIDDEN_MAX = 5
+# distinct cut texts also cut from the names of the headings/paragraphs above them (one regex pass each);
+# past it a page with thousands of marked nodes cannot make the cut quadratic, and `hidden_note` says so
+AGENT_HIDDEN_CUT_MAX = 64
 # D-0109 (blind set M1): hidden delivery caught 42/50 and no injection_suspect false alarm, but hidden_text
 # fired on 10/60 clean pages (long sr-only descriptions 6/6, clipped carousel slides 4/5; bar <= 6). So the
 # hidden_text and hidden_check FIELDS are opt-in (CDPILOT_AGENT_HIDDEN=1) until a rule that separates
@@ -17237,10 +17251,12 @@ def _agent_text_view(nodes, vis=None):
     words}, at most AGENT_HIDDEN_MAX), then name_attr names. In a listed part that is offscreen or
     tiny and carries no transparent/camouflage label, the text nodes that match an injection
     pattern themselves leave `text` (by node id: a visible twin, the other nodes of the part and
-    other text nodes stay; the matched text is cut from the names of the headings that hold them);
+    other text nodes stay; the matched text is cut from the names of the headings that hold them,
+    for the first AGENT_HIDDEN_CUT_MAX distinct texts; `uncut` counts the nodes past that);
     `removed` counts them, and those parts are listed first, so each is in hidden_text.
-    `why` maps a node to its labels, `why_names` a labelled text's name to {AX node id: labels}
-    (injection_suspect); `parts` are the listed texts uncut."""
+    `why` maps a node to its labels, `why_names` a labelled text's name to {AX node id: labels},
+    `why_cut` an ancestor of a cut node to {cut text: labels} (injection_suspect); `parts` are the
+    listed texts uncut."""
     vis = vis or {}
     labels = vis.get('labels') or {}
     attr = _agent_name_attr(nodes)
@@ -17275,16 +17291,30 @@ def _agent_text_view(nodes, vis=None):
     listed = (cut + keep)[:AGENT_HIDDEN_MAX]
     gone = [n for _r, _t, hits in cut[:AGENT_HIDDEN_MAX] for n in hits]
     skip = {n.get('backendDOMNodeId') for n in gone}
-    strip = {}
-    if gone:  # the headings/paragraphs above a cut node repeat its text in their names
+    # the headings/paragraphs above a cut node repeat its text in their names: strip = {AX node id of an
+    # ancestor: {text (whitespace collapsed): labels}}, cut in one pass (_extract_text_summary). Only the
+    # first AGENT_HIDDEN_CUT_MAX distinct texts are cut there; `uncut` counts the nodes past that limit
+    # (their own text node still leaves `text`)
+    strip, uncut = {}, 0
+    if gone:
         parent = {}
         for n in nodes:
             for c in n.get('childIds') or ():
                 parent.setdefault(c, n.get('nodeId'))
+        cut_names = set()
         for n in gone:
-            nm, a, depth = (n.get('name') or {}).get('value') or '', parent.get(n.get('nodeId')), 0
+            nm = ' '.join(((n.get('name') or {}).get('value') or '').split())
+            if nm not in cut_names:
+                if len(cut_names) >= AGENT_HIDDEN_CUT_MAX:
+                    uncut += 1
+                    continue
+                cut_names.add(nm)
+            a, depth = parent.get(n.get('nodeId')), 0
             while a is not None and depth < 200:
-                strip.setdefault(a, []).append(nm)
+                held = strip.setdefault(a, {})
+                if nm in held:
+                    break  # this ancestor, and so every one above it, has it already
+                held[nm] = list(labels.get(n.get('backendDOMNodeId')) or ())
                 a, depth = parent.get(a), depth + 1
     text = _extract_text_summary(nodes, skip=skip, strip=strip)
     hidden_text = [r for r, _t, _h in listed]
@@ -17304,22 +17334,27 @@ def _agent_text_view(nodes, vis=None):
     hashed = hidden_text if show else [(n.get('name') or {}).get('value') or '' for n in gone]
     h = text + ('\0' + json.dumps(hashed, sort_keys=True, ensure_ascii=False) if hashed else '')
     return {'text': text, 'text_hash': hashlib.md5(h.encode()).hexdigest()[:8], 'hidden_text': hidden_text,
-            'hidden_check': vis.get('check'), 'why': why, 'why_names': why_names, 'removed': len(gone),
-            'parts': [t for _r, t, _h in cut + keep], 'show': show}
+            'hidden_check': vis.get('check'), 'why': why, 'why_names': why_names, 'why_cut': strip,
+            'removed': len(gone), 'uncut': uncut, 'parts': [t for _r, t, _h in cut + keep], 'show': show}
 
 
 def _agent_text_fields(view, nodes, state, out):
     """Write one observation's text side into `out`: text, then injection_suspect, hidden_removed
-    (how many text nodes left `text`; always, so a cut is never silent), and with
-    CDPILOT_AGENT_HIDDEN=1 hidden_text and hidden_check, each only when it has something; push the
-    hosts the hidden parts and the suspects name for the guard (_agent_taint_push, url_from_hidden)."""
+    (how many text nodes left `text`; always, so a cut is never silent), hidden_note when the cut
+    from heading names stopped at AGENT_HIDDEN_CUT_MAX, and with CDPILOT_AGENT_HIDDEN=1 hidden_text
+    and hidden_check, each only when it has something; push the hosts the hidden parts and the
+    suspects name for the guard (_agent_taint_push, url_from_hidden)."""
     out['text'] = view['text']
     names = []
-    suspects = _agent_injection_scan(nodes, why=view.get('why'), names=names, why_names=view.get('why_names'))
+    suspects = _agent_injection_scan(nodes, why=view.get('why'), names=names, why_names=view.get('why_names'),
+                                     why_cut=view.get('why_cut'))
     if suspects:
         out['injection_suspect'] = suspects
     if view.get('removed'):
         out['hidden_removed'] = view['removed']
+    if view.get('uncut'):
+        out['hidden_note'] = (f"{view['uncut']} of the removed nodes are past the first {AGENT_HIDDEN_CUT_MAX} "
+                              "distinct texts: a heading or paragraph that holds them may still repeat them in text")
     if view.get('show') and view.get('hidden_text'):
         out['hidden_text'] = view['hidden_text']
     if view.get('show') and view.get('hidden_check'):
@@ -17440,6 +17475,7 @@ async def cmd_agent_observe(diff=False, full=False, rows=False):
     before = _load_agent_state()
     old_map = dict(before.get('actions_map', {}))
     page, nodes, actions, state, view = await _agent_full_snapshot()
+    page_url = _agent_page_url(page, state)
     text = view['text']
     text_hash = view['text_hash']
     # Actions for output — exclude backend_node_id (internal only)
@@ -17447,7 +17483,7 @@ async def cmd_agent_observe(diff=False, full=False, rows=False):
     full_tok = _estimate_tokens({'actions': out_actions, 'text': text})
     if diff and old_map:
         snap = {
-            'url': page.get('url', ''),
+            'url': page_url,
             'title': page.get('title', ''),
             'changed': _agent_out_diff(_diff_snapshots(old_map, actions), old_map, before.get('hidden_refs'),
                                        actions, state.get('hidden_refs'), full, rows),
@@ -17461,7 +17497,7 @@ async def cmd_agent_observe(diff=False, full=False, rows=False):
         state['total_tokens_diff'] = state.get('total_tokens_diff', 0) + token_est
     else:
         snap = {
-            'url': page.get('url', ''),
+            'url': page_url,
             'title': page.get('title', ''),
             'actions': out_actions,
             'text': text,
@@ -17473,7 +17509,7 @@ async def cmd_agent_observe(diff=False, full=False, rows=False):
         token_est = _estimate_tokens(snap)
         snap['token_estimate'] = token_est
         state['total_tokens_full'] = state.get('total_tokens_full', 0) + token_est
-    state['last_url'] = page.get('url', '')
+    state['last_url'] = page_url
     state['last_snapshot_hash'] = hashlib.md5(json.dumps(snap).encode()).hexdigest()[:8]
     state['last_text_hash'] = text_hash
     state['step'] = state.get('step', 0) + 1
@@ -17604,7 +17640,10 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None, full=Fals
 
     guard, guard_found = [], []
     if url:
-        guard, guard_found = await _agent_guard(url, state)  # warn only: the navigation runs anyway
+        try:  # warn only: the navigation runs anyway, also when the guard itself fails
+            guard, guard_found = await _agent_guard(url, state)
+        except Exception:
+            guard, guard_found = [], []
         _slog_note_guard(guard, guard_found)
         await _agent_go_silent(url)
     elif ref:
@@ -17617,19 +17656,19 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None, full=Fals
     # and title; the 0.5 s /json cache would still show the old ones.
     cdp_cache_invalidate()
     page, nodes, new_actions, new_state, view = await _agent_full_snapshot()
-    # a cookie value the guard found is replaced in what is printed and stored (url, url_after,
-    # last_url); the browser's own URL still carries it, so a later observe of that page shows it
-    page_url = _slog_scrub_values(page.get('url', ''), guard_found)
+    # a cookie value the guard found (now or in an earlier command) is replaced in what is printed and
+    # stored (url, url_after, url_before, last_url): _agent_page_url
+    page_url = _agent_page_url(page, new_state, guard_found)
     # The trail: what a flow is saved from. Anchors, never refs or node ids;
     # a typed secret is a {{placeholder}} before it reaches agent-state.json.
     if url:  # nor does it reach the trail (nor a flow saved from it)
-        entry = {'kind': 'go', 'url': _slog_scrub_values(_slog_mask_url(url), guard_found)}
+        entry = {'kind': 'go', 'url': _agent_page_url(_slog_mask_url(url), new_state, guard_found)}
     else:
         anchor = _agent_anchor(old_map[ref], old_map)
         entry = {'kind': 'act', 'action': action, 'anchor': anchor}
         if action in ('type', 'fill'):
             entry['text'] = _agent_mask_text(anchor['name'], text or '')
-        entry['url_before'] = url_before
+        entry['url_before'] = _agent_page_url(url_before, new_state)
     entry['url_after'] = page_url
     entry['ts'] = int(time.time())
     _agent_trail_push(new_state, entry)
@@ -17678,7 +17717,7 @@ async def cmd_agent_stats():
         'project_id': PROJECT_ID,
         'step': state.get('step', 0),
         'ref_counter': state.get('ref_counter', 0),
-        'last_url': state.get('last_url'),
+        'last_url': _agent_page_url(state.get('last_url'), state),
         'total_tokens_full': full_tok,
         'total_tokens_diff': diff_tok,
         'estimated_savings': saved,
@@ -17863,10 +17902,12 @@ def _agent_host_allowed(host, allowed):
 # CDPILOT_AGENT_GUARD=off|warn (default warn): the action runs anyway; the result carries `guard` and the
 # session log line its records. `strict` (stop before the action) is not available: it waits for a week of
 # warn data, M3 and a new jury (J2-1). The guard never prints or logs a cookie it read; a value it found in
-# the target URL is replaced («redacted») in that result's url, in agent-state.json (last_url, trail) and in
-# the session log line (args, url, summary, percent-encoded spellings too). The browser's own URL keeps it.
-# String matching only: base64, changed letters, splitting, double encoding, cookies under 16 characters and
-# shared suffixes missing from _AGENT_SUFFIX2 (s3.amazonaws.com, myshopify.com) pass.
+# the target URL is replaced («redacted») wherever an agent command prints or stores the page URL (url,
+# last_url, the trail, stats; _agent_page_url) and in the session log line (args, url, summary, percent-
+# encoded spellings too), in that command and in later ones: agent-state.json keeps a fingerprint of the
+# value (length + 64 bits of its SHA-256, never the value; agent reset clears it). The browser's own URL
+# keeps it. String matching only: base64, changed letters, splitting, double encoding, cookies under 16
+# characters and shared suffixes missing from _AGENT_SUFFIX2 (s3.amazonaws.com, myshopify.com) pass.
 AGENT_GUARD_ENV = 'CDPILOT_AGENT_GUARD'
 AGENT_ORIGINS_ENV = 'CDPILOT_AGENT_ORIGINS'
 AGENT_GUARD_SECRET_MIN = 16
@@ -17994,7 +18035,7 @@ async def _agent_guard(url, state):
     urls = []
     for u in [(page or {}).get('url'), state.get('last_url')] + [
             t.get('url_after') for t in reversed(state.get('trail') or []) if isinstance(t, dict)]:
-        if (isinstance(u, str) and u.startswith(('http://', 'https://')) and u.isascii()  # «redacted» ones out
+        if (isinstance(u, str) and u.startswith(('http://', 'https://')) and '«redacted' not in u
                 and u not in urls and len(urls) < 10):
             urls.append(u)
     cookies = []
@@ -18031,6 +18072,64 @@ def _agent_guard_field(recs):
     if len(recs) > 1:
         out['also'] = [r['rule'] for r in recs[1:]]
     return out
+
+
+AGENT_SCRUB_MAX = 48  # fingerprints kept in agent-state.json (a value and its encoded spellings: up to 4)
+AGENT_SCRUB_SCAN = 16384  # characters of a page URL searched for a fingerprinted value
+
+
+def _agent_scrub_fp(form):
+    return hashlib.sha256(form.encode('utf-8', 'surrogatepass')).hexdigest()[:16]
+
+
+def _agent_scrub_note(state, found):
+    """Remember in `state` the values the guard found (with their spellings, as _agent_guard returns
+    them) as [length, 64 bits of SHA-256] fingerprints, never the value, so a later agent command
+    replaces them too. Percent escapes count upper-cased (_slog_pct_upper)."""
+    fps = [fp for fp in (state.get('guard_scrub') or ()) if isinstance(fp, list) and len(fp) == 2]
+    for form in found:
+        form = _slog_pct_upper(form)
+        fp = [len(form), _agent_scrub_fp(form)]
+        if fp not in fps:
+            fps.append(fp)
+    state['guard_scrub'] = fps[-AGENT_SCRUB_MAX:]
+
+
+def _agent_page_url(page, state, found=()):
+    """The page URL as every agent command prints and stores it (observe, act, run, stats, the trail).
+    `page`: a tab dict or a URL. A cookie value the guard found in this command (`found`, noted into
+    `state`) or in an earlier one (state['guard_scrub']) is replaced by «redacted:N chars»; the spellings
+    a fingerprint matched are handed to the session log scrub (in memory only)."""
+    url = page.get('url', '') if isinstance(page, dict) else page
+    if not isinstance(url, str) or not url:
+        return url  # None stays None (no last_url yet)
+    if found:
+        if state is not None:
+            _agent_scrub_note(state, found)
+        url = _slog_scrub_values(url, found)
+    by_len = {}
+    for fp in ((state or {}).get('guard_scrub') or ()):
+        if isinstance(fp, list) and len(fp) == 2 and isinstance(fp[0], int) and fp[0] >= AGENT_GUARD_SECRET_MIN:
+            by_len.setdefault(fp[0], set()).add(fp[1])
+    matched = []
+    for n in sorted(by_len, reverse=True):
+        cmp, hs, out, start, i = _slog_pct_upper(url), by_len[n], [], 0, 0
+        end = min(len(cmp), AGENT_SCRUB_SCAN) - n
+        while i <= end:
+            if _agent_scrub_fp(cmp[i:i + n]) in hs:
+                out.append(url[start:i])
+                out.append(_slog_mark(url[i:i + n]))
+                matched.append(url[i:i + n])
+                i += n
+                start = i
+            else:
+                i += 1
+        if out:
+            out.append(url[start:])
+            url = ''.join(out)
+    if matched:
+        _slog_note_guard([], matched)
+    return url
 
 
 _VAR_LOOPBACK_HOSTS = frozenset({'localhost', '127.0.0.1', '::1'})
@@ -18495,8 +18594,9 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
     run_guard = []  # guard records of the go steps (warn only), with the step number
     run_found = []  # cookie values the guard found: replaced in every URL printed or stored
 
-    def clean(u):
-        return _slog_scrub_values(u or '', run_found)
+    def clean(u, st=None):  # the state about to be saved also keeps their fingerprints
+        st = st if st is not None else state
+        return _agent_page_url(u or '', st, run_found) if st is not None else _slog_scrub_values(u or '', run_found)
 
     last_nodes, last_view = [], {}
 
@@ -18514,13 +18614,13 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
         # (text, injection_suspect, hidden_text, …) is that of the last snapshot, the one shown.
         res = {'status': 'drift', 'flow': slug, 'step': step['n'], 'reason': reason,
                'expected': step.get('anchor') or {'kind': step.get('kind')},
-               'done': done, 'url': clean(page.get('url', '')), 'title': page.get('title', ''),
+               'done': done, 'url': clean(page.get('url', ''), st), 'title': page.get('title', ''),
                'actions': out_actions, 'text': text,
                'hint': f"act on a ref (agent act --ref @N …), finish the task, then: agent flow save {slug}"}
         _agent_text_fields(last_view, last_nodes, st, res)
         if run_guard:
             res['guard'] = _agent_guard_field(run_guard)
-        st['last_url'] = clean(page.get('url', ''))
+        st['last_url'] = clean(page.get('url', ''), st)
         st['last_text_hash'] = last_view.get('text_hash') or hashlib.md5(text.encode()).hexdigest()[:8]
         st['step'] = st.get('step', 0) + 1
         st['total_tokens_avoided'] = st.get('total_tokens_avoided', 0) + tokens_avoided
@@ -18534,7 +18634,10 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
         if step.get('kind') == 'go':
             url_before = (state or {}).get('last_url') if state else None
             go_url = subst(step.get('url', ''))
-            g, g_found = await _agent_guard(go_url, state or _load_agent_state())
+            try:  # warn only: a failing guard never stops the step
+                g, g_found = await _agent_guard(go_url, state or _load_agent_state())
+            except Exception:
+                g, g_found = [], []
             g = [dict(rec, step=step['n']) for rec in g]
             _slog_note_guard(g, g_found)
             run_guard.extend(g)
@@ -22949,33 +23052,56 @@ def _slog_mask_urls(text):
     return _SLOG_URL_RE.sub(lambda m: _slog_mask_url(m.group(0)), text)
 
 
+_SLOG_PCT_RE = _re.compile(r"%[0-9a-fA-F]{2}")
+
+
+def _slog_pct_upper(text):
+    """`text` with each percent escape upper-cased (%2b -> %2B); same length, same positions."""
+    return _SLOG_PCT_RE.sub(lambda m: m.group(0).upper(), text) if "%" in text else text
+
+
 def _slog_scrub_values(text, secrets):
     """Replace echoes of known secret values, including cut-off ones.
 
     Commands echo what they typed, sometimes truncated ("= <first 50 chars>"),
     so a match starts at the value's first 8 chars and extends as far as the
     text keeps agreeing with it. Values under 3 chars are not searched for.
+    A percent escape matches in either case (%2b = %2B): text and value are
+    compared with their escapes upper-cased, which keeps every position.
+    Spellings of one value that share their first 8 chars (raw, %2B, %2B/)
+    all match, and overlapping matches are cut as one span, so a shorter
+    match of one spelling never leaves the tail another spelling covers.
     """
     if not text or not secrets:
         return text
-    for secret in sorted({s for s in secrets if s and len(s) >= 3}, key=len, reverse=True):
-        probe = secret[:8]
-        if probe not in text:
-            continue
-        out, i = [], 0
+    text_c, spans = _slog_pct_upper(text), []
+    for secret in {s for s in secrets if s and len(s) >= 3}:
+        secret_c = _slog_pct_upper(secret)
+        probe, i = secret_c[:8], 0
         while True:
-            j = text.find(probe, i)
+            j = text_c.find(probe, i)
             if j < 0:
-                out.append(text[i:])
                 break
             k = len(probe)
-            while k < len(secret) and j + k < len(text) and text[j + k] == secret[k]:
+            while k < len(secret_c) and j + k < len(text_c) and text_c[j + k] == secret_c[k]:
                 k += 1
-            out.append(text[i:j])
-            out.append(_slog_mark(secret))
+            spans.append((j, j + k, secret))
             i = j + k
-        text = "".join(out)
-    return text
+    if not spans:
+        return text
+    spans.sort(key=lambda s: (s[0], -s[1]))  # at one start the longest match first: it names the span
+    out, i, start, end, value = [], 0, None, 0, ""
+    for a, b, s in spans + [(len(text) + 1, 0, "")]:
+        if start is not None and a < end:  # overlaps the current span: one span
+            end = max(end, b)
+            continue
+        if start is not None:
+            out.append(text[i:start])
+            out.append(_slog_mark(value))
+            i = end
+        start, end, value = a, b, s
+    out.append(text[i:])
+    return "".join(out)
 
 
 def _slog_scrub_echo(m):
