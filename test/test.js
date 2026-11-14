@@ -17576,9 +17576,9 @@ print(json.dumps(out))
   // 1. Birim test: PNG/JPEG/WebP başlık okuyucu + token formülü
   test('screenshot: unit - image dimensions parser (PNG, JPEG, WebP) and token formula', () => {
     const pyScript = `
-import sys, struct, math
-sys.path.insert(0, '${path.join(ROOT, 'src')}')
-import cdpilot
+import importlib.util, struct, math
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+cdpilot = importlib.util.module_from_spec(spec); spec.loader.exec_module(cdpilot)
 
 # 1. PNG (800x600)
 png_hdr = b"\\x89PNG\\r\\n\\x1a\\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", 800, 600) + b"\\x08\\x02\\x00\\x00\\x00\\x00\\x00\\x00\\x00"
