@@ -784,6 +784,8 @@ function showHelp() {
                        lift it for one call)
     CDPILOT_VAR_HOSTS  Hosts (comma-separated, host:port for another port)
                        an agent flow or replay step may type CDPILOT_VAR_* on
+    CDPILOT_SHOT_SCALE=device
+                       Keep native device pixels for screenshots on HiDPI displays
 
   SETUP
     setup              Auto-detect browser, create isolated profile
@@ -809,7 +811,9 @@ function showHelp() {
     go <url>           Navigate to URL (alias: open)
     content            Get page text content
     html               Get page HTML
-    shot [file]        Take screenshot
+    shot [file] [--element=<sel>] [--quality=N] [--format=fmt] [--hidpi]
+                       Take screenshot (defaults to CSS pixels on HiDPI displays;
+                       --hidpi keeps device pixels)
     pdf [file]         Save page as PDF
 
   INTERACTION

@@ -227,9 +227,15 @@ See [CHANGELOG.md](CHANGELOG.md) for the full list with rationale.
 cdpilot go <url>              # Navigate to URL (alias: open <url>)
 cdpilot content               # Get page text content
 cdpilot html                  # Get page HTML
-cdpilot shot [file]           # Take screenshot (PNG)
+cdpilot shot [file]           # Take screenshot (CSS pixels by default, --hidpi for device pixels)
 cdpilot pdf [file]            # Save page as PDF
 ```
+
+### Screenshots
+
+`cdpilot shot` defaults to CSS pixels on HiDPI displays (`scale = 1/devicePixelRatio`). Use `--hidpi` or `CDPILOT_SHOT_SCALE=device` to capture native device pixels instead.
+Each screenshot costs `ceil(width / 28) * ceil(height / 28)` vision tokens (before any model downscale). Cropping with `--element=<selector>` reduces pixel dimensions; `--format` (png/jpeg/webp) and `--quality` adjust file size without changing token costs.
+
 
 ### Interaction
 
