@@ -9625,7 +9625,7 @@ out["observe"] = srv._execute_tool(3, "browser_agent_observe", {})
 out["launch"] = srv._execute_tool(4, "browser_launch", {})  # spawn-only by rule
 out["spawned"] = spawned
 real = mod.cmd_agent_observe
-async def hang(diff=False, full=False, rows=False, all_=False):
+async def hang(*_a, **_kw):
     await asyncio.sleep(30)
 mod.cmd_agent_observe = hang
 srv.TOOL_TIMEOUT_S = 1
