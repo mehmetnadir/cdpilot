@@ -49,6 +49,8 @@ Environment:
                        row; same as --rows); objects = object format (default, --objects)
   CDPILOT_OBSERVE_MAX  Most entries one agent observe/act/run list prints (default 400,
                        AX order; 0 = no limit; --all / --full lift it for one call)
+  CDPILOT_GO_FAST=1    go ends the settle 30 ms after a quiet load (no request in flight,
+                       none started); default waits for 100 ms of event silence
   CDPILOT_AGENT_HIDDEN=1  agent observe/act/run also print hidden_text and
                        hidden_check (page text the layout hides; opt-in)
   CDPILOT_AGENT_GUARD  off|warn (default warn): before agent act --url and an
@@ -5915,12 +5917,14 @@ async def navigate_collect(ws_url, url, network=False, console=False, glow=True,
         #
         # Rule B (D-0106, measured 11.11): when no request is in flight at the
         # load event and none starts within SETTLE_FAST_S after it, the page is
-        # quiet and the settle ends at 30 ms. Off with network/har/console
-        # (they want the late events) and after any WebSocket. Rule A otherwise.
+        # quiet and the settle ends at 30 ms. Opt-in with CDPILOT_GO_FAST=1 (D-0106 condition 4,
+        # 15.11: on an idle runner nextjs.org wrote text 100-300 ms after a quiet load in 4/4 B runs).
+        # Off with network/har/console (they want the late events) and after any WebSocket.
+        # Rule A otherwise.
         loaded_at = None
         pending = set()
         ws_seen = False
-        b_ok = not (network or har or console)
+        b_ok = os.environ.get('CDPILOT_GO_FAST') == '1' and not (network or har or console)
         b_deadline = None
         branch = None
         start = time.time()

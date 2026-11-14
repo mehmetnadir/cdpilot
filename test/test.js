@@ -1266,13 +1266,14 @@ test('navigate_collect post-load settle: event silence (100 ms), 300 ms cap, no 
     'navigate_collect must not regress to a blind post-load sleep');
 });
 
-test('navigate_collect settle rule B (30 ms quiet) vs rule A, by branch not by wall clock', () => {
+test('navigate_collect settle rule B (30 ms quiet, CDPILOT_GO_FAST=1) vs rule A, by branch not by wall clock', () => {
   const { spawnSync } = require('child_process');
   const script = `
 import asyncio, json, sys, types, importlib.util, contextlib, io
 spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
 mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
 assert mod.SETTLE_FAST_S == 0.03
+import os
 def run(pre, post, **kw):
     # pre: events delivered before loadEventFired; post: [(delay_s, event)] after it
     class S:
@@ -1299,6 +1300,10 @@ def run(pre, post, **kw):
     return mod._LAST_SETTLE_BRANCH
 rq = lambda i: {"method": "Network.requestWillBeSent", "params": {"requestId": i}}
 fin = lambda i: {"method": "Network.loadingFinished", "params": {"requestId": i}}
+# opt-in (D-0106 condition 4): without CDPILOT_GO_FAST=1 a quiet load still takes rule A
+os.environ.pop("CDPILOT_GO_FAST", None)
+assert run([rq("1"), fin("1")], []) == "A"
+os.environ["CDPILOT_GO_FAST"] = "1"
 assert run([rq("1"), fin("1")], []) == "B"
 assert run([rq("1")], []) == "A"
 assert run([rq("1"), rq("1"), fin("1")], []) == "B"

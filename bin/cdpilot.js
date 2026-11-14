@@ -786,6 +786,8 @@ function showHelp() {
                        lift it for one call)
     CDPILOT_VAR_HOSTS  Hosts (comma-separated, host:port for another port)
                        an agent flow or replay step may type CDPILOT_VAR_* on
+    CDPILOT_GO_FAST=1  go ends the settle 30 ms after a quiet load (no request in
+                       flight, none started); default waits for 100 ms of silence
     CDPILOT_SHOT_SCALE=device
                        Keep native device pixels for screenshots on HiDPI displays
     CDPILOT_AGENT_HIDDEN

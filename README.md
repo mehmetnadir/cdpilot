@@ -1524,6 +1524,7 @@ print(result.stdout)
 | `CDPILOT_OBSERVE_FORMAT` | unset | `rows` = `agent observe/act/run` print `actions` as `[ref, role, name(, value)]` arrays (`""` = same role as previous row; same as `--rows`); `objects` = object format (same as `--objects`); MCP has no per-call switch |
 | `CDPILOT_AGENT_HIDDEN` | unset | `1` = `agent observe/act/run` also print `hidden_text` and `hidden_check` (detection, `why` and the guard run either way) |
 | `CDPILOT_AGENT_GUARD` | `warn` | `off` = no guard before `agent act --url` / `agent run` go steps; `warn` = report `guard` and let the navigation run |
+| `CDPILOT_GO_FAST` | unset | `1` = `go` ends the settle 30 ms after a quiet load (no request in flight at the load event, none started within 30 ms) instead of 100 ms of event silence; off with `--network`, `--har`, `--console` and after a WebSocket |
 | `CDPILOT_AGENT_ORIGINS` | unset | Hosts an agent may navigate to (comma-separated, subdomains included, `host:port` for another port); a target outside gets `guard` `outside_origins` |
 | `CDPILOT_LOG` | `1` | `0` = do not write the session log (`cdpilot log`) |
 | `CDPILOT_LOG_DAYS` | `14` | Days of session log to keep; older day files are deleted on the first write of a day (`0` keeps all) |
