@@ -520,8 +520,19 @@ cdpilot agent observe --full          # every entry, nothing hidden, no size lim
 cdpilot agent observe --all           # default view without the 400-entry limit (CDPILOT_OBSERVE_MAX=N sets it, 0 = none)
 cdpilot agent find "Stalingrad" --role link   # {ref, role, name} of up to 20 matches + total_matches; refs work with act
 cdpilot agent observe --rows          # entries as [ref, role, name, value?] arrays
+cdpilot agent observe --frame 1       # the entries of iframe 1 (index from `frames`); act --ref clicks inside it
 cdpilot agent stats | agent reset
 ```
+
+`agent observe` never saw into iframes, so a cookie layer in a full-screen iframe (theguardian.com, weather.com) left the model
+with 400 entries of a page it could not click. It now adds `frames` (at most 5 visible iframes: `{i, origin, w, h, cover,
+blocking}`, read in the main document with one `Runtime.evaluate`) and, when one covers the page, a `frames_hint`. Top-level
+`frames[].origin` is read from the iframe's `src` attribute (not the post-redirect address) and is not a trust signal; the
+`frame` field in `agent observe --frame <i>` output comes from the live frame URL. `agent observe
+--frame <i>` lists that frame's entries and names the frame's live origin as `frame`; they pass the same tag-character cleaning and
+`injection_suspect` scan as page text (a frame is third-party content). A frame ref belongs to its frame and never resolves in the main
+document; if the frame is gone or replaced, `agent act --ref` gives the stale-ref error. Only `click` works on a frame ref, and
+such a click is not part of a saved flow's trail.
 
 The agent commands (`agent observe`, `agent act`, `agent run`, `agent flow list|show`) print compact
 UTF-8 JSON when stdout is not a terminal (an agent, a pipe, an MCP tool call) and indented JSON in a

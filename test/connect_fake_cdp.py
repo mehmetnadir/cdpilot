@@ -324,6 +324,11 @@ def answer(msg, path):
         if "FAKE_EVAL_EMPTY" in expr:
             # a real empty object value: returnByValue of `({})`
             return {"id": msg.get("id"), "result": {"result": {"type": "object", "value": {}}}}, events
+        if "cdpilot-agent-frames" in expr:
+            # the visible-iframe probe of `agent observe` (FAKE_CDP_FRAMES = its JSON value)
+            raw = os.environ.get("FAKE_CDP_FRAMES")
+            val = json.loads(raw) if raw else []
+            return {"id": msg.get("id"), "result": {"result": {"type": "object", "value": val}}}, events
         if "cdpilot-var-find" in expr:
             # the field a strict fill/smart-fill resolves: an object, not a value
             kind = "IFRAME" if '"iframe' in expr else "INPUT"

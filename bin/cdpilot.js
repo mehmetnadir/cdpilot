@@ -945,7 +945,11 @@ function showHelp() {
                        acted on and lists at most 400 entries in AX order,
                        with a "truncated" note); --all = no size limit,
                        default view; --rows = [ref, role, name, value?] arrays
-                       ("" = role same as previous row); --objects = objects
+                       ("" = role same as previous row); --objects = objects;
+                       "frames" lists visible iframes (an iframe that covers
+                       the page adds a hint); --frame <i> = the entries of
+                       iframe <i> (names its live origin as frame; no --diff/--rows); agent act
+                       --ref on one clicks inside that frame
     agent find "<text>" [--role <role>] [--max 20] [--rows] [--objects]
                        Entries of the whole page whose name contains <text>
                        (any case): {ref, role, name} + total_matches; the
