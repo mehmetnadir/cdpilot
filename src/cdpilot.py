@@ -16343,30 +16343,22 @@ async def _assert_in_viewport(ws_url, x, y, ref_num):
     If 0 <= x < w and 0 <= y < h is false, exits 1 without clicking/hovering.
     """
     res_m = await cdp_send(ws_url, [(90, "Page.getLayoutMetrics", {})])
-    metrics = res_m.get(90, {})
-    vp = metrics.get("cssLayoutViewport") or metrics.get("layoutViewport") or {}
-    w = vp.get("clientWidth")
-    h = vp.get("clientHeight")
-    if w is None or h is None:
-        vp2 = metrics.get("visualViewport") or {}
-        w = w or vp2.get("clientWidth")
-        h = h or vp2.get("clientHeight")
-    if w is None or h is None:
+    inside = _viewport_contains(res_m.get(90, {}), x, y)
+    if inside is None:
         try:
             r = await cdp_send(ws_url, [(91, "Runtime.evaluate", {
                 "expression": "JSON.stringify({w: window.innerWidth, h: window.innerHeight})",
                 "returnByValue": True,
             })])
             val = json.loads(r.get(91, {}).get("result", {}).get("value") or "{}")
-            w = w or val.get("w")
-            h = h or val.get("h")
+            inside = _viewport_contains({"cssLayoutViewport": {"clientWidth": val.get("w"),
+                                                               "clientHeight": val.get("h")}}, x, y)
         except Exception:
             pass
-    if w is not None and h is not None:
-        if not (0 <= x < w and 0 <= y < h):
-            num = str(ref_num).lstrip("@")
-            print(f"Error: Element @{num} is outside the viewport after scrolling", file=sys.stderr)
-            sys.exit(1)
+    if inside is False:
+        num = str(ref_num).lstrip("@")
+        print(f"Error: Element @{num} is outside the viewport after scrolling", file=sys.stderr)
+        sys.exit(1)
 
 
 async def cmd_click_ref(ref_str):
@@ -17542,10 +17534,18 @@ def _agent_frame_same(fa, loader_id, url):
 
 
 def _viewport_contains(metrics, x, y):
-    """True/False for (x, y) against Page.getLayoutMetrics' CSS layout viewport; None when unknown."""
-    vp = (metrics or {}).get('cssLayoutViewport') or (metrics or {}).get('layoutViewport') or {}
-    w, h = vp.get('clientWidth'), vp.get('clientHeight')
-    if not isinstance(w, (int, float)) or not isinstance(h, (int, float)):
+    """True/False for (x, y) against Page.getLayoutMetrics' CSS layout viewport (visual viewport
+    as fallback); None when neither gives a size (the caller may ask window.innerWidth)."""
+    m = metrics or {}
+    w = h = None
+    for key in ('cssLayoutViewport', 'layoutViewport', 'visualViewport'):
+        vp = m.get(key) or {}
+        cw, ch = vp.get('clientWidth'), vp.get('clientHeight')
+        if w is None and isinstance(cw, (int, float)):
+            w = cw
+        if h is None and isinstance(ch, (int, float)):
+            h = ch
+    if w is None or h is None:
         return None
     return 0 <= x < w and 0 <= y < h
 

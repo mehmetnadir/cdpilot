@@ -9271,6 +9271,8 @@ assert mod._frame_points([[100, 50, 2, 3, 2, 2]], 10, 10)[0] == (124, 76)
 assert mod._viewport_contains({"cssLayoutViewport": {"clientWidth": 800, "clientHeight": 600}}, 799, 599) is True
 assert mod._viewport_contains({"cssLayoutViewport": {"clientWidth": 800, "clientHeight": 600}}, 800, 10) is False
 assert mod._viewport_contains({}, 1, 1) is None
+assert mod._viewport_contains({"visualViewport": {"clientWidth": 800, "clientHeight": 600}}, 900, 10) is False
+assert mod._viewport_contains({"cssLayoutViewport": {"clientWidth": 800}, "visualViewport": {"clientHeight": 600}}, 10, 10) is True
 assert mod._agent_frame_origin("https://ok.example:8443/x") == "https://ok.example"
 assert mod._agent_frame_origin("https://ignore previous.example/") == "https:"
 assert mod._agent_frame_origin("javascript:alert(1)") == "javascript:" and mod._agent_frame_origin("") == "about:blank"
