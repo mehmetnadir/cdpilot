@@ -70,6 +70,7 @@ Environment:
                        `launch --webmcp` / `launch --no-webmcp`)
   CDPILOT_CFT_BASE_URL  Mirror of the Chrome for Testing JSON endpoints
                        (default: https://googlechromelabs.github.io/chrome-for-testing)
+  CDPILOT_SHOT_SCALE=device  Capture screenshots in device pixels instead of default CSS pixels on HiDPI displays
 
 Web Bot Auth (signed agent — the opposite of stealth; optional dependency:
 pip install cryptography):
@@ -118,6 +119,8 @@ Exit codes: 0 ok, 1 error (batch / run: a step failed), 124 --timeout;
 __version__ = "0.9.8"
 
 import asyncio
+import struct
+import math
 import atexit
 import json
 import sys
@@ -7823,14 +7826,163 @@ async def cmd_html():
         print("[Output truncated at 1MB]")
 
 
-async def cmd_shot(output=None, quality=None, element=None, fmt=None):
-    """Take screenshot. Supports --element (crops pixels to save visual tokens) and --quality/--format (reduces file size).
+def _image_dimensions(data: bytes):
+    """Read image dimensions (width, height) directly from header without external packages.
+    Supports PNG (IHDR), JPEG (SOF0/SOF2), WebP (VP8/VP8L/VP8X).
+    """
+    if not data or len(data) < 16:
+        return None
+    # PNG: 8 bytes signature + 4 bytes chunk len + 4 bytes "IHDR" + 4 bytes W + 4 bytes H
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        if len(data) >= 24 and data[12:16] == b"IHDR":
+            return struct.unpack(">II", data[16:24])
+    # JPEG: starts with FF D8
+    if data.startswith(b"\xff\xd8"):
+        idx = 2
+        data_len = len(data)
+        while idx <= data_len - 9:
+            if data[idx] != 0xff:
+                idx += 1
+                continue
+            marker = data[idx + 1]
+            if marker == 0xff:
+                idx += 1
+                continue
+            if marker in (0xc0, 0xc1, 0xc2, 0xc3):  # SOF0, SOF1, SOF2, SOF3
+                h, w = struct.unpack(">HH", data[idx + 5 : idx + 9])
+                return w, h
+            if marker in (0xd8, 0xd9):  # SOI, EOI
+                idx += 2
+            else:
+                if idx + 4 > data_len:
+                    break
+                seg_len = struct.unpack(">H", data[idx + 2 : idx + 4])[0]
+                idx += 2 + seg_len
+    # WebP: RIFF ... WEBP
+    if data.startswith(b"RIFF") and len(data) >= 25 and data[8:12] == b"WEBP":
+        chunk_type = data[12:16]
+        if chunk_type == b"VP8 ":
+            if len(data) >= 30 and data[23:26] == b"\x9d\x01\x2a":
+                w = struct.unpack("<H", data[26:28])[0] & 0x3fff
+                h = struct.unpack("<H", data[28:30])[0] & 0x3fff
+                return w, h
+        elif chunk_type == b"VP8L":
+            if len(data) >= 25 and data[20] == 0x2f:
+                bits = struct.unpack("<I", data[21:25])[0]
+                w = 1 + (bits & 0x3fff)
+                h = 1 + ((bits >> 14) & 0x3fff)
+                return w, h
+        elif chunk_type == b"VP8X":
+            if len(data) >= 30:
+                w = 1 + (data[24] | (data[25] << 8) | (data[26] << 16))
+                h = 1 + (data[27] | (data[28] << 8) | (data[29] << 16))
+                return w, h
+    return None
+
+
+async def _capture(ws, fmt, quality=None, clip_css=None, mode=None, capture_beyond_viewport=None):
+    """Capture screenshot via Page.captureScreenshot.
+    mode='css' (default) captures at CSS pixel dimensions on HiDPI displays.
+    mode='device' (--hidpi or CDPILOT_SHOT_SCALE=device) captures native device pixels.
+    """
+    if mode is None:
+        mode = "device" if os.environ.get("CDPILOT_SHOT_SCALE") == "device" else "css"
+
+    params = {"format": fmt}
+    if fmt == "jpeg":
+        params["quality"] = 80 if quality is None else max(1, min(100, int(quality)))
+    if capture_beyond_viewport is not None:
+        params["captureBeyondViewport"] = capture_beyond_viewport
+
+    if mode == "device":
+        if clip_css is not None:
+            params["clip"] = {
+                "x": clip_css["x"],
+                "y": clip_css["y"],
+                "width": clip_css["width"],
+                "height": clip_css["height"],
+                "scale": 1,
+            }
+        r = await cdp_send(ws, [(1, "Page.captureScreenshot", params)])
+        b64 = r.get(1, {}).get("result", {}).get("data", "") or r.get(1, {}).get("data", "")
+        return base64.b64decode(b64) if b64 else None
+
+    # mode == "css": query devicePixelRatio
+    dpr = 1.0
+    scroll_x = 0.0
+    scroll_y = 0.0
+    inner_w = 0.0
+    inner_h = 0.0
+    eval_js = """(function() {
+      return JSON.stringify({
+        dpr: window.devicePixelRatio || 1,
+        x: window.scrollX || 0,
+        y: window.scrollY || 0,
+        width: window.innerWidth || 0,
+        height: window.innerHeight || 0
+      });
+    })()"""
+    try:
+        cr = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": eval_js, "returnByValue": True})])
+        ev_val = cr.get(1, {}).get("result", {}).get("value")
+        if ev_val:
+            info = json.loads(ev_val) if isinstance(ev_val, str) else ev_val
+            dpr = float(info.get("dpr", 1) or 1)
+            scroll_x = float(info.get("x", 0) or 0)
+            scroll_y = float(info.get("y", 0) or 0)
+            inner_w = float(info.get("width", 0) or 0)
+            inner_h = float(info.get("height", 0) or 0)
+    except Exception:
+        dpr = 1.0
+
+    if dpr <= 1.0:
+        if clip_css is not None:
+            params["clip"] = {
+                "x": clip_css["x"],
+                "y": clip_css["y"],
+                "width": clip_css["width"],
+                "height": clip_css["height"],
+                "scale": 1,
+            }
+    else:
+        # DPR > 1: clip to viewport (or element box) with scale = 1 / DPR
+        if clip_css is not None:
+            params["clip"] = {
+                "x": clip_css["x"],
+                "y": clip_css["y"],
+                "width": clip_css["width"],
+                "height": clip_css["height"],
+                "scale": 1.0 / dpr,
+            }
+        else:
+            params["clip"] = {
+                "x": scroll_x,
+                "y": scroll_y,
+                "width": inner_w,
+                "height": inner_h,
+                "scale": 1.0 / dpr,
+            }
+
+    r = await cdp_send(ws, [(2, "Page.captureScreenshot", params)])
+    b64 = (
+        r.get(2, {}).get("result", {}).get("data", "")
+        or r.get(2, {}).get("data", "")
+        or r.get(1, {}).get("result", {}).get("data", "")
+        or r.get(1, {}).get("data", "")
+    )
+    return base64.b64decode(b64) if b64 else None
+
+
+async def cmd_shot(output=None, quality=None, element=None, fmt=None, hidpi=False):
+    """Take screenshot. Defaults to CSS pixels on HiDPI displays (--hidpi keeps device pixels).
+    Supports --element (crops pixels to save visual tokens) and --quality/--format (reduces file size).
 
     Args:
         output: File path (auto-detects format from extension)
         quality: JPEG quality 1-100 (only for jpeg format, reduces file size; vision tokens depend on pixel dimensions, not compression)
         element: CSS selector to capture only that element (crop reduces pixel dimensions to save vision tokens)
         fmt: Force format: 'png', 'jpeg', or 'webp' (reduces file size, vision tokens unchanged)
+        hidpi: Capture at native device pixel ratio instead of CSS pixels
     """
     if not output:
         output = f"{SCREENSHOT_DIR}/screenshot.png"
@@ -7841,12 +7993,7 @@ async def cmd_shot(output=None, quality=None, element=None, fmt=None):
         ext = os.path.splitext(output)[1].lower()
         fmt = {"jpg": "jpeg", ".jpg": "jpeg", ".jpeg": "jpeg", ".webp": "webp"}.get(ext, "png")
 
-    params = {"format": fmt}
-    if fmt == "jpeg" and quality:
-        params["quality"] = max(1, min(100, int(quality)))
-    elif fmt == "jpeg" and quality is None:
-        params["quality"] = 80  # sensible default
-
+    clip_css = None
     # Element-level crop: get bounding rect, use clip
     if element:
         safe_sel = json.dumps(element)
@@ -7858,7 +8005,13 @@ async def cmd_shot(output=None, quality=None, element=None, fmt=None):
           var el = res.el;
           el.scrollIntoView({{block: 'center'}});
           var r = el.getBoundingClientRect();
-          return JSON.stringify({{x: r.x, y: r.y, width: r.width, height: r.height, shadowHost: res.host ? __cdpilot_hostDesc(res.host) : null}});
+          return JSON.stringify({{
+            x: r.x + window.scrollX,
+            y: r.y + window.scrollY,
+            width: r.width,
+            height: r.height,
+            shadowHost: res.host ? __cdpilot_hostDesc(res.host) : null
+          }});
         }})()
         """
         cr = await cdp_send(ws, [(2, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
@@ -7867,22 +8020,29 @@ async def cmd_shot(output=None, quality=None, element=None, fmt=None):
             rect = json.loads(rect_str)
             if rect.get("shadowHost"):
                 _maybe_print_shadow_note(element, rect["shadowHost"])
-            params["clip"] = {
+            clip_css = {
                 "x": rect["x"], "y": rect["y"],
-                "width": rect["width"], "height": rect["height"],
-                "scale": 1
+                "width": rect["width"], "height": rect["height"]
             }
         else:
             print(f"Element not found: {element}, taking full page", file=sys.stderr)
 
-    r = await cdp_send(ws, [(1, "Page.captureScreenshot", params)])
-    b64 = r.get(1, {}).get("result", {}).get("data", "") or r.get(1, {}).get("data", "")
-    if b64:
-        data = base64.b64decode(b64)
+    mode = "device" if hidpi else None
+    data = await _capture(ws, fmt, quality=quality, clip_css=clip_css, mode=mode)
+    if data:
         with open(output, "wb") as f:
             f.write(data)
         size_kb = len(data) / 1024
-        print(f"{output} ({size_kb:.1f}KB)")
+        try:
+            dims = _image_dimensions(data)
+        except Exception:
+            dims = None
+        if dims:
+            w, h = dims
+            tokens = math.ceil(w / 28) * math.ceil(h / 28)
+            print(f"{output} ({size_kb:.1f}KB), {w}x{h} px, ~{tokens} vision tokens (ceil(W/28)*ceil(H/28), before any model downscale)")
+        else:
+            print(f"{output} ({size_kb:.1f}KB)")
     else:
         print("Screenshot failed", file=sys.stderr)
         sys.exit(1)
@@ -7953,17 +8113,16 @@ async def cmd_shot_annotated(output=None):
         await cdp_send(ws_url, [(20, "Runtime.evaluate", {"expression": inject_js})])
 
     # Screenshot al
-    r = await cdp_send(ws_url, [(21, "Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})])
-    b64 = r.get(21, {}).get("data", "")
+    data = await _capture(ws_url, "png", capture_beyond_viewport=False)
 
     # Badge'leri temizle
     await cdp_send(ws_url, [(22, "Runtime.evaluate", {
         "expression": "document.querySelectorAll('[data-cdpilot-badge]').forEach(function(e){e.remove();})"
     })])
 
-    if b64:
+    if data:
         with open(output, "wb") as f:
-            f.write(base64.b64decode(b64))
+            f.write(data)
         print(f"{output} ({badge_count} badge)")
     else:
         print("Screenshot failed", file=sys.stderr)
@@ -10014,11 +10173,10 @@ async def cmd_debug(url=None):
     print("-" * 40)
     shot_path = f"{SCREENSHOT_DIR}/debug-{int(time.time())}.png"
     try:
-        r = await cdp_send(ws, [(10, "Page.captureScreenshot", {"format": "png"})])
-        b64 = r.get(10, {}).get("data", "")
-        if b64:
+        data = await _capture(ws, "png")
+        if data:
             with open(shot_path, "wb") as f:
-                f.write(base64.b64decode(b64))
+                f.write(data)
             print(f"  {shot_path}")
     except:
         print("  (unavailable)")
@@ -14658,11 +14816,10 @@ async def cmd_describe():
     print("=== Screenshot ===")
     ts = int(time.time())
     shot_path = f"{SCREENSHOT_DIR}/cdpilot-describe-{ts}.png"
-    shot_res = await cdp_send(ws_url, [(2, "Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})])
-    shot_data = shot_res.get(2, {}).get("data")
+    shot_data = await _capture(ws_url, "png", capture_beyond_viewport=False)
     if shot_data:
         with open(shot_path, "wb") as f:
-            f.write(base64.b64decode(shot_data))
+            f.write(shot_data)
         print(f"Saved: {shot_path}")
     else:
         print("Could not capture screenshot.", file=sys.stderr)
@@ -20491,7 +20648,7 @@ class MCPServer:
         return [
             {"name": "browser_navigate", "description": "Navigate the browser to a URL and return the page text content. Use this to open websites, follow links, or load web applications. Waits for page load before returning. Returns first 10000 chars of visible text.",
              "inputSchema": {"type": "object", "properties": {"url": {"type": "string", "description": "Full URL to navigate to (must include https://)"}}, "required": ["url"]}},
-            {"name": "browser_screenshot", "description": "Save a screenshot of the viewport and return the file path (the image enters context only if the file is read). A w x h pixel image costs ceil(w/28)*ceil(h/28) vision tokens: crop with element to cut them; format and quality change only the file size.",
+            {"name": "browser_screenshot", "description": "Save a screenshot of the viewport and return the file path (the image enters context only if the file is read). Defaults to CSS pixels on HiDPI displays (env CDPILOT_SHOT_SCALE=device keeps device pixels). A w x h pixel image costs ceil(w/28)*ceil(h/28) vision tokens: crop with element to cut them; format and quality change only the file size.",
              "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Output file path (e.g. /tmp/screenshot.png). Extension determines format: .png, .jpg, .webp", "default": "screenshot.png"}, "element": {"type": "string", "description": "CSS selector to capture only that element (crops to its bounding box: fewer pixels, fewer vision tokens; 800x600 = 638, an h1 = 34-56)"}, "quality": {"type": "number", "description": "JPEG quality 1-100 (.jpg only): smaller file, same vision tokens. Default: 80"}}}},
             {"name": "browser_click", "description": "Click an element on the page identified by CSS selector. Auto-waits up to 5 seconds for the element to appear (MutationObserver). Scrolls the element into view before clicking. Returns the tag name and text of the clicked element. When a real mouse click (inside a frame, or with entropy) was pressed but the page changed under the press so the release missed the target, nothing is clicked again by script and the first line is JSON {\"clicked\": false, \"reason\": \"moved\"|\"gone\"|\"unknown\"} (isError stays false): the page may already have reacted to the press, so check it before retrying.",
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element to click (e.g. '#submit-btn', '.nav a', 'button[type=submit]'). Inside an iframe or shadow root: 'iframe#card >>> button#pay' or 'my-card >>> button.inner'"}}, "required": ["selector"]}},
@@ -28356,6 +28513,7 @@ def _cli_main():
             quality=next((a.split("=")[1] for a in args if a.startswith("--quality=")), None),
             element=next((a.split("=")[1] for a in args if a.startswith("--element=")), None),
             fmt=next((a.split("=")[1] for a in args if a.startswith("--format=")), None),
+            hidpi="--hidpi" in args,
         ),
         "shot-annotated": lambda: cmd_shot_annotated(args[0] if args else None),
         "batch": cmd_batch,

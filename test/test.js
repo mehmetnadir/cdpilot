@@ -17181,6 +17181,275 @@ print(json.dumps(out))
   });
 })();
 
+// ── Screenshot CSS pixels default on HiDPI (D-0111) ──
+(function() {
+  const { execFileSync, spawnSync, spawn } = require('child_process');
+  const path = require('path');
+  const fs = require('fs');
+  const os = require('os');
+  const assert = require('assert');
+
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const ROOT = path.join(__dirname, '..');
+  const CLI = path.join(ROOT, 'bin', 'cdpilot.js');
+
+  function runWithFakeCdp(dpr, envExtra, runFn) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-shotfake-'));
+    const logFile = path.join(home, 'cdp.log');
+    const portFile = path.join(home, 'port.txt');
+    const fakeProc = spawn(PYB, [path.join(__dirname, 'shot_fake_cdp.py'), portFile, logFile], {
+      env: { ...process.env, FAKE_DPR: String(dpr) },
+      stdio: 'ignore',
+    });
+    let port = null;
+    const start = Date.now();
+    while (!fs.existsSync(portFile) && Date.now() - start < 5000) {
+      try { require('child_process').execSync('sleep 0.05'); } catch (_) {}
+    }
+    if (fs.existsSync(portFile)) {
+      port = parseInt(fs.readFileSync(portFile, 'utf-8').trim(), 10);
+    }
+    if (!port) {
+      try { fakeProc.kill('SIGKILL'); } catch (_) {}
+      throw new Error('shot_fake_cdp failed to start');
+    }
+
+    const reg = {
+      version: 1,
+      projects: {
+        'test-proj': {
+          cwd: home,
+          port: port,
+          profile_dir: path.join(home, 'profile'),
+          status: 'connected',
+          external: true,
+          browser_name: 'HeadlessChrome/152.0.0.0',
+        },
+      },
+    };
+    fs.writeFileSync(path.join(home, 'registry.json'), JSON.stringify(reg));
+
+    const env = {
+      ...process.env,
+      CDPILOT_HOME: home,
+      CDPILOT_PROJECT_ID: 'test-proj',
+      CDPILOT_NO_AUTOLAUNCH: '1',
+      CDP_PORT: String(port),
+      ...envExtra,
+    };
+
+    try {
+      runFn({ home, logFile, env, port });
+    } finally {
+      try { fakeProc.kill('SIGKILL'); } catch (_) {}
+    }
+  }
+
+  // 1. Birim test: PNG/JPEG/WebP başlık okuyucu + token formülü
+  test('screenshot: unit - image dimensions parser (PNG, JPEG, WebP) and token formula', () => {
+    const pyScript = `
+import sys, struct, math
+sys.path.insert(0, '${path.join(ROOT, 'src')}')
+import cdpilot
+
+# 1. PNG (800x600)
+png_hdr = b"\\x89PNG\\r\\n\\x1a\\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", 800, 600) + b"\\x08\\x02\\x00\\x00\\x00\\x00\\x00\\x00\\x00"
+
+# 2. JPEG (800x600)
+jpg_hdr = b"\\xff\\xd8\\xff\\xc0" + struct.pack(">H", 17) + b"\\x08" + struct.pack(">HH", 600, 800) + b"\\x03\\x01\\x11\\x00\\x02\\x11\\x00\\x03\\x11\\x00"
+
+# 3. WebP VP8 (800x600)
+vp8_hdr = b"RIFF\\x20\\x00\\x00\\x00WEBPVP8 \\x0a\\x00\\x00\\x00\\x00\\x00\\x00\\x9d\\x01\\x2a" + struct.pack("<H", 800) + struct.pack("<H", 600)
+
+# 4. WebP VP8L (800x600)
+bits = (799 & 0x3fff) | ((599 & 0x3fff) << 14)
+vp8l_hdr = b"RIFF\\x20\\x00\\x00\\x00WEBPVP8L\\x05\\x00\\x00\\x00\\x2f" + struct.pack("<I", bits)
+
+# 5. WebP VP8X (800x600)
+w799 = struct.pack("<I", 799)[:3]
+h599 = struct.pack("<I", 599)[:3]
+vp8x_hdr = b"RIFF\\x20\\x00\\x00\\x00WEBPVP8X\\x0a\\x00\\x00\\x00\\x00\\x00\\x00\\x00" + w799 + h599
+
+assert cdpilot._image_dimensions(png_hdr) == (800, 600)
+assert cdpilot._image_dimensions(jpg_hdr) == (800, 600)
+assert cdpilot._image_dimensions(vp8_hdr) == (800, 600)
+assert cdpilot._image_dimensions(vp8l_hdr) == (800, 600)
+assert cdpilot._image_dimensions(vp8x_hdr) == (800, 600)
+
+assert cdpilot._image_dimensions(b"") is None
+assert cdpilot._image_dimensions(b"too_short") is None
+
+w, h = 800, 600
+tokens = math.ceil(w / 28) * math.ceil(h / 28)
+assert tokens == 638, f"Expected 638, got {tokens}"
+
+print("OK")
+`;
+    const out = execFileSync(PYB, ['-c', pyScript], { encoding: 'utf-8' });
+    assert.strictEqual(out.trim(), 'OK');
+  });
+
+  // 2. Sahte CDP testleri
+  test('screenshot: fake CDP - DPR 1 params identical to baseline (no clip scale)', () => {
+    runWithFakeCdp(1, {}, ({ home, logFile, env }) => {
+      const outPng = path.join(home, 'shot1.png');
+      const r = spawnSync(process.execPath, [CLI, 'shot', outPng], { env, encoding: 'utf-8', timeout: 10000 });
+      assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+
+      const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
+      assert(shotCall, 'Page.captureScreenshot must be called');
+      assert.strictEqual(shotCall.params.format, 'png');
+      assert.strictEqual(shotCall.params.clip, undefined, 'DPR 1 must have no clip parameter (identical to baseline)');
+    });
+  });
+
+  test('screenshot: fake CDP - DPR 2 scales by 0.5 (CSS pixel default)', () => {
+    runWithFakeCdp(2, {}, ({ home, logFile, env }) => {
+      const outPng = path.join(home, 'shot2.png');
+      const r = spawnSync(process.execPath, [CLI, 'shot', outPng], { env, encoding: 'utf-8', timeout: 10000 });
+      assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+
+      const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
+      assert(shotCall, 'Page.captureScreenshot must be called');
+      assert(shotCall.params.clip, 'DPR 2 must have clip parameter');
+      assert.strictEqual(shotCall.params.clip.scale, 0.5, 'DPR 2 must have clip.scale == 0.5');
+      assert.strictEqual(shotCall.params.clip.width, 800);
+      assert.strictEqual(shotCall.params.clip.height, 600);
+      // clip 800x600 x scale 0.5 x DPR 2 = 800x600 image pixels.
+      assert(r.stdout.includes(', 800x600 px, ~638 vision tokens'), `DPR 2 line: ${r.stdout}`);
+    });
+  });
+
+  test('screenshot: fake CDP - --hidpi and CDPILOT_SHOT_SCALE=device disable scale', () => {
+    runWithFakeCdp(2, {}, ({ home, logFile, env }) => {
+      const outPng = path.join(home, 'shot_hidpi.png');
+      const r = spawnSync(process.execPath, [CLI, 'shot', outPng, '--hidpi'], { env, encoding: 'utf-8', timeout: 10000 });
+      assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+
+      const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
+      assert(shotCall, 'Page.captureScreenshot must be called');
+      assert.strictEqual(shotCall.params.clip, undefined, '--hidpi must not have clip scale');
+      // The fake PNG size follows Chrome: no clip at DPR 2 = 1600x1200 device pixels.
+      assert(r.stdout.includes(', 1600x1200 px, ~2494 vision tokens'), `--hidpi line: ${r.stdout}`);
+    });
+
+    runWithFakeCdp(2, { CDPILOT_SHOT_SCALE: 'device' }, ({ home, logFile, env }) => {
+      const outPng = path.join(home, 'shot_env.png');
+      const r = spawnSync(process.execPath, [CLI, 'shot', outPng], { env, encoding: 'utf-8', timeout: 10000 });
+      assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+
+      const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
+      assert(shotCall, 'Page.captureScreenshot must be called');
+      assert.strictEqual(shotCall.params.clip, undefined, 'CDPILOT_SHOT_SCALE=device must not have clip scale');
+    });
+  });
+
+  // 3. Çıktı satırı biçimi testi
+  test('screenshot: output format preserves prefix and appends px and vision tokens', () => {
+    runWithFakeCdp(2, {}, ({ home, env }) => {
+      const outPng = path.join(home, 'formatted.png');
+      const r = spawnSync(process.execPath, [CLI, 'shot', outPng], { env, encoding: 'utf-8', timeout: 10000 });
+      assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+      const line = r.stdout.trim();
+      assert(line.startsWith(outPng), `Line must start with path: ${line}`);
+      assert(/\(\d+\.\d+KB\)/.test(line), `Line must contain (<N>KB): ${line}`);
+      assert(line.includes(', 800x600 px, ~638 vision tokens (ceil(W/28)*ceil(H/28), before any model downscale)'),
+        `Line must contain dimensions and token info: ${line}`);
+    });
+  });
+
+  // 4. e2e (CDPILOT_E2E=1): own headless browser, isolated home, free ports (CI e2e job).
+  // Emulation overrides are bound to one CDP session and each cdpilot command opens its own,
+  // so DPR 2 is covered by the fake-CDP tests; this checks the scrolled element crop for real:
+  // Page.captureScreenshot clip is document-relative, the old viewport-relative clip captured
+  // the top of the page (white) instead of the element once the page was scrolled.
+  test('screenshot: e2e viewport size and scrolled element crop (gated by CDPILOT_E2E=1)', () => {
+    if (process.env.CDPILOT_E2E !== '1') {
+      console.log('  - skipped: screenshot e2e (set CDPILOT_E2E=1 to run it against a headless browser)');
+      return;
+    }
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-shot-e2e-'));
+    const site = path.join(home, 'site');
+    fs.mkdirSync(site);
+    fs.writeFileSync(path.join(site, 'index.html'), '<!DOCTYPE html><html><body style="margin:0;height:4000px;background:#fff">'
+      + '<div id="target" style="position:absolute;top:2000px;left:100px;width:200px;height:200px;background:#f00"></div>'
+      + '</body></html>');
+    const [cdpPort, webPort] = JSON.parse(execFileSync(PYB, ['-c', [
+      'import json, socket', 'ss = [socket.socket() for _ in range(2)]',
+      '[s.bind(("127.0.0.1", 0)) for s in ss]',
+      'print(json.dumps([s.getsockname()[1] for s in ss]))', '[s.close() for s in ss]',
+    ].join('\n')], { encoding: 'utf-8', timeout: 10000 }).trim());
+    const server = spawn(PYB, ['-m', 'http.server', String(webPort), '--bind', '127.0.0.1'], { cwd: site, stdio: 'ignore' });
+    const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+      CDP_PORT: String(cdpPort), CHROME_HEADLESS: '1' };
+    delete env.CDPILOT_TARGET;
+    delete env.CDPILOT_SHOT_SCALE;
+    const c = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf-8', timeout: 60000, env });
+    // Center pixel and size of a PNG (8-bit RGB/RGBA, non-interlaced: what Chrome writes).
+    const pngCenter = (file) => JSON.parse(execFileSync(PYB, ['-c', [
+      'import json, struct, sys, zlib',
+      'd = open(sys.argv[1], "rb").read(); i = 8; idat = b""',
+      'while i < len(d):',
+      '    n = struct.unpack(">I", d[i:i+4])[0]; t = d[i+4:i+8]; b = d[i+8:i+8+n]',
+      '    if t == b"IHDR": w, h, bd, ct = struct.unpack(">IIBB", b[:10])',
+      '    if t == b"IDAT": idat += b',
+      '    i += 12 + n',
+      'bpp = 4 if ct == 6 else 3; raw = zlib.decompress(idat); st = w * bpp; prev = bytearray(st); p = 0',
+      'for y in range(h // 2 + 1):',
+      '    f = raw[p]; ln = bytearray(raw[p+1:p+1+st]); p += 1 + st',
+      '    for x in range(st):',
+      '        a = ln[x-bpp] if x >= bpp else 0; up = prev[x]; c = prev[x-bpp] if x >= bpp else 0',
+      '        if f == 1: ln[x] = (ln[x] + a) & 255',
+      '        elif f == 2: ln[x] = (ln[x] + up) & 255',
+      '        elif f == 3: ln[x] = (ln[x] + (a + up) // 2) & 255',
+      '        elif f == 4:',
+      '            pa, pb, pc = abs(up - c), abs(a - c), abs(a + up - 2 * c)',
+      '            ln[x] = (ln[x] + (a if pa <= pb and pa <= pc else (up if pb <= pc else c))) & 255',
+      '    prev = ln',
+      'x = (w // 2) * bpp',
+      'print(json.dumps({"w": w, "h": h, "px": list(prev[x:x+3])}))',
+    ].join('\n'), file], { encoding: 'utf-8', timeout: 10000 }).trim());
+    try {
+      execFileSync(PYB, ['-c', [
+        'import time, urllib.request',
+        'for _ in range(50):',
+        `    try: urllib.request.urlopen("http://127.0.0.1:${webPort}/", timeout=1); break`,
+        '    except Exception: time.sleep(0.1)',
+      ].join('\n')], { timeout: 20000 });
+      const l = c('launch');
+      assert(/CDP ready/.test(l.stdout + l.stderr), `launch: ${l.stdout}${l.stderr}`);
+      c('go', `http://127.0.0.1:${webPort}/`);
+      const vp = c('eval', 'innerWidth + "x" + innerHeight + "@" + devicePixelRatio');
+      const m = /(\d+)x(\d+)@([\d.]+)/.exec(vp.stdout);
+      assert(m, `viewport eval: ${vp.stdout}${vp.stderr}`);
+
+      const full = path.join(home, 'vp.png');
+      const r1 = c('shot', full);
+      assert.strictEqual(r1.status, 0, r1.stderr || r1.stdout);
+      assert(/, \d+x\d+ px, ~\d+ vision tokens/.test(r1.stdout), `output line: ${r1.stdout}`);
+      const s1 = pngCenter(full);
+      if (Number(m[3]) === 1) {
+        assert.deepStrictEqual([s1.w, s1.h], [Number(m[1]), Number(m[2])], `viewport shot size ${s1.w}x${s1.h}`);
+      }
+
+      c('eval', 'window.scrollTo(0, 1500); scrollY');
+      const crop = path.join(home, 'crop.png');
+      const r2 = c('shot', crop, '--element=#target');
+      assert.strictEqual(r2.status, 0, r2.stderr || r2.stdout);
+      const s2 = pngCenter(crop);
+      assert.deepStrictEqual(s2.px, [255, 0, 0], `scrolled element crop must show the element (red), got ${JSON.stringify(s2)}`);
+      assert.strictEqual(s2.w, 200, `crop width in CSS pixels: ${s2.w}`);
+    } finally {
+      c('stop');
+      try { server.kill(); } catch (err) { /* already gone */ }
+    }
+  });
+})();
+
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);
