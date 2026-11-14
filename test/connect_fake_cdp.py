@@ -36,6 +36,7 @@ GUID = sys.argv[4]
 LOCK = threading.Lock()
 PAGES = [{"id": "PAGE1", "type": "page", "url": "https://user.example/inbox",
           "title": "The user's own tab"}]
+CONTEXTS = set()
 SEQ = [1]
 SCROLLED_NODES = set()
 # The field check cdpilot runs before it types a flow's placeholder value
@@ -373,12 +374,29 @@ def answer(msg, path):
         events = [{"method": "Page.frameStartedLoading", "params": {"frameId": "F1"}},
                   {"method": "Page.loadEventFired", "params": {"timestamp": 1}},
                   {"method": "Page.frameStoppedLoading", "params": {"frameId": "F1"}}]
+    elif method == "Target.createBrowserContext":
+        with LOCK:
+            SEQ[0] += 1
+            cid = f"CTX{SEQ[0]}"
+            CONTEXTS.add(cid)
+        result = {"browserContextId": cid}
+    elif method == "Target.disposeBrowserContext":
+        cid = p.get("browserContextId")
+        with LOCK:
+            CONTEXTS.discard(cid)
+            PAGES[:] = [x for x in PAGES if x.get("browserContextId") != cid]
+        result = {}
+    elif method == "Target.getBrowserContexts":
+        with LOCK:
+            result = {"browserContextIds": sorted(list(CONTEXTS))}
     elif method == "Target.createTarget":
         with LOCK:
             SEQ[0] += 1
             new = {"id": f"PAGE{SEQ[0]}", "type": "page", "url": p.get("url") or "about:blank",
                    "title": "", "background": bool(p.get("background")),
                    "newWindow": bool(p.get("newWindow")), "_born": time.time()}
+            if p.get("browserContextId"):
+                new["browserContextId"] = p["browserContextId"]
             PAGES.append(new)
         result = {"targetId": new["id"]}
     elif method == "Target.closeTarget":
@@ -390,7 +408,8 @@ def answer(msg, path):
     elif method == "Target.getTargets":
         with LOCK:
             result = {"targetInfos": [{"targetId": x["id"], "type": "page", "url": x["url"],
-                                       "title": x["title"], "attached": False}
+                                       "title": x["title"], "attached": False,
+                                       **({"browserContextId": x["browserContextId"]} if x.get("browserContextId") else {})}
                                       for x in PAGES if listed(x, targets=True)]}
     elif method == "Page.getFrameTree":
         result = {"frameTree": {"frame": {"id": "F1", "url": "https://user.example/inbox"}}}
