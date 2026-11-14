@@ -600,8 +600,11 @@ carries `why: ["pattern", "hidden:<how>"]` (also when the record comes from the 
 it, its name containing the removed text), and only the marked text node itself of an `offscreen` or `tiny` part
 leaves `text`: the rest of the part, a visible copy of the same words and every other node stay. A heading or
 paragraph that holds such a node is printed from its text nodes only (its name, which repeats them, is left out).
-`hidden_removed: N` counts the nodes left out whenever there are any; `injection_suspect` (at most 5 records) usually
-shows them, but on a page with more marks it may not.
+`hidden_removed: N` counts every node left out, also past the 5 parts `hidden_text` lists; `injection_suspect` (at
+most 5 records) usually shows them, but on a page with more marks it may not. Known limits: a heading whose name
+comes from an image's alt, an SVG title or an `aria-label` rather than from its text nodes loses that name in `text`
+when it holds such a node; a heading named through `aria-labelledby` by an off-screen node elsewhere keeps that
+text (only an `aria-label` that differs from the content is `name_attr`).
 With `CDPILOT_AGENT_HIDDEN=1`
 the output also lists `hidden_text: [{text, how, words}]` (parts of 8 words or more, at most 5) and
 `hidden_check: "unavailable"` when the layout probe failed and the text was not checked. The list is opt-in until a
@@ -616,9 +619,11 @@ whose text is hidden, or that has none, does not count; `url_from_hidden`), or l
 stderr line. A cookie value the guard found is replaced by `«redacted:N chars»` wherever an agent command prints or
 stores the page URL — that result and every later `agent observe`, `act`, `run` and `stats` (`url`, `last_url`, the
 trail) — and in their session log lines, however the URL spells it (any mix of raw and percent-escaped characters);
-`agent-state.json` keeps a fingerprint for that, written before the navigation (the length and 64 bits of the
-SHA-256 of the decoded value, unsalted, never the value; `agent reset` clears it). The browser's own URL still
-carries it, and so may the page's text and the log lines of other commands. The guard compares strings: a value sent base64-encoded, with letters changed, split, encoded twice, a cookie shorter
+`agent-state.json` keeps fingerprints for that, written before the navigation (the length and 64 bits of the
+SHA-256 of the decoded value and of each spelling, unsalted, never the value; `agent reset` clears them). Later
+commands search the first 16 KB of a URL for them: a value placed after that is printed. The browser's own URL still
+carries it, and so may the page's text and the log lines of other commands. The guard compares strings: a value sent
+base64-encoded, with letters changed, split, encoded twice, partly escaped right after a stray `%`, a cookie shorter
 than 16 characters, or a shared suffix missing from its short list (`s3.amazonaws.com`, `myshopify.com`) passes.
 
 ### Live canvas (experimental)

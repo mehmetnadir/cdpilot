@@ -17243,15 +17243,16 @@ def _agent_text_view(nodes, vis=None):
     """The text side of one observation: {text, text_hash, hidden_text, hidden_check, why, parts}.
     Consecutive AX text nodes with the same labels (vis['labels'], _agent_invisible_bids) are one
     part; a part of >= AGENT_HIDDEN_MIN_WORDS words is listed in hidden_text ({text <= 160, how,
-    words}, at most AGENT_HIDDEN_MAX), then name_attr names. In a listed part that is offscreen or
-    tiny and carries no transparent/camouflage label, the text nodes that match an injection
-    pattern themselves leave `text` (by node id: a visible twin, the other nodes of the part and
-    other text nodes stay; the headings/paragraphs that hold them are printed from their text
-    nodes only, their names, which repeat the removed text, left out); `removed` counts them,
-    and those parts are listed first, so each is in hidden_text.
+    words}, at most AGENT_HIDDEN_MAX), then name_attr names. In every such part (listed or not)
+    that is offscreen or tiny and carries no transparent/camouflage label, the text nodes that
+    match an injection pattern themselves leave `text` (by node id: a visible twin, the other
+    nodes of the part and other text nodes stay; the headings/paragraphs that hold them are
+    printed from their text nodes only, their names, which repeat the removed text, left out);
+    `removed` counts them all. Those parts are listed first, so hidden_text shows the first
+    AGENT_HIDDEN_MAX of them.
     `why` maps a node to its labels, `why_names` a labelled text's name to {AX node id: labels},
     `why_cut` an ancestor of a removed node to (its text, labels) (injection_suspect); `parts` are
-    the listed texts whole."""
+    the texts of all parts, whole."""
     vis = vis or {}
     labels = vis.get('labels') or {}
     attr = _agent_name_attr(nodes)
@@ -17284,7 +17285,7 @@ def _agent_text_view(nodes, vis=None):
     for _bid, name in attr.items():
         keep.append(({'text': name[:160], 'how': 'name_attr', 'words': len(name.split())}, name, ()))
     listed = (cut + keep)[:AGENT_HIDDEN_MAX]
-    gone = [n for _r, _t, hits in cut[:AGENT_HIDDEN_MAX] for n in hits]
+    gone = [n for _r, _t, hits in cut for n in hits]  # every part, not only the listed ones (fail closed)
     skip = {n.get('backendDOMNodeId') for n in gone}
     # the headings/paragraphs above a removed node repeat its text in their names: every ancestor goes into
     # `drop` ({AX node id: (removed text, labels)} of the first removed node below it) and its name is left
@@ -18066,25 +18067,28 @@ def _agent_guard_field(recs):
     return out
 
 
-AGENT_SCRUB_MAX = 48  # fingerprints kept in agent-state.json (one per decoded spelling of a value)
-AGENT_SCRUB_SCAN = 16384  # decoded bytes of a page URL searched for a fingerprinted value
+AGENT_SCRUB_MAX = 48  # fingerprints kept in agent-state.json (per spelling: its decoded bytes and as written)
+AGENT_SCRUB_SCAN = 16384  # characters / decoded bytes of a page URL searched for a fingerprinted value
+AGENT_SCRUB_MIN = 3  # the shortest value _slog_scrub_values searches for
 
 
-def _agent_scrub_fp(decoded):
-    """64 bits of the SHA-256 of a value as _slog_decode_map reads it (its bytes, percent escapes decoded)."""
-    return hashlib.sha256(decoded.encode('latin-1')).hexdigest()[:16]
+def _agent_scrub_fp(text, encoding='latin-1'):
+    """64 bits of the SHA-256 of a value: its decoded bytes (_slog_decode_map, latin-1) or, as written,
+    its UTF-8 bytes."""
+    return hashlib.sha256(text.encode(encoding, 'surrogatepass')).hexdigest()[:16]
 
 
 def _agent_scrub_note(state, found):
     """Remember in `state` the values the guard found (with their spellings, as _agent_guard returns
-    them) as [length, 64 bits of SHA-256] fingerprints of their decoded bytes, never the value, so a
-    later agent command replaces them however the URL spells them."""
-    fps = [fp for fp in (state.get('guard_scrub') or ()) if isinstance(fp, list) and len(fp) == 2]
+    them) as fingerprints, never the value, so a later agent command replaces them however the URL
+    spells them: [length, 64 bits of SHA-256] of the decoded bytes, and [length, …, 'raw'] of the
+    spelling as written (a value right after a stray '%' or '%h' is not at a decoded boundary)."""
+    fps = [fp for fp in (state.get('guard_scrub') or ()) if isinstance(fp, list) and len(fp) in (2, 3)]
     for form in found:
         dec = _slog_decode_map(form)[0]
-        fp = [len(dec), _agent_scrub_fp(dec)]
-        if fp not in fps:
-            fps.append(fp)
+        for fp in ([len(dec), _agent_scrub_fp(dec)], [len(form), _agent_scrub_fp(form, 'utf-8'), 'raw']):
+            if fp[0] >= AGENT_SCRUB_MIN and fp not in fps:
+                fps.append(fp)
     state['guard_scrub'] = fps[-AGENT_SCRUB_MAX:]
 
 
@@ -18110,36 +18114,41 @@ def _agent_page_url(page, state, found=()):
         if state is not None:
             _agent_scrub_note(state, found)
         url = _slog_scrub_values(url, found)
-    by_len = {}
+    dec_len, raw_len = {}, {}
     for fp in ((state or {}).get('guard_scrub') or ()):
-        if isinstance(fp, list) and len(fp) == 2 and isinstance(fp[0], int) and fp[0] >= 8:
-            by_len.setdefault(fp[0], set()).add(fp[1])
-    if not by_len:
+        if isinstance(fp, list) and len(fp) in (2, 3) and isinstance(fp[0], int) and fp[0] >= AGENT_SCRUB_MIN:
+            (raw_len if len(fp) == 3 else dec_len).setdefault(fp[0], set()).add(fp[1])
+    if not dec_len and not raw_len:
         return url
-    dec, starts = _slog_decode_map(url)  # windows over the decoded bytes: any spelling of the value matches
+    dec, starts = _slog_decode_map(url)
     at = (lambda k: k) if starts is None else starts.__getitem__
-    spans = []
-    for n, hs in by_len.items():
-        i, last = 0, min(len(dec), AGENT_SCRUB_SCAN) - n
-        while i <= last:
-            if _agent_scrub_fp(dec[i:i + n]) in hs:
-                spans.append((i, i + n))
-                i += n
-            else:
-                i += 1
+    spans = []  # (start, end) in `url`
+
+    def scan(hay, by_len, conv, encoding):
+        for n, hs in by_len.items():
+            i, last = 0, min(len(hay), AGENT_SCRUB_SCAN) - n
+            while i <= last:
+                if _agent_scrub_fp(hay[i:i + n], encoding) in hs and conv(i) < conv(i + n):
+                    spans.append((conv(i), conv(i + n)))
+                    i += n
+                else:
+                    i += 1
+
+    scan(dec, dec_len, at, 'latin-1')  # windows over the decoded bytes: any spelling of the value matches
+    if starts is not None:  # and as written (else the decoded URL is the URL itself)
+        scan(url, raw_len, lambda k: k, 'utf-8')
     if not spans:
         return url
     spans.sort()
     out, matched, pos, start, end = [], [], 0, None, 0
-    for a, b in spans + [(len(dec) + 1, 0)]:
+    for a, b in spans + [(len(url) + 1, 0)]:
         if start is not None and a < end:
             end = max(end, b)
             continue
         if start is not None:
-            a0, b0 = at(start), at(end)
-            out += [url[pos:a0], _slog_mark(url[a0:b0])]
-            matched.append(url[a0:b0])
-            pos = b0
+            out += [url[pos:start], _slog_mark(url[start:end])]
+            matched.append(url[start:end])
+            pos = end
         start, end = a, b
     out.append(url[pos:])
     _slog_note_guard([], matched)  # the spellings found, for the session log scrub (in memory)
@@ -23104,43 +23113,50 @@ def _slog_scrub_values(text, secrets):
     text keeps agreeing with it. Values under 3 chars are not searched for.
     Text and values are compared percent-decoded (_slog_decode_map) and mapped
     back to the text's own positions, so any mix of raw and escaped characters,
-    in either hex case, matches; overlapping matches are cut as one span. A
-    whole match is marked with the length it had in the text, a cut-off one
-    with the value's length.
+    in either hex case, matches. Each spelling is also searched as written: a
+    value right after a stray '%' or '%h' (`%2Ab12…`) is read by the decoder
+    as an escape that swallows its first characters. Overlapping matches are
+    cut as one span. A whole match is marked with the length it had in the
+    text, a cut-off one with the value's length.
     """
     if not text or not secrets:
         return text
     dec, starts = _slog_decode_map(text)
-    spans = []
+    at = (lambda k: k) if starts is None else starts.__getitem__
+    spans = []  # (start, end) in `text`, the value for a cut-off match (None: a whole one)
+
+    def find(hay, value, conv, secret):
+        probe, i = value[:8], 0
+        while True:
+            j = hay.find(probe, i)
+            if j < 0:
+                return
+            k = len(probe)
+            while k < len(value) and j + k < len(hay) and hay[j + k] == value[k]:
+                k += 1
+            if conv(j) < conv(j + k):
+                spans.append((conv(j), conv(j + k), secret if k < len(value) else None))
+            i = j + k
+
     for secret in {s for s in secrets if s and len(s) >= 3}:
         sd = _slog_decode_map(secret)[0]
-        if len(sd) < 3:
-            continue
-        probe, i = sd[:8], 0
-        while True:
-            j = dec.find(probe, i)
-            if j < 0:
-                break
-            k = len(probe)
-            while k < len(sd) and j + k < len(dec) and dec[j + k] == sd[k]:
-                k += 1
-            spans.append((j, j + k, secret if k < len(sd) else None))
-            i = j + k
+        if len(sd) >= 3:
+            find(dec, sd, at, secret)
+        if starts is not None:  # else the decoded text is the text itself
+            find(text, secret, lambda k: k, secret)
     if not spans:
         return text
-    at = (lambda k: k) if starts is None else starts.__getitem__
     spans.sort(key=lambda s: (s[0], -s[1]))  # at one start the longest match first: it names the span
     out, i, start, end, value = [], 0, None, 0, None
-    for a, b, s in spans + [(len(dec) + 1, 0, None)]:
+    for a, b, s in spans + [(len(text) + 1, 0, None)]:
         if start is not None and a < end:  # overlaps the current span: one span
             if end < b:
                 end, value = b, s
             continue
         if start is not None:
-            a0, b0 = at(start), at(end)
-            out.append(text[i:a0])
-            out.append(_slog_mark(value if value is not None else text[a0:b0]))
-            i = b0
+            out.append(text[i:start])
+            out.append(_slog_mark(value if value is not None else text[start:end]))
+            i = end
         start, end, value = a, b, s
     out.append(text[i:])
     return "".join(out)
