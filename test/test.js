@@ -11298,7 +11298,8 @@ print(json.dumps(out))
     assert.strictEqual(reg.ext.external, true);
     assert(/def _atomic_write_json[\s\S]*?tempfile\.mkstemp/.test(PY_CONTENT), 'unique temp files');
     assert(/def _save_owned_tabs[\s\S]*?_atomic_write_json\(OWNED_TABS_FILE/.test(PY_CONTENT));
-    assert(/def _mark_owned_context[\s\S]*?_atomic_write_json\(OWNED_CONTEXTS_FILE/.test(PY_CONTENT));
+    assert(/def _mark_owned_context[\s\S]*?for fpath in \(OWNED_CONTEXTS_FILE, CONNECT_OWNED_CONTEXTS_FILE\):[\s\S]*?_atomic_write_json\(fpath/.test(PY_CONTENT),
+      'owned contexts: both records written atomically');
   });
 
   // ── connect --auto ──
