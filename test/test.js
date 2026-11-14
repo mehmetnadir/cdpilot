@@ -2362,7 +2362,7 @@ test('_snapshot_to_actions reuses existing ref for same backend_node_id', () => 
 });
 
 test('cmd_agent_observe is async and outputs JSON with required fields', () => {
-  assert(/async def cmd_agent_observe\(diff=False(?:, full=False, rows=False(?:, all_=False)?)?\)/.test(PY_CONTENT),
+  assert(/async def cmd_agent_observe\(diff=False(?:, full=False, rows=False(?:, objects=False)?(?:, all_=False)?)?\)/.test(PY_CONTENT),
     "cmd_agent_observe must be async def, with the --diff switch");
   const m = PY_CONTENT.match(/cmd_agent_observe[\s\S]{0,2500}?token_estimate/);  // the function grew a --diff branch
   assert(m, "cmd_agent_observe output must include token_estimate");
