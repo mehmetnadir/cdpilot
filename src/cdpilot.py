@@ -10855,23 +10855,29 @@ async def cmd_context_list():
 
 
 OWNED_CONTEXTS_FILE = os.path.join(PROFILE_DIR, 'owned-contexts.json')
+CONNECT_OWNED_CONTEXTS_FILE = os.path.join(CDPILOT_HOME, 'owned-contexts.json')
 
 
 def _load_owned_contexts():
-    try:
-        with open(OWNED_CONTEXTS_FILE) as f:
-            return set(json.load(f).get("owned", []))
-    except (OSError, ValueError, AttributeError):
-        return set()
+    owned = set()
+    for fpath in (OWNED_CONTEXTS_FILE, CONNECT_OWNED_CONTEXTS_FILE):
+        try:
+            with open(fpath) as f:
+                owned.update(json.load(f).get("owned", []))
+        except (OSError, ValueError, AttributeError):
+            pass
+    return owned
 
 
 def _mark_owned_context(ctx_id):
     """Record a browser context `context create` made (see cmd_context_close)."""
     owned = _load_owned_contexts() | {ctx_id}
-    try:
-        _atomic_write_json(OWNED_CONTEXTS_FILE, {"owned": sorted(owned)})
-    except OSError:
-        pass
+    data = {"owned": sorted(owned)}
+    for fpath in (OWNED_CONTEXTS_FILE, CONNECT_OWNED_CONTEXTS_FILE):
+        try:
+            _atomic_write_json(fpath, data)
+        except OSError as e:
+            print(f"cdpilot: cannot record owned context: {e}", file=sys.stderr)
 
 
 async def cmd_context_close(context_id):
@@ -10884,6 +10890,8 @@ async def cmd_context_close(context_id):
     if not context_id or context_id == 'default':
         print('Cannot destroy the default context.', file=sys.stderr)
         sys.exit(1)
+    if _is_external() and not cdp_get('/json/version'):
+        _autolaunch_if_down()  # connected browser gone: says so and exits, never launches
     if _is_external() and context_id not in _load_owned_contexts():
         print(f"context close refused: {context_id} was not created by cdpilot and this is "
               f"your connected browser; {EXTERNAL_LEFT_RUNNING}", file=sys.stderr)

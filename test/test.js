@@ -11225,6 +11225,47 @@ print(json.dumps(out))
     } finally { fake.stop(); }
   });
 
+  test('connect: context create records ownership and context close disposes context (even after reconnect)', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, {});
+      const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' };
+      delete env.CDP_PORT;
+      delete env.CDPILOT_PROFILE;
+      delete env.CDPILOT_PROJECT_ID;
+
+      const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-work-a-'));
+      const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'cdp-work-b-'));
+
+      const run = (args, cwd) => spawnSync(process.execPath, [CLI, ...args],
+        { encoding: 'utf-8', timeout: 20000, env, cwd });
+
+      // Scenario 1: connect <port> -> context create -> separate process context close -> exit 0
+      assert.strictEqual(run(['connect', String(fake.port)], dirA).status, 0);
+      const rCreate = run(['context', 'create', 'about:blank'], dirA);
+      assert.strictEqual(rCreate.status, 0, rCreate.stdout + rCreate.stderr);
+      const ctxId = JSON.parse(rCreate.stdout).context_id;
+      assert(ctxId, 'must return context_id');
+      const rClose = run(['context', 'close', ctxId], dirA);
+      assert.strictEqual(rClose.status, 0, rClose.stdout + rClose.stderr);
+      assert(fake.methods().includes('Target.disposeBrowserContext'), 'Target.disposeBrowserContext must be called');
+
+      // Scenario 2: create in dirA -> connect <port> again in dirB -> close in dirB -> still exit 0
+      const rCreate2 = run(['context', 'create', 'about:blank'], dirA);
+      assert.strictEqual(rCreate2.status, 0, rCreate2.stdout + rCreate2.stderr);
+      const ctxId2 = JSON.parse(rCreate2.stdout).context_id;
+      assert.strictEqual(run(['connect', String(fake.port)], dirB).status, 0);
+      const rClose2 = run(['context', 'close', ctxId2], dirB);
+      assert.strictEqual(rClose2.status, 0, rClose2.stdout + rClose2.stderr);
+
+      // Foreign context: cdpilot did not create it -> refuse close
+      const rForeign = run(['context', 'close', 'CTX-FOREIGN'], dirB);
+      assert.notStrictEqual(rForeign.status, 0, 'must refuse foreign context');
+      assert(/was not created by cdpilot/i.test(rForeign.stderr), rForeign.stderr);
+    } finally { fake.stop(); }
+  });
+
   test('disconnect: stops this project\'s watch daemon', () => {
     const home = mkHome();
     const port = freePort();
