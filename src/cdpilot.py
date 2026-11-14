@@ -8032,7 +8032,10 @@ async def cmd_shot(output=None, quality=None, element=None, fmt=None, hidpi=Fals
         with open(output, "wb") as f:
             f.write(data)
         size_kb = len(data) / 1024
-        dims = _image_dimensions(data)
+        try:
+            dims = _image_dimensions(data)
+        except Exception:
+            dims = None
         if dims:
             w, h = dims
             tokens = math.ceil(w / 28) * math.ceil(h / 28)
@@ -20532,7 +20535,7 @@ class MCPServer:
         return [
             {"name": "browser_navigate", "description": "Navigate the browser to a URL and return the page text content. Use this to open websites, follow links, or load web applications. Waits for page load before returning. Returns first 10000 chars of visible text.",
              "inputSchema": {"type": "object", "properties": {"url": {"type": "string", "description": "Full URL to navigate to (must include https://)"}}, "required": ["url"]}},
-            {"name": "browser_screenshot", "description": "Save a screenshot of the viewport and return the file path (the image enters context only if the file is read). Defaults to CSS pixels on HiDPI displays. A w x h pixel image costs ceil(w/28)*ceil(h/28) vision tokens: crop with element to cut them; format and quality change only the file size.",
+            {"name": "browser_screenshot", "description": "Save a screenshot of the viewport and return the file path (the image enters context only if the file is read). Defaults to CSS pixels on HiDPI displays (env CDPILOT_SHOT_SCALE=device keeps device pixels). A w x h pixel image costs ceil(w/28)*ceil(h/28) vision tokens: crop with element to cut them; format and quality change only the file size.",
              "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Output file path (e.g. /tmp/screenshot.png). Extension determines format: .png, .jpg, .webp", "default": "screenshot.png"}, "element": {"type": "string", "description": "CSS selector to capture only that element (crops to its bounding box: fewer pixels, fewer vision tokens; 800x600 = 638, an h1 = 34-56)"}, "quality": {"type": "number", "description": "JPEG quality 1-100 (.jpg only): smaller file, same vision tokens. Default: 80"}}}},
             {"name": "browser_click", "description": "Click an element on the page identified by CSS selector. Auto-waits up to 5 seconds for the element to appear (MutationObserver). Scrolls the element into view before clicking. Returns the tag name and text of the clicked element. When a real mouse click (inside a frame, or with entropy) was pressed but the page changed under the press so the release missed the target, nothing is clicked again by script and the first line is JSON {\"clicked\": false, \"reason\": \"moved\"|\"gone\"|\"unknown\"} (isError stays false): the page may already have reacted to the press, so check it before retrying.",
              "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector for the element to click (e.g. '#submit-btn', '.nav a', 'button[type=submit]'). Inside an iframe or shadow root: 'iframe#card >>> button#pay' or 'my-card >>> button.inner'"}}, "required": ["selector"]}},

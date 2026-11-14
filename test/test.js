@@ -17149,6 +17149,8 @@ print("OK")
       assert.strictEqual(shotCall.params.clip.scale, 0.5, 'DPR 2 must have clip.scale == 0.5');
       assert.strictEqual(shotCall.params.clip.width, 800);
       assert.strictEqual(shotCall.params.clip.height, 600);
+      // clip 800x600 x scale 0.5 x DPR 2 = 800x600 image pixels.
+      assert(r.stdout.includes(', 800x600 px, ~638 vision tokens'), `DPR 2 line: ${r.stdout}`);
     });
   });
 
@@ -17162,6 +17164,8 @@ print("OK")
       const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
       assert(shotCall, 'Page.captureScreenshot must be called');
       assert.strictEqual(shotCall.params.clip, undefined, '--hidpi must not have clip scale');
+      // The fake PNG size follows Chrome: no clip at DPR 2 = 1600x1200 device pixels.
+      assert(r.stdout.includes(', 1600x1200 px, ~2494 vision tokens'), `--hidpi line: ${r.stdout}`);
     });
 
     runWithFakeCdp(2, { CDPILOT_SHOT_SCALE: 'device' }, ({ home, logFile, env }) => {

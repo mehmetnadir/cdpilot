@@ -19,15 +19,26 @@ PORT_FILE = sys.argv[1] if len(sys.argv) > 1 else None
 LOG = sys.argv[2] if len(sys.argv) > 2 else "shot_fake.log"
 LOCK = threading.Lock()
 
-# 800x600 PNG minimal valid image data for screenshot response
-PNG_800x600 = (
-    b"\x89PNG\r\n\x1a\n"
-    + struct.pack(">I", 13)
-    + b"IHDR"
-    + struct.pack(">II", 800, 600)
-    + b"\x08\x02\x00\x00\x00\x00\x00\x00\x00"
-    + b"\x00\x00\x00\x00IEND\xaeB`\x82"
-)
+def png_header(w, h):
+    """Minimal PNG (signature + IHDR + IEND): enough for the size read in cdpilot._image_dimensions."""
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + struct.pack(">I", 13)
+        + b"IHDR"
+        + struct.pack(">II", w, h)
+        + b"\x08\x02\x00\x00\x00\x00\x00\x00\x00"
+        + b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+
+def shot_size(params):
+    """Image size the way Chrome derives it: clip x scale x DPR, or the 800x600 viewport x DPR."""
+    dpr = float(os.environ.get("FAKE_DPR", "1"))
+    clip = params.get("clip")
+    if clip:
+        f = float(clip.get("scale", 1)) * dpr
+        return round(clip["width"] * f), round(clip["height"] * f)
+    return round(800 * dpr), round(600 * dpr)
 
 
 def log(entry):
@@ -116,7 +127,7 @@ def handle_ws(conn, path, headers, bound_port):
                 else:
                     reply = {"id": mid, "result": {"result": {"type": "string", "value": "ok"}}}
             elif method == "Page.captureScreenshot":
-                reply = {"id": mid, "result": {"data": base64.b64encode(PNG_800x600).decode()}}
+                reply = {"id": mid, "result": {"data": base64.b64encode(png_header(*shot_size(p))).decode()}}
             elif method == "Target.getTargets":
                 reply = {
                     "id": mid,
