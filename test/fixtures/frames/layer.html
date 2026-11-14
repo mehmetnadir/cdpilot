@@ -1,6 +1,6 @@
 <!doctype html>
 <title>layer host</title>
-<button id="main" style="position:absolute;left:40px;top:20px">Main button</button>
+<button id="main" onclick="document.body.dataset.main='clicked'" style="position:absolute;left:40px;top:20px">Main button</button>
 <script>
   var child = new URLSearchParams(location.search).get('child') || 'inner-layer.html';
   var f = document.createElement('iframe');

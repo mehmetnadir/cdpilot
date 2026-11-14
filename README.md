@@ -521,7 +521,7 @@ cdpilot agent stats | agent reset
 `agent observe` never saw into iframes, so a cookie layer in a full-screen iframe (theguardian.com, weather.com) left the model
 with 400 entries of a page it could not click. It now adds `frames` (at most 5 visible iframes: `{i, origin, w, h, cover,
 blocking}`, read in the main document with one `Runtime.evaluate`) and, when one covers the page, a `frames_hint`. `agent observe
---frame <i>` lists that frame's entries, each with `frame: <origin>`; they pass the same tag-character cleaning and
+--frame <i>` lists that frame's entries and names the frame's live origin as `frame`; they pass the same tag-character cleaning and
 `injection_suspect` scan as page text (a frame is third-party content). A frame ref belongs to its frame and never resolves in the main
 document; if the frame is gone or replaced, `agent act --ref` gives the stale-ref error. Only `click` works on a frame ref, and
 such a click is not part of a saved flow's trail.

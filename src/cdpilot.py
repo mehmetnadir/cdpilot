@@ -17163,6 +17163,18 @@ _AGENT_LAST_FRAMES = []   # frames of the last snapshot taken with _AGENT_WANT_F
 _AGENT_WANT_FRAMES = [False]   # observe / run ask _agent_full_snapshot for the frames too
 
 
+@contextlib.contextmanager
+def _agent_want_frames():
+    """Snapshots taken inside also read the visible iframes; reset on any exit (a failed snapshot
+    must not leave later warm calls paying for the probe or reading stale frames)."""
+    global _AGENT_LAST_FRAMES
+    _AGENT_WANT_FRAMES[0] = True
+    try:
+        yield
+    finally:
+        _AGENT_WANT_FRAMES[0] = False
+
+
 def _agent_frames_cmd():
     """The frames probe as an extra command of the snapshot request (only when observe/run want it)."""
     if not _AGENT_WANT_FRAMES[0]:
@@ -17178,7 +17190,9 @@ def _agent_frames_from_reply(reply):
     keep = []
     for e in val:
         if isinstance(e, dict) and isinstance(e.get('i'), int):
-            keep.append({'i': e['i'], 'origin': str(e.get('origin', ''))[:80], 'w': e.get('w'),
+            o = str(e.get('origin', ''))
+            o = o if o in ('srcdoc', 'about:blank') else _agent_frame_origin(o)
+            keep.append({'i': e['i'], 'origin': o, 'w': e.get('w'),
                          'h': e.get('h'), 'cover': e.get('cover'), 'blocking': bool(e.get('blocking'))})
     keep.sort(key=lambda e: -(e['cover'] or 0))
     return keep[:_AGENT_FRAMES_MAX]
@@ -17218,16 +17232,66 @@ async def _agent_full_snapshot():
     return page, nodes, actions, state
 
 
+_AGENT_HOST_RE = _re.compile(r"^[A-Za-z0-9.\-\[\]:]{1,253}$")
+
+
 def _agent_frame_origin(src, base=''):
-    """scheme://hostname of an iframe's src (resolved against the page URL); 'about:blank' without one."""
+    """scheme://hostname of a frame URL (resolved against `base`). Only http(s) with a plain host
+    name is printed as an origin (a hostname cannot carry text that addresses the model); any other
+    scheme prints as 'scheme:' alone, no URL at all as 'about:blank'."""
     from urllib.parse import urljoin, urlsplit
     try:
         u = urlsplit(urljoin(base or '', src or ''))
-        if u.scheme and u.hostname:
-            return f"{u.scheme}://{u.hostname}"
+        scheme = (u.scheme or '').lower()
+        if scheme in ('http', 'https') and u.hostname and _AGENT_HOST_RE.match(u.hostname):
+            return f"{scheme}://{u.hostname}"
+        if scheme and _re.match(r"^[a-z][a-z0-9+.\-]{0,20}$", scheme) and scheme != 'about':
+            return f"{scheme}:"
     except ValueError:
         pass
     return 'about:blank'
+
+
+def _agent_frame_find(tree, frame_id):
+    """The {id, url, loaderId} dict of `frame_id` in a Page.getFrameTree result (None if absent)."""
+    node = (tree or {}).get('frameTree') or {}
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        fr = n.get('frame') or {}
+        if fr.get('id') == frame_id:
+            return fr
+        stack.extend(n.get('childFrames') or [])
+    return None
+
+
+async def _agent_frame_identity(route):
+    """(loaderId, url) of the frame the route points at, live from Page.getFrameTree. The frame id
+    survives a navigation, the loaderId does not (and an out-of-process frame that navigates gets a
+    new process where backendNodeIds start over). (None, None) when the browser does not say."""
+    r = await _frame_cdp(route, [(1, 'Page.getFrameTree', {}, None)])
+    fr = _agent_frame_find(r.get(1), route.frame_id)
+    if fr is None and route.session_id:  # an out-of-process frame may be the root of its own tree
+        r = await _frame_cdp(route, [(2, 'Page.getFrameTree', {}, route.session_id)])
+        fr = ((r.get(2) or {}).get('frameTree') or {}).get('frame')
+    fr = fr or {}
+    return fr.get('loaderId'), fr.get('url')
+
+
+def _agent_frame_same(fa, loader_id, url):
+    """True when the frame is still the document the ref was observed in."""
+    if fa.get('loader_id'):
+        return fa['loader_id'] == loader_id
+    return (fa.get('frame_url') or None) == (url or None)
+
+
+def _viewport_contains(metrics, x, y):
+    """True/False for (x, y) against Page.getLayoutMetrics' CSS layout viewport; None when unknown."""
+    vp = (metrics or {}).get('cssLayoutViewport') or (metrics or {}).get('layoutViewport') or {}
+    w, h = vp.get('clientWidth'), vp.get('clientHeight')
+    if not isinstance(w, (int, float)) or not isinstance(h, (int, float)):
+        return None
+    return 0 <= x < w and 0 <= y < h
 
 
 async def _agent_frame_open(ws_url, index, scroll=False):
@@ -17265,7 +17329,7 @@ async def cmd_agent_observe_frame(frame, full=False, all_=False):
 
     Refs come from the project's counter but live in state['frame_actions'] with the frame
     they belong to; the main-document map is untouched, so a frame's backendNodeId can never
-    resolve in the main document. Entries carry `frame: <origin>`, pass the same tag cleaning
+    resolve in the main document. The reply carries `frame: <origin>` (live URL), entries pass the same tag cleaning
     (_agent_json) and the injection scan as the main page: third-party content."""
     limit = _agent_obs_limit(all_, full)
     ws_url, page = get_page_ws()
@@ -17277,10 +17341,12 @@ async def cmd_agent_observe_frame(frame, full=False, all_=False):
     try:
         nodes = await _agent_frame_nodes(route)
         frame_id, src = route.frame_id, route.src
-        oopif = route.session_id is not None
+        loader_id, live_url = await _agent_frame_identity(route)
     finally:
         await _frame_route_close(route)
-    origin = _agent_frame_origin(src, page.get('url', ''))
+    # provenance = where the frame IS (live URL), not what its src attribute said
+    origin = _agent_frame_origin(live_url, page.get('url', '')) if live_url \
+        else _agent_frame_origin(src, page.get('url', ''))
     state = _load_agent_state()
     old = {r: a for r, a in (state.get('frame_actions') or {}).items() if a.get('frame_id') == frame_id}
     tmp = {'actions_map': old, 'ref_counter': state.get('ref_counter', 0)}
@@ -17288,13 +17354,14 @@ async def cmd_agent_observe_frame(frame, full=False, all_=False):
     state['ref_counter'] = tmp['ref_counter']
     kept = {r: a for r, a in (state.get('frame_actions') or {}).items() if a.get('frame_id') != frame_id}
     for a in actions:
-        a.update({'frame_index': int(frame), 'frame_id': frame_id, 'frame': origin, 'oopif': oopif})
+        a.update({'frame_index': int(frame), 'frame_id': frame_id, 'frame': origin,
+                  'loader_id': loader_id, 'frame_url': live_url})
         kept[a['ref']] = a
     state['frame_actions'] = dict(list(kept.items())[-2000:])
     _save_agent_state(state)
     shown, trunc = _agent_cap_list(
-        [dict(_agent_out_entry({k: v for k, v in a.items() if k in ('ref', 'role', 'name', 'value')}, full),
-              frame=origin) for a in actions], limit)
+        [_agent_out_entry({k: v for k, v in a.items() if k in ('ref', 'role', 'name', 'value')}, full)
+         for a in actions], limit)
     res = {'url': page.get('url', ''), 'frame': origin, 'frame_index': int(frame),
            'actions': shown, 'text': _extract_text_summary(nodes)}
     if trunc:
@@ -17323,6 +17390,8 @@ async def _agent_perform_frame(ref, fa, action, ws_url):
     try:
         if route.frame_id != fa.get('frame_id'):
             _stale_ref_exit(ref, what)
+        if not _agent_frame_same(fa, *await _agent_frame_identity(route)):
+            _stale_ref_exit(ref, 'The iframe navigated since the snapshot:')
         sid = route.session_id
         await _frame_cdp(route, [(1, 'DOM.enable', {}, sid)])
         r = await _frame_cdp(route, [(2, 'DOM.resolveNode', {'backendNodeId': fa['backend_node_id']}, sid)])
@@ -17337,10 +17406,25 @@ async def _agent_perform_frame(ref, fa, action, ws_url):
         if r.get(3, {}).get('result', {}).get('value') is not True:
             _stale_ref_exit(ref, 'Could not find in its iframe')
         try:
+            await _frame_route_settle(route)
+            boxes = await _frame_route_boxes(route)
+            r = await _frame_cdp(route, [(4, 'Runtime.callFunctionOn', {
+                'objectId': oid, 'functionDeclaration': _CENTER_FN, 'returnByValue': True}, sid)])
+            c = r.get(4, {}).get('result', {}).get('value')
+            if not (isinstance(c, list) and len(c) == 4):
+                _stale_ref_exit(ref, 'Could not find in its iframe')
+            px, py = _frame_points(boxes, c[0], c[1])[0]
+            m = await _frame_cdp(route, [(5, 'Page.getLayoutMetrics', {}, None)])
+            if _viewport_contains(m.get(5), px, py) is False:
+                print(f"Error: Element {ref} is outside the viewport after scrolling", file=sys.stderr)
+                sys.exit(1)
             with contextlib.redirect_stdout(io.StringIO()):
-                await _pointer_click(route, oid, f"{ref} in iframe {fa.get('frame', '')}")
+                how, _, _ = await _pointer_click(route, oid, f"{ref} in iframe {fa.get('frame', '')}")
         except _FrameError:
             _stale_ref_exit(ref, 'Could not click in its iframe')
+        if how in PRESSED_PREFIX:  # pressed, release elsewhere: said on stderr, exit 3 like click-ref
+            _CLICK_MISSES.append(how)
+            _click_missed_exit()
     finally:
         _FRAME_ROUTE.reset(token)
         await _frame_route_close(route)
@@ -17363,9 +17447,8 @@ async def cmd_agent_observe(diff=False, full=False, rows=False, all_=False):
     limit = _agent_obs_limit(all_, full)
     before = _load_agent_state()
     old_map = dict(before.get('actions_map', {}))
-    _AGENT_WANT_FRAMES[0] = True
-    page, nodes, actions, state = await _agent_full_snapshot()
-    _AGENT_WANT_FRAMES[0] = False
+    with _agent_want_frames():
+        page, nodes, actions, state = await _agent_full_snapshot()
     frames = list(_AGENT_LAST_FRAMES)
     text = _extract_text_summary(nodes)
     text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
@@ -17559,9 +17642,8 @@ async def cmd_agent_act(ref=None, url=None, action='click', text=None, full=Fals
     # Take new snapshot for diff. The action may have changed the tab's URL
     # and title; the 0.5 s /json cache would still show the old ones.
     cdp_cache_invalidate()
-    _AGENT_WANT_FRAMES[0] = True
-    page, nodes, new_actions, new_state = await _agent_full_snapshot()
-    _AGENT_WANT_FRAMES[0] = False
+    with _agent_want_frames():
+        page, nodes, new_actions, new_state = await _agent_full_snapshot()
     # The trail: what a flow is saved from. Anchors, never refs or node ids;
     # a typed secret is a {{placeholder}} before it reaches agent-state.json.
     if url:
@@ -18295,9 +18377,8 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
     async def snapshot():
         nonlocal last_nodes
         cdp_cache_invalidate()
-        _AGENT_WANT_FRAMES[0] = True
-        page, nodes, actions, st = await _agent_full_snapshot()
-        _AGENT_WANT_FRAMES[0] = False
+        with _agent_want_frames():
+            page, nodes, actions, st = await _agent_full_snapshot()
         last_nodes = nodes
         text = _extract_text_summary(nodes)
         out = _agent_out_actions(actions, st.get('hidden_refs', ()), full, rows)
@@ -18466,6 +18547,9 @@ def _dispatch_agent_run(rest):
 def _dispatch_agent_observe_frame(rest):
     """`agent observe --frame <i>`: parse, return the coroutine (exit 2 on a bad value)."""
     try:
+        for bad in ('--diff', '--rows'):
+            if bad in rest:
+                raise ValueError(f"agent observe --frame does not take {bad}")
         rest, frame = _extract_frame_flag(list(rest))
         if not frame.strip().isdigit():
             raise ValueError("agent observe --frame takes an iframe index (see `frames` in agent observe)")

@@ -5912,12 +5912,14 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
         assert(!snap.actions.some((a) => a.name === 'Accept layer'), 'the main page does not list the frame button');
         const fr = JSON.parse(c('agent', 'observe', '--frame', '0').stdout);
         const btn = fr.actions.find((a) => a.name === 'Accept layer');
-        assert(btn && btn.frame && /^http:\/\/(127\.0\.0\.1|localhost)$/.test(btn.frame), JSON.stringify(fr));
+        assert(btn && /^http:\/\/(127\.0\.0\.1|localhost)$/.test(fr.frame), JSON.stringify(fr));
         const r = c('agent', 'act', '--ref', btn.ref);
         assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`);
         let title = '';
         for (let i = 0; i < 20 && !/layer-gone/.test(title); i++) title = c('eval', 'document.title').stdout;
         ok({ stdout: title, stderr: '' }, /layer-gone/, `the layer is gone (${url})`);
+        assert.strictEqual(c('eval', 'document.body.dataset.main || "unclicked"').stdout.trim().replace(/^Result: /, ''), 'unclicked',
+          'the main button stayed unclicked');
         const after = JSON.parse(c('agent', 'observe').stdout);
         assert(!after.frames, `no iframe left: ${JSON.stringify(after.frames)}`);
       }
@@ -8477,7 +8479,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert.deepStrictEqual(snap.frames.map((f) => f.i), [7, 6, 5, 4, 3], 'largest cover first');
       assert.deepStrictEqual(Object.keys(snap.frames[0]).sort(), ['blocking', 'cover', 'h', 'i', 'origin', 'w']);
       assert.strictEqual(snap.frames[0].blocking, true);
-      assert.strictEqual(snap.frames[0].origin, 'https://cmp.example', 'tag characters removed');
+      assert.strictEqual(snap.frames[0].origin, 'https:', 'a host name with tag characters is not printed as an origin');
       assert(/agent observe --frame 7/.test(snap.frames_hint), snap.frames_hint);
       assert(!/[\u{E0000}-\u{E007F}]/u.test(o.stdout), 'no tag character in the output');
     });
@@ -9003,7 +9005,7 @@ class Route:
     sessions = ["S1"]
     root_ws = "ws://fake"
 ROUTE = Route()
-MODE = {"open_error": False, "resolve": True, "alive": True}
+MODE = {"open_error": False, "resolve": True, "alive": True, "url": "https://redirected.example/consent", "loader": "L1", "vw": 800, "how": "mouse"}
 async def fake_open(ws_url, index, scroll=False):
     if MODE["open_error"]: raise mod._FrameError("no iframe matches '#%d'" % index)
     return ROUTE
@@ -9016,14 +9018,24 @@ async def fake_frame_cdp(route, commands, timeout=10):
         calls.append((c[1], c[3] if len(c) > 3 else None, c[2]))
         if c[1] == "DOM.resolveNode":
             out[c[0]] = {"object": {"objectId": "%s-oid-%s" % (c[3], c[2]["backendNodeId"])}} if MODE["resolve"] else {}
+        elif c[1] == "Runtime.callFunctionOn" and "getBoundingClientRect" in c[2]["functionDeclaration"] and "scrollIntoView" not in c[2]["functionDeclaration"]:
+            out[c[0]] = {"result": {"value": [10, 10, 20, 20]}}
         elif c[1] == "Runtime.callFunctionOn":
             out[c[0]] = {"result": {"value": MODE["alive"]}}
+        elif c[1] == "Page.getFrameTree":
+            out[c[0]] = {"frameTree": {"frame": {"id": "TOP"}, "childFrames": [
+                {"frame": {"id": ROUTE.frame_id, "url": MODE["url"], "loaderId": MODE["loader"]}}]}}
+        elif c[1] == "Page.getLayoutMetrics":
+            out[c[0]] = {"cssLayoutViewport": {"clientWidth": MODE["vw"], "clientHeight": MODE["vw"]}}
         else:
             out[c[0]] = {}
     return out
 clicked, main_clicked = [], []
 async def fake_pointer(route, oid, label, humanize=False):
-    clicked.append((oid, label)); return ("mouse", 1, 1)
+    clicked.append((oid, label)); return (MODE["how"], 1, 1)
+async def fake_settle(route): pass
+async def fake_boxes(route): return [[100, 50, 0, 0, 1, 1]]
+mod._frame_route_settle, mod._frame_route_boxes = fake_settle, fake_boxes
 async def fake_main_click(ref): main_clicked.append(ref)
 async def noop(*a, **k): pass
 mod._agent_frame_open, mod._agent_frame_nodes, mod._frame_route_close = fake_open, fake_nodes, fake_close
@@ -9043,8 +9055,8 @@ assert main["actions"][0]["name"] == "Main button"
 main_map = json.dumps(mod._load_agent_state()["actions_map"], sort_keys=True)
 
 r = out(mod.cmd_agent_observe_frame(0))
-assert r["frame"] == "https://a.example" and r["frame_index"] == 0, r
-assert all(a["frame"] == "https://a.example" for a in r["actions"]), r["actions"]
+assert r["frame"] == "https://redirected.example" and r["frame_index"] == 0, ("live origin, not the src attribute", r)
+assert all("frame" not in a for a in r["actions"]), r["actions"]
 names = [a["name"] for a in r["actions"]]
 assert "Accept all" in names and not any(ord(ch) >= 0xE0000 for a in r["actions"] for ch in a["name"]), names
 assert "backend_node_id" not in r["actions"][0] and "frame_id" not in r["actions"][0], r["actions"][0]
@@ -9061,7 +9073,7 @@ assert next(a for a in r2["actions"] if a["name"] == "Accept all")["ref"] == acc
 # act on the frame ref: the click goes through the frame route (session S1), not cmd_click_ref
 calls.clear()
 res = out(mod.cmd_agent_act(ref=accept["ref"]))
-assert clicked == [("S1-oid-17", "%s in iframe https://a.example" % accept["ref"])], clicked
+assert clicked == [("S1-oid-17", "%s in iframe https://redirected.example" % accept["ref"])], clicked
 assert main_clicked == [], "the main node with backendNodeId 17 was not clicked"
 assert any(c[0] == "DOM.resolveNode" and c[1] == "S1" for c in calls), calls
 assert not any(c[1] is None and c[0] == "DOM.resolveNode" for c in calls), "never resolved in the main document"
@@ -9087,6 +9099,48 @@ ROUTE.frame_id = "F2"; stale("another frame at that index"); ROUTE.frame_id = "F
 MODE["open_error"] = True; stale("frame gone"); MODE["open_error"] = False
 MODE["resolve"] = False; stale("node gone"); MODE["resolve"] = True
 MODE["alive"] = False; stale("node detached"); MODE["alive"] = True
+MODE["loader"] = "L2"; stale("same frame id, new loaderId (navigated)"); MODE["loader"] = "L1"
+# off-viewport: real translation (box 100,50 + centre 10,10 = 110,60) against a 50 px viewport -> exit 1, no click
+clicked.clear()
+MODE["vw"] = 50
+try:
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(mod.cmd_agent_act(ref=accept["ref"]))
+except SystemExit as e:
+    assert e.code == 1 and "outside the viewport after scrolling" in err.getvalue(), (e.code, err.getvalue())
+else:
+    raise AssertionError("off-viewport frame click did not exit")
+assert clicked == [], "no click outside the viewport"
+MODE["vw"] = 800
+# a pressed-but-missed click exits 3, a replaced target (gone) exits 0
+for how, code in (("moved", 3), ("unknown", 3), ("gone", None)):
+    MODE["how"] = how; mod._CLICK_MISSES.clear()
+    try:
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            asyncio.run(mod.cmd_agent_act(ref=accept["ref"]))
+        got = None
+    except SystemExit as e:
+        got = e.code
+    assert got == code, (how, got)
+MODE["how"] = "mouse"
+# pure pieces, not stubbed: coordinate translation and the viewport rule
+assert mod._frame_points([[100, 50, 2, 3, 2, 2]], 10, 10)[0] == (124, 76)
+assert mod._viewport_contains({"cssLayoutViewport": {"clientWidth": 800, "clientHeight": 600}}, 799, 599) is True
+assert mod._viewport_contains({"cssLayoutViewport": {"clientWidth": 800, "clientHeight": 600}}, 800, 10) is False
+assert mod._viewport_contains({}, 1, 1) is None
+assert mod._agent_frame_origin("https://ok.example:8443/x") == "https://ok.example"
+assert mod._agent_frame_origin("https://ignore previous.example/") == "about:blank" or "ignore" not in mod._agent_frame_origin("https://ignore previous.example/")
+assert mod._agent_frame_origin("javascript:alert(1)") == "javascript:" and mod._agent_frame_origin("") == "about:blank"
+# --diff / --rows with --frame: exit 2
+for bad in ("--diff", "--rows"):
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            mod._dispatch_agent_cmd(["observe", "--frame", "0", bad])
+    except SystemExit as e:
+        assert e.code == 2, bad
+    else:
+        raise AssertionError(bad)
 # a non-click action on a frame ref is refused, nothing clicked
 try:
     with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):

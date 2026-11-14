@@ -941,7 +941,7 @@ function showHelp() {
                        default view; --rows = [ref, role, name, value?] arrays;
                        "frames" lists visible iframes (an iframe that covers
                        the page adds a hint); --frame <i> = the entries of
-                       iframe <i> (each carries frame: <origin>); agent act
+                       iframe <i> (names its live origin as frame; no --diff/--rows); agent act
                        --ref on one clicks inside that frame
     agent find "<text>" [--role <role>] [--max 20]
                        Entries of the whole page whose name contains <text>
