@@ -5246,6 +5246,35 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.deepStrictEqual(r.twice.res.map((x) => x[0]), ['ok', 'ok'], 'both commands ran');
   });
 
+  test('frames (fake CDP): agent observe --frame and agent act resolve frame index in isolated world ' +
+       '(immune to monkey-patched querySelectorAll)', () => {
+    const r = fake('agent_frame_isolated');
+
+    // (a) observe --frame 0 resolves the correct frame (f0) using isolated world context
+    const obs = r.observe_isolated;
+    assert.deepStrictEqual(obs.res, ['ok', null]);
+    assert.strictEqual(obs.owner_evals, 1, 'one _FRAME_OWNER_JS evaluate call');
+    assert(obs.isolated.includes(obs.owner_ctx),
+      `owner evaluation contextId ${obs.owner_ctx} must be an isolated world (${obs.isolated})`);
+    assert(obs.data.actions && obs.data.actions.some((a) => a.name === 'f0 button'),
+      `observed f0 button in isolated world, got: ${JSON.stringify(obs.data.actions)}`);
+
+    // (b) if createIsolatedWorld fails, falls back to main world (resolves f1 in reverse mode)
+    const fb = r.fallback_main;
+    assert.deepStrictEqual(fb.res, ['ok', null]);
+    assert.strictEqual(fb.owner_evals, 1);
+    assert.strictEqual(fb.owner_ctx, null, 'fallback evaluation uses main world (contextId is null/omitted)');
+    assert(fb.data.actions && fb.data.actions.some((a) => a.name === 'f1 button'),
+      `fallback resolved f1 button in main world, got: ${JSON.stringify(fb.data.actions)}`);
+
+    // (c) agent act --ref on a frame ref also uses isolated world resolution
+    const act = r.act_isolated;
+    assert.deepStrictEqual(act.res, ['ok', null], 'agent act on frame ref succeeded');
+    assert.strictEqual(act.frame_id, 'f0', 'act resolved the correct frame f0');
+    assert(act.owner_ctx !== null && act.isolated.includes(act.owner_ctx),
+      `act owner evaluate contextId ${act.owner_ctx} is an isolated world`);
+  });
+
   test('frames (fake CDP): click is one click; real mouse input with --entropy=on and in frames', () => {
     // clicks: el.click() calls cdpilot caused; pressed: Input mousePressed
     // events; hits: hit-tests, [object, x, y] per document (the <iframe> on
@@ -5821,6 +5850,26 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
   const ok = (r, re, what) => assert(re.test(r.stdout + r.stderr),
     `${what}: exit ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
   const needE2E = () => { assert(e2e, 'browser setup failed'); return e2e; };
+  const assertOopifTarget = (cdpPort, p) => {
+    const prefix = `http://localhost:${p}/`;
+    let lastTypes = [];
+    for (let i = 0; i < 10; i++) {
+      try {
+        const raw = execFileSync('curl', ['-s', `http://127.0.0.1:${cdpPort}/json/list`],
+          { encoding: 'utf-8', timeout: 5000 });
+        const list = JSON.parse(raw);
+        lastTypes = list.map((t) => `${t.type}: ${t.url || ''}`);
+        if (list.some((t) => t.type === 'iframe' && (t.url || '').startsWith(prefix))) {
+          return;
+        }
+      } catch (e) {
+        // retry
+      }
+      execFileSync(PYB, ['-c', 'import time; time.sleep(0.2)'], { timeout: 2000 });
+    }
+    assert.fail(`Expected OOPIF target (type === 'iframe', url starting with ${prefix}) on port ${cdpPort}, ` +
+      `but found: ${JSON.stringify(lastTypes)}`);
+  };
   try {
     test('frames e2e: click/fill/type/smart-click in same-origin and cross-origin (OOPIF) iframes', () => {
       const { c, p1, p2 } = needE2E();
@@ -5908,11 +5957,12 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     });
 
     test('frames e2e: agent observe hints the blocking iframe, observe --frame <i> lists its button, act clicks it (same-origin and OOPIF); the main button is not clicked', () => {
-      const { c, p1, p2 } = needE2E();
+      const { c, p1, p2, env } = needE2E();
       const cross = `http://localhost:${p2}/inner-layer.html`;
       for (const url of [`http://127.0.0.1:${p1}/layer.html`,
         `http://127.0.0.1:${p1}/layer.html?child=${encodeURIComponent(cross)}`]) {
         c('go', url);
+        if (url.includes('?child=')) assertOopifTarget(env.CDP_PORT, p2);
         c('agent', 'reset');
         const snap = JSON.parse(c('agent', 'observe').stdout);
         assert(snap.frames && snap.frames.length === 1, `one visible iframe: ${JSON.stringify(snap.frames)}`);
@@ -5935,11 +5985,12 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     });
 
     test('frames e2e: agent act --fill on a frame ref types into the field (same-origin and OOPIF); a button is refused', () => {
-      const { c, p1, p2 } = needE2E();
+      const { c, p1, p2, env } = needE2E();
       const child = `http://localhost:${p2}/inner.html`;
       for (const url of [`http://127.0.0.1:${p1}/top.html`,
         `http://127.0.0.1:${p1}/top.html?child=${encodeURIComponent(child)}`]) {
         c('go', url);
+        if (url.includes('?child=')) assertOopifTarget(env.CDP_PORT, p2);
         c('agent', 'reset');
         // top.html has one iframe: [0] iframe#card (below the fold; inner.html, OOPIF with ?child=)
         let fr = null;

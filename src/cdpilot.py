@@ -4587,8 +4587,11 @@ async def _frame_cdp(route, commands, timeout=10):
     return {ids[k]: v for k, v in res.items() if k in ids}
 
 
-async def _frame_list(route):
-    r = await _frame_cdp(route, [(1, "Runtime.evaluate", route.eval_params(_FRAME_LIST_JS),
+async def _frame_list(route, context_id=None):
+    params = route.eval_params(_FRAME_LIST_JS)
+    if context_id is not None:
+        params["contextId"] = context_id
+    r = await _frame_cdp(route, [(1, "Runtime.evaluate", params,
                                   route.session_id)])
     val = r.get(1, {}).get("result", {}).get("value")
     return val if isinstance(val, list) else []
@@ -4675,7 +4678,7 @@ async def _frame_context_for(route, frame_id, node, allow_oopif=True):
     raise _FrameError(f"cannot enter frame {frame_id} (no execution context, no target)")
 
 
-async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oopif=True):
+async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oopif=True, lookup_ctx=None):
     """Descend one hop: route now points at the child frame.
 
     Returns True, or False when no element matches the hop and missing_ok.
@@ -4683,9 +4686,10 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     #card-element) still works, with one stderr note.
     """
     args = f"{json.dumps(hop['kind'])}, {json.dumps(hop['value'])}"
-    cmds = [(1, "Runtime.evaluate",
-             route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False),
-             route.session_id)]
+    p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False)
+    if lookup_ctx is not None:
+        p1["contextId"] = lookup_ctx
+    cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
     if hop["kind"] in ("auto", "sel"):
         cmds.append((3, "Runtime.evaluate",
                      route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)"), route.session_id))
@@ -4696,7 +4700,7 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     if not oid:
         if missing_ok:
             return False
-        frames = await _frame_list(route)
+        frames = await _frame_list(route, context_id=lookup_ctx)
         avail = "; ".join(f"[{f['index']}] {f['id'] or f['name'] or f['src'][:60]}" for f in frames)
         raise _FrameError(f"no iframe matches '{shown}' in {route.describe()}"
                           + (f" (frames: {avail})" if avail else " (it has no iframes)"))
@@ -18061,7 +18065,17 @@ async def _agent_frame_open(ws_url, index, scroll=False):
     route = _FrameRoute(ws_url)
     try:
         _frame_pool_pin(route)
-        await _frame_route_push(route, {'kind': 'index', 'value': int(index)}, scroll=scroll)
+        lookup_ctx = None
+        try:
+            r = await _frame_cdp(route, [(1, "Page.getFrameTree", {}, None)])
+            fid = (((r.get(1) or {}).get("frameTree") or {}).get("frame") or {}).get("id")
+            if fid:
+                r2 = await _frame_cdp(route, [(2, "Page.createIsolatedWorld", {
+                    "frameId": fid, "worldName": "cdpilot", "grantUniveralAccess": True}, None)])
+                lookup_ctx = (r2.get(2) or {}).get("executionContextId")
+        except Exception:
+            lookup_ctx = None
+        await _frame_route_push(route, {"kind": "index", "value": int(index)}, scroll=scroll, lookup_ctx=lookup_ctx)
     except BaseException:
         await _frame_route_close(route)
         raise

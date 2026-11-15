@@ -2,6 +2,11 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Security
+- **`agent observe --frame <i>` and frame-ref `agent act` resolve frame indices in an isolated world.** The iframe index lookup now evaluates `_FRAME_OWNER_JS` in cdpilot's isolated world (`Page.createIsolatedWorld`, matching the `frames` hint), protecting against pages that monkey-patch `document.querySelectorAll` to point to a different frame. If isolated world creation fails, resolution falls back to the main world; other `--frame` commands are unchanged.
+
 ## [0.9.10] - 2026-11-15
 
 ### Added

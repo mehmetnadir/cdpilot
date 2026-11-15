@@ -88,6 +88,8 @@ class Browser:
         self.opaque_ids = False   # remote-object ids without "<isolate>.<context>.<n>"
         self.isolated = set()     # context ids made by Page.createIsolatedWorld
         self.next_ctx = [900]
+        self.reverse_main_index = bool(os.environ.get("CDPILOT_FAKE_REVERSE_FRAMES"))
+        self.isolated_fail = False
         # The browser routes mouse input into out-of-process frames by its own
         # copy of the layout: while route_stale > 0 every mouse event goes
         # elsewhere (into `misrouted`, never reaching a frame); each answered
@@ -119,10 +121,13 @@ class Browser:
             return self.frames.get(oid[len("owner:"):])
         return None
 
-    def find_owner(self, frame, kind, value):
+    def find_owner(self, frame, kind, value, ctx_id=None):
         """(child frame or None, matched through a wrapper element?)"""
         kids = frame.children
         if kind == "index":
+            if self.reverse_main_index and ctx_id not in self.isolated:
+                rev = list(reversed(kids))
+                return (rev[value] if 0 <= value < len(rev) else None), False
             return (kids[value] if 0 <= value < len(kids) else None), False
         for c in kids:
             if value == "iframe" or (c.elem_id and value in ("#" + c.elem_id, "iframe#" + c.elem_id)):
@@ -158,18 +163,25 @@ class Browser:
         def err(text):
             return [dict({"id": mid, "error": {"code": -32000, "message": text}}, **tag)]
 
-        STATE["methods"][method] = STATE["methods"].get(method, 0) + 1
+        if method != "DOM.resolveNode" or p.get("objectGroup") == "cdpilot-frame":
+            STATE["methods"][method] = STATE["methods"].get(method, 0) + 1
         if sid and sid not in self.sessions:
             return err("Session with given id not found.")
         root = self.sessions[sid] if sid else self.top
         if method == "DOM.resolveNode":  # the frame document, in its main world
-            f = self.ctx.get(p.get("backendNodeId", 0) - 5000)
+            bid = p.get("backendNodeId", 0)
+            f = self.ctx.get(bid - 5000 if bid <= 5500 else bid - 6000)
             if f is None or f not in self.process(root):
                 return err("No node with given id found")
+            if bid >= 6000:
+                return ok({"object": {"type": "object", "subtype": "node", "className": "HTMLButtonElement",
+                                      "description": "button", "objectId": "el:%s:btn" % f.fid}})
             oid = ("opaque-" + f.fid) if self.opaque_ids else "-77.%d.1" % f.ctx
             return ok({"object": {"type": "object", "subtype": "node", "className": "HTMLDocument",
                                   "description": "#document", "objectId": oid}})
         if method == "Page.createIsolatedWorld":
+            if self.isolated_fail:
+                return err("Cannot create isolated world")
             f = self.frames.get(p.get("frameId"))
             if f is None or f not in self.process(root):
                 return err("No frame for given id found")
@@ -181,7 +193,10 @@ class Browser:
             STATE["released"][g] = STATE["released"].get(g, 0) + 1
             return ok({})
         if method == "Page.getFrameTree":
-            return ok({"frameTree": {"frame": {"id": root.fid}}})
+            def make_node(f):
+                return {"frame": {"id": f.fid, "url": f.src or f.origin, "loaderId": "L-" + f.fid},
+                        "childFrames": [make_node(c) for c in f.children]}
+            return ok({"frameTree": make_node(root)})
         if method == "Runtime.evaluate" and p.get("expression") == "document":
             ctx = p.get("contextId", root.ctx)
             f = self.ctx.get(ctx)
@@ -237,6 +252,19 @@ class Browser:
                     if f.cover_after_press:
                         f.target_cover = f.cover_after_press
             return ok({})
+        if method in ("Accessibility.enable", "DOM.enable"):
+            return ok({})
+        if method == "Accessibility.getFullAXTree":
+            f = self.frames.get(p.get("frameId")) or root
+            return ok({"nodes": [
+                {"nodeId": "1", "role": {"value": "RootWebArea"}, "name": {"value": f.fid}, "childIds": ["2"]},
+                {"nodeId": "2", "role": {"value": "button"}, "name": {"value": f.fid + " button"},
+                 "backendDOMNodeId": 6000 + f.ctx, "childIds": []}
+            ]})
+        if method == "DOMSnapshot.captureSnapshot":
+            return ok({"documents": []})
+        if method == "Page.getLayoutMetrics":
+            return ok({"cssLayoutViewport": {"clientWidth": 800, "clientHeight": 600}})
         if method == "Runtime.evaluate":
             frame = root
             if "contextId" in p:
@@ -281,6 +309,8 @@ class Browser:
                 pid = "mprobe:%d" % len(self.probes)
                 self.probes[pid] = [self.moves_in, False]
                 return ok({"result": {"type": "function", "objectId": pid}})
+            if "scrollIntoView" in fd:
+                return ok({"result": {"type": "boolean", "value": True}})
             if fd == mod._CENTER_FN:
                 return value([40, 50, 20, 10])
             if fd == mod._CLICK_LABEL_FN:
@@ -309,7 +339,8 @@ class Browser:
         owner_call = "(" + self.mod._FRAME_OWNER_JS + ")("
         if expr.startswith(owner_call):
             args = json.loads("[" + expr[len(owner_call):-1] + "]")
-            f, wrapped = self.find_owner(frame, args[0], args[1])
+            ctx_id = params.get("contextId")
+            f, wrapped = self.find_owner(frame, args[0], args[1], ctx_id=ctx_id)
             if len(args) > 3 and args[3]:  # wrappedOnly
                 return ok({"result": {"type": "boolean", "value": bool(f is not None and wrapped)}})
             if f is None:
@@ -318,8 +349,11 @@ class Browser:
                                   "description": "iframe#" + f.elem_id if f.elem_id else "iframe",
                                   "objectId": "owner:" + f.fid}})
         if expr == self.mod._FRAME_LIST_JS:
+            kids = (list(reversed(frame.children))
+                    if (self.reverse_main_index and params.get("contextId") not in self.isolated)
+                    else frame.children)
             return value([{"index": i, "src": c.src or "(no source)", "name": c.name, "id": c.elem_id,
-                           "visible": c.visible} for i, c in enumerate(frame.children)])
+                           "visible": c.visible} for i, c in enumerate(kids)])
         if "var iframes = document.querySelectorAll('iframe');" in expr:  # `frame list`, top page
             return value([{"index": i, "src": c.src or "(no source)", "name": c.name, "id": c.elem_id}
                           for i, c in enumerate(frame.children)])
@@ -477,6 +511,8 @@ def run(mod, top, body, pool=True):
         mod._CLICK_MISSES.clear()  # per command process
     if hasattr(mod, "_FRAME_ISOLATED_NOTED"):
         mod._FRAME_ISOLATED_NOTED[0] = False  # once per process: a run is a process
+    if hasattr(mod, "_save_agent_state"):
+        mod._save_agent_state({})
     mod._WS_POOL_ENABLED = pool
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -1366,6 +1402,78 @@ def scenario_commands(mod):
             "limits": [mod.FRAME_SEARCH_MAX_FRAMES, mod.FRAME_SEARCH_BUDGET_S, mod.SMART_STRONG_SCORE]}
 
 
+def scenario_agent_frame_isolated(mod):
+    """Jury 0.9.10 T1: frame index resolution in agent observe --frame <i> and agent act --ref
+    runs in an isolated world, protecting against pages that monkey-patch querySelectorAll.
+    """
+    top = Frame("top", children=[
+        Frame("f0", elem_id="f0", src="http://a.test/f0.html"),
+        Frame("f1", elem_id="f1", src="http://a.test/f1.html"),
+    ])
+    out = {}
+
+    # Case a: reverse_main_index=True -> observe --frame 0 resolves f0 (correct), using isolated world
+    async def body_a(b):
+        b.reverse_main_index = True
+        res = await call(mod.cmd_agent_observe_frame, 0)
+        owner_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                       and mod._FRAME_OWNER_JS in m.get("params", {}).get("expression", "")]
+        return {
+            "res": res,
+            "owner_evals": len(owner_evals),
+            "owner_ctx": owner_evals[0]["params"].get("contextId") if owner_evals else None,
+            "isolated": sorted(b.isolated),
+        }
+    b_a, res_a, stdout_a, stderr_a = run(mod, top, body_a)
+    obs_a = json.loads(stdout_a) if stdout_a.strip() else {}
+    res_a["data"] = obs_a
+    out["observe_isolated"] = res_a
+
+    # Case b: createIsolatedWorld fails -> falls back to main world (resolves f1 due to reverse_main_index)
+    async def body_b(b):
+        b.reverse_main_index = True
+        b.isolated_fail = True
+        res = await call(mod.cmd_agent_observe_frame, 0)
+        owner_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                       and mod._FRAME_OWNER_JS in m.get("params", {}).get("expression", "")]
+        return {
+            "res": res,
+            "owner_evals": len(owner_evals),
+            "owner_ctx": owner_evals[0]["params"].get("contextId") if owner_evals else None,
+        }
+    b_b, res_b, stdout_b, stderr_b = run(mod, top, body_b)
+    obs_b = json.loads(stdout_b) if stdout_b.strip() else {}
+    res_b["data"] = obs_b
+    out["fallback_main"] = res_b
+
+    # Case c: agent act --ref on a frame ref also uses isolated world resolution
+    async def body_c(b):
+        b.reverse_main_index = True
+        # First observe to populate agent state with frame refs
+        await mod.cmd_agent_observe_frame(0)
+        state = mod._load_agent_state()
+        fa_map = state.get("frame_actions") or {}
+        ref = next(iter(fa_map.keys()))
+        fa = fa_map[ref]
+        b.log.clear()
+        ws_url = mod.get_page_ws()[0]
+        res = await call(mod._agent_perform_frame, ref, fa, "click", ws_url)
+        owner_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                       and mod._FRAME_OWNER_JS in m.get("params", {}).get("expression", "")]
+        return {
+            "res": res,
+            "ref": ref,
+            "frame_id": fa.get("frame_id"),
+            "owner_ctx": owner_evals[0]["params"].get("contextId") if owner_evals else None,
+            "isolated": sorted(b.isolated),
+            "clicks": list(b.clicks),
+        }
+    b_c, res_c, stdout_c, stderr_c = run(mod, top, body_c)
+    out["act_isolated"] = res_c
+
+    return out
+
+
 SCENARIOS = {
     "commands": scenario_commands,
     "routing": scenario_routing,
@@ -1388,6 +1496,7 @@ SCENARIOS = {
     "press_hold": scenario_press_hold,
     "timeout_hold": scenario_timeout_hold,
     "click_outcome": scenario_click_outcome,
+    "agent_frame_isolated": scenario_agent_frame_isolated,
 }
 
 

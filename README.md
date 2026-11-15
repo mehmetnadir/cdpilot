@@ -530,7 +530,7 @@ blocking}`, read in cdpilot's isolated world, so a page that replaces `getBoundi
 hide or invent one) and, when one covers the page, a `frames_hint`. Top-level
 `frames[].origin` is read from the iframe's `src` attribute (not the post-redirect address) and is not a trust signal; the
 `frame` field in `agent observe --frame <i>` output comes from the live frame URL. `agent observe
---frame <i>` lists that frame's entries and names the frame's live origin as `frame`; they pass the same tag-character cleaning and
+--frame <i>` resolves the frame index in that isolated world, lists that frame's entries and names the frame's live origin as `frame`; they pass the same tag-character cleaning and
 `injection_suspect` scan as page text (a frame is third-party content), and its text passes the same hidden-text cut
 (`hidden_removed`); hosts its hidden text names feed the guard's `url_from_hidden`. A frame ref belongs to its frame and never resolves in the main
 document; if the frame is gone or replaced, `agent act --ref` gives the stale-ref error. `click`, `type` and `fill` work on a frame ref
