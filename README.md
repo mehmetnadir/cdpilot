@@ -148,13 +148,13 @@ tools (navigate, click, fill, content, screenshot, eval, wait_for, assert, tabs,
 plus `browser_tools`. The agent calls `browser_tools` with `list` to see the other
 tools, or `enable` to add some (the server sends `tools/list_changed`). `--tools a,b,c`
 picks tools by name; `all` (default) is unchanged. Schema size of `tools/list`
-(tiktoken `o200k_base`): 45 tools = 5,769 tokens, `core` = 11 tools = 1,342 tokens; the four
-`browser_agent_*` tools add ~11% of schema (49 tools ≈ 6,400 tokens, scaled from the measurement).
+(tiktoken `o200k_base`, compact JSON, measured 15.11.2026 on 0.9.9): `all` = 50 tools = 7,027 tokens,
+of which the five `browser_agent_*` tools are 1,209; `core` = 11 tools = 1,395 tokens.
 The three `browser_canvas_*` tools are listed only while a live canvas is open (`cdpilot canvas open`), and never under `core`; `tools/list_changed` follows when the first canvas opens or the last one closes.
 
 ### Agent mode over MCP
 
-`browser_agent_observe` (`diff`, `full`, `all`), `browser_agent_find` (`text`, `role`, `max`), `browser_agent_act` (`ref`/`url`, `action`, `text`), `browser_agent_flow_save`
+`browser_agent_observe` (`diff`, `full`, `all`, `frame`), `browser_agent_find` (`text`, `role`, `max`), `browser_agent_act` (`ref`/`url`, `action`, `text`), `browser_agent_flow_save`
 (`name`, `last`) and `browser_agent_run` (`flow`, `vars`, `dry_run`) wrap the agent commands below, so a model
 on MCP works from numbered refs, gets diffs, and replays a learned flow with no page read at all. They are
 outside the `core` profile; `browser_tools enable` adds them. A drift or a missing variable comes back as
@@ -1524,6 +1524,8 @@ print(result.stdout)
 | `CDPILOT_OBSERVE_FORMAT` | unset | `rows` = `agent observe/act/run` print `actions` as `[ref, role, name(, value)]` arrays (`""` = same role as previous row; same as `--rows`); `objects` = object format (same as `--objects`); MCP has no per-call switch |
 | `CDPILOT_AGENT_HIDDEN` | unset | `1` = `agent observe/act/run` also print `hidden_text` and `hidden_check` (detection, `why` and the guard run either way) |
 | `CDPILOT_AGENT_GUARD` | `warn` | `off` = no guard before `agent act --url` / `agent run` go steps; `warn` = report `guard` and let the navigation run |
+| `CDPILOT_OBSERVE_MAX` | `400` | Most entries one `agent observe` / `act` / `run` list prints; `0` = no limit (same as `--all`) |
+| `CDPILOT_SHOT_SCALE` | CSS pixels | `device` = screenshots in device pixels on HiDPI displays (same as `--hidpi`) |
 | `CDPILOT_GO_FAST` | unset | `1` = `go` ends the settle 30 ms after a quiet load (no request in flight at the load event, none started within 30 ms) instead of 100 ms of event silence; off with `--network`, `--har`, `--console` and after a WebSocket |
 | `CDPILOT_AGENT_ORIGINS` | unset | Hosts an agent may navigate to (comma-separated, subdomains included, `host:port` for another port); a target outside gets `guard` `outside_origins` |
 | `CDPILOT_LOG` | `1` | `0` = do not write the session log (`cdpilot log`) |
