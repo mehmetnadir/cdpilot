@@ -20095,6 +20095,10 @@ async def cmd_agent_flow_save(name, last=None):
             hb = _agent_host_path(e.get('url_before'))[0]
             if hb:  # a {{placeholder}} is typed only here
                 step['before'] = {'host': hb, 'origin': _agent_origin(e.get('url_before'))}
+                if _AGENT_VAR_RE.search(step.get('text') or '') \
+                        and str(e.get('url_before')).lower().startswith(('https://', 'http://')):
+                    # the page: where `agent run` opens its own tab for an environment value
+                    step['before']['url'] = _slog_mask_url(e['url_before'])
         for m in _AGENT_VAR_RE.finditer(step.get('text') or step.get('url') or ''):
             label = (step.get('anchor') or {}).get('name') or step.get('kind')
             vars_dict.setdefault(m.group(1), {'step': n, 'hint': f"{step.get('action', 'go')} {label}"})
@@ -20166,8 +20170,207 @@ async def cmd_agent_flow_delete(name):
     print(json.dumps({'deleted': slug}))
 
 
+# ─── A tab of the run's own for an environment value (2026-11-15 audit) ───
+# `replay` of a flow that types a CDPILOT_VAR_<NAME> value, and `agent run` when
+# it types one, used the shared session tab: an MCP model's browser_eval runs
+# page script there, so a listener it installed earlier (or a later eval) read
+# the field, and a `watch` screencast filmed it. Such a run now opens a tab of
+# its own (Target.createTarget about:blank: no opener, the browser context of
+# the tab it would otherwise use), pins every step to it the way get_page_ws
+# honours CDPILOT_TARGET (this process and every child), and closes it before
+# it returns. A page that tab opens (openerId) refuses the value; a live watch
+# daemon refuses the run, and `watch start` refuses while one is active (marker).
+ENV_RUN_MARKER_PREFIX = 'env-run-'
+
+
+def _env_run_marker_dir():
+    return os.path.join(CDPILOT_HOME, 'projects', PROJECT_ID or _get_project_id())
+
+
+def _env_run_active():
+    """Pid of a live environment-value run of this project (its marker), or
+    None. A marker whose process is gone is stale and ignored."""
+    d = _env_run_marker_dir()
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return None
+    for n in names:
+        if not (n.startswith(ENV_RUN_MARKER_PREFIX) and n.endswith('.json')):
+            continue
+        try:
+            with open(os.path.join(d, n)) as f:
+                pid = json.load(f).get('pid')
+        except (OSError, ValueError, AttributeError):
+            continue
+        if _pid_alive(pid):
+            return int(pid)
+    return None
+
+
+def _env_tab_popups(tid):
+    """Ids of the pages the run's tab opened (openerId is that tab, or one of
+    those pages), or None when the browser does not list its targets."""
+    infos = (_browser_ws_call('Target.getTargets', {}, timeout=5) or {}).get('targetInfos')
+    if not isinstance(infos, list):
+        return None
+    kids = {}
+    for i in infos:
+        if i.get('openerId') and i.get('targetId'):
+            kids.setdefault(i['openerId'], []).append(i['targetId'])
+    out, todo = [], [tid]
+    while todo:
+        for k in kids.get(todo.pop(), ()):
+            if k != tid and k not in out:
+                out.append(k)
+                todo.append(k)
+    return out
+
+
+def _env_tab_close(tid, popups=()):
+    """Close the run's tab, and the pages it opened, by id on the browser socket."""
+    for t in list(popups) + [tid]:
+        _browser_ws_call('Target.closeTarget', {'targetId': t}, timeout=5)
+    if _is_external():
+        guid, tabs = _external_tabs_load()
+        if tid in tabs:
+            _external_tabs_save(guid, tabs - {tid})
+    cdp_cache_invalidate()
+
+
+def _env_tab_open():
+    """Open the run's own tab; its target id. about:blank, no opener, in the
+    browser context of the tab the run would otherwise use (get_page_ws: a
+    CDPILOT_TARGET pin, else the session tab); in a connected browser a new
+    inactive window (_external_create_tab). Exit 1 when no tab opens."""
+    with contextlib.redirect_stdout(sys.stderr):
+        _ws, page = get_page_ws()
+    if _is_external():
+        tid = _external_create_tab()
+    else:
+        params = {'url': 'about:blank'}
+        infos = (_browser_ws_call('Target.getTargets', {}, timeout=5) or {}).get('targetInfos') or []
+        ctx = next((i.get('browserContextId') for i in infos if i.get('targetId') == (page or {}).get('id')), None)
+        if ctx and ctx in ((_browser_ws_call('Target.getBrowserContexts', {}, timeout=5) or {})
+                           .get('browserContextIds') or []):
+            params['browserContextId'] = ctx  # a context of its own (context pool), not the default one
+        tid = (_browser_ws_call('Target.createTarget', params) or {}).get('targetId')
+        _mark_owned_tab(tid)
+    for _ in range(30 if tid else 0):  # a CDPILOT_TARGET pin reads the /json listing (get_page_ws)
+        if any(t.get('id') == tid for t in cdp_get('/json', no_cache=True) or []):
+            cdp_cache_invalidate()
+            return tid
+        time.sleep(0.2)
+    if tid:
+        _env_tab_close(tid)
+    print(json.dumps({'error': "could not open a tab of the run's own for the environment value; nothing typed"}),
+          file=sys.stderr)
+    sys.exit(1)
+
+
+def _env_run_begin(st):
+    """Before the first step of a run that types an environment value: write
+    the marker `watch start` checks, refuse under a live watch daemon (exit 2),
+    open the run's own tab and pin it (CDPILOT_TARGET). `st` collects what
+    _env_run_end undoes; the caller runs _env_run_end in a finally."""
+    st['pin'] = os.environ.get('CDPILOT_TARGET')
+    path = os.path.join(_env_run_marker_dir(), f'{ENV_RUN_MARKER_PREFIX}{os.getpid()}.json')
+    try:
+        _atomic_write_json(path, {'pid': os.getpid(), 'started': int(time.time())})
+    except OSError as e:
+        print(json.dumps({'error': f'cannot write {path}: {e}; nothing typed'}), file=sys.stderr)
+        sys.exit(1)
+    st['marker'] = path
+    watch = _watch_load_state()
+    pid = watch.get('pid') if isinstance(watch, dict) else None
+    if pid and _watch_pid_alive(pid):
+        print(json.dumps({'error': f"cdpilot watch is recording this project's browser (pid {pid}); a run that "
+                                   'types an environment value does not start under a screencast',
+                          'missing': [], 'watch_pid': pid, 'hint': 'cdpilot watch stop, then run again'}),
+              file=sys.stderr)
+        sys.exit(2)
+    st['tab'] = _env_tab_open()
+    os.environ['CDPILOT_TARGET'] = st['tab']
+    cdp_cache_invalidate()
+
+
+def _env_tab_popup_refusal(st):
+    """Why the run may not type its environment value now (a page its tab
+    opened could read the field), or None."""
+    popups = _env_tab_popups(st['tab'])
+    if popups is None:
+        return "the browser did not list its targets, so a page the run's tab opened cannot be ruled out"
+    if popups:
+        st['popups_refused'] = True
+        return f"the run's tab opened another page ({len(popups)}), which could read the field"
+    return None
+
+
+def _env_run_end(st):
+    """After a run _env_run_begin started, success or failure: close its tab and
+    every page that tab opened, undo the pin, remove the marker. Exit 2 when the
+    tab had opened a page the run did not already refuse for."""
+    popups = None
+    if st.get('tab'):
+        popups = _env_tab_popups(st['tab'])
+        _env_tab_close(st['tab'], popups or ())
+        if st.get('pin') is None:
+            os.environ.pop('CDPILOT_TARGET', None)
+        else:
+            os.environ['CDPILOT_TARGET'] = st['pin']
+    if st.get('marker'):
+        try:
+            os.remove(st['marker'])
+        except OSError:
+            pass
+    if popups and not st.get('popups_refused'):
+        print(json.dumps({'error': "the run's own tab opened another page while it ran; both are closed, but "
+                                   'that page could have read the typed environment value',
+                          'pages': len(popups), 'hint': "check the site's popups before running the flow again"}),
+              file=sys.stderr)
+        sys.exit(2)
+
+
+def _agent_env_start_url(step):
+    """Where `agent run` opens its own tab when no go comes before the first step
+    that types an environment value: that step's recorded page (before.url, on
+    the recorded origin), else the recorded origin, else https://<host>/."""
+    before = step.get('before') or {}
+    origin, url = before.get('origin') or '', before.get('url') or ''
+    if not origin.startswith(('https://', 'http://')):
+        return f"https://{before.get('host')}/"
+    return url if url and _agent_origin(url) == origin else origin + '/'
+
+
+def _agent_refs_forget():
+    """Drop the last snapshot's refs (agent-state.json, a11y-refs.json): they
+    named nodes of the run's own tab, closed now, so the next `agent act --ref`
+    asks for `agent observe` instead of acting on another tab's node ids."""
+    try:
+        st = _load_agent_state()
+        st['actions_map'], st['hidden_refs'], st['frame_actions'] = {}, [], {}
+        _save_agent_state(st)
+        _save_a11y_refs({})
+    except OSError:
+        pass
+
+
 async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=False, objects=False, all_=False,
                         trust_flow=False):
+    """`agent run` (_agent_run_flow); a tab it opened for an environment value
+    is closed before it returns, success or failure (_env_run_end)."""
+    env_run = {}
+    try:
+        return await _agent_run_flow(name, var_values=var_values, dry_run=dry_run, full=full, rows=rows,
+                                     objects=objects, all_=all_, trust_flow=trust_flow, env_run=env_run)
+    finally:
+        if env_run.get('tab'):
+            _agent_refs_forget()
+        _env_run_end(env_run)
+
+
+async def _agent_run_flow(name, var_values=None, dry_run=False, full=False, rows=False, objects=False, all_=False,
+                          trust_flow=False, *, env_run):
     """Replay a saved flow by anchors, no model in the loop.
 
     Exit 0: every step found its anchor (one result JSON: url, title, ms,
@@ -20257,6 +20460,15 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
                                             'steps': flow['steps'], 'vars': sorted(needed)}),
                          indent=2, ensure_ascii=False))
         return
+    if env_by_step:
+        # An environment value is typed in a tab of the run's own, never the shared
+        # session tab an MCP model's browser_eval reaches (2026-11-15 audit);
+        # cmd_agent_run closes it. With no go before the first such step, that
+        # tab first opens the step's recorded page.
+        _env_run_begin(env_run)
+        first = next(i for i, s in enumerate(flow['steps']) if s.get('n') in env_by_step)
+        if not any(s.get('kind') == 'go' for s in flow['steps'][:first]):
+            await _agent_go_silent(_agent_env_start_url(flow['steps'][first]))
 
     t0 = time.monotonic()
     tokens_avoided = 0
@@ -20293,7 +20505,10 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
                'expected': step.get('anchor') or {'kind': step.get('kind')},
                'done': done, 'url': clean(page.get('url', ''), st), 'title': page.get('title', ''),
                'actions': shown_actions, 'text': text,
-               'hint': f"act on a ref (agent act --ref @N …), finish the task, then: {save}"}
+               'hint': f"act on a ref (agent act --ref @N …), finish the task, then: {save}"
+                       if not env_run.get('tab') else
+                       "the run typed an environment value in a tab of its own, closed now: open the page in "
+                       f"your tab (agent act --url …), act on a ref from agent observe, then: {save}"}
         res.update(_agent_frames_fields(list(_AGENT_LAST_FRAMES)))
         if trunc:
             res['truncated'] = trunc
@@ -20349,7 +20564,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
                             f"({recorded or 'no recorded host'}); this page is {here or 'an opaque origin'}",
                       page, out_actions, text, state)
             if step['n'] in env_by_step:  # an environment value: https on a listed host, as replay
-                why = _var_url_allowed(page.get('url', ''), _var_host_entries())
+                why = _var_url_allowed(page.get('url', ''), _var_host_entries()) or _env_tab_popup_refusal(env_run)
                 if why:
                     print(json.dumps({'error': f"step {step['n']}: environment value refused: {why}",
                                       'flow': slug, 'step': step['n']}), file=sys.stderr)
@@ -24209,6 +24424,14 @@ def cmd_watch_start(*args):
     _url = next((a for a in args if not a.startswith('--')), '')
     if _url and _url != '-':
         _mcp_url_gate("browser_watch_start", _url)
+    # A replay / agent run typing a CDPILOT_VAR_* value in this project: no
+    # screencast while it types (its marker, _env_run_begin; 2026-11-15 audit).
+    run_pid = _env_run_active()
+    if run_pid:
+        print(json.dumps({'error': f'a run that types an environment value is active in this project (pid {run_pid}); '
+                                   'watch does not start while it types',
+                          'hint': 'start watch after that run ends'}), file=sys.stderr)
+        sys.exit(2)
     # Stop any prior daemon — two screencasts on one target would race.
     prev = _watch_load_state()
     if prev and _watch_pid_alive(prev.get('pid')):
@@ -26958,7 +27181,17 @@ def _replay_live_host():
 
 
 def cmd_replay(*args):
-    """Replay a recorded flow JSON file."""
+    """Replay a recorded flow JSON file (_replay_run); a tab it opened for an
+    environment value is closed before it returns, success or failure."""
+    env_run = {}
+    try:
+        _replay_run(*args, env_run=env_run)
+    finally:
+        _env_run_end(env_run)
+
+
+def _replay_run(*args, env_run):
+    """cmd_replay's body; `env_run` collects the run's own tab (_env_run_begin)."""
     if not args:
         print("Usage: cdpilot replay <flow.json> [--var k=v ...] [--delay real|none|<ms>] [--dry-run] [--continue]",
               file=sys.stderr)
@@ -27183,6 +27416,10 @@ def cmd_replay(*args):
             line = f"[{idx}/{total_steps}] {cmd} {args_str}".strip()
             print(line)
         sys.exit(0)
+    if env_flow:
+        # The flow runs in a tab of its own, never the shared session tab an MCP
+        # model's browser_eval reaches (2026-11-15 audit); cmd_replay closes it.
+        _env_run_begin(env_run)
 
     had_failure = False
     typed_at = 0  # the last step that took an environment value (0: none yet)
@@ -27251,9 +27488,21 @@ def cmd_replay(*args):
                 print(json.dumps({"error": "environment value(s) refused: " + ", ".join(names),
                                   "missing": [],
                                   "refused": [{"var": k, "step": idx, "cmd": cmd, "why": why} for k in names],
-                                  "hint": f"open an https page on a host named in {AGENT_VAR_HOSTS_ENV} "
-                                          "(host:port for another port) first, or pass --var name=value"}),
+                                  "hint": "start the flow with `go <https URL>`; a flow that types an environment "
+                                          f"value runs in its own tab (a host named in {AGENT_VAR_HOSTS_ENV}, "
+                                          "host:port for another port), or pass --var name=value"}),
                       file=sys.stderr)
+                sys.exit(2)
+        if env_here:
+            why = _env_tab_popup_refusal(env_run)  # a page the run's tab opened could read the field
+            if why:
+                names = sorted({k for ks in env_here.values() for k in ks})
+                print(f"[{idx}/{total_steps}] {step_label} ... refused")
+                print(json.dumps({"error": "environment value(s) refused: " + ", ".join(names),
+                                  "missing": [],
+                                  "refused": [{"var": k, "step": idx, "cmd": cmd, "why": why} for k in names],
+                                  "hint": "the page opened a popup before the value was typed; nothing was "
+                                          "typed, or pass --var name=value"}), file=sys.stderr)
                 sys.exit(2)
 
         child_values = {}  # REPLAY_VALUE_ENV<slot> -> environment value, for this child only

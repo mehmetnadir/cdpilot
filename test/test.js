@@ -12107,7 +12107,9 @@ print("ok %.1f" % best)
       const tri = list.find((f) => f.name === 'inbox_triage');
       assert(list.length === 2 && tri && tri.steps === 4 && tri.runs === 0 && tri.host === 'user.example', JSON.stringify(list));
       // 2026-11-10 review: a placeholder step remembers the host it was typed on; files are 0600
-      assert.deepStrictEqual(flow.steps[3].before, { host: 'user.example', origin: 'https://user.example' }, JSON.stringify(flow.steps[3]));
+      // (2026-11-15: and its page, where `agent run` opens its own tab for an environment value)
+      assert.deepStrictEqual(flow.steps[3].before, { host: 'user.example', origin: 'https://user.example',
+        url: 'https://user.example/inbox' }, JSON.stringify(flow.steps[3]));
       if (process.platform !== 'win32') {
         assert.strictEqual(fs.statSync(flowPath).mode & 0o777, 0o600, 'flow file 0600');
         assert.strictEqual(fs.statSync(statePath).mode & 0o777, 0o600, 'agent-state.json 0600');
@@ -12390,6 +12392,78 @@ print("ok %.1f" % best)
       const pw = since.filter((x) => x.var_target);
       assert.strictEqual(pw.length, 1, JSON.stringify(since.map((x) => x.method)));
     } finally { b.fake.stop(); }
+  });
+
+  // 2026-11-15 audit: `agent run` typed an environment value into the shared session tab, where an
+  // MCP model's browser_eval runs page script (a listener installed earlier, or a later eval, read the
+  // field). Such a run now opens a tab of its own, goes to the step's recorded page when no go comes
+  // before it, types there and closes the tab; the session tab never sees the value.
+  test('learned flows (fake browser): agent run types an environment value in a tab of its own — a flow saved with --last 1 (no go) opens the step\'s recorded page there, the session tab never gets the value, the tab is closed; a popup that tab opened refuses the value (exit 2)', () => {
+    const typed = 'zq-agent-owntab-6203';
+    const valueEnv = { CDPILOT_VAR_PASSWORD: typed, CDPILOT_VAR_HOSTS: 'user.example' };
+    let flowSrc;
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_WATCH: typed });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const ok = (args, extra) => {
+        const r = cli(args, { ...env, ...(extra || {}) });
+        assert.strictEqual(r.status, 0, `${args.join(' ')} exit ${r.status}: ${r.stderr}\n${r.stdout}`);
+        return r;
+      };
+      // the operator teaches the login step in the terminal and saves the act alone
+      ok(['agent', 'act', '--url', 'https://user.example/inbox']);
+      const byName = Object.fromEntries(JSON.parse(ok(['agent', 'observe']).stdout).actions.map((a) => [a.name, a]));
+      ok(['agent', 'act', '--ref', byName.Password.ref, '--action', 'fill', '--text', 'taught-by-hand-1']);
+      assert.strictEqual(JSON.parse(ok(['agent', 'flow', 'save', 'login', '--last', '1']).stdout).steps, 1);
+      const flowPath = path.join(home, 'projects', 'proj', 'flows', 'login.json');
+      flowSrc = fs.readFileSync(flowPath, 'utf-8');
+      const step = JSON.parse(flowSrc).steps[0];
+      assert(step.text === '{{password}}' && step.before.url === 'https://user.example/inbox', flowSrc);
+      // the session tab moves on; the run must not use it
+      ok(['agent', 'act', '--url', 'https://example.com/']);
+      const session = fake.entries().filter((x) => x.method === 'Page.navigate').pop().ws;
+      const mark = fake.entries().length;
+      const run = JSON.parse(ok(['agent', 'run', 'login'], valueEnv).stdout);
+      assert(run.status === 'ok' && run.url === 'https://user.example/inbox', JSON.stringify(run));
+      const since = fake.entries().slice(mark);
+      const made = since.filter((x) => x.created).map((x) => x.created);
+      assert.strictEqual(made.length, 1, `one tab of its own: ${JSON.stringify(since)}`);
+      const tab = `/devtools/page/${made[0]}`;
+      assert(since.some((x) => x.method === 'Page.navigate' && x.ws === tab), 'the run tab went to the recorded page');
+      const carried = since.filter((x) => x.watch);
+      assert(carried.length === 1 && carried[0].ws === tab && carried[0].var_target, JSON.stringify(carried));
+      assert(!since.some((x) => x.ws === session), `the session tab was used: ${JSON.stringify(since.filter((x) => x.ws === session))}`);
+      assert(since.some((x) => x.method === 'Target.closeTarget' && x.targetId === made[0]), 'the run tab was closed');
+      const state = fs.readFileSync(path.join(home, 'projects', 'proj', 'agent-state.json'), 'utf-8');
+      assert(!state.includes(typed), 'agent-state.json holds the value');
+      assert.deepStrictEqual(JSON.parse(state).actions_map, {}, 'refs of the closed tab are dropped');
+      // the session tab is where it was
+      assert.strictEqual(JSON.parse(ok(['agent', 'observe']).stdout).url, 'https://example.com/');
+      // a --var value keeps the session tab: no tab of its own
+      const m2 = fake.entries().length;
+      ok(['agent', 'act', '--url', 'https://user.example/inbox']);
+      assert.strictEqual(JSON.parse(ok(['agent', 'run', 'login', '--var', `password=${typed}`]).stdout).status, 'ok');
+      assert(!fake.entries().slice(m2).some((x) => x.created), 'a --var run opened a tab');
+    } finally { fake.stop(); }
+    // the page in the run's tab opens a popup (its openerId is the run tab): nothing is typed
+    const pop = startFake('full', 'guid-user', { FAKE_CDP_WATCH: typed, FAKE_CDP_POPUP: '1' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(pop.port) });
+      const flowPath = path.join(home, 'projects', 'proj', 'flows', 'login.json');
+      fs.mkdirSync(path.dirname(flowPath), { recursive: true });
+      fs.writeFileSync(flowPath, flowSrc);
+      const r = cli(['agent', 'run', 'login'], { ...isoEnv(home, pop.port, 'proj'), ...valueEnv });
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      assert(/opened another page/.test(r.stderr) && !(r.stdout + r.stderr).includes(typed), r.stderr);
+      const all = pop.entries();
+      assert(!all.some((x) => x.watch || x.var_target), 'nothing typed');
+      const popups = all.filter((x) => x.popup).map((x) => x.popup);
+      const closed = all.filter((x) => x.method === 'Target.closeTarget').map((x) => x.targetId);
+      assert(popups.length === 1 && closed.includes(popups[0]), JSON.stringify({ popups, closed }));
+    } finally { pop.stop(); }
   });
 
   // ── Flow provenance (2026-11-15 review) ──
@@ -18120,13 +18194,16 @@ print(json.dumps(res))
     assert(/routed into a frame/.test(out.frameflag), out.frameflag);
   });
 
-  test('replay: env var — live host not in CDPILOT_VAR_HOSTS refuses that step, value printed nowhere', () => {
-    const fake = startFakeCdp();
+  // 2026-11-15 audit: an environment flow typed into the shared session tab, where an MCP model's
+  // browser_eval runs page script. It now runs in a tab of its own, which starts at about:blank:
+  // a flow with no navigation of its own stops at its first value step, even when the session
+  // tab sits on an allowed host, and nothing is sent to the session tab.
+  test('replay: env var — a flow with no navigation stops at its first value step (its own tab is about:blank) with the go hint; the session tab on an allowed host is not used', () => {
+    const fake = startFakeCdp({ FAKE_CDP_DOM: '1' });
     try {
       const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envlive-'));
-      // 2026-11-11: such a flow may not `go` to an unlisted host itself, so the tab is
-      // moved first (a link the page followed, another tool), then the flow runs
-      assert.strictEqual(runCli(['go', 'https://evil.example/login'], fakeEnv(home, fake.port)).status, 0);
+      assert.strictEqual(runCli(['go', 'https://login.example.com/'], fakeEnv(home, fake.port)).status, 0);
+      const mark = fakeEntries(fake).length;
       const flowPath = writeFlow(home, [
         { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 },
         { cmd: 'click', args: ['#next'], t_ms: 20 },
@@ -18138,10 +18215,16 @@ print(json.dumps(res))
       assert(!r.stdout.includes('[2/2]'), 'a refusal stops the replay, --continue or not');
       const e = errJson(r);
       assert.strictEqual(e.refused[0].step, 1);
-      assert(/active page is on evil\.example; CDPILOT_VAR_HOSTS does not name it/.test(e.refused[0].why),
-        e.refused[0].why);
+      assert(/no host/.test(e.refused[0].why), e.refused[0].why);
+      assert(/start the flow with `go <https URL>`; a flow that types an environment value runs in its own tab/.test(e.hint),
+        e.hint);
       noSecret(r);
       assert(!fs.readFileSync(fake.log, 'utf-8').includes(PLANTED), 'the value never reached the browser');
+      const run = fakeEntries(fake).slice(mark);
+      assert(!run.some((x) => x.ws === '/devtools/page/PAGE1'), `the session tab was used: ${JSON.stringify(run)}`);
+      const made = run.filter((x) => x.created).map((x) => x.created);
+      assert.strictEqual(made.length, 1, JSON.stringify(run));
+      assert(run.some((x) => x.method === 'Target.closeTarget' && x.targetId === made[0]), 'the run closed its tab');
     } finally {
       fake.stop();
     }
@@ -18167,6 +18250,8 @@ print(json.dumps(res))
       const seen = spawnSync(PYB, ['-c', `import urllib.request,json; print(json.dumps([p["url"] for p in json.load(urllib.request.urlopen("http://127.0.0.1:${fake.port}/json"))]))`],
         { encoding: 'utf-8', timeout: 10000 }).stdout;
       assert(seen.includes(`https://evil.example/?p=${PLANTED}`), seen);
+      // --var only: the session tab, as before (no tab of its own)
+      assert(!fakeEntries(fake).some((x) => x.method === 'Target.createTarget'), 'a --var flow opened a tab');
     } finally {
       fake.stop();
     }
@@ -18234,6 +18319,128 @@ print(json.dumps(res))
     } finally {
       fake.stop();
     }
+  });
+
+  test('replay: env var — the flow runs in a tab of its own: Target.createTarget, every page call on that tab, Target.closeTarget at the end, also after a refused step; the session tab is not touched', () => {
+    const fake = startFakeCdp({ FAKE_CDP_WATCH: PLANTED, FAKE_CDP_DOM: '1' });
+    try {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envtab-'));
+      const env = fakeEnv(home, fake.port, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com' });
+      const runIn = (steps, status) => {
+        const mark = fakeEntries(fake).length;
+        const r = runCli(['replay', writeFlow(home, steps), '--delay', 'none'], env);
+        assert.strictEqual(r.status, status, r.stdout + r.stderr);
+        noSecret(r);
+        const run = fakeEntries(fake).slice(mark);
+        const made = run.filter((x) => x.created).map((x) => x.created);
+        assert.strictEqual(made.length, 1, `one tab of its own: ${JSON.stringify(run)}`);
+        const tab = `/devtools/page/${made[0]}`;
+        const pageCalls = run.filter((x) => x.ws && x.ws.startsWith('/devtools/page/'));
+        assert(pageCalls.length > 0 && pageCalls.every((x) => x.ws === tab),
+          `a page call off the run's tab: ${JSON.stringify(pageCalls.filter((x) => x.ws !== tab))}`);
+        const closeAt = run.findIndex((x) => x.method === 'Target.closeTarget' && x.targetId === made[0]);
+        assert(closeAt >= 0, `the run's tab was not closed: ${JSON.stringify(run)}`);
+        assert(run.slice(closeAt).every((x) => x.ws !== tab), 'nothing ran on the tab after it closed');
+        return { r, run, tab };
+      };
+      const go = { cmd: 'go', args: ['https://login.example.com/'], t_ms: 0 };
+      let { r, run, tab } = runIn([go, { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 }], 0);
+      assert(r.stdout.includes('[2/2] fill #pw ... ok'), r.stdout);
+      assert(run.some((x) => x.method === 'Page.navigate' && x.ws === tab), 'the go moved the run tab');
+      const carried = run.filter((x) => x.watch);
+      assert(carried.length === 1 && carried[0].ws === tab && carried[0].var_target, JSON.stringify(carried));
+      // a refused step (an <iframe> target) stops the replay with 2; the tab is closed all the same
+      ({ r } = runIn([go, { cmd: 'fill', args: ['iframe#widget', '{{password}}'], t_ms: 10 },
+        { cmd: 'click', args: ['#next'], t_ms: 20 }], 2));
+      assert(r.stdout.includes('[2/3] fill iframe#widget ... refused (2)'), r.stdout);
+      // the session tab kept its pin and its page
+      const seen = spawnSync(PYB, ['-c', `import urllib.request,json; print(json.dumps([p["id"] for p in json.load(urllib.request.urlopen("http://127.0.0.1:${fake.port}/json"))]))`],
+        { encoding: 'utf-8', timeout: 10000 }).stdout;
+      assert.deepStrictEqual(JSON.parse(seen), ['PAGE1'], 'only the session tab is left');
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test('replay: env var — a page the run\'s tab opened (openerId) refuses the value step: exit 2, nothing typed, both tabs closed', () => {
+    const fake = startFakeCdp({ FAKE_CDP_WATCH: PLANTED, FAKE_CDP_DOM: '1', FAKE_CDP_POPUP: '1' });
+    try {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envpopup-'));
+      const r = runCli(['replay', writeFlow(home, [{ cmd: 'go', args: ['https://login.example.com/'], t_ms: 0 },
+        { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 }]), '--delay', 'none'],
+      fakeEnv(home, fake.port, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com' }));
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      assert(r.stdout.includes('[2/2] fill #pw ... refused'), r.stdout);
+      assert(/opened another page/.test(errJson(r).refused[0].why), r.stderr);
+      noSecret(r);
+      const run = fakeEntries(fake);
+      assert(!run.some((x) => x.watch || x.var_target), 'nothing typed');
+      const popups = run.filter((x) => x.popup).map((x) => x.popup);
+      assert.strictEqual(popups.length, 1, JSON.stringify(run));
+      const closed = run.filter((x) => x.method === 'Target.closeTarget').map((x) => x.targetId);
+      assert(closed.includes(popups[0]) && run.filter((x) => x.created).every((x) => closed.includes(x.created)),
+        `closed: ${JSON.stringify(closed)}`);
+    } finally {
+      fake.stop();
+    }
+  });
+
+  // ── 2026-11-15 audit: a `watch` screencast films the typed value ──
+  test('replay/agent: env var — a live watch daemon stops an environment run before its first step (exit 2, hint `cdpilot watch stop`); watch start refuses while such a run is active; a stale marker is ignored', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envwatch-'));
+    const proj = path.join(home, 'projects', 'rep-watch');
+    fs.mkdirSync(path.join(proj, 'watch'), { recursive: true });
+    fs.mkdirSync(path.join(proj, 'flows'), { recursive: true });
+    // this test process stands in for the detached daemon: a live pid
+    fs.writeFileSync(path.join(proj, 'watch', 'state.json'), JSON.stringify({ pid: process.pid, url: '' }));
+    const env = varEnv(home, { CDPILOT_PROJECT_ID: 'rep-watch', CDPILOT_VAR_PASSWORD: PLANTED,
+      CDPILOT_VAR_HOSTS: 'bank.example' });
+    const flowPath = writeFlow(home, [{ cmd: 'go', args: ['https://bank.example/login'], t_ms: 0 },
+      { cmd: 'fill', args: ['#password', '{{password}}'], t_ms: 1 }]);
+    let r = runCli(['replay', flowPath, '--delay', 'none'], env);
+    assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+    assert.strictEqual(r.stdout, '', 'no step ran');
+    let e = errJson(r);
+    assert(/watch/.test(e.error) && /cdpilot watch stop/.test(e.hint), r.stderr);
+    noSecret(r);
+    assert.strictEqual(runCli(['replay', flowPath, '--dry-run'], env).status, 0, 'a dry run types nothing');
+    // agent run, the same: refused before its first step (every agent page command reads the
+    // session tab first, so a fake browser answers; the run opens no tab and navigates nothing)
+    fs.writeFileSync(path.join(proj, 'flows', 'login.json'), JSON.stringify({ name: 'login', host: 'bank.example',
+      vars: { password: { step: 1 } }, steps: [{ n: 1, kind: 'act', action: 'fill', text: '{{password}}',
+        anchor: { role: 'textbox', name: 'Password', nth: 0 },
+        before: { host: 'bank.example', origin: 'https://bank.example', url: 'https://bank.example/login' } }] }));
+    const fake = startFakeCdp();
+    try {
+      r = runCli(['agent', 'run', 'login'], fakeEnv(home, fake.port, { CDPILOT_PROJECT_ID: 'rep-watch',
+        CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'bank.example' }));
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      e = JSON.parse(r.stderr.trim().split('\n').pop());
+      assert(/watch/.test(e.error) && /cdpilot watch stop/.test(e.hint), r.stderr);
+      noSecret(r);
+      const seen = fakeEntries(fake);
+      assert(!seen.some((x) => x.method === 'Target.createTarget' || x.method === 'Page.navigate'), JSON.stringify(seen));
+      assert(!fs.readFileSync(fake.log, 'utf-8').includes(PLANTED), 'the value never reached the browser');
+    } finally {
+      fake.stop();
+    }
+    // watch start while an environment run of this project is active: refused, no daemon
+    fs.unlinkSync(path.join(proj, 'watch', 'state.json'));
+    const marker = path.join(proj, `env-run-${process.pid}.json`);
+    fs.writeFileSync(marker, JSON.stringify({ pid: process.pid, started: Math.floor(Date.now() / 1000) }));
+    r = runCli(['watch', 'start', '-'], env);
+    const state = path.join(proj, 'watch', 'state.json');
+    if (r.status !== 2 && fs.existsSync(state)) {  // a daemon started: stop it before failing
+      try { process.kill(JSON.parse(fs.readFileSync(state, 'utf-8')).pid, 'SIGKILL'); } catch {}
+    }
+    assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+    assert(/environment value/.test(r.stderr) && !fs.existsSync(state), r.stderr);
+    // a marker whose process is gone is stale
+    fs.writeFileSync(marker, JSON.stringify({ pid: 2147483646, started: 1 }));
+    const live = spawnSync(PYB, ['-c', 'import sys, json; sys.path.insert(0, "src"); import cdpilot; '
+      + 'print(json.dumps(cdpilot._env_run_active()))'], { cwd: path.join(__dirname, '..'), encoding: 'utf-8',
+      timeout: 20000, env });
+    assert.strictEqual(live.stdout.trim(), 'null', live.stdout + live.stderr);
   });
 
   // ── 2026-11-11 review: the flow rule, option values, scheme and port, the child's one checked call ──
@@ -18428,17 +18635,15 @@ print(json.dumps(res))
         { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 }]);
       const fillOnly = writeFlow(home, [{ cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 }]);
       const env = (hosts) => fakeEnv(home, fake.port, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: hosts });
-      // the live check (the flow's own go to such a page is refused before step 1: other test)
+      // the live check (the flow's own go to such a page is refused before step 1: other test).
+      // 2026-11-15: the flow runs in a tab of its own, so the session tab's page (http here) is
+      // not where it types: with no go of its own the run tab is about:blank, which has no host.
       assert.strictEqual(runCli(['go', 'http://login.example.com/'], fakeEnv(home, fake.port)).status, 0);
       let r = runCli(['replay', fillOnly, '--delay', 'none'], env('example.com'));
       assert.strictEqual(r.status, 2, r.stdout + r.stderr);
       assert(r.stdout.includes('[1/1] fill #pw ... refused'), r.stdout);
-      assert(/only over https/.test(errJson(r).refused[0].why), r.stderr);
+      assert(/no host/.test(errJson(r).refused[0].why), r.stderr);
       noSecret(r);
-      assert.strictEqual(runCli(['go', 'https://login.example.com:8443/'], fakeEnv(home, fake.port)).status, 0);
-      r = runCli(['replay', fillOnly, '--delay', 'none'], env('example.com'));
-      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
-      assert(/host:8443/.test(errJson(r).refused[0].why), r.stderr);
       assert(!fs.readFileSync(fake.log, 'utf-8').includes(PLANTED), 'the value never reached the browser');
       r = runCli(['replay', flow('https://login.example.com:8443/'), '--delay', 'none'], env('login.example.com:8443'));
       assert(/\[2\/2\] fill #pw \.\.\. ok/.test(r.stdout), r.stdout + r.stderr);
@@ -18542,7 +18747,17 @@ print(json.dumps(res))
   });
 
   // cmd_replay in-process with the child run and the live page read stubbed: what each child
-  // gets (argv, its CDPILOT_REPLAY_* environment) and when the replay stops.
+  // gets (argv, its CDPILOT_REPLAY_* environment, its CDPILOT_TARGET pin) and when the replay
+  // stops. The run's own tab (an environment flow) is stubbed too: "RUNTAB", closed once.
+  const HARNESS_TAB_STUBS = [
+    'tabs = {"opened": 0, "closed": []}',
+    'def _tab_open():',
+    '    tabs["opened"] += 1',
+    '    return "RUNTAB"',
+    'cdpilot._env_tab_open = _tab_open',
+    'cdpilot._env_tab_popups = lambda tid: []',
+    'cdpilot._env_tab_close = lambda tid, popups=(): tabs["closed"].append(tid)',
+  ];
   function replayHarness(home, steps, urls, extraEnv = {}, extraArgs = []) {
     const out = path.join(home, 'harness.json');
     const r = spawnSync(PYB, ['-c', [
@@ -18551,9 +18766,11 @@ print(json.dumps(res))
       'calls = []',
       'def run(argv, **kw):',
       '    env = kw.get("env") or {}',
-      '    calls.append({"argv": argv[2:], "env": {k: v for k, v in env.items() if k.startswith("CDPILOT_REPLAY_")}})',
+      '    calls.append({"argv": argv[2:], "env": {k: v for k, v in env.items() if k.startswith("CDPILOT_REPLAY_")},',
+      '                  "target": env.get("CDPILOT_TARGET")})',
       '    return subprocess.CompletedProcess(argv, 0, "", "")',
       'cdpilot.subprocess.run = run',
+      ...HARNESS_TAB_STUBS,
       'urls = iter(json.loads(sys.argv[2]))',
       'cdpilot._replay_live_url = lambda: next(urls)',
       'code = 0',
@@ -18561,7 +18778,8 @@ print(json.dumps(res))
       '    cdpilot.cmd_replay(sys.argv[1], "--delay", "none", *sys.argv[4:])',
       'except SystemExit as e:',
       '    code = e.code',
-      'json.dump({"code": code, "calls": calls}, open(sys.argv[3], "w"))',
+      'json.dump({"code": code, "calls": calls, "tabs": tabs, "pin": cdpilot.os.environ.get("CDPILOT_TARGET")},',
+      '          open(sys.argv[3], "w"))',
     ].join('\n'), writeFlow(home, steps), JSON.stringify(urls), out, ...extraArgs],
     { cwd: REPO, encoding: 'utf-8', timeout: 30000, env: varEnv(home, extraEnv) });
     // Windows print() writes \r\n; the assertions below match \n
@@ -18688,6 +18906,13 @@ print(json.dumps(res))
     const again = replayHarness(home, steps, urls, env);
     assert.notStrictEqual(again.calls[1].env.CDPILOT_REPLAY_TOKEN, m[1], 'a new token every run');
     noSecret(h);
+    // 2026-11-15: every step of the flow is pinned to the run's own tab, closed once at the end,
+    // and the pin is undone; a --var flow keeps the session tab (no tab of its own)
+    assert(h.calls.every((c) => c.target === 'RUNTAB'), JSON.stringify(h.calls.map((c) => c.target)));
+    assert.deepStrictEqual([h.tabs.opened, h.tabs.closed, h.pin], [1, ['RUNTAB'], null], JSON.stringify(h.tabs));
+    const cliv = replayHarness(home, steps, [], {}, ['--var', `password=${PLANTED}`, '--var', 'pin=1']);
+    assert.strictEqual(cliv.code, 0, cliv.stdout + cliv.stderr);
+    assert(cliv.calls.every((c) => c.target == null) && cliv.tabs.opened === 0, JSON.stringify(cliv));
   });
 
   // 2026-11-15 audit: a flow with no {{NAME}} is not an environment flow, so its steps are not
@@ -18707,6 +18932,7 @@ print(json.dumps(res))
         '                  "values": {k: v for k, v in env.items() if k.startswith("CDPILOT_REPLAY_VALUE_")}})',
         '    return subprocess.CompletedProcess(argv, 0, "", "")',
         'cdpilot.subprocess.run = run',
+        ...HARNESS_TAB_STUBS,
         'urls = iter(json.loads(sys.argv[2]))',
         'cdpilot._replay_live_url = lambda: next(urls)',
         'code = 0',
