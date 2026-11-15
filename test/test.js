@@ -14318,6 +14318,7 @@ print(json.dumps(out))
     };
     const NOT_A_BROWSER = [  // signal 0 probes / cdpilot's own helper processes
       '_pid_alive', '_watch_pid_alive', '_watch_daemon_run', 'cmd_watch_start', 'cmd_watch_stop',
+      '_watch_refuse_late_env_run',  // stops only the watch daemon cmd_watch_start just spawned (checked below)
       '_arm_timeout_watchdog',
       '_daemon_serve_entry',  // SIGTERM/SIGHUP handlers for the warm process itself; touches no browser
       // Web Bot Auth: the spawn lock (a docstring), the signer a launch just
@@ -14346,7 +14347,8 @@ print(json.dumps(out))
     // signals only a pid whose command line is this canvas's host (B2 D8).
     // Connect: _external_abandon_own_tab closes the tab get_page_ws opened a moment earlier.
     // Env-value runs: _env_tab_close closes the run's own tab (_env_tab_open made it) and the
-    // pages that tab opened (_env_tab_popups: openerId chain from that tab).
+    // pages that tab opened (_env_tab_popups: openerId chain from that tab); the watchdog
+    // (_env_run_close_on_exit) and the orphan sweep (_env_run_sweep) close that tab by its marker.
     const OWN_BY_CONSTRUCTION = ['_CanvasHost', '_canvas_host_entry', 'cmd_canvas_open',
       '_canvas_close_one', '_external_abandon_own_tab', '_env_tab_close'];
     const known = new Set([...GUARDED, ...Object.keys(VIA_GUARDED_HELPER), ...NOT_A_BROWSER,
@@ -14387,12 +14389,31 @@ print(json.dumps(out))
     }
     const envCloseCallers = Object.keys(bodies).filter((f) => f !== '_env_tab_close'
       && /_env_tab_close\(/.test(bodies[f])).sort();
-    assert.deepStrictEqual(envCloseCallers, ['_env_run_end', '_env_tab_open'],
+    assert.deepStrictEqual(envCloseCallers, ['_env_run_close_on_exit', '_env_run_end', '_env_run_sweep', '_env_tab_open'],
       `_env_tab_close callers: ${envCloseCallers}`);
     assert(/tid = _external_create_tab\(\)[\s\S]*?tid = \(_browser_ws_call\('Target\.createTarget'[\s\S]*?_env_tab_close\(tid\)/
       .test(bodies._env_tab_open || ''), '_env_tab_open closes only the tab it just created');
-    assert(/popups = _env_tab_popups\(st\['tab'\]\)\s*\n\s*_env_tab_close\(st\['tab'\], popups or \(\)\)/
+    assert(/popups = _env_tab_popups\(st\['tab'\]\)\s*\n\s*closed = _env_tab_close\(st\['tab'\], popups or \(\)\)/
       .test(bodies._env_run_end || ''), "_env_run_end closes the run's tab and the pages that tab opened");
+    assert(/left = _ENV_RUN_LIVE\.get\('tab'\) if st\.get\('marker'\)[\s\S]*?closed = _env_tab_close\(left\)/
+      .test(bodies._env_run_end || ''), '_env_run_end closes a leftover tab only of the run it began');
+    // the watchdog: only this process's run tab (_ENV_RUN_LIVE); the sweep: only the tab a marker
+    // names whose run is dead, and in a connected browser only a tab cdpilot opened there
+    assert(/tab, marker = _ENV_RUN_LIVE\.get\('tab'\), _ENV_RUN_LIVE\.get\('marker'\)[\s\S]*?closed = _env_tab_close\(tab, popups or \(\)\)/
+      .test(bodies._env_run_close_on_exit || ''), "_env_run_close_on_exit closes only this process's run tab");
+    assert(/if _pid_alive\(data\.get\('pid'\)\):\s*\n\s*continue\s*\n\s*tid = data\.get\('tab'\)\s*\n[^\n]*not \(_is_external\(\) and tid not in _external_own_tabs\(\)\):\s*\n\s*if not _env_tab_close\(tid, _env_tab_popups\(tid\) or \(\)\):/
+      .test(bodies._env_run_sweep || ''), '_env_run_sweep closes only the tab of a dead run\'s marker');
+    for (const h of hits._watch_refuse_late_env_run || []) {
+      assert(/^proc\.(terminate|kill)\(\)$/.test(h), `_watch_refuse_late_env_run may only stop the daemon it is given: ${h}`);
+    }
+    assert(/proc = subprocess\.Popen\([\s\S]*?_watch_refuse_late_env_run\(proc\)/.test(bodies.cmd_watch_start || ''),
+      '_watch_refuse_late_env_run gets the daemon cmd_watch_start just spawned');
+    const lateCallers = Object.keys(bodies).filter((f) => f !== '_watch_refuse_late_env_run'
+      && /_watch_refuse_late_env_run\(/.test(bodies[f]));
+    assert.deepStrictEqual(lateCallers, ['cmd_watch_start'], `_watch_refuse_late_env_run callers: ${lateCallers}`);
+    const recordCallers = Object.keys(bodies).filter((f) => f !== '_env_run_record_tab'
+      && /_env_run_record_tab\(/.test(bodies[f])).sort();
+    assert.deepStrictEqual(recordCallers, ['_env_run_begin', '_env_tab_open'], `_env_run_record_tab callers: ${recordCallers}`);
     assert(/kids\.setdefault\(i\['openerId'\][\s\S]*?todo = \[\], \[tid\]|out, todo = \[\], \[tid\]/
       .test(bodies._env_tab_popups || ''), '_env_tab_popups walks the openerId chain from the run tab');
     for (const f of OWN_CONTEXT_ONLY) {
@@ -18768,6 +18789,223 @@ print(json.dumps(res))
     return fs.readFileSync(fake.log, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   }
 
+  // ── 2026-11-15 review: the run's tab (the typed value in its field) left open when the run dies ──
+  const envMarkers = (proj) => (fs.existsSync(proj) ? fs.readdirSync(proj) : [])
+    .filter((n) => n.startsWith('env-run-') && n.endsWith('.json'));
+  test('replay/agent: env var — a --timeout that fires mid-run closes the run\'s own tab before exit 124 and removes its marker (fake CDP)', () => {
+    const fake = startFakeCdp({ FAKE_CDP_WATCH: PLANTED, FAKE_CDP_DOM: '1' });
+    try {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envexpire-'));
+      // --delay 8000: the replay sleeps between steps, the watchdog (3 s) fires in that sleep (os._exit)
+      const r = runCli(['replay', writeFlow(home, [{ cmd: 'go', args: ['https://login.example.com/'], t_ms: 0 },
+        { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 }]), '--delay', '8000'],
+      fakeEnv(home, fake.port, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com', CDPILOT_TIMEOUT: '3' }));
+      assert.strictEqual(r.status, 124, r.stdout + r.stderr);
+      noSecret(r);
+      const run = fakeEntries(fake);
+      const made = run.filter((x) => x.created).map((x) => x.created);
+      assert.strictEqual(made.length, 1, JSON.stringify(run));
+      assert(run.some((x) => x.method === 'Target.closeTarget' && x.targetId === made[0]),
+        `the run's tab was left open: ${JSON.stringify(run.filter((x) => x.method && x.method.startsWith('Target.')))}`);
+      assert.deepStrictEqual(envMarkers(path.join(home, 'projects', 'rep-var')), [], 'the marker is removed');
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test('replay/agent: env var — a dead run\'s marker (its tab id) is swept by the next page command and by watch start: that tab closed, the marker removed; a live run\'s marker and tab untouched (fake CDP)', () => {
+    const fake = startFakeCdp();
+    try {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envorphan-'));
+      const proj = path.join(home, 'projects', 'rep-var');
+      fs.mkdirSync(proj, { recursive: true });
+      const newTab = () => JSON.parse(spawnSync(PYB, ['-c', 'import urllib.request, json; '
+        + `r = urllib.request.Request("http://127.0.0.1:${fake.port}/json/new?about:blank", method="PUT"); `
+        + 'print(json.dumps(json.load(urllib.request.urlopen(r))["id"]))'], { encoding: 'utf-8', timeout: 10000 }).stdout);
+      const mark = (pid, tab) => {
+        const p = path.join(proj, `env-run-${pid}.json`);
+        fs.writeFileSync(p, JSON.stringify({ pid, started: 1, tab }));
+        return p;
+      };
+      const closed = () => fakeEntries(fake).filter((x) => x.method === 'Target.closeTarget').map((x) => x.targetId);
+      const [dead, live] = [newTab(), newTab()];
+      const deadMarker = mark(2147483646, dead);
+      const liveMarker = mark(process.pid, live);  // this test process stands in for a live run
+      let r = runCli(['go', 'https://login.example.com/'], fakeEnv(home, fake.port));
+      assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+      assert.deepStrictEqual(closed(), [dead], 'only the dead run\'s tab is closed');
+      assert(!fs.existsSync(deadMarker) && fs.existsSync(liveMarker), JSON.stringify(envMarkers(proj)));
+      // watch start sweeps first, then refuses while the live run types
+      const dead2 = newTab();
+      const deadMarker2 = mark(2147483645, dead2);
+      r = runCli(['watch', 'start', '-'], fakeEnv(home, fake.port));
+      const state = path.join(proj, 'watch', 'state.json');
+      if (r.status !== 2 && fs.existsSync(state)) {  // a daemon started: stop it before failing
+        try { process.kill(JSON.parse(fs.readFileSync(state, 'utf-8')).pid, 'SIGKILL'); } catch {}
+      }
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      assert.deepStrictEqual(closed(), [dead, dead2], JSON.stringify(closed()));
+      assert(!fs.existsSync(deadMarker2) && fs.existsSync(liveMarker), JSON.stringify(envMarkers(proj)));
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test('replay/agent: env var — the MCP server runs the orphan sweep right after it kills a tool call at its time limit (the child skipped its finally)', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-mcp-envsweep-'));
+    const r = spawnSync(PYB, ['-c', [
+      'import sys, json, subprocess; sys.path.insert(0, "src")',
+      'import cdpilot',
+      'swept, real_run = [], subprocess.run',
+      'cdpilot._env_run_sweep = lambda: swept.append(1)',
+      'def run(argv, **kw):  # the fresh tool-call process: killed at TOOL_TIMEOUT_S',
+      '    if isinstance(argv, (list, tuple)) and len(argv) > 1 and argv[1] == cdpilot.__file__:',
+      '        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))',
+      '    return real_run(argv, **kw)',
+      'subprocess.run = run',
+      'res = cdpilot.MCPServer(None)._execute_tool(1, "browser_tabs", {})',
+      'print(json.dumps({"swept": len(swept), "error": res["result"]["isError"],',
+      '                  "text": res["result"]["content"][0]["text"]}))'].join('\n')],
+    { cwd: REPO, encoding: 'utf-8', timeout: 30000, env: varEnv(home, { CDPILOT_DAEMON: '', CDPILOT_PROJECT_ID: 'rep-mcp' }) });
+    const out = JSON.parse((r.stdout || '').trim().split('\n').pop() || 'null');
+    assert(out, r.stdout + r.stderr);
+    assert(out.error && /timed out/.test(out.text), JSON.stringify(out));
+    assert.strictEqual(out.swept, 1, JSON.stringify(out));
+  });
+
+  test('replay/agent: env var — the browser still lists the run\'s tab after Target.closeTarget: exit 2 naming the tab, the marker kept for the next sweep (fake CDP)', () => {
+    const fake = startFakeCdp({ FAKE_CDP_WATCH: PLANTED, FAKE_CDP_DOM: '1', FAKE_CDP_CLOSE_IGNORE: '1' });
+    try {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envnoclose-'));
+      const r = runCli(['replay', writeFlow(home, [{ cmd: 'go', args: ['https://login.example.com/'], t_ms: 0 },
+        { cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 10 }]), '--delay', 'none'],
+      fakeEnv(home, fake.port, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com' }));
+      assert(r.stdout.includes('[2/2] fill #pw ... ok'), r.stdout + r.stderr);
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      noSecret(r);
+      const made = fakeEntries(fake).filter((x) => x.created).map((x) => x.created);
+      assert.strictEqual(made.length, 1);
+      const e = errJson(r);
+      assert(e.tab === made[0] && e.error.includes(made[0]) && /not confirmed closed/.test(e.error), r.stderr);
+      const proj = path.join(home, 'projects', 'rep-var');
+      const left = envMarkers(proj);
+      assert.strictEqual(left.length, 1, JSON.stringify(left));
+      assert.strictEqual(JSON.parse(fs.readFileSync(path.join(proj, left[0]), 'utf-8')).tab, made[0]);
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test('replay/agent: env var — agent run: an exception while dropping the refs (agent-state.json a JSON list, a ValueError) still closes the run\'s own tab', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-agent-envrefs-'));
+    const proj = path.join(home, 'projects', 'rep-refs');
+    fs.mkdirSync(proj, { recursive: true });
+    fs.writeFileSync(path.join(proj, 'agent-state.json'), '[]');
+    const r = spawnSync(PYB, ['-c', [
+      'import sys, json, asyncio; sys.path.insert(0, "src")',
+      'import cdpilot',
+      'closed = []',
+      'cdpilot._env_tab_popups = lambda tid: []',
+      'cdpilot._env_tab_close = lambda tid, popups=(): closed.append(tid) or True',
+      'async def flow(*a, env_run, **k):',
+      '    env_run["tab"] = "RUNTAB"',
+      'cdpilot._agent_run_flow = flow',
+      'out = {}',
+      'for mode in ("list", "value"):',
+      '    if mode == "value":',
+      '        def boom():',
+      '            raise ValueError("refs")',
+      '        cdpilot._agent_refs_forget = boom',
+      '    closed.clear()',
+      '    try:',
+      '        asyncio.run(cdpilot.cmd_agent_run("login"))',
+      '        out[mode] = {"raised": None}',
+      '    except Exception as e:',
+      '        out[mode] = {"raised": type(e).__name__}',
+      '    out[mode]["closed"] = list(closed)',
+      'print(json.dumps(out))'].join('\n')],
+    { cwd: REPO, encoding: 'utf-8', timeout: 30000, env: varEnv(home, { CDPILOT_PROJECT_ID: 'rep-refs' }) });
+    const out = JSON.parse((r.stdout || '').trim().split('\n').pop() || 'null');
+    assert(out, r.stdout + r.stderr);
+    assert.deepStrictEqual(out.list.closed, ['RUNTAB'], JSON.stringify(out));
+    assert.deepStrictEqual(out.value, { raised: 'ValueError', closed: ['RUNTAB'] }, JSON.stringify(out));
+  });
+
+  // M3: with no session tab, a leaked run tab (or one the session tab vanished next to) must not
+  // become the MCP session tab: browser_eval would read its field.
+  test('replay/agent: env var — no session tab and only the run\'s tab listed (a marker names it): _create_session_window and get_page_ws open a new tab; the last-resort fallback refuses the run\'s tab (fake CDP)', () => {
+    const fake = startFakeCdp();
+    try {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envadopt-'));
+      const proj = path.join(home, 'projects', 'rep-var');
+      fs.mkdirSync(proj, { recursive: true });
+      // PAGE1, the fake's only page, is a live run's tab (this test process stands in for the run)
+      fs.writeFileSync(path.join(proj, `env-run-${process.pid}.json`), JSON.stringify({ pid: process.pid, started: 1, tab: 'PAGE1' }));
+      const r = spawnSync(PYB, ['-c', [
+        'import sys, json; sys.path.insert(0, "src")',
+        'import cdpilot',
+        'out = {"create": cdpilot._create_session_window()}',
+        'cdpilot._save_sessions({})',
+        'if out["create"] and out["create"] != "PAGE1":  # the run\'s tab is the only page again',
+        '    cdpilot.urllib.request.urlopen(cdpilot.CDP_BASE + "/json/close/" + out["create"], timeout=5)',
+        '    cdpilot.cdp_cache_invalidate()',
+        'out["page"] = cdpilot.get_page_ws()[1]["id"]',
+        'cdpilot._save_sessions({})',
+        'listed = cdpilot.get_tabs',
+        'cdpilot.get_tabs = lambda: [t for t in listed() if t.get("id") == "PAGE1"]',
+        'cdpilot._create_session_window = lambda: None  # no tab can be opened: the last resort',
+        'try:',
+        '    out["last"] = cdpilot.get_page_ws()[1]["id"]',
+        'except SystemExit as e:',
+        '    out["last"] = "exit %s" % e.code',
+        'print(json.dumps(out))'].join('\n')],
+      { cwd: REPO, encoding: 'utf-8', timeout: 30000, env: fakeEnv(home, fake.port, { CDPILOT_TARGET: '' }) });
+      const out = JSON.parse((r.stdout || '').trim().split('\n').pop() || 'null');
+      assert(out, r.stdout + r.stderr);
+      assert(out.create && out.create !== 'PAGE1', `the run's tab became the session tab: ${JSON.stringify(out)}`);
+      assert(out.page && out.page !== 'PAGE1' && out.page !== out.create, JSON.stringify(out));
+      assert.strictEqual(out.last, 'exit 1', JSON.stringify(out));
+      assert.strictEqual(fakeEntries(fake).filter((x) => x.http === '/json/new?about:blank').length, 2, 'two new tabs');
+      assert(!fakeEntries(fake).some((x) => x.ws === '/devtools/page/PAGE1'), 'nothing ran in the run\'s tab');
+    } finally {
+      fake.stop();
+    }
+  });
+
+  // L4: the run writes its marker, then reads the watch state; watch start read the markers, then
+  // saved its pid. Interleaved, both went ahead.
+  test('replay/agent: env var — watch start: a run marker that appears after its first check stops the daemon it started (exit 2, state cleared)', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-watch-envrace-'));
+    const r = spawnSync(PYB, ['-c', [
+      'import sys, os, json; sys.path.insert(0, "src")',
+      'import cdpilot',
+      'marker = os.path.join(cdpilot._env_run_marker_dir(), "env-run-%d.json" % os.getpid())',
+      'class Daemon:',
+      '    last = None',
+      '    def __init__(self, *a, **k):',
+      '        # the run writes its marker after watch start checked, before the pid is saved',
+      '        cdpilot._atomic_write_json(marker, {"pid": os.getpid(), "started": 1})',
+      '        self.pid, self.ops = os.getpid(), []',
+      '        Daemon.last = self',
+      '    def terminate(self): self.ops.append("terminate")',
+      '    def kill(self): self.ops.append("kill")',
+      '    def wait(self, timeout=None): self.ops.append("wait"); return 0',
+      '    def poll(self): return None',
+      'cdpilot.subprocess.Popen = Daemon',
+      'code = 0',
+      'try:',
+      '    cdpilot.cmd_watch_start("-")',
+      'except SystemExit as e:',
+      '    code = e.code',
+      'print(json.dumps({"code": code, "ops": Daemon.last.ops, "state": cdpilot._watch_load_state()}))'].join('\n')],
+    { cwd: REPO, encoding: 'utf-8', timeout: 30000, env: varEnv(home, { CDPILOT_PROJECT_ID: 'rep-race' }) });
+    const out = JSON.parse((r.stdout || '').trim().split('\n').pop() || 'null');
+    assert(out, r.stdout + r.stderr);
+    assert.strictEqual(out.code, 2, JSON.stringify(out) + r.stderr);
+    assert(out.ops.includes('terminate') && out.state === null, JSON.stringify(out));
+    assert(/environment value/.test(r.stderr), r.stderr);
+  });
+
   test('replay: env var — a script step after or before the fill refuses the whole flow before step 1 (eval, batch, run, tools…)', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envflow-'));
     const env = varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'bank.example' });
@@ -19062,7 +19300,7 @@ print(json.dumps(res))
     '    return "RUNTAB"',
     'cdpilot._env_tab_open = _tab_open',
     'cdpilot._env_tab_popups = lambda tid: []',
-    'cdpilot._env_tab_close = lambda tid, popups=(): tabs["closed"].append(tid)',
+    'cdpilot._env_tab_close = lambda tid, popups=(): tabs["closed"].append(tid) or True',  // True: confirmed closed
   ];
   function replayHarness(home, steps, urls, extraEnv = {}, extraArgs = []) {
     const out = path.join(home, 'harness.json');

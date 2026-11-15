@@ -61,7 +61,10 @@ DOM = os.environ.get("FAKE_CDP_DOM") == "1"
 # FAKE_CDP_POPUP=1: a tab made by Target.createTarget / PUT /json/new that navigates opens a
 # popup, a page whose openerId (Target.getTargets) is that tab, logged as {"popup": id}.
 # Target.createTarget logs {"created": id}; a Target.* call's targetId is in its log entry.
+# FAKE_CDP_CLOSE_IGNORE=1: Target.closeTarget answers success but the tab stays listed
+# (a page that does not close, e.g. held by a beforeunload dialog).
 LIST_EMPTY = [int(os.environ.get("FAKE_CDP_LIST_EMPTY", "0") or 0)]
+CLOSE_IGNORE = os.environ.get("FAKE_CDP_CLOSE_IGNORE") == "1"
 HIDE_MS = float(os.environ.get("FAKE_CDP_HIDE_MS", "0") or 0)
 HIDE_FOREVER = os.environ.get("FAKE_CDP_HIDE_FOREVER") == "1"
 POPUP = os.environ.get("FAKE_CDP_POPUP") == "1"
@@ -483,7 +486,8 @@ def answer(msg, path):
         result = {"targetId": new["id"]}
     elif method == "Target.closeTarget":
         with LOCK:
-            PAGES[:] = [x for x in PAGES if x["id"] != p.get("targetId")]
+            if not CLOSE_IGNORE:
+                PAGES[:] = [x for x in PAGES if x["id"] != p.get("targetId")]
         result = {"success": True}
     elif method == "Page.addScriptToEvaluateOnNewDocument":
         result = {"identifier": "1"}
