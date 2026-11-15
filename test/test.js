@@ -9958,6 +9958,81 @@ print("ok")
     } finally { fake.stop(); }
   });
 
+  // T1 15.11: browser_agent_act built `--ref <v> --action <v> --text <v>` as separate tokens and
+  // dropped empty ones, so `--ref` swallowed the next flag and a "--url=file:///…" given as text or
+  // action became the url (`agent act --ref --text --url=file:///etc/passwd` opened the file). The
+  // fake records a Page.navigate whose message carries FAKE_CDP_WATCH as `watch: true`.
+  const navigatedToFile = (fake) => fake.entries().filter((e) => e.method === 'Page.navigate' && e.watch);
+
+  test('mcp url smuggling (fake browser): browser_agent_act text/action/ref "--url=file:…" never navigates there, fresh or warm', () => {
+    const SMUGGLED = '--url=file:///etc/hosts';
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_WATCH: '/etc/hosts' });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const acts = [{ text: SMUGGLED }, { action: SMUGGLED }, { ref: '', action: 'fill', text: SMUGGLED },
+        { ref: SMUGGLED }];
+      for (const daemon of ['', '1']) {
+        const env = isoEnv(home, fake.port, 'proj', { CDPILOT_DAEMON: daemon, CDPILOT_WEBMCP: '0',
+          CDPILOT_MCP_TOOLS: '', CDPILOT_MCP_ALLOW_FILE: '' });
+        const lines = [
+          { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+          { jsonrpc: '2.0', method: 'notifications/initialized' },
+          ...acts.map((a, i) => ({ jsonrpc: '2.0', id: 10 + i, method: 'tools/call',
+            params: { name: 'browser_agent_act', arguments: a } })),
+        ].map((m) => JSON.stringify(m)).join('\n') + '\n';
+        const r = spawnSync(process.execPath, [CLI, 'mcp'], { input: lines, encoding: 'utf-8', timeout: 60000, env });
+        assert.strictEqual(r.status, 0, r.stderr);
+        const msgs = r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+        acts.forEach((a, i) => {
+          const m = msgs.find((x) => x.id === 10 + i);
+          assert(m && m.result.isError === true, `${JSON.stringify(a)} (daemon=${daemon || 'off'}) must fail: ${JSON.stringify(m && m.result)}`);
+        });
+        assert.deepStrictEqual(navigatedToFile(fake), [], `daemon=${daemon || 'off'}: a smuggled url reached Page.navigate`);
+      }
+    } finally { fake.stop(); }
+  });
+
+  test('mcp url gate at the destination (fake browser): an MCP tool call refuses file: in go, agent act/run, console, network, watch start; the CLI still opens it', () => {
+    const FILE = 'file:///etc/hosts';
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_WATCH: '/etc/hosts' });
+    const home = mkHome();
+    try {
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const mcpEnv = isoEnv(home, fake.port, 'proj', { CDPILOT_MCP_TOOL_CALL: '1', CDPILOT_MCP_ALLOW_FILE: '' });
+      const flows = path.join(home, 'projects', 'proj', 'flows');
+      fs.mkdirSync(flows, { recursive: true });
+      fs.writeFileSync(path.join(flows, 'to_file.json'),
+        JSON.stringify({ name: 'to_file', steps: [{ n: 1, kind: 'go', url: FILE }] }));
+      fs.writeFileSync(path.join(flows, 'to_var.json'),
+        JSON.stringify({ name: 'to_var', steps: [{ n: 1, kind: 'go', url: '{{target}}' }] }));
+      for (const args of [['go', FILE], ['agent', 'act', '--url', FILE], ['agent', 'run', 'to_file'],
+        ['agent', 'run', 'to_var', `--var=target=${FILE}`], ['console', FILE], ['network', '--', FILE],
+        ['watch', 'start', FILE]]) {
+        const r = cli(args, mcpEnv);
+        assert.strictEqual(r.status, 2, `${args.join(' ')} exit ${r.status}: ${r.stderr}\n${r.stdout}`);
+        assert(r.stderr.includes('refused: MCP tools open only') && r.stderr.includes('CDPILOT_MCP_ALLOW_FILE'),
+          `${args.join(' ')}: ${r.stderr}`);
+      }
+      assert.deepStrictEqual(navigatedToFile(fake), [], 'a refused url reached Page.navigate');
+      // http(s) still opens in an MCP tool call; the operator's CDPILOT_MCP_ALLOW_FILE=1 adds file:
+      assert.strictEqual(cli(['go', 'https://user.example/inbox'], mcpEnv).status, 0);
+      const allowed = cli(['go', FILE], { ...mcpEnv, CDPILOT_MCP_ALLOW_FILE: '1' });
+      assert.strictEqual(allowed.status, 0, allowed.stderr);
+      assert.strictEqual(navigatedToFile(fake).length, 1, 'CDPILOT_MCP_ALLOW_FILE=1 opens file:');
+      // Without the marker (the CLI) any URL opens. CDPILOT_MCP_SESSION=1 is not the marker:
+      // `cdpilot run` sets it for its lines and users set it to keep the visual layer on.
+      for (const extra of [{}, { CDPILOT_MCP_SESSION: '1' }]) {
+        const r = cli(['go', FILE], isoEnv(home, fake.port, 'proj', extra));
+        assert.strictEqual(r.status, 0, `${JSON.stringify(extra)}: ${r.stderr}`);
+      }
+      assert.strictEqual(navigatedToFile(fake).length, 3, 'the CLI opened file: twice more');
+    } finally {
+      cli(['watch', 'stop'], isoEnv(home, fake.port, 'proj'));
+      fake.stop();
+    }
+  });
+
   test('agent observe view (unit): clickable rule, native-ancestor rule, container drop, name cut, view of a diff, fail open on a broken or timed-out DOMSnapshot', () => {
     const { spawnSync } = require('child_process');
     const os = require('os');
@@ -15309,6 +15384,87 @@ test('mcp url scheme: http(s) and about:blank pass the check; CDPILOT_MCP_ALLOW_
   ]);
   assert(!mcpRefused(byId(msgs, 10)), 'file: refused although CDPILOT_MCP_ALLOW_FILE=1');
   assert(mcpRefused(byId(msgs, 11)), 'javascript: allowed by CDPILOT_MCP_ALLOW_FILE=1');
+});
+
+test('mcp url smuggling (unit): a model string after a flag goes in one --flag=<v> token and parses back unchanged', () => {
+  // T1 15.11: as `--ref <v>`, an empty ref was dropped and `--ref` swallowed the next flag, so a
+  // text or action "--url=file:///…" became agent act's url, and a text "--timeout=0" the global
+  // timeout. The tool call also carries the marker the URL rule at the destination reads.
+  const { spawnSync } = require('child_process');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const S = '--url=file:///etc/hosts';
+  const cases = [
+    ['browser_agent_act', { text: S }],
+    ['browser_agent_act', { action: S }],
+    ['browser_agent_act', { ref: '', action: 'fill', text: S }],
+    ['browser_agent_act', { ref: '@3', action: 'fill', text: '--timeout=0' }],
+    ['browser_agent_act', { ref: S }],
+    ['browser_agent_find', { text: 'x', role: S }],
+    ['browser_agent_run', { flow: 'f', vars: { '--url': 'file:///etc/hosts' } }],
+  ];
+  const script = `
+import asyncio, importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+srv = mod.MCPServer("all")
+seen, got = [], {}
+srv._run_warm = lambda cli_args, env: (seen.append((list(cli_args), env.get("CDPILOT_MCP_TOOL_CALL"))), (0, "ok", ""))[1]
+async def fake_act(**kw): got.update(kw)
+async def fake_find(text, **kw): got.update(kw, text=text)
+async def fake_run(name, **kw): got.update(kw, name=name)
+real = (mod.cmd_agent_act, mod.cmd_agent_find, mod.cmd_agent_run)
+mod.cmd_agent_act, mod.cmd_agent_find, mod.cmd_agent_run = fake_act, fake_find, fake_run
+out = []
+for tool, args in json.load(sys.stdin):
+    seen.clear(); got.clear()
+    srv._execute_tool(1, tool, args)
+    argv, marker = seen[-1]
+    timeout, plain = mod._extract_timeout(argv, env={})
+    asyncio.run(mod._dispatch_agent_cmd(plain[1:]))
+    out.append({"argv": argv, "marker": marker, "timeout": timeout, "parsed": dict(got)})
+# The warm path (CDPILOT_DAEMON=1: the call runs in the server process, environment swapped in)
+# applies the URL rule at the destination too; the same call without the marker does not.
+import os
+os.environ["CDPILOT_DAEMON"] = "1"
+mod.cmd_agent_act, mod.cmd_agent_find, mod.cmd_agent_run = real
+def no_browser(*_a, **_k):  # the control wrapper swallows it; the command runs on to its own check
+    raise RuntimeError("no browser in this test")
+mod.get_page_ws = no_browser
+warm = mod.MCPServer.__new__(mod.MCPServer)
+marked = dict(os.environ, CDPILOT_MCP_SESSION="1", CDPILOT_MCP_TOOL_CALL="1")
+res = {k: list(mod.MCPServer._run_warm(warm, argv, e)) for k, argv, e in [
+    ("go", ["go", "file:///etc/hosts"], marked),
+    ("act", ["agent", "act", "--url=file:///etc/hosts"], marked),
+    ("plain", ["go", "file:///etc/hosts"], dict(os.environ))]}
+print(json.dumps({"argv": out, "warm": res}))
+`;
+  const r = spawnSync(PYB, ['-c', script], { input: JSON.stringify(cases), encoding: 'utf-8', timeout: 60000,
+    env: { ...process.env, CDPILOT_LOG: '0', CDPILOT_DAEMON: '', CDPILOT_MCP_TOOL_CALL: '', CDPILOT_MCP_SESSION: '',
+           CDPILOT_MCP_ALLOW_FILE: '', CDP_PORT: '1', CDPILOT_NO_AUTOLAUNCH: '1',
+           CDPILOT_HOME: fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-mcpargv-')) } });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const { argv: o, warm } = JSON.parse(r.stdout.trim().split('\n').pop());
+  for (const k of ['go', 'act']) {
+    assert(warm[k][0] === 2 && warm[k][2].includes('refused: MCP tools open only'), `warm ${k}: ${JSON.stringify(warm[k])}`);
+  }
+  assert(!warm.plain[2].includes('refused: MCP'), `warm without the marker: ${JSON.stringify(warm.plain)}`);
+  const acts = o.slice(0, 5);
+  acts.forEach((c, i) => {
+    assert.strictEqual(c.parsed.url, null, `${JSON.stringify(cases[i][1])} became a url: ${JSON.stringify(c.argv)}`);
+    assert(c.argv.slice(2).every((t) => /^--(ref|url|action|text)=/.test(t)), `one token per flag: ${JSON.stringify(c.argv)}`);
+  });
+  o.forEach((c, i) => {
+    assert.strictEqual(c.timeout, null, `${JSON.stringify(cases[i][1])} set the timeout: ${JSON.stringify(c.argv)}`);
+    assert.strictEqual(c.marker, '1', `${cases[i][0]}: the tool call carries CDPILOT_MCP_TOOL_CALL=1`);
+  });
+  assert.strictEqual(acts[0].parsed.text, S);
+  assert.strictEqual(acts[1].parsed.action, S);
+  assert.deepStrictEqual([acts[2].parsed.ref, acts[2].parsed.action, acts[2].parsed.text], ['', 'fill', S]);
+  assert.deepStrictEqual([acts[3].parsed.ref, acts[3].parsed.text], ['@3', '--timeout=0']);
+  assert.strictEqual(acts[4].parsed.ref, S);
+  assert(o[5].argv.includes(`--role=${S}`) && o[5].parsed.role === S, JSON.stringify(o[5]));
+  assert(o[6].argv.includes('--var=--url=file:///etc/hosts'), JSON.stringify(o[6].argv));
+  assert.deepStrictEqual(o[6].parsed.var_values, { '--url': 'file:///etc/hosts' });
 });
 
 // ── HAR Export Tests ──

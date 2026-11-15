@@ -7843,6 +7843,7 @@ def cmd_tabs(reap=False, max_tabs=1, include_real=False, dry_run=False):
 
 
 async def cmd_go(url):
+    _mcp_url_gate("browser_navigate", url)  # an MCP tool call: http(s)/about:blank only
     # No explicit launch here any more: get_page_ws() -> get_tabs()
     # auto-launches (quietly, honouring CDPILOT_NO_AUTOLAUNCH).
     ws, page = get_page_ws()
@@ -9628,6 +9629,8 @@ def _har_from_events(events, page=None, creator_version=None):
 
 
 async def cmd_network(url=None, har=None):
+    if url is not None:  # no url: the current page reloads
+        _mcp_url_gate("browser_network", url)
     ws, page = get_page_ws()
     if url is None:
         url = page.get("url", "")
@@ -9655,6 +9658,8 @@ async def cmd_network(url=None, har=None):
 
 
 async def cmd_console(url=None):
+    if url is not None:  # no url: the current page reloads
+        _mcp_url_gate("browser_console", url)
     ws, page = get_page_ws()
     if url is None:
         url = page.get("url", "")
@@ -18713,6 +18718,7 @@ async def cmd_agent_observe(diff=False, full=False, rows=False, objects=False, a
 async def _agent_go_silent(url):
     """cmd_go prints the whole page to stdout; an agent asked for a diff.
     Its stderr (drift, friction, CAPTCHA warnings) still comes through."""
+    _mcp_url_gate("browser_agent_act", url, as_json=True)  # also `agent run` go steps
     with contextlib.redirect_stdout(io.StringIO()):
         await cmd_go(url)
 
@@ -18831,6 +18837,8 @@ async def _agent_type_placeholder(ref, value, origin, old_map, from_env=False):
 
 async def cmd_agent_act(ref=None, url=None, action='click', text=None, full=False, rows=False, objects=False, all_=False):
     """Perform action, return diff observation (same view as observe)."""
+    if url:
+        _mcp_url_gate("browser_agent_act", url, as_json=True)
     rows = _agent_rows_wanted(rows, objects)
     limit = _agent_obs_limit(all_, full)
     state = _load_agent_state()
@@ -22179,6 +22187,27 @@ def _mcp_url_refusal(tool_name: str, url: object) -> str | None:
             f"with {MCP_ALLOW_FILE_ENV}=1 (adds file: only); the CLI `cdpilot go` opens any URL.")
 
 
+# Set by the MCP server for each tool call it runs (child process or warm run),
+# and by nothing else. Not CDPILOT_MCP_SESSION: `cdpilot run` sets that for its
+# lines and users set it to keep the visual layer on; both open any URL.
+MCP_TOOL_CALL_ENV = "CDPILOT_MCP_TOOL_CALL"
+
+
+def _mcp_url_gate(tool_name: str, url: object, as_json: bool = False) -> None:
+    """The MCP URL rule where the URL is opened. In a tool call of the MCP
+    server (MCP_TOOL_CALL_ENV=1) a URL _mcp_url_refusal refuses exits 2 with
+    the reason; nothing navigates. The server checks a tool's `url`
+    argument first; this also stops a URL that reached the command another
+    way (a value smuggled through another argument, a saved flow's go step).
+    Without the marker (the CLI) any URL opens."""
+    if os.environ.get(MCP_TOOL_CALL_ENV) != "1":
+        return
+    why = _mcp_url_refusal(tool_name, url)
+    if why:
+        print(json.dumps({"error": why}) if as_json else f"Error: {why}", file=sys.stderr)
+        sys.exit(2)
+
+
 class MCPServer:
     """Minimal MCP (Model Context Protocol) server over stdin/stdout.
     Implements JSON-RPC 2.0 for tool discovery and execution.
@@ -22503,18 +22532,21 @@ class MCPServer:
             + (["--frame", str(a["frame"])] if isinstance(a.get("frame"), int) else [])
             + (["--full"] if a.get("full") else [])
             + (["--all"] if a.get("all") else []),
+            # A model string after a flag goes in one token (--flag=<v>): as its own
+            # token, an empty value is dropped below and the flag swallows the next
+            # token, so a value like "--url=file:///…" became a flag (T1 15.11).
             "browser_agent_find": lambda a: ["agent", "find"]
-                + (["--role", a["role"]] if a.get("role") else [])
+                + ([f"--role={a['role']}"] if a.get("role") else [])
                 + (["--max", str(int(a["max"]))] if a.get("max") else [])
                 + ["--", a.get("text", "")],
             "browser_agent_act": lambda a: ["agent", "act"]
-                + (["--url", a["url"]] if a.get("url") else ["--ref", a.get("ref", "")])
-                + (["--action", a["action"]] if a.get("action") else [])
-                + (["--text", a["text"]] if a.get("text") is not None else []),
+                + ([f"--url={a['url']}"] if a.get("url") else [f"--ref={a.get('ref', '')}"])
+                + ([f"--action={a['action']}"] if a.get("action") else [])
+                + ([f"--text={a['text']}"] if a.get("text") is not None else []),
             "browser_agent_flow_save": lambda a: ["agent", "flow", "save", a.get("name", "")]
                 + (["--last", str(int(a["last"]))] if a.get("last") else []),
             "browser_agent_run": lambda a: ["agent", "run", a.get("flow", "")]
-                + [x for k, v in (a.get("vars") or {}).items() for x in ("--var", f"{k}={v}")]
+                + [f"--var={k}={v}" for k, v in (a.get("vars") or {}).items()]
                 + (["--dry-run"] if a.get("dry_run") else []),
             "browser_smart_click": lambda a: ["smart-click", a.get("text", "")],
             "browser_dismiss": lambda a: ["dismiss"] + ([str(a["repeat"])] if a.get("repeat") else []),
@@ -22549,7 +22581,7 @@ class MCPServer:
             tool_map["browser_site_tools"] = lambda a: ["tools", "list", "--json"]
             tool_map["browser_site_tool_call"] = lambda a: (
                 ["tools", "call", a.get("name", ""), json.dumps(a.get("arguments") or {})]
-                + (["--frame", a["frame"]] if a.get("frame") else []))
+                + ([f"--frame={a['frame']}"] if a.get("frame") else []))
         if tool_name not in tool_map:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}}
         if tool_name == "browser_connect" and os.environ.get(MCP_ALLOW_CONNECT_ENV, "").strip() != "1":
@@ -22580,6 +22612,7 @@ class MCPServer:
         try:
             env = os.environ.copy()
             env["CDPILOT_MCP_SESSION"] = "1"
+            env[MCP_TOOL_CALL_ENV] = "1"  # the URL rule where the URL is opened (_mcp_url_gate)
             env[SLOG_VIA_ENV] = via
             # Both ends in UTF-8: with the locale default a child writing one
             # code page and a parent reading another raised here, and the
@@ -23608,6 +23641,7 @@ async def _watch_daemon_run(url, fps, quality, max_width, retention_s,
     # Navigate first (so the page exists before we start screencasting).
     # If url is empty we just attach to whatever is currently loaded.
     if url:
+        _mcp_url_gate("browser_watch_start", url)  # forked by an MCP watch start: same rule
         try:
             await navigate_collect(ws_url, url, glow=False)
         except Exception as e:
@@ -23764,6 +23798,11 @@ def cmd_watch_start(*args):
     - Idempotent: if a daemon for this project is already running it is
       stopped first (we never want two screencasts on the same target).
     """
+    # The url as parsed below (first non-flag word); checked before a prior
+    # capture is stopped or its frames are wiped.
+    _url = next((a for a in args if not a.startswith('--')), '')
+    if _url and _url != '-':
+        _mcp_url_gate("browser_watch_start", _url)
     # Stop any prior daemon — two screencasts on one target would race.
     prev = _watch_load_state()
     if prev and _watch_pid_alive(prev.get('pid')):
