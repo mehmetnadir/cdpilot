@@ -148,8 +148,8 @@ tools (navigate, click, fill, content, screenshot, eval, wait_for, assert, tabs,
 plus `browser_tools`. The agent calls `browser_tools` with `list` to see the other
 tools, or `enable` to add some (the server sends `tools/list_changed`). `--tools a,b,c`
 picks tools by name; `all` (default) is unchanged. Schema size of `tools/list`
-(tiktoken `o200k_base`, compact JSON, measured 15.11.2026 on 0.9.9): `all` = 50 tools = 7,027 tokens,
-of which the five `browser_agent_*` tools are 1,209; `core` = 11 tools = 1,395 tokens.
+(tiktoken `o200k_base`, compact JSON, measured 15.11.2026 after the description diet): `all` = 50 tools = 5,423 tokens,
+of which the five `browser_agent_*` tools are 1,050; `core` = 11 tools = 1,088 tokens.
 The three `browser_canvas_*` tools are listed only while a live canvas is open (`cdpilot canvas open`), and never under `core`; `tools/list_changed` follows when the first canvas opens or the last one closes.
 
 ### Agent mode over MCP
