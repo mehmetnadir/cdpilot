@@ -2,7 +2,7 @@
 
 All notable changes to cdpilot will be documented in this file.
 
-## [Unreleased]
+## [0.9.11] - 2026-11-15
 
 ### Changed
 - **`frame list` numbers `<frame>` elements too**, as `--frame <i>` does, so a listed index is the one `--frame` resolves (iframe-only pages print the same list as before).
