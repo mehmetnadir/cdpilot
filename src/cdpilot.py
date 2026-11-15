@@ -20606,12 +20606,24 @@ async def _agent_run_flow(name, var_values=None, dry_run=False, full=False, rows
         return _agent_page_url(u or '', st, run_found) if st is not None else _slog_scrub_values(u or '', run_found)
 
     last_nodes, last_view = [], {}
+    # The trail entries this run pushed (as pushed, mcp mark included). Every snapshot reloads
+    # agent-state.json, which holds none of them until the run saves (2026-11-15 T2): each fresh
+    # state gets them back, so a drift, an error exit or the result saves them all.
+    run_trail = []
+
+    def trail_push(entry):
+        _agent_trail_push(state, entry, mcp=by_mcp)
+        run_trail.append(state['trail'][-1])
+        del run_trail[:-AGENT_TRAIL_MAX]
 
     async def snapshot():
         nonlocal last_nodes, last_view
         cdp_cache_invalidate()
         with _agent_want_frames():
             page, nodes, actions, st, view = await _agent_full_snapshot()
+        if run_trail:
+            st['trail'] = (st.get('trail') or []) + run_trail
+            del st['trail'][:-AGENT_TRAIL_MAX]
         last_nodes, last_view = nodes, view
         text = view['text']
         out = _agent_out_actions(actions, st.get('hidden_refs', ()), full, rows)
@@ -20662,9 +20674,8 @@ async def _agent_run_flow(name, var_values=None, dry_run=False, full=False, rows
             await _agent_go_silent(go_url)
             page, actions, out_actions, text, state = await snapshot()
             tokens_avoided += _estimate_tokens({'actions': out_actions, 'text': text})
-            _agent_trail_push(state, {'kind': 'go', 'url': clean(step.get('url', '')),
-                                      'url_after': clean(page.get('url', '')), 'ts': int(time.time()), 'replayed': True},
-                              mcp=by_mcp)
+            trail_push({'kind': 'go', 'url': clean(step.get('url', '')),
+                        'url_after': clean(page.get('url', '')), 'ts': int(time.time()), 'replayed': True})
             done.append({'n': step['n'], 'kind': 'go', 'url': clean(page.get('url', ''))})
             continue
         page, actions, out_actions, text, state = await snapshot()
@@ -20690,6 +20701,7 @@ async def _agent_run_flow(name, var_values=None, dry_run=False, full=False, rows
             if step['n'] in env_by_step:  # an environment value: https on a listed host, as replay
                 why = _var_url_allowed(page.get('url', ''), _var_host_entries()) or _env_tab_popup_refusal(env_run)
                 if why:
+                    _save_agent_state(state)  # the steps replayed so far stay in the trail
                     print(json.dumps({'error': f"step {step['n']}: environment value refused: {why}",
                                       'flow': slug, 'step': step['n']}), file=sys.stderr)
                     sys.exit(2)
@@ -20705,16 +20717,17 @@ async def _agent_run_flow(name, var_values=None, dry_run=False, full=False, rows
             why = await _agent_type_placeholder(match['ref'], text_in, _agent_origin(page.get('url', '')), amap,
                                                 from_env=step['n'] in env_by_step)
             if why:
+                _save_agent_state(state)  # as above; typed_nodes on disk merge in (_agent_typed_merge)
                 print(json.dumps({'error': f"step {step['n']}: placeholder value refused: {why}",
                                   'flow': slug, 'step': step['n']}), file=sys.stderr)
                 sys.exit(2)
         else:
             await _agent_perform(match['ref'], step.get('action', 'click'), text_in, amap)
         page2, actions2, out2, text2, state = await snapshot()
-        _agent_trail_push(state, {'kind': 'act', 'action': step.get('action', 'click'), 'anchor': anchor,
-                                  **({'text': step['text']} if step.get('text') is not None else {}),
-                                  'url_before': clean(page.get('url', '')), 'url_after': clean(page2.get('url', '')),
-                                  'ts': int(time.time()), 'replayed': True}, mcp=by_mcp)
+        trail_push({'kind': 'act', 'action': step.get('action', 'click'), 'anchor': anchor,
+                    **({'text': step['text']} if step.get('text') is not None else {}),
+                    'url_before': clean(page.get('url', '')), 'url_after': clean(page2.get('url', '')),
+                    'ts': int(time.time()), 'replayed': True})
         done.append({'n': step['n'], 'action': step.get('action', 'click'), 'ref': match['ref'],
                      'name': match.get('name', ''), 'match': how, 'url': clean(page2.get('url', ''))})
         after = step.get('after') or {}

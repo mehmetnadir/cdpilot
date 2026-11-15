@@ -12688,23 +12688,132 @@ print("ok %.1f" % best)
       ok(['agent', 'act', '--url', 'https://user.example/inbox'], mcpEnv);
       ok(['agent', 'act', '--ref', observe(mcpEnv).Archive.ref, '--action', 'click'], mcpEnv);
       assert.strictEqual(JSON.parse(ok(['agent', 'flow', 'save', 'archive'], mcpEnv).stdout).written_by, 'mcp');
-      // the operator navigates in the terminal (the trail's last navigation is the terminal's), vouches
-      // for the flow's origins and runs it, then saves the trail (as after a drift repair)
-      ok(['agent', 'act', '--url', 'https://user.example/inbox']);
+      // the operator vouches for the flow's origins and runs it from the terminal, then saves the trail
+      // (as after a drift repair): every replayed step is in the trail, its go too, so no terminal
+      // navigation is needed first to give the saved flow its steps
       assert.strictEqual(JSON.parse(ok(['agent', 'run', 'login', '--var', 'password=zq-trusted-7731', '--trust-flow']).stdout).status, 'ok');
       const resaved = JSON.parse(ok(['agent', 'flow', 'save', 'login']).stdout);
-      assert.deepStrictEqual([resaved.written_by, read('login').written_by], ['mcp', 'mcp'], JSON.stringify(resaved));
+      assert.deepStrictEqual([resaved.written_by, read('login').written_by, resaved.steps], ['mcp', 'mcp', 2], JSON.stringify(resaved));
       const copy = JSON.parse(ok(['agent', 'flow', 'save', 'login_copy']).stdout);
       assert.strictEqual(copy.written_by, 'mcp', `the model chose those pages, under any name: ${JSON.stringify(copy)}`);
       // a flow with no value needs no flag; its replayed steps keep the mark too
-      ok(['agent', 'act', '--url', 'https://user.example/inbox']);
       assert.strictEqual(JSON.parse(ok(['agent', 'run', 'archive']).stdout).status, 'ok');
-      assert.strictEqual(JSON.parse(ok(['agent', 'flow', 'save', 'archive_copy']).stdout).written_by, 'mcp');
+      const archCopy = JSON.parse(ok(['agent', 'flow', 'save', 'archive_copy']).stdout);
+      assert.deepStrictEqual([archCopy.written_by, archCopy.steps], ['mcp', 2], JSON.stringify(archCopy));
       // the terminal's own acts after that are the terminal's again
       ok(['agent', 'act', '--url', 'https://user.example/inbox']);
       ok(['agent', 'act', '--ref', observe(env).Archive.ref, '--action', 'click']);
       assert.strictEqual(JSON.parse(ok(['agent', 'flow', 'save', 'mine']).stdout).written_by, 'cli');
     } finally { fake.stop(); }
+  });
+
+  // ── Trail keep (2026-11-15 T2): every snapshot of `agent run` reloads agent-state.json, so a
+  // replayed step pushed to the trail in memory was lost at the next one. After a drift the repair
+  // (`agent flow save`) found no replayed step ("nothing to save"), and the mcp mark of an
+  // MCP-written flow's steps had nothing to ride on.
+  const trailKeep = (fake, flows) => {
+    const home = mkHome();
+    writeRegistry(home, { proj: externalEntry(fake.port) });
+    const dir = path.join(home, 'projects', 'proj', 'flows');
+    fs.mkdirSync(dir, { recursive: true });
+    for (const [name, flow] of Object.entries(flows)) {
+      fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify({ version: 1, name, host: 'user.example', vars: {}, ...flow }));
+    }
+    const env = isoEnv(home, fake.port, 'proj');
+    const run = (args, extra) => cli(args, { ...env, ...(extra || {}) });
+    const trail = () => JSON.parse(fs.readFileSync(path.join(home, 'projects', 'proj', 'agent-state.json'), 'utf-8')).trail;
+    return { home, env, run, trail, read: (n) => JSON.parse(fs.readFileSync(path.join(dir, `${n}.json`), 'utf-8')) };
+  };
+  const tkRec = { host: 'user.example', origin: 'https://user.example' };
+  const tkGo = { n: 1, kind: 'go', url: 'https://user.example/inbox' };
+  const tkArchive = { n: 2, kind: 'act', action: 'click', anchor: { role: 'button', name: 'Archive', nth: 0 },
+    before: tkRec, after: { host: 'user.example', path: '/inbox' } };
+  const tkMissing = { n: 3, kind: 'act', action: 'click', anchor: { role: 'button', name: 'No such button', nth: 0 },
+    before: tkRec, after: { host: 'user.example', path: '/inbox' } };
+
+  test('learned flows (fake browser): trail keep — a successful agent run leaves every replayed step in the trail (the go and each act, in order, marked replayed)', () => {
+    const fake = startFake();
+    try {
+      const t = trailKeep(fake, { triage: { steps: [tkGo, tkArchive,
+        { n: 3, kind: 'act', action: 'fill', anchor: { role: 'textbox', name: 'Search', nth: 0 }, text: 'cdpilot',
+          before: tkRec, after: { host: 'user.example', path: '/inbox' } }] } });
+      const r = t.run(['agent', 'run', 'triage']);
+      assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+      assert.strictEqual(JSON.parse(r.stdout).steps, 3, r.stdout);
+      const got = t.trail().map((e) => [e.kind, e.action || e.url, e.replayed === true]);
+      assert.deepStrictEqual(got, [['go', 'https://user.example/inbox', true], ['act', 'click', true], ['act', 'fill', true]],
+        JSON.stringify(t.trail()));
+      assert(t.trail().every((e) => !e.mcp), 'a terminal flow\'s steps carry no mcp mark');
+    } finally { fake.stop(); }
+  });
+
+  test('learned flows (fake browser): trail keep — after a drift, `agent flow save` (no act added) saves the go and the act the run replayed before it, not "nothing to save"', () => {
+    const fake = startFake();
+    try {
+      const t = trailKeep(fake, { three: { steps: [tkGo, tkArchive, tkMissing] } });
+      const r = t.run(['agent', 'run', 'three']);
+      assert.strictEqual(r.status, 4, r.stdout + r.stderr);
+      const d = JSON.parse(r.stdout);
+      assert(d.status === 'drift' && d.step === 3 && d.done.length === 2, JSON.stringify([d.status, d.step, d.done]));
+      const s = t.run(['agent', 'flow', 'save', 'repaired']);
+      assert.strictEqual(s.status, 0, `the repair save found no replayed step: ${s.stderr}`);
+      assert.deepStrictEqual([JSON.parse(s.stdout).steps, JSON.parse(s.stdout).written_by], [2, 'cli'], s.stdout);
+      const f = t.read('repaired');
+      assert(f.steps[0].kind === 'go' && f.steps[0].url === 'https://user.example/inbox', JSON.stringify(f.steps));
+      assert.deepStrictEqual(f.steps[1].anchor, { role: 'button', name: 'Archive', nth: 0 }, JSON.stringify(f.steps));
+    } finally { fake.stop(); }
+  });
+
+  test('learned flows (fake browser): trail keep — an MCP-written flow run from the terminal with --trust-flow drifts; `agent flow save` then says written_by mcp with no terminal navigation first', () => {
+    const typed = 'zq-trailkeep-trusted-3390';
+    const fake = startFake();
+    try {
+      const t = trailKeep(fake, { login: { written_by: 'mcp', vars: { password: { step: 2, hint: 'fill Password' } }, steps: [tkGo,
+        { n: 2, kind: 'act', action: 'fill', anchor: { role: 'textbox', name: 'Password', nth: 0 }, text: '{{password}}',
+          before: tkRec, after: { host: 'user.example', path: '/inbox' } }, tkMissing] } });
+      const r = t.run(['agent', 'run', 'login', '--var', `password=${typed}`, '--trust-flow']);
+      assert.strictEqual(r.status, 4, r.stdout + r.stderr);
+      assert.strictEqual(JSON.parse(r.stdout).step, 3, r.stdout);
+      const s = t.run(['agent', 'flow', 'save', 'x']);
+      assert.strictEqual(s.status, 0, `the repair save found no replayed step: ${s.stderr}`);
+      const saved = JSON.parse(s.stdout);
+      assert.deepStrictEqual([saved.written_by, saved.steps, saved.vars], ['mcp', 2, ['password']], s.stdout);
+      assert.strictEqual(t.read('x').steps[1].text, '{{password}}');
+      assert(t.trail().slice(-2).every((e) => e.mcp === true && e.replayed === true), JSON.stringify(t.trail()));
+      const disk = fs.readFileSync(path.join(t.home, 'projects', 'proj', 'agent-state.json'), 'utf-8')
+        + fs.readFileSync(path.join(t.home, 'projects', 'proj', 'flows', 'x.json'), 'utf-8');
+      assert(!disk.includes(typed), 'the typed value reached agent-state.json or the flow');
+    } finally { fake.stop(); }
+  });
+
+  test('learned flows (fake browser): trail keep — a run refused at a placeholder step (an iframe node; an environment value over http) keeps the go it replayed before in the trail', () => {
+    const typed = 'zq-trailkeep-refused-8817';
+    const pwStep = (origin) => ({ n: 2, kind: 'act', action: 'fill', anchor: { role: 'textbox', name: 'Password', nth: 0 },
+      text: '{{password}}', before: { host: 'user.example', origin }, after: { host: 'user.example', path: '/inbox' } });
+    const flows = {
+      login: { steps: [tkGo, pwStep('https://user.example')] },
+      login_http: { steps: [{ ...tkGo, url: 'http://user.example/inbox' }, pwStep('http://user.example')] },
+    };
+    // the Password node is an <iframe>: the checked call refuses it (exit 2)
+    const a = startFake('full', 'guid-user', { FAKE_CDP_FRAME_NODES: '106' });
+    try {
+      const t = trailKeep(a, flows);
+      const r = t.run(['agent', 'run', 'login', '--var', `password=${typed}`]);
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      assert(/placeholder value refused/.test(r.stderr), r.stderr);
+      assert.deepStrictEqual((t.trail() || []).map((e) => [e.kind, e.url, e.replayed]), [['go', 'https://user.example/inbox', true]],
+        JSON.stringify(t.trail()));
+    } finally { a.stop(); }
+    // an environment value is typed only over https: refused at step 2 (exit 2)
+    const b = startFake();
+    try {
+      const t = trailKeep(b, flows);
+      const r = t.run(['agent', 'run', 'login_http'], { CDPILOT_VAR_PASSWORD: typed, CDPILOT_VAR_HOSTS: 'user.example' });
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      assert(/environment value refused/.test(r.stderr) && !(r.stdout + r.stderr).includes(typed), r.stderr);
+      assert.deepStrictEqual((t.trail() || []).map((e) => [e.kind, e.url, e.replayed]), [['go', 'http://user.example/inbox', true]],
+        JSON.stringify(t.trail()));
+    } finally { b.stop(); }
   });
 
   test('learned flows (fake browser): the drift hint over MCP for a terminal flow says to save under another name (`agent flow save <new-name>`), which an MCP session may do; its own flow and the terminal keep `agent flow save <name>`', () => {
