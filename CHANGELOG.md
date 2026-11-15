@@ -9,6 +9,7 @@ All notable changes to cdpilot will be documented in this file.
 
 ### Security
 - **Two page reads no longer run in the page's own JavaScript.** The `agent observe` iframe probe (`frames`: cover, blocking) runs in cdpilot's isolated world (`Page.createIsolatedWorld`), so a page that replaces `getBoundingClientRect` or `elementFromPoint` cannot hide a covering iframe or invent one; the screenshot's CSS-pixel scale and viewport come from `Page.getLayoutMetrics` instead of `devicePixelRatio` / `scrollX` / `innerWidth`. An `element` crop still reads the element's box in the page (jury note, 0.9.9).
+- **`agent observe --frame` text gets the same protection as the main page.** Its `text` went out as the raw AX text: an offscreen/tiny injection line in an iframe stayed in it, and hosts named only in the iframe's hidden text never reached the guard. The frame's own document is now probed (DOMSnapshot in its session) and its text passes the hidden-text cut (`hidden_removed`, `injection_suspect`, `hidden_check: unavailable` when the probe fails) and feeds `url_from_hidden` (jury note, 0.9.9).
 
 ## [0.9.9] - 2026-11-15
 
