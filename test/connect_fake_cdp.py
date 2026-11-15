@@ -58,9 +58,13 @@ DOM = os.environ.get("FAKE_CDP_DOM") == "1"
 #   FAKE_CDP_EXTRA_PAGE=ID adds one more page of the user's browser at start.
 #   FAKE_CDP_CANVAS_PAGE=ID adds a canvas tab (cdpilot-canvas.invalid) FIRST in the
 #                          listing, where a real browser puts the newest tab.
+# FAKE_CDP_POPUP=1: a tab made by Target.createTarget / PUT /json/new that navigates opens a
+# popup, a page whose openerId (Target.getTargets) is that tab, logged as {"popup": id}.
+# Target.createTarget logs {"created": id}; a Target.* call's targetId is in its log entry.
 LIST_EMPTY = [int(os.environ.get("FAKE_CDP_LIST_EMPTY", "0") or 0)]
 HIDE_MS = float(os.environ.get("FAKE_CDP_HIDE_MS", "0") or 0)
 HIDE_FOREVER = os.environ.get("FAKE_CDP_HIDE_FOREVER") == "1"
+POPUP = os.environ.get("FAKE_CDP_POPUP") == "1"
 if os.environ.get("FAKE_CDP_CANVAS_PAGE"):
     PAGES.insert(0, {"id": os.environ["FAKE_CDP_CANVAS_PAGE"], "type": "page",
                      "url": "http://cdpilot-canvas.invalid/demo/", "title": ""})
@@ -434,10 +438,19 @@ def answer(msg, path):
         result = {"result": {"type": "string", "value": value} if value is not None
                   else {"type": "undefined"}}
     elif method == "Page.navigate":
+        popup = None
         with LOCK:  # the tab this socket is attached to now shows the new URL
             for pg in PAGES:
                 if path.endswith("/" + pg["id"]):
                     pg["url"], pg["title"] = p.get("url", ""), "navigated by cdpilot"
+                    if POPUP and pg.get("_born") is not None and not pg.get("openerId"):
+                        SEQ[0] += 1
+                        popup = {"id": f"PAGE{SEQ[0]}", "type": "page", "url": "https://login.example.com/popup",
+                                 "title": "", "openerId": pg["id"], "_born": time.time()}
+            if popup:
+                PAGES.append(popup)
+        if popup:
+            log({"popup": popup["id"]})
         result = {"frameId": "F1", "loaderId": "L1"}
         events = [{"method": "Page.frameStartedLoading", "params": {"frameId": "F1"}},
                   {"method": "Page.loadEventFired", "params": {"timestamp": 1}},
@@ -466,6 +479,7 @@ def answer(msg, path):
             if p.get("browserContextId"):
                 new["browserContextId"] = p["browserContextId"]
             PAGES.append(new)
+        log({"created": new["id"]})
         result = {"targetId": new["id"]}
     elif method == "Target.closeTarget":
         with LOCK:
@@ -477,7 +491,8 @@ def answer(msg, path):
         with LOCK:
             result = {"targetInfos": [{"targetId": x["id"], "type": "page", "url": x["url"],
                                        "title": x["title"], "attached": False,
-                                       **({"browserContextId": x["browserContextId"]} if x.get("browserContextId") else {})}
+                                       **({"browserContextId": x["browserContextId"]} if x.get("browserContextId") else {}),
+                                       **({"openerId": x["openerId"]} if x.get("openerId") else {})}
                                       for x in PAGES if listed(x, targets=True)]}
     elif method == "Page.getFrameTree":
         result = {"frameTree": {"frame": {"id": "F1", "url": "https://user.example/inbox"}}}
@@ -601,6 +616,8 @@ def handle_ws(conn, path, headers):
         params = msg.get("params") or {}
         if "contextId" in params:
             entry["contextId"] = params["contextId"]
+        if "targetId" in params and str(msg.get("method") or "").startswith("Target."):
+            entry["targetId"] = params["targetId"]
         if msg.get("method") == "Page.createIsolatedWorld":
             if "worldName" in params:
                 entry["worldName"] = params["worldName"]
