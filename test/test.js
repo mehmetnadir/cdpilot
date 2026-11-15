@@ -247,6 +247,8 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
       `srv.listen(${JSON.stringify(sock)});`,
       'setTimeout(() => process.exit(0), 20000).unref();',
     ].join('\n'));
+    // The runtime dir exists only if an earlier test started a daemon; run alone, listen() had no dir.
+    fs.mkdirSync(path.dirname(sock), { recursive: true, mode: 0o700 });
     const fake = spawn(process.execPath, [script], { stdio: 'ignore' });
     try {
       assert(waitFor(() => fs.existsSync(sock)), 'fake daemon socket');
