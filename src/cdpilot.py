@@ -26534,8 +26534,14 @@ def cmd_replay(*args):
         # The strict-target pair is replay's own, set for a step that takes an
         # environment value and removed for every other (a flow file sets no
         # environment; an inherited pair never reaches an unrelated step).
+        # No child gets CDPILOT_VAR_* (CDPILOT_VAR_HOSTS too): a step's value
+        # comes only from replay's own substitution below (2026-11-15 audit:
+        # a flow with no {{NAME}} ran unrestricted while an `agent run` or a
+        # nested `replay` step typed the inherited value on its own rules and
+        # a later eval read the field).
         for k in [k for k in env if k in (REPLAY_STRICT_ENV, REPLAY_ALLOWED_HOSTS_ENV, REPLAY_TOKEN_ENV,
-                                          REPLAY_ORIGIN_ENV) or k.startswith(REPLAY_VALUE_ENV)]:
+                                          REPLAY_ORIGIN_ENV) or k.startswith(REPLAY_VALUE_ENV)
+                  or k.upper().startswith("CDPILOT_VAR_")]:
             del env[k]
         if env_here:
             pinned = pinned or _agent_origin(live)
