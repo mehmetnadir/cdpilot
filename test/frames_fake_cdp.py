@@ -93,6 +93,8 @@ class Browser:
         self.isolated_fail = False
         self.owner_iso_error = False
         self.owner_iso_exception = False
+        self.frame_list_iso_exception = False
+        self.frame_list_iso_error = 0
         self.custom_frame_list = None
         # The browser routes mouse input into out-of-process frames by its own
         # copy of the layout: while route_stale > 0 every mouse event goes
@@ -303,6 +305,25 @@ class Browser:
                     if expr.startswith("(" + self.mod._FRAME_OWNER_JS + ")("):
                         self.owner_iso_error = False
                         # Context destroyed; next Page.createIsolatedWorld call allocates fresh context
+                        for k, v in list(self.isolated_worlds.items()):
+                            if v == p["contextId"]:
+                                del self.isolated_worlds[k]
+                        return err("Cannot find context with specified id")
+                if self.frame_list_iso_exception and p["contextId"] in self.isolated:
+                    expr = p.get("expression", "")
+                    if self.mod._FRAME_LIST_JS in expr or "querySelectorAll('iframe" in expr:
+                        return ok({
+                            "result": {"type": "object", "subtype": "error",
+                                       "description": "TypeError: frame list isolated error"},
+                            "exceptionDetails": {
+                                "text": "Uncaught TypeError: frame list isolated error",
+                                "exception": {"description": "TypeError: frame list isolated error"}
+                            }
+                        })
+                if getattr(self, "frame_list_iso_error", 0) > 0 and p["contextId"] in self.isolated:
+                    expr = p.get("expression", "")
+                    if self.mod._FRAME_LIST_JS in expr or "querySelectorAll('iframe" in expr:
+                        self.frame_list_iso_error -= 1
                         for k, v in list(self.isolated_worlds.items()):
                             if v == p["contextId"]:
                                 del self.isolated_worlds[k]
@@ -1777,6 +1798,78 @@ def scenario_framehop_isolated(mod):
     b_n, res_n, stdout_n, stderr_n = run(mod, top_desc, body_n)
     res_n.update({"stdout": stdout_n, "stderr": stderr_n})
     out["route_describe_long_sanitize"] = res_n
+
+    # 5.o: frame list: isolated evaluate exceptionDetails -> "frame list failed in cdpilot's isolated world", exit 1
+    async def body_o(b):
+        b.frame_list_iso_exception = True
+        res = await call(mod.cmd_frame, "list")
+        list_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                      and (mod._FRAME_LIST_JS in m.get("params", {}).get("expression", "")
+                           or "querySelectorAll('iframe" in m.get("params", {}).get("expression", ""))]
+        return {
+            "res": res,
+            "list_evals": len(list_evals),
+            "eval_contexts": [m["params"].get("contextId") for m in list_evals],
+        }
+    b_o, res_o, stdout_o, stderr_o = run(mod, top, body_o)
+    res_o.update({"stdout": stdout_o, "stderr": stderr_o})
+    out["frame_list_iso_exception"] = res_o
+
+    # 5.p: frame list CDP context error -> world recreated once, second eval in new context, stdout correct
+    async def body_p(b):
+        b.frame_list_iso_error = 1
+        res = await call(mod.cmd_frame, "list")
+        list_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                      and (mod._FRAME_LIST_JS in m.get("params", {}).get("expression", "")
+                           or "querySelectorAll('iframe" in m.get("params", {}).get("expression", ""))]
+        top_world_calls = [m for m in b.log if m.get("method") == "Page.createIsolatedWorld"
+                           and m.get("params", {}).get("frameId") == "top"]
+        return {
+            "res": res,
+            "list_evals": len(list_evals),
+            "eval_contexts": [m["params"].get("contextId") for m in list_evals],
+            "top_world_calls": len(top_world_calls),
+            "isolated": sorted(b.isolated),
+        }
+    b_p, res_p, stdout_p, stderr_p = run(mod, top, body_p)
+    res_p.update({"stdout": stdout_p, "stderr": stderr_p})
+    out["frame_list_iso_error_retry"] = res_p
+
+    # 5.q: frame list double context error -> main world + note, message does not say "isolated world"
+    async def body_q(b):
+        b.frame_list_iso_error = 2
+        if hasattr(mod, "_FRAME_LOOKUP_FALLBACK_NOTED"):
+            mod._FRAME_LOOKUP_FALLBACK_NOTED[0] = False
+        res = await call(mod.cmd_frame, "list")
+        list_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                      and (mod._FRAME_LIST_JS in m.get("params", {}).get("expression", "")
+                           or "querySelectorAll('iframe" in m.get("params", {}).get("expression", ""))]
+        return {
+            "res": res,
+            "list_evals": len(list_evals),
+            "eval_contexts": [m["params"].get("contextId") for m in list_evals],
+        }
+    b_q, res_q, stdout_q, stderr_q = run(mod, top, body_q)
+    res_q.update({"stdout": stdout_q, "stderr": stderr_q})
+    out["frame_list_iso_error_fallback"] = res_q
+
+    # 5.r: _frame_search skips invalid children list without traceback
+    async def body_r(b):
+        b.custom_frame_list = [
+            "not a dict",
+            {"index": "bad_index", "visible": True},
+            {"index": 0, "visible": False},
+            None,
+        ]
+        res = await mod._frame_search(WS, mod._smart_wrap("FINDER", probe=True),
+                                      mod._smart_wrap("FINDER"), "smart-click", budget_s=0.5)
+        b.custom_frame_list = "not a list"
+        res2 = await mod._frame_search(WS, mod._smart_wrap("FINDER", probe=True),
+                                       mod._smart_wrap("FINDER"), "smart-click", budget_s=0.5)
+        return {"res": res, "res2": res2}
+    b_r, res_r, stdout_r, stderr_r = run(mod, top, body_r)
+    res_r.update({"stdout": stdout_r, "stderr": stderr_r})
+    out["frame_search_invalid_children"] = res_r
 
     return out
 

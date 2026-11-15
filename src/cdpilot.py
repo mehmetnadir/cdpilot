@@ -4296,6 +4296,7 @@ MOUSE_PROBE_TRIES = 4
 # process (CDPILOT_DAEMON=1, MCP) prints each note only on its first fallback.
 _FRAME_ISOLATED_NOTED = [False]
 _FRAME_LOOKUP_FALLBACK_NOTED = [False]
+_SHOT_LOOKUP_FALLBACK_NOTED = [False]
 
 
 class _FrameError(Exception):
@@ -4613,6 +4614,14 @@ def _frame_lookup_fallback_note():
     if not _FRAME_LOOKUP_FALLBACK_NOTED[0]:
         _FRAME_LOOKUP_FALLBACK_NOTED[0] = True
         print("note: cdpilot's isolated world was not available; the frame was looked up with the page's own JS",
+              file=sys.stderr)
+
+
+def _shot_lookup_fallback_note():
+    """One stderr note per command when element crop runs in the page's own JS."""
+    if not _SHOT_LOOKUP_FALLBACK_NOTED[0]:
+        _SHOT_LOOKUP_FALLBACK_NOTED[0] = True
+        print("note: cdpilot's isolated world was not available; the element box was read with the page's own JS",
               file=sys.stderr)
 
 
@@ -5337,7 +5346,16 @@ async def _frame_search(ws_url, probe_js, act_js, label, same_origin_only=False,
                 stopped = True
                 break
             parent = queue.pop(0)
-            kids = [f["index"] for f in await _frame_list(parent) if f.get("visible")]
+            flist = await _frame_list(parent)
+            kids = []
+            if isinstance(flist, list):
+                for f in flist:
+                    if not isinstance(f, dict) or not f.get("visible"):
+                        continue
+                    try:
+                        kids.append(int(f.get("index")))
+                    except (TypeError, ValueError):
+                        continue
             known += len(kids)
             for idx in kids:
                 if searched >= max_frames:
@@ -8157,6 +8175,7 @@ async def cmd_shot(output=None, quality=None, element=None, fmt=None, hidpi=Fals
             else:
                 rect_str = (reply.get("result") or {}).get("value")
         if use_main:
+            _shot_lookup_fallback_note()
             p_ev = {"expression": js, "returnByValue": True}
             try:
                 cr = await cdp_send(ws, [(2, "Runtime.evaluate", p_ev)])
@@ -26644,6 +26663,7 @@ def _daemon_reset_state():
         coll.clear()
     _FRAME_ISOLATED_NOTED[0] = False
     _FRAME_LOOKUP_FALLBACK_NOTED[0] = False
+    _SHOT_LOOKUP_FALLBACK_NOTED[0] = False
 
 
 def _daemon_exit_code(exc, err):
