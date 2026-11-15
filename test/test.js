@@ -12456,12 +12456,20 @@ print(json.dumps(out))
   const nap = (ms) => execFileSync(process.execPath, ['-e', `setTimeout(() => {}, ${ms})`]);
   // Poll fn() until pred(result), up to a time budget (not a count: under
   // load every cdpilot process is slower).
-  const until = (fn, pred, what, budgetMs = 30000) => {
-    const deadline = Date.now() + budgetMs;
+  // onStall (once, halfway through the budget) may repair the page; the budget then restarts at half.
+  const until = (fn, pred, what, budgetMs = 30000, onStall = null) => {
+    const start = Date.now();
+    let deadline = start + budgetMs;
     let last;
+    let stalled = false;
     do {
       last = fn();
       if (pred(last)) return last;
+      if (onStall && !stalled && Date.now() - start > budgetMs / 2) {
+        stalled = true;
+        onStall();
+        deadline = Date.now() + budgetMs / 2;
+      }
       nap(200);
     } while (Date.now() < deadline);
     assert.fail(`${what}: ${JSON.stringify(last)}`);
@@ -12518,6 +12526,16 @@ print(json.dumps(out))
     }
     assert.fail(`${what}: page not settled: ${JSON.stringify(last)}`);
   };
+  // An iframe whose registerTool() WAS answered can still be missing from every getTools() for
+  // good (CI 43654106729, attempt 1: frame_echo absent for 30 s; the rerun passed). Also a
+  // Chromium bug: the iframes are reloaded once (with a note) and waited on again. The top
+  // document is never reloaded, so a tool missing there still fails the test.
+  const reloadFrames = (c, what) => () => {
+    console.log(`    note: ${what}: iframe tools missing from getTools(); reloading the iframes `
+      + '(Chromium bug)');
+    c('eval', 'document.querySelectorAll("iframe").forEach((f) => f.contentWindow.location.reload())');
+    settle(c, `${what} (iframes reloaded)`);
+  };
 
   try {
     test('webmcp e2e: go + tools list shows imperative, declarative and iframe tools with title/annotations', () => {
@@ -12526,7 +12544,8 @@ print(json.dumps(out))
       ok(c('go', `http://127.0.0.1:${httpPort}/shop.html`), /WebMCP fixture shop/, 'go');
       settle(c, 'shop');
       fs.writeFileSync(trace, '');
-      const out = until(() => listJson(c), (o) => o.tools.length === 4, 'four tools');
+      const out = until(() => listJson(c), (o) => o.tools.length === 4, 'four tools', 30000,
+        reloadFrames(c, 'shop'));
       const byName = Object.fromEntries(out.tools.map((t) => [t.name, t]));
       assert.deepStrictEqual(Object.keys(byName).sort(),
         ['add_to_cart', 'frame_echo', 'subscribe_newsletter', 'wait_for_abort']);
@@ -12610,7 +12629,8 @@ print(json.dumps(out))
       const { c, httpPort } = needE2E();
       c('go', `http://127.0.0.1:${httpPort}/twoframes.html`);
       settle(c, 'two frames');
-      const out = until(() => listJson(c), (o) => o.tools.length === 2, 'two frame tools');
+      const out = until(() => listJson(c), (o) => o.tools.length === 2, 'two frame tools', 30000,
+        reloadFrames(c, 'two frames'));
       assert.deepStrictEqual(out.tools.map((t) => t.name), ['frame_echo', 'frame_echo']);
       assert.deepStrictEqual(out.tools.map((t) => t.frame.replace(/^.*\//, '')).sort(),
         ['frame.html?who=left', 'frame.html?who=right']);
@@ -12631,7 +12651,8 @@ print(json.dumps(out))
       const { c, httpPort } = needE2E();
       c('go', `http://127.0.0.1:${httpPort}/shop.html`);
       settle(c, 'shop');
-      until(() => listJson(c), (o) => o.tools.length === 4, 'shop tools');
+      until(() => listJson(c), (o) => o.tools.length === 4, 'shop tools', 30000,
+        reloadFrames(c, 'shop'));
       // 10 s: connecting and listing (slow on a loaded CI runner) come out of the
       // same budget, and the tool must have started before its signal aborts.
       const r = c('--timeout', '10', 'tools', 'call', 'wait_for_abort');
