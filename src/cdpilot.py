@@ -66,6 +66,9 @@ Environment:
                        idle exit after CDPILOT_DAEMON_IDLE s, default 1800).
                        Set for `cdpilot mcp`, tool calls run in the server
                        process instead of a fresh one (~400 -> ~10 ms a call)
+  CDPILOT_MCP_ALLOW_FILE=1  Let `cdpilot mcp` tools open file: URLs (MCP opens
+                       only http, https and about:blank by default; the CLI
+                       opens any URL)
   CDPILOT_NO_AUTOLAUNCH=1  Do not start the browser when a page command
                        finds it not running (print the error instead)
   CDPILOT_IDLE_CLOSE   Minutes without a cdpilot command or page change before
@@ -14081,12 +14084,57 @@ def _api_release_session(session_id: str) -> bool:
     return True
 
 
+_LOOPBACK_HOST_NAMES = ('127.0.0.1', 'localhost', '[::1]')
+
+
+def _loopback_request_refusal(headers, port: int) -> str | None:
+    """Why a request to a 127.0.0.1-only HTTP server (`serve --api`, the trace
+    viewer) must be refused, or None. Binding 127.0.0.1 does not keep web pages
+    out: by DNS rebinding a page's own host name resolves to 127.0.0.1 (its
+    Host header then carries that name), and any page can send a cross-site
+    request. So the Host must be a loopback name with this server's port, an
+    Origin header (if any) a loopback origin, and Sec-Fetch-Site not cross-site."""
+    from urllib.parse import urlsplit
+    host = (headers.get('Host') or '').strip().lower()
+    if host not in {f'{name}:{port}' for name in _LOOPBACK_HOST_NAMES}:
+        return 'Host header is not a loopback address of this server'
+    origin = headers.get('Origin')
+    if origin is not None:
+        try:
+            o = urlsplit(origin.strip().lower())
+            loopback = o.scheme in ('http', 'https') and o.hostname in ('127.0.0.1', 'localhost', '::1')
+        except ValueError:
+            loopback = False
+        if not loopback:
+            return 'cross-origin request'
+    if (headers.get('Sec-Fetch-Site') or '').strip().lower() == 'cross-site':
+        return 'cross-site request'
+    return None
+
+
 class BrowserbaseHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass  # quiet
 
     def parse_request(self):
         _idle_write_activity()  # every API request is activity (idle auto-close)
         return super().parse_request()
+
+    def _refused(self, state_changing: bool = False) -> bool:
+        """Send 403/415 and return True when the request must not run: see
+        _loopback_request_refusal. A POST must carry Content-Type
+        application/json, which a page can send cross-site only after a CORS
+        preflight this server never answers (a form or no-cors POST cannot)."""
+        why = _loopback_request_refusal(self.headers, self.server.server_address[1])
+        if why:
+            self._send_json(403, {'error': {'message': why, 'code': 'forbidden'}})
+            return True
+        if state_changing:
+            ctype = (self.headers.get('Content-Type') or '').split(';', 1)[0].strip().lower()
+            if ctype != 'application/json':
+                self._send_json(415, {'error': {'message': 'Content-Type must be application/json',
+                                                'code': 'unsupported_media_type'}})
+                return True
+        return False
 
     def _send_json(self, code: int, data):
         body = json.dumps(data).encode()
@@ -14106,6 +14154,8 @@ class BrowserbaseHandler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self):
+        if self._refused():
+            return
         path = self.path.split('?')[0].rstrip('/')
         if not path:
             path = '/'
@@ -14142,6 +14192,8 @@ class BrowserbaseHandler(BaseHTTPRequestHandler):
         self._send_json(404, {'error': {'message': 'Not found', 'code': 'not_found'}})
 
     def do_POST(self):
+        if self._refused(state_changing=True):
+            return
         path = self.path.split('?')[0].rstrip('/')
         parts = [p for p in path.split('/') if p]
 
@@ -14164,6 +14216,8 @@ class BrowserbaseHandler(BaseHTTPRequestHandler):
         self._send_json(404, {'error': {'message': 'Not found', 'code': 'not_found'}})
 
     def do_DELETE(self):
+        if self._refused():
+            return
         path = self.path.split('?')[0].rstrip('/')
         parts = [p for p in path.split('/') if p]
 
@@ -22075,6 +22129,33 @@ async def cmd_tools_call(name, call_args, frame=None):
 
 # ─── MCP Server ───
 
+# MCP tools whose `url` argument the browser opens (Page.navigate).
+MCP_URL_TOOLS = ("browser_navigate", "browser_console", "browser_network",
+                 "browser_agent_act", "browser_watch_start")
+MCP_ALLOW_FILE_ENV = "CDPILOT_MCP_ALLOW_FILE"
+
+
+def _mcp_url_refusal(tool_name: str, url: object) -> str | None:
+    """Why an MCP tool may not open `url`, or None. The MCP client is a model
+    that page text can steer; with file:, chrome:, data: or javascript: it could
+    read local files or browser pages back through the content and screenshot
+    tools. So MCP opens http, https and about:blank only; CDPILOT_MCP_ALLOW_FILE=1
+    adds file:. The CLI (`cdpilot go`) is the operator's and opens any URL."""
+    # The browser drops tabs and newlines anywhere in a URL and trims leading
+    # and trailing control characters and spaces before it reads the scheme.
+    s = _re.sub(r'[\t\n\r]', '', str(url)).strip(''.join(map(chr, range(0x21)))).lower()
+    if tool_name == "browser_watch_start" and s == "-":
+        return None  # attach to the current page, no navigation
+    if s.startswith(("http://", "https://")) or s == "about:blank":
+        return None
+    if s.startswith("file:") and os.environ.get(MCP_ALLOW_FILE_ENV, "").strip() == "1":
+        return None
+    scheme = s.split(":", 1)[0] + ":" if ":" in s else "a URL without a scheme"
+    return (f"refused: MCP tools open only http(s) and about:blank URLs, not {scheme[:40]}. "
+            f"Pass an absolute http(s) URL. To let MCP open local files, start the server "
+            f"with {MCP_ALLOW_FILE_ENV}=1 (adds file: only); the CLI `cdpilot go` opens any URL.")
+
+
 class MCPServer:
     """Minimal MCP (Model Context Protocol) server over stdin/stdout.
     Implements JSON-RPC 2.0 for tool discovery and execution.
@@ -22448,6 +22529,11 @@ class MCPServer:
                 + (["--frame", a["frame"]] if a.get("frame") else []))
         if tool_name not in tool_map:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}}
+        if tool_name in MCP_URL_TOOLS and args.get("url"):
+            why = _mcp_url_refusal(tool_name, args["url"])
+            if why:
+                return {"jsonrpc": "2.0", "id": req_id, "result": {
+                    "content": [{"type": "text", "text": why}], "isError": True}}
 
         if tool_name == "browser_screenshot_diff":
             shot_root = os.path.realpath(SCREENSHOT_DIR)
@@ -22816,7 +22902,17 @@ def cmd_trace_open(run_id=None, port=9444):
         def log_message(self, fmt, *a):
             pass  # suppress request logs
 
+        def do_HEAD(self):
+            # GET only: the inherited HEAD answered (size, date) for any file
+            # under the current directory, without the checks below.
+            self.send_error(405)
+
         def do_GET(self):
+            # A web page reaches 127.0.0.1 by DNS rebinding too: loopback Host
+            # only, no cross-site request (_loopback_request_refusal).
+            if _loopback_request_refusal(self.headers, self.server.server_address[1]):
+                self.send_error(403)
+                return
             if self.path == '/':
                 body = TRACE_VIEWER_HTML.encode()
                 self.send_response(200)
@@ -22828,8 +22924,14 @@ def cmd_trace_open(run_id=None, port=9444):
                 rel = self.path.lstrip('/')
                 target = os.path.join(trace_path, rel)
                 target = os.path.realpath(target)
-                # Security: only serve files within trace_path
-                if not target.startswith(os.path.realpath(trace_path)):
+                # Security: only serve files within trace_path. commonpath, not a
+                # string prefix: a sibling `<run>-x` starts with the run dir's name.
+                root = os.path.realpath(trace_path)
+                try:
+                    inside = os.path.commonpath([root, target]) == root
+                except ValueError:  # different drives (Windows)
+                    inside = False
+                if not inside:
                     self.send_error(403)
                     return
                 if os.path.exists(target) and os.path.isfile(target):

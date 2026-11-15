@@ -141,6 +141,14 @@ that teaches Claude Code when and how to reach for cdpilot's commands. See
 [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json) and
 [`plugins/cdpilot/`](plugins/cdpilot/).
 
+### URLs the MCP tools open
+
+MCP tools that take a `url` (`browser_navigate`, `browser_console`, `browser_network`,
+`browser_agent_act`, `browser_watch_start`) open only `http:`, `https:` and `about:blank`.
+Other schemes (`file:`, `chrome:`, `javascript:`, `data:` ...) come back as an error with a
+hint: a model steered by page text must not open local files and read them back. Start the
+server with `CDPILOT_MCP_ALLOW_FILE=1` to allow `file:` too. The CLI (`cdpilot go`) opens any URL.
+
 ### Smaller MCP tool list
 
 `cdpilot mcp --tools core` (or `CDPILOT_MCP_TOOLS=core`; the flag wins) lists 10 core
