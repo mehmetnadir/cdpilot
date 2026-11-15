@@ -7160,13 +7160,15 @@ def _proxy_redact(url):
 
     Everything before the last '@' is masked, so a scheme-less value, an
     unencoded '#', '/' or '?' in the password, or an invalid port cannot leak.
+    What precedes '://' is kept only when it is a scheme (letters, digits, '+',
+    '-', '.'; a letter first): in 'u:pa://ss@host' it is credentials.
     Never returns the raw input when it holds credentials.
     """
     if not url:
         return ''
     url = str(url)
     scheme, sep, rest = url.partition('://')
-    if not sep:
+    if not sep or not _re.fullmatch(r'[A-Za-z][A-Za-z0-9+.-]*', scheme):
         scheme, rest = '', url
     else:
         scheme += sep
@@ -7840,10 +7842,12 @@ def cmd_tabs(reap=False, max_tabs=1, include_real=False, dry_run=False):
     tabs = get_tabs()
     pages = [t for t in tabs if t.get("type") == "page"]
     hidden = 0
-    if IS_MCP_SESSION and _is_external():
+    if (MCP_SERVER_PROCESS or _mcp_tool_call()) and _is_external():
         # A connected browser's other tabs are the user's own (mail, bank): over
         # MCP (a model page text can steer) list only the tabs cdpilot opened
         # there. No MCP tool picks a tab by index or id, so nothing is lost.
+        # Keyed on the tool-call marker: CDPILOT_MCP_SESSION=1 is also a `run`
+        # script line or a user keeping the visual layer on.
         own = _external_own_tabs()
         hidden = sum(1 for p in pages if p.get("id") not in own)
         pages = [p for p in pages if p.get("id") in own]
@@ -16987,7 +16991,7 @@ def _agent_value_is_typed_secret(val):
 # tab leaves: a page the back/forward cache restores is the same document, the value still in the field.
 AGENT_TYPED_DOCS = 8
 AGENT_TYPED_MAX = 64
-_AGENT_FIELD_ROLES = frozenset({'textbox', 'combobox', 'searchbox'})
+_AGENT_FIELD_ROLES = frozenset({'textbox', 'combobox', 'searchbox', 'spinbutton'})  # spinbutton: type=number
 
 
 def _agent_typed_scope(url, nodes):
@@ -17001,7 +17005,8 @@ def _agent_typed_scope(url, nodes):
 def _agent_typed_recs(state):
     """The well-formed typed_nodes records of `state` (anything else in the file is dropped)."""
     recs = state.get('typed_nodes')
-    return [r for r in recs if isinstance(r, dict) and isinstance(r.get('bids'), list)] \
+    return [r for r in recs if isinstance(r, dict) and isinstance(r.get('bids'), list)
+            and isinstance(r.get('origin'), (str, type(None))) and isinstance(r.get('doc'), (int, type(None)))] \
         if isinstance(recs, list) else []
 
 
@@ -17026,6 +17031,38 @@ def _agent_typed_add(state, bids, scope):
     state['typed_nodes'] = recs[-AGENT_TYPED_DOCS:]
 
 
+class _AgentState(dict):
+    """agent-state.json as _load_agent_state read it; `typed_seen` holds the typed_nodes the file had
+    then ({(origin, doc): ids}), so a save can tell what another process added since."""
+    typed_seen = None
+
+
+def _agent_typed_index(state):
+    return {(r.get('origin'), r.get('doc')): {b for b in r['bids'] if isinstance(b, int)}
+            for r in _agent_typed_recs(state)}
+
+
+def _agent_typed_merge(state):
+    """Right before agent-state.json is written: add to `state` the typed_nodes ids the file holds now
+    that it did not hold when `state` was loaded. Another process (`agent run` marking a node) may
+    have written them meanwhile; dropping them would unmask its field. Ids this process's own caps
+    dropped were in the file at load time, so they stay dropped."""
+    try:
+        with open(_agent_state_path()) as f:
+            disk = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not isinstance(disk, dict):
+        return
+    seen = getattr(state, 'typed_seen', None) or {}  # a state not read from the file has seen nothing
+    for rec in _agent_typed_recs(disk):
+        scope = (rec.get('origin'), rec.get('doc'))
+        have = _agent_typed_bids(state, scope)
+        new = [b for b in rec['bids'] if isinstance(b, int) and b not in have and b not in seen.get(scope, ())]
+        if new:
+            _agent_typed_add(state, new, scope)
+
+
 def _agent_typed_persist(bid, scope):
     """Write to agent-state.json at once, before `agent run` sets a --var / CDPILOT_VAR_* value on node
     `bid`: a run that fails or exits after the value is set must not leave the field unmasked for the
@@ -17046,15 +17083,17 @@ def _agent_mask_inner(nodes, typed=None):
     """`nodes` without what lies below a field whose value is masked. Chrome repeats a text field's
     content below it (the inner editor: generic → StaticText) and a contenteditable field holds it as
     its own text: left in, the masked value comes back as a text-anchor entry (the output, actions_map
-    in agent-state.json), in `text` and in hidden_text. An interactive node below (an option of a
-    select) stays, with what lies below it."""
-    stack = []
+    in agent-state.json), in `text` and in hidden_text. A node of `typed` is masked whatever its role
+    (a number field is a spinbutton, a contenteditable may be a generic node with no value). An
+    interactive node below (an option of a select) stays, with what lies below it."""
+    stack, typed = [], typed or ()
     for n in nodes:
-        raw = (n.get('role') or {}).get('value', '')
-        if not n.get('childIds') or AGENT_ROLE_NORMALIZE.get(raw, raw) not in _AGENT_FIELD_ROLES:
+        if not n.get('childIds'):
             continue
+        raw, bid = (n.get('role') or {}).get('value', ''), n.get('backendDOMNodeId') or n.get('backendNodeId')
         name, val = (n.get('name') or {}).get('value') or '', (n.get('value') or {}).get('value')
-        if _agent_value_masked(name, val, n.get('backendDOMNodeId') or n.get('backendNodeId'), typed):
+        if bid in typed or (AGENT_ROLE_NORMALIZE.get(raw, raw) in _AGENT_FIELD_ROLES
+                            and _agent_value_masked(name, val, bid)):
             stack.extend(n['childIds'])
     if not stack:
         return nodes
@@ -17080,9 +17119,9 @@ def _load_agent_state():
     path = _agent_state_path()
     try:
         with open(path) as f:
-            return json.load(f)
+            state = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {
+        state = {
             'last_url': None,
             'last_snapshot_hash': None,
             'actions_map': {},
@@ -17092,6 +17131,10 @@ def _load_agent_state():
             'step': 0,
             'trail': [],
         }
+    if isinstance(state, dict):
+        state = _AgentState(state)
+        state.typed_seen = _agent_typed_index(state)
+    return state
 
 
 def _save_agent_state(state):
@@ -17105,10 +17148,13 @@ def _save_agent_state(state):
         for ref in sorted_refs[8000:]:
             del amap[ref]
         state['actions_map'] = amap
-    tmp = path + '.tmp'
+    _agent_typed_merge(state)  # what another process marked since this one loaded the file stays
+    tmp = f'{path}.{os.getpid()}.tmp'  # one temp file per writer: two writers never share one
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as f:
         json.dump(state, f)
     os.replace(tmp, path)
+    if isinstance(state, _AgentState):
+        state.typed_seen = _agent_typed_index(state)
 
 
 def _estimate_tokens(obj):
@@ -19907,8 +19953,9 @@ async def _replay_strict_act(ws_url, find_js, value, rule, kind):
         _WS_POOL_ENABLED = was
 
 
-def _agent_trail_push(state, entry):
-    if _mcp_tool_call():  # a flow saved from these acts, even in the terminal, is written_by "mcp"
+def _agent_trail_push(state, entry, mcp=False):
+    """`mcp`: the entry replays a step of a flow an MCP session wrote (agent run, also --trust-flow)."""
+    if mcp or _mcp_tool_call():  # a flow saved from these acts, even in the terminal, is written_by "mcp"
         entry = dict(entry, mcp=True)
     trail = state.setdefault('trail', [])
     trail.append(entry)
@@ -20097,7 +20144,9 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
     # no --var / CDPILOT_VAR_* value goes into it without --trust-flow (2026-11-15
     # review). A dry run shows the origins; a flow with no value runs as before.
     value_steps = _agent_flow_value_steps(flow)
-    if value_steps and _agent_flow_author(flow) == 'mcp' and not (dry_run or trust_flow or _mcp_tool_call()):
+    # its replayed steps keep that mark in the trail: a flow saved from them is written_by "mcp" too
+    by_mcp = _agent_flow_author(flow) == 'mcp'
+    if value_steps and by_mcp and not (dry_run or trust_flow or _mcp_tool_call()):
         print(json.dumps({'error': f'flow {slug!r} was saved by an MCP session, so a model chose the pages its '
                                    'values are typed on; no --var or CDPILOT_VAR_* value goes into it '
                                    'without --trust-flow',
@@ -20190,11 +20239,14 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
         # (text, injection_suspect, hidden_text, …) is that of the last snapshot, the one shown.
         shown_actions, trunc = _agent_cap_list(out_actions, limit)
         shown_actions = _agent_rows_e1(shown_actions)
+        # an MCP session cannot overwrite a terminal flow (cmd_agent_flow_save): it saves under another name
+        save = ("save it under another name (`agent flow save <new-name>`)" if _mcp_tool_call() and not by_mcp
+                else f"agent flow save {slug}")
         res = {'status': 'drift', 'flow': slug, 'step': step['n'], 'reason': reason,
                'expected': step.get('anchor') or {'kind': step.get('kind')},
                'done': done, 'url': clean(page.get('url', ''), st), 'title': page.get('title', ''),
                'actions': shown_actions, 'text': text,
-               'hint': f"act on a ref (agent act --ref @N …), finish the task, then: agent flow save {slug}"}
+               'hint': f"act on a ref (agent act --ref @N …), finish the task, then: {save}"}
         res.update(_agent_frames_fields(list(_AGENT_LAST_FRAMES)))
         if trunc:
             res['truncated'] = trunc
@@ -20225,7 +20277,8 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
             page, actions, out_actions, text, state = await snapshot()
             tokens_avoided += _estimate_tokens({'actions': out_actions, 'text': text})
             _agent_trail_push(state, {'kind': 'go', 'url': clean(step.get('url', '')),
-                                      'url_after': clean(page.get('url', '')), 'ts': int(time.time()), 'replayed': True})
+                                      'url_after': clean(page.get('url', '')), 'ts': int(time.time()), 'replayed': True},
+                              mcp=by_mcp)
             done.append({'n': step['n'], 'kind': 'go', 'url': clean(page.get('url', ''))})
             continue
         page, actions, out_actions, text, state = await snapshot()
@@ -20275,7 +20328,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
         _agent_trail_push(state, {'kind': 'act', 'action': step.get('action', 'click'), 'anchor': anchor,
                                   **({'text': step['text']} if step.get('text') is not None else {}),
                                   'url_before': clean(page.get('url', '')), 'url_after': clean(page2.get('url', '')),
-                                  'ts': int(time.time()), 'replayed': True})
+                                  'ts': int(time.time()), 'replayed': True}, mcp=by_mcp)
         done.append({'n': step['n'], 'action': step.get('action', 'click'), 'ref': match['ref'],
                      'name': match.get('name', ''), 'match': how, 'url': clean(page2.get('url', ''))})
         after = step.get('after') or {}
