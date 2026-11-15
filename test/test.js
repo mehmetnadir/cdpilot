@@ -2012,6 +2012,26 @@ test('cmd_cookies save: writes JSON array via Network.getCookies', () => {
   assert(m, "cookies save must use Network.getCookies and json.dump the result");
 });
 
+// Local file permissions (T2 audit, 15.11.2026): private data is owner-only, default outputs in /tmp
+// cannot be pre-seeded. Browser-free harness: test/fsperm_check.py <cdpilot.py>.
+{
+  const fsperm = (() => {
+    const { spawnSync } = require('child_process');
+    const r = spawnSync(process.platform === 'win32' ? 'python' : '/opt/homebrew/bin/python3.13', [path.join(__dirname, 'fsperm_check.py'), PY_PATH],
+      { encoding: 'utf-8', timeout: 60000 });
+    try { return JSON.parse(r.stdout.trim().split('\n').pop()); } catch (e) { return { crash: `${r.stdout}${r.stderr}` }; }
+  })();
+  const names = {
+    home_mode: 'fsperm: a new CDPILOT_HOME is 0700, an existing directory keeps its mode',
+    watch_frame: 'fsperm: watch dirs are 0700 and screencast frames are written 0600',
+    cookies_export: 'fsperm: cookies save <file> writes the export 0600',
+    output_helper: 'fsperm: shot/pdf output helper refuses a symlink and a foreign file, overwrites our own',
+  };
+  for (const [k, n] of Object.entries(names)) {
+    testUnix(n, () => { assert(fsperm[k] === 'ok', fsperm[k] || fsperm.crash || 'no result'); });
+  }
+}
+
 test('cmd_cookies load: round-trips via Network.setCookies and verifies count', () => {
   const m = PY_CONTENT.match(/sub == 'load'[\s\S]{0,2500}?Network\.setCookies[\s\S]{0,500}?Network\.getCookies/);
   assert(m, "cookies load must call Network.setCookies and verify via Network.getCookies");
