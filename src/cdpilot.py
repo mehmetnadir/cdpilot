@@ -5105,7 +5105,9 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
         print(f"note: frame '{route.labels[-1]}': its page context was not reachable; using an isolated"
               " world (same DOM, no page JS globals)", file=sys.stderr)
     route.dirty = True
-    if url_first and not by_url:  # no frame on that host: the page-set match is used, say so
+    # no frame on that host: the page-set match is used, say so (not for a selector on the frame
+    # element itself, such as iframe.card, which names no host)
+    if url_first and not by_url and not _re.match(r'(?i)i?frame\.', hop["value"]):
         shown_host = _frame_label(hop["value"], 120)
         print(f"note: no frame on host {shown_host}; used the page-set selector or name/id match "
               f"'{route.labels[-1]}' (write --frame url={shown_host} to require the host)",

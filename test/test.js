@@ -6233,14 +6233,15 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.deepStrictEqual(r.attr_id_only.value_in, ['iddecoy'], 'then the iframe id');
   });
 
-  test('frames (fake CDP): live frame identity — a host-shaped --frame value with no frame on that host says on stderr that it used the page-set selector or name/id match (no note when a frame on the host matched)', () => {
+  test('frames (fake CDP): live frame identity — a host-shaped --frame value with no frame on that host says on stderr that it used the page-set selector or name/id match (no note when a frame on the host matched, or for an iframe./frame. selector)', () => {
     const r = fake('frame_identity');
     const note = (host, label) => `note: no frame on host ${host}; used the page-set selector or name/id match `
       + `'${label}' (write --frame url=${host} to require the host)\n`;
     assert.strictEqual(r.attr_decoy_only.stderr, note('js.stripe.com', 'iframe#w')
       + "note: 'js.stripe.com' is not an iframe; using the iframe inside it\n");
     assert.strictEqual(r.attr_id_only.stderr, note('js.stripe.com', 'iframe#js.stripe.com'));
-    assert.strictEqual(r.dotted_selector_flag.stderr, note('iframe.card', 'iframe#card'));
+    // a selector on the frame element itself (iframe.card, frame.x) names no host: no note
+    assert.strictEqual(r.dotted_selector_flag.stderr, '', 'iframe.card is a selector: no note');
     for (const key of ['attr_decoy_flag', 'attr_id_flag', 'decoy_flag', 'host_suffix_flag', 'honest_fill', 'path_flag']) {
       assert.strictEqual(r[key].stderr, '', `${key}: a frame on the host matched, or not host-shaped: no note`);
     }
