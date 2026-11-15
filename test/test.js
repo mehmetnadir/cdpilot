@@ -4185,14 +4185,22 @@ test('security: blog regenerate keeps the old post when publish fails', () => {
 
 test('security: MCP browser_screenshot_diff confines paths to SCREENSHOT_DIR', () => {
   const home = secHome();
-  const outside = path.join(home, 'secret.png');
+  // SCREENSHOT_DIR is /tmp on Linux and macOS, and os.tmpdir() is /tmp on Linux: the outside file
+  // goes next to this test file, which is never under /tmp.
+  const outDir = fs.mkdtempSync(path.join(__dirname, '.sec-outside-'));
+  const outside = path.join(outDir, 'secret.png');
   fs.writeFileSync(outside, 'abc');
   const input = [{ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
     { jsonrpc: '2.0', method: 'notifications/initialized' },
     { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'browser_screenshot_diff',
       arguments: { path1: outside, path2: outside } } }].map((m) => JSON.stringify(m)).join('\n') + '\n';
-  const r = require('child_process').spawnSync(process.execPath, [CLI, 'mcp'],
-    { input, encoding: 'utf-8', timeout: 60000, env: secEnv(home, { CDPILOT_WEBMCP: '0' }) });
+  let r;
+  try {
+    r = require('child_process').spawnSync(process.execPath, [CLI, 'mcp'],
+      { input, encoding: 'utf-8', timeout: 60000, env: secEnv(home, { CDPILOT_WEBMCP: '0' }) });
+  } finally {
+    fs.rmSync(outDir, { recursive: true, force: true });
+  }
   const msg = r.stdout.trim().split('\n').map((l) => JSON.parse(l)).find((m) => m.id === 2);
   assert(msg && msg.result && msg.result.isError === true, JSON.stringify(msg));
   assert(!/MATCH|DIFF/.test(JSON.stringify(msg.result.content)), 'no equality oracle for outside paths');
