@@ -6,6 +6,7 @@ All notable changes to cdpilot will be documented in this file.
 
 ### Security
 - **`agent observe --frame <i>` and frame-ref `agent act` resolve frame indices in an isolated world.** The iframe index lookup now evaluates `_FRAME_OWNER_JS` in cdpilot's isolated world (`Page.createIsolatedWorld`, matching the `frames` hint), protecting against pages that monkey-patch `document.querySelectorAll` to point to a different frame. If isolated world creation fails, resolution falls back to the main world; other `--frame` commands are unchanged.
+- **Element bounding box for `shot --element=<selector>` is read in an isolated world.** A page that overrides `getBoundingClientRect`, `scrollX`, `scrollY`, or `scrollIntoView` can no longer tamper with element crop coordinates or detect automation through those methods; falls back to the main world when the isolated world cannot be used or finds no element.
 
 ## [0.9.10] - 2026-11-15
 
