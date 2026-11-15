@@ -4,6 +4,13 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- **`ext-remove` only deletes real extension folders.** The id must be a Chrome extension id (32 characters a-p) and the folder must resolve inside the profile's Extensions folder; `../` ids and absolute paths now exit 2 and delete nothing.
+- **`cookies clear --host` can no longer delete cdpilot's home.** Hosts such as `..`, `.`, empty names, names starting with a dot, or names with a slash are refused (exit 2); only host names (with an optional port) name a cookie store.
+- **Cookie auto-save matches cookie domains on a dot boundary.** A cookie for `ank.com` is no longer saved for `bank.com`.
+- **`blog regenerate` validates the slug and keeps the post on failure.** A slug that is not lowercase kebab-case exits 2; the old post is moved aside and restored if publishing fails.
+- **MCP `browser_screenshot_diff` reads only inside the screenshot folder.** Paths outside it return an error; the CLI command still accepts any path.
+
 ### Changed
 - **`blog publish` / `blog regenerate` read their output folder from `CDPILOT_BLOG_DIR`.** The folder was a hard-coded maintainer path; without the variable both commands now exit 2 with a message and write nothing. `day-NNN` sources are looked up in `CDPILOT_BLOG_PLAN_DIR` (default: the current directory). Maintainer notes, social-media drafts and the X bot are no longer in the repository.
 
