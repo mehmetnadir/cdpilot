@@ -12717,6 +12717,123 @@ print(json.dumps(out))
     } finally { live.stop(); }
   });
 
+  // ── MCP browser_connect needs the operator's opt-in ──
+  // A model on MCP (page text can steer it) must not move this project, and every later
+  // cdpilot call, into the user's own logged-in browser. CDPILOT_MCP_ALLOW_CONNECT=1 in the
+  // server's environment is the operator's opt-in; `cdpilot connect` (CLI) is unchanged.
+  const mcpToolCall = (id, name, args = {}) => ({ jsonrpc: '2.0', id, method: 'tools/call',
+    params: { name, arguments: args } });
+  function mcpRun(env, calls) {
+    const input = [{ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+      { jsonrpc: '2.0', id: 2, method: 'tools/list' }, ...calls]
+      .map((m) => JSON.stringify(m)).join('\n') + '\n';
+    const r = spawnSync(process.execPath, [CLI, 'mcp'], { input, encoding: 'utf-8', timeout: 90000,
+      env: { ...env, CDPILOT_DAEMON: '', CDPILOT_WEBMCP: '0', CDPILOT_MCP_TOOLS: '' } });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const msgs = r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+    return (id) => msgs.find((m) => m.id === id);
+  }
+  const mcpText = (m) => m.result.content.map((c) => c.text).join('\n');
+  // A search root whose only DevToolsActivePort names the fake: `--auto` finds it, and never
+  // the real profile dirs of the machine running the tests.
+  function autoRoot(home, fake) {
+    const root = path.join(home, 'browsers');
+    fs.mkdirSync(path.join(root, 'UserChrome'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'UserChrome', 'DevToolsActivePort'),
+      `${fake.port}\n/devtools/browser/${fake.guid}\n`);
+    return root;
+  }
+
+  test('mcp connect gate: browser_connect without CDPILOT_MCP_ALLOW_CONNECT=1 is refused with the hint; registry.json and the browser untouched', () => {
+    const fake = startFake('full', 'guid-mcp-gate');
+    try {
+      const home = mkHome();
+      writeRegistry(home, { other: externalEntry(freePort(), 'OtherBrowser') });
+      const before = fs.readFileSync(path.join(home, 'registry.json'), 'utf-8');
+      // CDP_PORT is another port: only the connect path (via the search root) reaches the fake.
+      const env = isoEnv(home, freePort(), 'gate', { CDPILOT_BROWSER_SEARCH_ROOT: autoRoot(home, fake),
+        CDPILOT_MCP_ALLOW_CONNECT: '' });
+      const res = mcpRun(env, [
+        mcpToolCall(10, 'browser_connect', { target: '--auto' }),
+        mcpToolCall(11, 'browser_connect', { target: String(fake.port) }),
+        mcpToolCall(12, 'browser_connect'),  // no target: the tool's default is --auto
+      ]);
+      for (const id of [10, 11, 12]) {
+        const t = mcpText(res(id));
+        assert.strictEqual(res(id).result.isError, true, `call ${id} not refused: ${t}`);
+        assert(t.includes('CDPILOT_MCP_ALLOW_CONNECT=1') && t.includes('`cdpilot connect`'), `call ${id} hint: ${t}`);
+      }
+      assert.strictEqual(fs.readFileSync(path.join(home, 'registry.json'), 'utf-8'), before,
+        'a refused browser_connect must leave registry.json as it was');
+      assert.deepStrictEqual(fake.entries().filter((e) => !('ready' in e)), [],
+        'a refused browser_connect must not even probe the browser');
+    } finally { fake.stop(); }
+  });
+
+  test('mcp connect gate: with CDPILOT_MCP_ALLOW_CONNECT=1 browser_connect passes the gate and registers the browser', () => {
+    const fake = startFake('full', 'guid-mcp-allow');
+    try {
+      const home = mkHome();
+      const env = isoEnv(home, fake.port, 'allow', { CDPILOT_BROWSER_SEARCH_ROOT: autoRoot(home, fake),
+        CDPILOT_MCP_ALLOW_CONNECT: '1' });
+      const res = mcpRun(env, [mcpToolCall(10, 'browser_connect', { target: '--auto' })]);
+      const t = mcpText(res(10));
+      assert.strictEqual(res(10).result.isError, false, t);
+      assert(!t.includes('CDPILOT_MCP_ALLOW_CONNECT') && new RegExp(`Connected to .* on port ${fake.port}`).test(t), t);
+      const entry = readRegistry(home).allow;
+      assert(entry && entry.external && entry.port === parseInt(fake.port, 10), JSON.stringify(entry));
+    } finally { fake.stop(); }
+  });
+
+  test('mcp connect gate: browser_disconnect needs no opt-in, and a browser the operator connected from the CLI serves MCP page tools', () => {
+    const fake = startFake('full', 'guid-mcp-cli');
+    try {
+      const home = mkHome();
+      const env = isoEnv(home, fake.port, 'cliconn', { CDPILOT_MCP_ALLOW_CONNECT: '' });
+      const c = cli(['connect', String(fake.port)], env);
+      assert.strictEqual(c.status, 0, c.stdout + c.stderr);
+      const res = mcpRun(env, [
+        mcpToolCall(10, 'browser_navigate', { url: 'https://cdpilot-own.example/' }),
+        mcpToolCall(11, 'browser_disconnect'),
+      ]);
+      assert.strictEqual(res(10).result.isError, false, mcpText(res(10)));
+      assert(fake.methods().includes('Page.navigate'), 'the navigation ran in the connected browser');
+      assert.strictEqual(res(11).result.isError, false, mcpText(res(11)));
+      assert(/Disconnected/.test(mcpText(res(11))), mcpText(res(11)));
+      assert(!readRegistry(home).cliconn, 'browser_disconnect removed the entry');
+    } finally { fake.stop(); }
+  });
+
+  test('mcp connect gate: the browser_connect description names the opt-in and no longer claims cdpilot never injects into the browser', () => {
+    const res = mcpRun(isoEnv(mkHome(), freePort(), 'desc'), []);
+    const d = res(2).result.tools.find((t) => t.name === 'browser_connect').description;
+    assert(d.includes('CDPILOT_MCP_ALLOW_CONNECT=1') && /cookies/.test(d), d);
+    assert(!/inject/i.test(d), d);
+  });
+
+  test('mcp external tabs: over MCP a connected browser lists only the tabs cdpilot opened, not the user\'s URLs and titles; `cdpilot tabs` still lists all', () => {
+    const fake = startFake('full', 'guid-mcp-tabs');
+    try {
+      const home = mkHome();
+      writeRegistry(home, { tabsproj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'tabsproj');
+      const res = mcpRun(env, [
+        mcpToolCall(10, 'browser_navigate', { url: 'https://cdpilot-own.example/' }),
+        mcpToolCall(11, 'browser_tabs'),
+      ]);
+      assert.strictEqual(res(10).result.isError, false, mcpText(res(10)));
+      const t = mcpText(res(11));
+      assert.strictEqual(res(11).result.isError, false, t);
+      assert(t.includes('https://cdpilot-own.example/'), `cdpilot's own tab must be listed: ${t}`);
+      assert(!t.includes('user.example') && !t.includes("The user's own tab"), `a user tab leaked over MCP: ${t}`);
+      assert(/1 tab\(s\) of your connected browser not listed/.test(t), t);
+      const c = cli(['tabs'], env);
+      assert.strictEqual(c.status, 0, c.stdout + c.stderr);
+      assert(c.stdout.includes('https://user.example/inbox') && c.stdout.includes('https://cdpilot-own.example/'),
+        `the operator's \`cdpilot tabs\` lists every tab: ${c.stdout}`);
+    } finally { fake.stop(); }
+  });
+
   // ── Tripwire: every destructive call site goes through the guard ──
 
   test('external guard: tripwire — Browser.close / kill / tab-close call sites are all known', () => {
