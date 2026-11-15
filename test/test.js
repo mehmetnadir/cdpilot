@@ -16917,11 +16917,13 @@ print(json.dumps(res))
     if (cachedSuite) return cachedSuite;
     const pyBin = findPython();
     assert(pyBin, 'python3 with websockets is required for canvas host fake CDP tests');
+    // ~45 s on an M1 Max at load 60-90; 60 s timed out with empty output under load.
     const r = spawnSync(pyBin, ['-I', fakeCdpScript, pyCanvasPath], {
       encoding: 'utf8',
-      timeout: 60000,
+      timeout: 150000,
     });
-    assert.strictEqual(r.status, 0, `canvas_fake_cdp.py failed: ${r.stderr || r.stdout}`);
+    assert.strictEqual(r.status, 0,
+      `canvas_fake_cdp.py failed (status ${r.status}, signal ${r.signal}): ${r.stderr || r.stdout}`);
     cachedSuite = JSON.parse(r.stdout.trim());
     for (const [k, v] of Object.entries(cachedSuite)) {
       assert(!v.error, `scenario ${k} failed:\n${v.error}`);

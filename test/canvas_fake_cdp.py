@@ -647,13 +647,23 @@ def scenario_bindings_and_limits(mod):
             await asyncio.sleep(0.02)
             ev1 = await host.handle_op({"op": "events", "after": 0, "max": 100})
 
-            # Rate limit: send 110 valid events in the same second -> excess dropped
+            # Rate limit: send 110 valid events in the same second -> excess dropped.
+            # The host counts per whole monotonic second: start the burst early in a second so a
+            # slow runner does not split it across two windows (CI 15.11: dropped 0), then wait
+            # until the host has handled it (or the second ends).
+            frac = time.monotonic() % 1.0
+            if frac > 0.4:
+                await asyncio.sleep(1.0 - frac + 0.01)
+            burst_second = int(time.monotonic())
+            dropped_before = host.dropped
             for i in range(110):
                 ws.emit_event("Runtime.bindingCalled", {
                     "name": mod.CANVAS_BINDING,
                     "payload": json.dumps({"type": "click", "action": "burst", "id": f"b-{i}", "data": i}),
                 })
             await asyncio.sleep(0.02)
+            while host.dropped - dropped_before < 10 and int(time.monotonic()) == burst_second:
+                await asyncio.sleep(0.01)
             ev_burst = await host.handle_op({"op": "events", "after": ev1["next"], "max": 100})
 
             # Unknown op -> code 2
