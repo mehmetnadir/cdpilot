@@ -6,12 +6,16 @@ All notable changes to cdpilot will be documented in this file.
 
 ### Fixed
 - **Frame fallback notes appear on every request in a warm process.** With `CDPILOT_DAEMON=1` or a warm MCP process, the stderr notes for an isolated-world fallback were printed only for the first request; each request now starts fresh, like a one-shot command.
-- **A stale isolated world context is re-created instead of downgrading to page JavaScript.** When the first-hop frame lookup in cdpilot's isolated world encounters a missing execution context (such as after navigation), the isolated world is re-established and retried once. An evaluation exception fails closed with an error and never falls back to the page's own JavaScript. A clean "not found" is not retried.
+- **No false "no iframe matches ... (it has no iframes)" after the page navigates.** When cdpilot's isolated world for the first-hop frame lookup (and the top-page `frame list`) is gone, it is made again and the lookup runs once more there; only if it cannot be made at all does cdpilot use the page's own JS, with one stderr note (as in 0.9.11). A clean "not found" is not retried.
+
+### Changed
+- **An error inside cdpilot's isolated world stops the frame lookup with an error.** The first-hop lookup, the top-page `frame list` (exit 1) and the `shot --element` box (full-page capture with "Element not found") no longer retry with the page's own JS after an exception there; 0.9.11 re-read `frame list` and the crop box with the page's JS. No page-made trigger is known (DOM clobbering does not reach the isolated world).
+- **Frame labels print zero-width and other format characters as spaces** (for example ZWJ/ZWNJ in emoji or Persian names), and `frame list` skips entries it cannot read instead of failing.
 
 ### Security
-- **`frame list` cleans page-controlled attributes and prevents line forgery.** Tag characters and invisible characters are stripped; newlines and other control characters turn into single spaces so a crafted frame name cannot inject fake lines. Frame `name` and `id` are truncated to 60 characters, `src` to 80 characters. Frame labels in error messages and route headers are cleaned and truncated to 60 characters as well. Pages with plain names print the same list.
+- **`frame list` cleans page-controlled attributes and prevents line forgery.** Tag characters, variation selectors and bidi embeddings are stripped; newlines, other control characters and format characters turn into single spaces so a crafted frame name cannot inject fake lines. Frame `name` and `id` are truncated to 60 characters, `src` to 80 characters. Frame labels in error messages and route headers are cleaned and truncated to 60 characters as well. Pages with plain names print the same list.
 - **The closed-shadow-root check of a `>>>` chain runs in cdpilot's isolated world** on the top document, so the page's own JS cannot change its result.
-- **Element crop evaluation exceptions fail closed.** An evaluation error in the isolated world when finding an element's bounding box for `shot --element` falls back to a full-page capture rather than falling back to the page's own JavaScript context.
+- **The smart-click / smart-fill "matched inside frame" note cleans the frame's `src`** the same way (no forged stderr line).
 
 ## [0.9.11] - 2026-11-15
 

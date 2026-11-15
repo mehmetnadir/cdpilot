@@ -4773,7 +4773,7 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
         exc = ((det.get("exception") or {}).get("description")
                or (det.get("exception") or {}).get("value")
                or det.get("text") or "unknown error")
-        exc_str = str(exc).splitlines()[0].strip()[:120]
+        exc_str = _frame_label(str(exc).splitlines()[0].strip() if str(exc).strip() else exc, 120)
         raise _FrameError(f"frame lookup failed in cdpilot's isolated world: {exc_str}")
     obj = r.get(1, {}).get("result", {})
     oid = obj.get("objectId")
@@ -5357,7 +5357,7 @@ async def _frame_search(ws_url, probe_js, act_js, label, same_origin_only=False,
                 data = _smart_data(r.get(1, {}).get("result", {}).get("value", ""))
                 if data.get("found"):
                     print(f"{label}: matched inside frame {child.describe()}"
-                          + (f" ({child.src[:100]})" if child.src else ""), file=sys.stderr)
+                          + (f" ({_frame_label(child.src, 100)})" if child.src else ""), file=sys.stderr)
                     child.deadline = None
                     if act_hook is not None:
                         return await act_hook(child, guarded(act_js))
@@ -20918,6 +20918,7 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
                 reply = res.get(2) or {}
                 if _cdp_error_reply(reply):
                     _frame_lookup_fallback_note()
+                    ctx = None  # read with the page's JS from here: an exception is no longer the isolated world's
                     res = await cdp_send(ws_url, [(3, "Runtime.evaluate",
                                                    {"expression": _FRAME_LIST_JS, "returnByValue": True})])
                     reply = res.get(3) or {}
