@@ -6050,11 +6050,12 @@ async def _pointer_click(route, target_oid, label, humanize=False):
     if missed is not None:  # the trusted press and release were sent
         text, kind = missed
         sent = "were sent" if kind == "unknown" else "reached the page"
-        print(f"note: {label} {text}; the press and release {sent}, so no script click"
-              " (it could click twice)", file=sys.stderr)
+        # text can name what covers the target (tag#id.class: page text)
+        print(_tty_text(f"note: {label} {text}; the press and release {sent}, so no script click"
+                        " (it could click twice)", err=True), file=sys.stderr)
         return kind, px, py
     if why is not None:
-        print(f"note: {label} {why[0]}; used a script click", file=sys.stderr)
+        print(_tty_text(f"note: {label} {why[0]}; used a script click", err=True), file=sys.stderr)
         await _frame_cdp(route, [(1, "Runtime.callFunctionOn", {
             "objectId": target_oid, "functionDeclaration": _SCRIPT_CLICK_FN}, sid)])
         return "script", px, py
@@ -8607,7 +8608,7 @@ async def cmd_eval_batch(exprs_json):
         print(json.dumps({"error": f"batch failed: {exc.get('text', '')}"}), file=sys.stderr)
         sys.exit(1)
     val = result.get("result", {}).get("value", [])
-    print(json.dumps(val, indent=2, ensure_ascii=False))
+    print(_tty_json(json.dumps(val, indent=2, ensure_ascii=False)))
 
 
 # ─── Selector Ladder ──────────────────────────────────────────────────────────
@@ -9130,10 +9131,11 @@ def _act_value_or_exit(r, selector):
     val = res.get("value")
     if det:
         desc = (det.get("exception") or {}).get("description") or det.get("text") or "script error"
-        print(f"Error: {str(desc).splitlines()[0]}", file=sys.stderr)
+        print(_tty_text(f"Error: {str(desc).splitlines()[0]}", err=True), file=sys.stderr)
         sys.exit(1)
     if not isinstance(val, str) or val.startswith("Timeout waiting for"):
-        print(val if isinstance(val, str) else f"Error: no result for '{selector}'", file=sys.stderr)
+        print(_tty_text(val if isinstance(val, str) else f"Error: no result for '{selector}'", err=True),
+              file=sys.stderr)
         sys.exit(1)
     return val
 
@@ -9189,7 +9191,8 @@ async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
         try:
             oid = found.get("objectId")
             if not oid:
-                print(found.get("value", "Error: no result for '%s'" % selector), file=sys.stderr)  # 'Timeout waiting for: ...'
+                print(_tty_text(found.get("value", "Error: no result for '%s'" % selector), err=True),
+                      file=sys.stderr)  # 'Timeout waiting for: ...'
                 sys.exit(1)
             r3 = await _frame_cdp(route, [(2, "Runtime.callFunctionOn", {
                 "objectId": oid, "functionDeclaration": _CLICK_LABEL_FN, "returnByValue": True}, sid)])
@@ -9209,7 +9212,7 @@ async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
             else:
                 await _frame_cdp(route, [(3, "Runtime.callFunctionOn", {
                     "objectId": oid, "functionDeclaration": _SCRIPT_CLICK_FN}, sid)])
-            print(res)
+            print(_tty_text(res))
         finally:
             await _frame_cdp(route, [(9, "Runtime.releaseObjectGroup", {"objectGroup": g}, sid)])
     else:
@@ -9233,7 +9236,7 @@ async def cmd_click(selector, ladder=None, no_heal=False, entropy=None):
     }});
 }})()"""
         r2 = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js_fast, "returnByValue": True, "awaitPromise": True})])
-        print(_act_value_or_exit(r2.get(1, {}), selector))
+        print(_tty_text(_act_value_or_exit(r2.get(1, {}), selector)))
 
 
 @_frame_aware("css")
@@ -9343,7 +9346,7 @@ async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
     }});
 }})()"""
         r2 = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})])
-        print(_act_value_or_exit(r2.get(1, {}), selector))
+        print(_tty_text(_act_value_or_exit(r2.get(1, {}), selector)))
 
 
 @_frame_aware("css")
@@ -9372,7 +9375,7 @@ async def cmd_submit(selector="form", ladder=None, no_heal=False):
         return res;
     }})()"""
     r = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-    print(r.get(1, {}).get("result", {}).get("value", "?"))
+    print(_tty_text(r.get(1, {}).get("result", {}).get("value", "?")))
 
 
 async def cmd_wait(selector, timeout=5):
@@ -10256,7 +10259,8 @@ async def cmd_cookies(*args):
     cookies = _cdp_reply(r, 1, "Network.getCookies", 15).get("cookies", [])
     for c in cookies:
         sec = "🔒" if c.get("secure") else "  "
-        print(f"  {sec} {c['name'][:35]:35} = {str(c.get('value',''))[:50]:50} ({c.get('domain','')})")
+        print(_tty_text(f"  {sec} {c['name'][:35]:35} = {str(c.get('value',''))[:50]:50} "
+                        f"({c.get('domain','')})"))
     print(f"\n{len(cookies)} cookies")
 
 
@@ -10455,8 +10459,8 @@ async def cmd_tls_check(*args):
     except (ValueError, TypeError):
         pass
 
-    if json_only:
-        print(raw)
+    if json_only:  # the echo page's text: JSON stays parseable on a terminal, other text \xNN
+        print(_tty_json(raw) if parsed is not None else _tty_text(raw))
         return
 
     if not parsed:
@@ -10484,15 +10488,15 @@ async def cmd_tls_check(*args):
         notes.append(f'HTTP/2 SETTINGS differ from Chrome default (got "{h2_settings[:40]}...")')
 
     print(f"TLS fingerprint probe via {service}")
-    print(f"  JA3:        {ja3 or '(missing)'}")
-    print(f"  JA3 hash:   {ja3_hash or '(missing)'}")
-    print(f"  JA4:        {ja4 or '(missing)'}")
-    print(f"  H2 akamai:  {h2_settings or '(missing)'}")
+    print(_tty_text(f"  JA3:        {ja3 or '(missing)'}"))
+    print(_tty_text(f"  JA3 hash:   {ja3_hash or '(missing)'}"))
+    print(_tty_text(f"  JA4:        {ja4 or '(missing)'}"))
+    print(_tty_text(f"  H2 akamai:  {h2_settings or '(missing)'}"))
     print(f"  Verdict:    {verdict}")
     if notes:
         print("  Notes:")
         for n in notes:
-            print(f"    - {n}")
+            print(_tty_text(f"    - {n}"))
     if verdict == 'non-chrome':
         print("\n  → cdpilot has no in-tree TLS fix in v0.8.0 (no CDP-compatible TLS-corrected")
         print("    Chromium binary exists on the market). v0.9 will ship an optional")
@@ -11439,8 +11443,8 @@ def cmd_switch_tab(index_or_id):
 
     if target:
         activate_tab(target['id'])
-        print(f'Switched to tab: {target.get("title", "")[:60]}')
-        print(f'  URL: {target.get("url", "")[:120]}')
+        print(f'Switched to tab: {_tty_text(target.get("title", "")[:60])}')
+        print(f'  URL: {_tty_text(target.get("url", "")[:120])}')
     else:
         print(f'Tab not found: {index_or_id}', file=sys.stderr)
         print('Available tabs:')
@@ -11487,7 +11491,7 @@ async def cmd_close_tab(index_or_id=None):
             except:
                 pass
         cdp_cache_invalidate()
-        print(f'Tab closed: {target.get("title", "")[:60]}')
+        print(f'Tab closed: {_tty_text(target.get("title", "")[:60])}')
     else:
         print(f'Tab not found: {index_or_id}', file=sys.stderr)
 
@@ -11592,7 +11596,7 @@ async def cmd_multi_eval(js_code):
     results = await asyncio.gather(*[eval_on_tab(t) for t in pages])
 
     for title, value in results:
-        print(f'  [{title}] → {value}')
+        print(_tty_text(f'  [{title}] → {value}'))
     print(f'\nExecuted on {len(results)} tabs')
 
 def cmd_proxy(*args):
@@ -12680,7 +12684,7 @@ async def cmd_friction():
     info = await _detect_friction(ws)
     action = _friction_action(info.get('level', 'none'))
     info['recommended'] = action
-    print(json.dumps(info, ensure_ascii=False))
+    print(_tty_json(json.dumps(info, ensure_ascii=False)))
 
 
 async def cmd_captcha_check():
@@ -12691,7 +12695,7 @@ async def cmd_captcha_check():
     """
     ws, _ = get_page_ws()
     info = await _detect_captcha(ws)
-    print(json.dumps(info, ensure_ascii=False))
+    print(_tty_json(json.dumps(info, ensure_ascii=False)))
     if info.get("error") and not info.get("detected"):
         sys.exit(1)
     sys.exit(3 if info.get("detected") else 0)
@@ -15129,14 +15133,14 @@ async def _run_intercept_session(ws_url, duration=30):
                     if fnmatch.fnmatch(req_url, pattern):
                         cmd_id += 1
                         if rule_type == "block":
-                            print(f"  Blocked: {req_url[:80]}")
+                            print(f"  Blocked: {_tty_text(req_url[:80])}")
                             await ws.send(json.dumps({"id": cmd_id, "method": "Fetch.failRequest",
                                 "params": {"requestId": req_id, "errorReason": "BlockedByClient"}}))
                         elif rule_type == "mock":
                             try:
                                 with open(data, "r", encoding="utf-8") as f:
                                     body = base64.b64encode(f.read().encode()).decode()
-                                print(f"  Mocked: {req_url[:80]} → {data}")
+                                print(f"  Mocked: {_tty_text(req_url[:80])} → {data}")
                                 await ws.send(json.dumps({"id": cmd_id, "method": "Fetch.fulfillRequest",
                                     "params": {"requestId": req_id, "responseCode": 200, "body": body,
                                                "responseHeaders": [{"name": "Content-Type", "value": "application/json"}]}}))
@@ -15150,7 +15154,7 @@ async def _run_intercept_session(ws_url, duration=30):
                                 if ":" in pair:
                                     n, v = pair.split(":", 1)
                                     extra.append({"name": n.strip(), "value": v.strip()})
-                            print(f"  Headers added: {req_url[:80]}")
+                            print(f"  Headers added: {_tty_text(req_url[:80])}")
                             await ws.send(json.dumps({"id": cmd_id, "method": "Fetch.continueRequest",
                                 "params": {"requestId": req_id, "headers": extra}}))
                         handled = True
@@ -15835,9 +15839,9 @@ async def cmd_smart_click(text):
     if data.get("via") in PRESSED_PREFIX:
         _CLICK_MISSES.append(data["via"])
         verb = PRESSED_PREFIX[data["via"]]
-    print(f'{verb}{data["tag"].upper()} "{data["text"]}" (score:{data["score"]})')
+    print(_tty_text(f'{verb}{data["tag"].upper()} "{data["text"]}" (score:{data["score"]})'))
     if data.get("alternatives"):
-        print(f'  Also found: {", ".join(data["alternatives"])}')
+        print(_tty_text(f'  Also found: {", ".join(data["alternatives"])}'))
 
 
 # ─── Auto-dismiss: heuristic click for "leave me alone" modal buttons ───
@@ -16027,8 +16031,8 @@ async def cmd_dismiss(repeat=None):
                 print("No dismiss candidates on page.")
             break
         total_clicked += 1
-        print(f'Dismissed: {data["tag"].upper()} "{data["text"]}" '
-              f'(pattern: "{data["pattern"]}", score: {data["score"]})')
+        print(_tty_text(f'Dismissed: {data["tag"].upper()} "{data["text"]}" '
+                        f'(pattern: "{data["pattern"]}", score: {data["score"]})'))
         # Give the modal a moment to close before next scan
         if i + 1 < max_iter:
             await asyncio.sleep(0.4)
@@ -16208,7 +16212,8 @@ async def cmd_smart_fill(text, value):
         sys.exit(1)
 
     ident = data.get("placeholder") or data.get("name") or data["tag"]
-    print(f'Filled: {data["tag"].upper()}[{data["type"]}] "{ident}" = {value} (score:{data["score"]})')
+    print(_tty_text(f'Filled: {data["tag"].upper()}[{data["type"]}] "{ident}" = {value} '
+                    f'(score:{data["score"]})'))
 
 
 @_frame_aware("text")
@@ -16340,9 +16345,10 @@ async def cmd_smart_select(text, option_text):
             print(f'No select found matching: "{text}"', file=sys.stderr)
         sys.exit(1)
     if not data.get("optionFound"):
-        print(f'Option "{option_text}" not found. Available: {", ".join(data.get("available", []))}', file=sys.stderr)
+        print(_tty_text(f'Option "{option_text}" not found. Available: {", ".join(data.get("available", []))}',
+                        err=True), file=sys.stderr)
         sys.exit(1)
-    print(f'Selected: "{data["selected"]}" (value={data["value"]})')
+    print(_tty_text(f'Selected: "{data["selected"]}" (value={data["value"]})'))
 
 
 async def cmd_run_script(script_path):
@@ -16387,19 +16393,20 @@ async def cmd_run_script(script_path):
                 # A recording keeps the `run <script>` step only (RECORD_SKIP_ENV).
                 env={**os.environ, "CDPILOT_MCP_SESSION": "1", RECORD_SKIP_ENV: "1"}
             )
+            # the step's own output was a pipe (page text unescaped): escaped here for a terminal
             output = result.stdout.strip()
             if output:
                 for out_line in output.split("\n"):
-                    print(f"     {out_line}")
+                    print(_tty_text(f"     {out_line}"))
             if result.returncode == CLICK_MISSED_EXIT_CODE:
                 # Pressed, the release missed the target: not an error, not a click.
                 err = result.stderr.strip()
-                print(f"     NOT CLICKED (exit {CLICK_MISSED_EXIT_CODE})" + (f": {err}" if err else ""))
+                print(_tty_text(f"     NOT CLICKED (exit {CLICK_MISSED_EXIT_CODE})" + (f": {err}" if err else "")))
                 not_clicked += 1
             elif result.returncode != 0:
                 err = result.stderr.strip()
                 if err:
-                    print(f"     ERROR: {err}")
+                    print(_tty_text(f"     ERROR: {err}"))
                 failed += 1
             else:
                 passed += 1
@@ -21465,7 +21472,7 @@ async def cmd_twitter_analytics(days=7):
         '_raw': metrics.get('_raw_metrics', [])[:5],
     }
     # raw page text (_raw, counts): the same tag-character cleaning as the agent JSON
-    print(json.dumps(_agent_clean_tags(out), indent=2, ensure_ascii=False))
+    print(_tty_json(json.dumps(_agent_clean_tags(out), indent=2, ensure_ascii=False)))
 
 
 def datetime_now_iso_date():
@@ -23601,15 +23608,20 @@ def cmd_test(files=None, watch=False, parallel=1, reporter='default', trace='def
                     n += 1
             return
         if rep == 'junit':
+            def xml_text(s):
+                # XML 1.0 also has no U+FFFE, U+FFFF or lone surrogate (U+D800-DFFF; print raises
+                # on one): each becomes the visible text \uXXXX, after _term_text's \xNN
+                return _re.sub('[\ud800-\udfff\ufffe\uffff]', lambda m: f'\\u{ord(m.group()):04x}',
+                               _term_text(s))
             lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<testsuites>']
             for r in all_results:
                 for t in r.get('tests', []):
-                    name = (_term_text(t.get('name', '')).replace('&', '&amp;').replace('<', '&lt;')
+                    name = (xml_text(t.get('name', '')).replace('&', '&amp;').replace('<', '&lt;')
                             .replace('"', '&quot;'))  # an XML attribute: ", & and < are escaped
                     lines.append(f'  <testcase name="{name}" time="{t.get("duration_ms", 0)/1000:.3f}">')
                     if t.get('status') != 'passed':
                         # page text: control characters are invalid in XML 1.0, so always \xNN here
-                        err = _term_text(t.get('error') or '').replace('&', '&amp;').replace('<', '&lt;')
+                        err = xml_text(t.get('error') or '').replace('&', '&amp;').replace('<', '&lt;')
                         lines.append(f'    <failure>{err}</failure>')
                     lines.append('  </testcase>')
             lines.append('</testsuites>')
@@ -27703,7 +27715,7 @@ def _replay_run(*args, env_run):
             print(f"[{idx}/{total_steps}] {step_label} ... refused (2){dur}")
             err_msg = _replay_scrub(res.stderr.rstrip(), flow_values)
             if err_msg:
-                print(err_msg, file=sys.stderr)
+                print(_tty_text(err_msg, err=True), file=sys.stderr)
             sys.exit(2)
         else:
             print(f"[{idx}/{total_steps}] {step_label} ... failed ({res.returncode}){dur}")
@@ -27712,7 +27724,7 @@ def _replay_run(*args, env_run):
             raw_err = res.stderr.rstrip() if res.stderr else ("" if env_flow else res.stdout.rstrip())
             err_msg = _replay_scrub(raw_err, flow_values)
             if err_msg:
-                print(err_msg, file=sys.stderr)
+                print(_tty_text(err_msg, err=True), file=sys.stderr)
             elif env_flow:
                 print("(step output withheld: the flow types an environment value)", file=sys.stderr)
             had_failure = True

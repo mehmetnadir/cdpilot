@@ -6,7 +6,9 @@ Page text that carries ESC, other C0 controls, DEL and C1 (0x80-0x9F) reaches th
 page-text commands (content, html, go, network, a11y, a11y-snapshot, describe, tabs,
 console, debug, storage, eval, the assert family, check, wait, wait-for, wait-for-text,
 extract, observe, frame eval / shadow, WebMCP tools list / call, the test reporter
-and its JUnit output). Every command
+and its JUnit output; click, fill, submit, smart-click, dismiss, smart-fill, smart-select,
+tab switch / close, the pointer-click note, cookies, eval-batch, multi-eval, tls-check,
+friction, captcha-check, twitter analytics, intercept, run and replay). Every command
 runs twice: once with stdout and stderr that say they are a terminal (isatty() is
 True) and once piped (plain text streams). A third pass writes `content` to a real
 pseudo-terminal (Unix), and the warm path (_daemon_execute) runs with the
@@ -49,6 +51,46 @@ class TTYText(io.StringIO):
         return True
 
 
+class Utf8Stream(io.TextIOWrapper):
+    """A strict UTF-8 text stream, like a real stdout: writing a lone surrogate raises."""
+
+    def __init__(self, tty=False):
+        super().__init__(io.BytesIO(), encoding="utf-8", errors="strict", newline="")
+        self._tty = tty
+
+    def isatty(self):
+        return self._tty
+
+    def getvalue(self):
+        self.flush()
+        return self.buffer.getvalue().decode("utf-8")
+
+
+class FakeWS:
+    """websockets.connect stand-in: `async with`, send() records, recv() pops `replies`
+    (empty: a short wait, then asyncio.TimeoutError, as a quiet socket under wait_for)."""
+
+    def __init__(self, replies=None):
+        self.replies = list(replies or [])
+        self.sent = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def send(self, data):
+        self.sent.append(data)
+
+    async def recv(self):
+        if self.replies:
+            r = self.replies.pop(0)
+            return r(self.sent) if callable(r) else r
+        await asyncio.sleep(0.02)
+        raise asyncio.TimeoutError()
+
+
 def load(path):
     fake = types.ModuleType("websockets")
     fake.connect = lambda url, **kw: None
@@ -67,6 +109,9 @@ def load(path):
                 else:
                     v = STATE["value"]
                     out[cid] = {"result": {"type": "string" if isinstance(v, str) else "object", "value": v}}
+            elif method == "Network.getCookies":
+                out[cid] = {"cookies": [{"name": "sid" + ESC + "[8m", "value": "v" + ESC + "]52;c;eA==\x07\x9b",
+                                         "domain": "x.test", "secure": True}]}
             elif method == "Accessibility.getFullAXTree":
                 out[cid] = {"nodes": [{"nodeId": "1", "role": {"value": "button"}, "backendDOMNodeId": 5,
                                        "name": {"value": "Buy" + ESC + "[8mhidden\x9b"}, "properties": []}]}
@@ -96,10 +141,13 @@ def load(path):
     return mod
 
 
-def run(mod, fn, *args, tty=True):
-    """{res, stdout, stderr}: res = ['ok', None] or ['exit', code]."""
-    cls = TTYText if tty else io.StringIO
-    out, err = cls(), cls()
+def run(mod, fn, *args, tty=True, utf8=False):
+    """{res, stdout, stderr}: res = ['ok', None] or ['exit', code]. utf8: strict UTF-8 streams."""
+    if utf8:
+        out, err = Utf8Stream(tty), Utf8Stream(tty)
+    else:
+        cls = TTYText if tty else io.StringIO
+        out, err = cls(), cls()
     mod._SHADOW_NOTES_PRINTED.clear()  # one note per selector and process: each run is its own process
     res = ["ok", None]
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -112,13 +160,13 @@ def run(mod, fn, *args, tty=True):
     return {"res": res, "stdout": out.getvalue(), "stderr": err.getvalue()}
 
 
-def both(mod, fn, *args, setup=None):
+def both(mod, fn, *args, setup=None, utf8=False):
     """The same call on a terminal and piped."""
     got = {}
     for tag, tty in (("tty", True), ("pipe", False)):
         if setup:
             setup()
-        got[tag] = run(mod, fn, *args, tty=tty)
+        got[tag] = run(mod, fn, *args, tty=tty, utf8=utf8)
     STATE.update(value=None, exception=None)
     return got
 
@@ -183,6 +231,178 @@ def scenario_followup(mod):
     return out
 
 
+EVIL = "Pay" + ESC + "]52;c;eA==\x07" + ESC + "[8m hidden\x9b"
+TABS = [{"type": "page", "id": "T1", "title": "Tab" + ESC + "[8mhidden\x9b",
+         "url": "https://x.test/a" + ESC + "[2J", "webSocketDebuggerUrl": WS}]
+
+
+def _stub(mod, **kw):
+    """Replace module attributes; returns the function that puts them back."""
+    old = {k: getattr(mod, k) for k in kw}
+    for k, v in kw.items():
+        setattr(mod, k, v)
+
+    def restore():
+        for k, v in old.items():
+            setattr(mod, k, v)
+    return restore
+
+
+async def _nothing(*a, **k):
+    return None
+
+
+def scenario_act(mod):
+    """click (fast path, frame path, their error lines), fill, submit, smart-click, dismiss,
+    smart-fill, smart-select, tab switch / close and the pointer-click note."""
+    out = {}
+
+    def val(v):
+        return lambda: STATE.update(value=v, exception=None)
+
+    async def ladder(ws, sel, lad):
+        return sel, [{"hit": True}]
+
+    frame = {}
+
+    async def frame_cdp(route, commands, timeout=10):
+        res = {}
+        for cmd in commands:
+            cid, method, params = cmd[0], cmd[1], cmd[2]
+            decl = params.get("functionDeclaration")
+            if method == "Runtime.evaluate":
+                res[cid] = {"result": frame["found"]}
+            elif decl == mod._CLICK_LABEL_FN:
+                res[cid] = {"result": {"value": json.dumps({"res": frame["res"], "box": False})}}
+            elif decl == mod._CENTER_FN:
+                res[cid] = {"result": {"value": [10, 10, 20, 20]}}
+            elif decl == mod._HIT_TEST_FN:  # what covers the target: tag#id.class, page text
+                res[cid] = {"result": {"value": "div#x" + ESC + "[8m.c\x9b"}}
+            else:
+                res[cid] = {"result": {}}
+        return res
+
+    ws_mod = sys.modules["websockets"]
+    old_connect = ws_mod.connect
+    restore = _stub(mod, _resolve_selector_ladder=ladder, _frame_cdp=frame_cdp, cdp_get=lambda *a, **k: [],
+                    activate_tab=lambda *a, **k: None, get_tabs=lambda *a, **k: [dict(t) for t in TABS],
+                    _frame_route_settle=_nothing, _blocker_pointer=_nothing)
+    ws_mod.connect = lambda url, **kw: FakeWS(['{"id": 1, "result": {}}'])
+    try:
+        # cmd_click(selector, ladder, no_heal, entropy): entropy off = the fast path
+        out["click"] = both(mod, mod.cmd_click, "#b", None, False, False, setup=val("Clicked: BUTTON " + EVIL))
+        out["click_error"] = both(mod, mod.cmd_click, "#b", None, False, False, setup=lambda: STATE.update(
+            value=None, exception={"text": "Uncaught", "exception": {"description": "Error: " + EVIL}}))
+        out["click_timeout"] = both(mod, mod.cmd_click, "#b", None, False, False,
+                                    setup=val("Timeout waiting for: " + EVIL))
+        frame.update(found={"objectId": "o1"}, res="Clicked: BUTTON " + EVIL)
+        out["click_frame"] = both(mod, mod.cmd_click, "#b", None, False, True)  # entropy on: the frame path
+        frame.update(found={"type": "string", "value": "Timeout waiting for: " + EVIL})
+        out["click_frame_missing"] = both(mod, mod.cmd_click, "#b", None, False, True)
+        out["fill"] = both(mod, mod.cmd_fill, "#f", "v", None, False, False, setup=val("Filled: INPUT = " + EVIL))
+        out["submit"] = both(mod, mod.cmd_submit, "form", setup=val("Submit clicked: " + EVIL))
+        out["smart_click"] = both(mod, mod.cmd_smart_click, "Pay", setup=val(json.dumps({
+            "found": True, "tag": "button", "text": EVIL, "score": 100, "x": 1, "y": 2,
+            "alternatives": ['a "' + EVIL + '" (score:60)']})))
+        out["dismiss"] = both(mod, mod.cmd_dismiss, setup=val(json.dumps({
+            "found": True, "tag": "button", "text": EVIL, "pattern": "no thanks", "score": 85})))
+        out["smart_fill"] = both(mod, mod.cmd_smart_fill, "Email", "v", setup=val(json.dumps({
+            "found": True, "tag": "input", "type": "text", "score": 100, "placeholder": EVIL, "name": ""})))
+        out["smart_select"] = both(mod, mod.cmd_smart_select, "Size", "L", setup=val(json.dumps({
+            "found": True, "optionFound": True, "selected": EVIL, "value": "v" + ESC + "[8m"})))
+        out["smart_select_missing"] = both(mod, mod.cmd_smart_select, "Size", "L", setup=val(json.dumps({
+            "found": True, "optionFound": False, "available": [EVIL, "M"]})))
+        out["tab_switch"] = both(mod, mod.cmd_switch_tab, "0")
+        out["tab_close"] = both(mod, mod.cmd_close_tab, "0")
+        out["pointer_note"] = both(mod, mod._pointer_click, mod._FrameRoute(WS), "o1", "#b")
+    finally:
+        restore()
+        ws_mod.connect = old_connect
+    return out
+
+
+def scenario_sweep(mod):
+    """eval-batch, cookies, multi-eval, tls-check, friction, captcha-check, twitter analytics,
+    intercept, run (a script's step output) and replay (a step's error output)."""
+    import subprocess
+    out = {}
+
+    def val(v):
+        return lambda: STATE.update(value=v, exception=None)
+
+    rows = [{"ok": True, "value": "x" + ESC + "y\x7fz\x9bw\u2028v"}]
+    out["eval_batch"] = both(mod, mod.cmd_eval_batch, '["document.title"]', setup=val(rows))
+    out["eval_batch_value"] = rows
+    out["cookies"] = both(mod, mod.cmd_cookies)
+
+    ws_mod = sys.modules["websockets"]
+    old_connect = ws_mod.connect
+    d = tempfile.mkdtemp(prefix="cdpilot-termout-s-")
+    mock = os.path.join(d, "mock.json")
+    with open(mock, "w") as fh:
+        fh.write("{}")
+    script = os.path.join(d, "steps.txt")
+    with open(script, "w") as fh:
+        fh.write("content\nclick #b\nclick #c\n")
+    flow = os.path.join(d, "flow.json")
+    with open(flow, "w") as fh:
+        json.dump({"cdpilot_flow": 1, "steps": [{"cmd": "click", "args": ["#r"]}]}, fh)
+    tw = {"impressions": "1\x9b2", "followers": "5\x7f", "_raw_metrics": ["post " + ESC + "[8m\u2028x"]}
+
+    async def tw_eval(ws, js, *a, **k):
+        return dict(tw)
+
+    async def friction(ws, *a, **k):
+        return {"level": "none", "signals": [], "detail": "", "error": "TypeError: " + ESC + "[8m\x9b"}
+
+    async def captcha(ws, *a, **k):
+        return {"detected": True, "types": ["amazon-classic"],
+                "details": [{"type": "amazon-classic", "img_src": "https://x.test/c\x9b\x7f.jpg", "input_id": "c\u2028"}]}
+
+    def paused(url, n):
+        return json.dumps({"method": "Fetch.requestPaused",
+                           "params": {"requestId": f"r{n}", "request": {"url": url}}})
+    real_run = subprocess.run
+    steps = {("content",): (0, "body " + ESC + "[8mhidden\x9b", ""),
+             ("click", "#b"): (mod.CLICK_MISSED_EXIT_CODE, "", "note: covered by div#x" + ESC + "[8m"),
+             ("click", "#c"): (1, "", "Error: " + ESC + "]0;x\x07")}
+    restore = _stub(mod, get_tabs=lambda *a, **k: [dict(t) for t in TABS], _tw_navigate=_nothing,
+                    _tw_pause=_nothing, _tw_eval=tw_eval, _detect_friction=friction, _detect_captcha=captcha)
+    try:
+        ws_mod.connect = lambda url, **kw: FakeWS([json.dumps(
+            {"id": 1, "result": {"result": {"type": "string", "value": "v" + ESC + "[8m\x9b"}}})])
+        out["multi_eval"] = both(mod, mod.cmd_multi_eval, "document.title")
+        tls = json.dumps({"tls": {"ja3": "771," + ESC + "[8m", "ja3_hash": "h\x9b", "ja4": "x13d\x7f"},
+                          "http2": {"akamai_fingerprint": "2:0\x9b"}}, ensure_ascii=False)
+        out["tls_json"] = both(mod, mod.cmd_tls_check, "--json", setup=val(tls))
+        out["tls_json_value"] = json.loads(tls)
+        out["tls_text"] = both(mod, mod.cmd_tls_check, "--json", setup=val("not json " + ESC + "[8m\x9b"))
+        out["tls"] = both(mod, mod.cmd_tls_check, setup=val(tls))
+        out["friction"] = both(mod, mod.cmd_friction)
+        out["captcha_check"] = both(mod, mod.cmd_captcha_check)
+        out["twitter_analytics"] = both(mod, mod.cmd_twitter_analytics)
+        mod.INTERCEPT_RULES[:] = [("block", "*blocked*", None), ("headers", "*hdr*", "X-A: 1"),
+                                  ("mock", "*mock*", mock)]
+        ws_mod.connect = lambda url, **kw: FakeWS([
+            '{"id": 1, "result": {}}', paused("https://x.test/blocked" + ESC + "[8m", 1),
+            paused("https://x.test/hdr\x9b", 2), paused("https://x.test/mock" + ESC + "]0;x\x07", 3)])
+        out["intercept"] = both(mod, mod._run_intercept_session, WS, 0.3)
+        mod.INTERCEPT_RULES[:] = []
+
+        def fake_run(cmd, **k):
+            code, so, se = steps.get(tuple(cmd[2:]), (1, "", "Error: " + ESC + "[8mhidden\x9b"))
+            return types.SimpleNamespace(returncode=code, stdout=so, stderr=se)
+        subprocess.run = fake_run
+        out["run_script"] = both(mod, mod.cmd_run_script, script)
+        out["replay"] = both(mod, mod.cmd_replay, flow)
+    finally:
+        subprocess.run = real_run
+        mod.INTERCEPT_RULES[:] = []
+        ws_mod.connect = old_connect
+        restore()
+    return out
+
+
 def scenario_webmcp(mod):
     out = {}
     tools = [{"name": "buy" + ESC + "[8m", "title": "Buy" + ESC + "]0;pwned\x07", "description": "d\x9b2J",
@@ -211,7 +431,7 @@ def scenario_webmcp(mod):
     return out
 
 
-def _reporter(mod, reporter, tail="", name="t" + ESC + "[8m"):
+def _reporter(mod, reporter, tail="", name="t" + ESC + "[8m", utf8=False):
     """cmd_test with one reporter: the test file's error text comes from the page."""
     import subprocess
     d = tempfile.mkdtemp(prefix="cdpilot-termout-t-")
@@ -225,7 +445,7 @@ def _reporter(mod, reporter, tail="", name="t" + ESC + "[8m"):
     real = subprocess.run
     subprocess.run = lambda *a, **k: types.SimpleNamespace(stdout=json.dumps(data), stderr="", returncode=1)
     try:
-        return both(mod, mod.cmd_test, [f], False, 1, reporter)
+        return both(mod, mod.cmd_test, [f], False, 1, reporter, utf8=utf8)
     finally:
         subprocess.run = real
 
@@ -262,6 +482,27 @@ def scenario_reporter_junit_name(mod):
     except ET.ParseError as e:
         out["xml_ok"] = str(e)
     return out
+
+
+def scenario_reporter_junit_codepoints(mod):
+    """JUnit: U+FFFE, U+FFFF and lone surrogates (invalid in XML 1.0) in the error text and the
+    name, written to strict UTF-8 streams (a real stdout raises on a lone surrogate)."""
+    import xml.etree.ElementTree as ET
+    # surrogates apart: an adjacent high + low pair would decode as one character
+    odd = "\ufffe" + "a" + "\uffff" + "b" + chr(0xD800) + "c" + chr(0xDFFF)
+    try:
+        got = _reporter(mod, "junit", odd, name="n" + odd, utf8=True)
+    except Exception as e:  # noqa: BLE001 - the old writer raised UnicodeEncodeError in print
+        return {"raised": f"{type(e).__name__}: {e}"}
+    for tag in ("tty", "pipe"):
+        try:
+            root = ET.fromstring(got[tag]["stdout"])
+            got[tag]["failure"] = [e.text for e in root.iter("failure")]
+            got[tag]["names"] = [e.get("name") for e in root.iter("testcase")]
+            got[tag]["xml_ok"] = True
+        except (ET.ParseError, UnicodeError) as e:
+            got[tag]["xml_ok"] = f"{type(e).__name__}: {e}"
+    return got
 
 
 def scenario_pty(mod):
@@ -369,10 +610,13 @@ def scenario_helper(mod):
 SCENARIOS = {
     "commands": scenario_commands,
     "followup": scenario_followup,
+    "act": scenario_act,
+    "sweep": scenario_sweep,
     "webmcp": scenario_webmcp,
     "reporter": scenario_reporter,
     "reporter_junit": scenario_reporter_junit,
     "reporter_junit_name": scenario_reporter_junit_name,
+    "reporter_junit_codepoints": scenario_reporter_junit_codepoints,
     "pty": scenario_pty,
     "daemon": scenario_daemon,
     "agent_json": scenario_agent_json,
