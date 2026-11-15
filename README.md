@@ -318,7 +318,13 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
 - Works for `click`, `fill`, `type`, `submit`, `hover`, `dblclick`, `rightclick`,
   `smart-click`, `smart-fill`, `smart-select` and `frame list|eval|shadow`.
 - A frame hop is a CSS selector, a 0-based index, a `name`/`id`, or
-  `url=<src substring>`. `--frame` also takes a bare `src` substring.
+  `url=<URL substring>`. `--frame` also takes a bare URL substring.
+  URL text is matched against each frame's current URL as the browser
+  reports it (`Page.getFrameTree`; an out-of-process frame's own target),
+  never against the `src` attribute, which the page sets: a `srcdoc` frame,
+  or a frame that navigated elsewhere, does not match by its `src`. The
+  first matching frame in page order is used. The text may appear anywhere
+  in the URL, query string included.
   `>>>` inside quotes or `[...]` is literal. A selector that matches an
   element *wrapping* an iframe (Stripe's `#card-element`) enters the iframe
   inside it and says so on stderr:
@@ -329,6 +335,12 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
   before. If that fails too, one stderr line explains:
   `note: 'Home' matched no iframe or shadow host; used the selector as written`.
   `--frame` never falls back: a frame it cannot find is an error (exit 1).
+- Right before `fill`, `type`, `smart-fill` or `smart-select` types into a
+  frame reached with `--frame` or `>>>`, cdpilot checks again that the frame
+  is the document it found (frame id and loader id). If the frame navigated
+  or was replaced in between, the command exits 2 and types nothing:
+  `Error: frame 'iframe#card' is no longer the document it was resolved to
+  (it navigated or was replaced); nothing was typed`.
 - **Shadow DOM support**: `>>>` hops also pierce open shadow roots (`host.shadowRoot.querySelector(next)`).
   Chains mix freely with iframes: `cdpilot click "iframe#pay >>> my-card >>> button.inner"` or
   `cdpilot click "my-app >>> my-panel >>> input"`. A closed shadow root is unreachable by design

@@ -6041,13 +6041,49 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.strictEqual(r.oopif.session, 'S-pay', 'out-of-process frame: flat session id on the message');
     assert.deepStrictEqual(r.oopif.mouse, ['mousePressed', 6, 9]);
     assert.deepStrictEqual(r.flag_index.res, ['ok', 'pay|#cc'], '--frame 1');
-    assert.deepStrictEqual(r.flag_src.res, ['ok', 'pay|#cc'], '--frame takes a bare src substring');
+    assert.deepStrictEqual(r.flag_src.res, ['ok', 'pay|#cc'], '--frame takes a bare URL substring (the committed URL)');
     assert.deepStrictEqual(r.arrow_src_word.res, ['ok', 'top|pay.html >>> #cc'],
-      'a >>> hop never matches by src substring (url= does): the string stays literal');
+      'a >>> hop never matches by URL substring (url= does): the string stays literal');
     assert.deepStrictEqual(r.attached, ['pay', 'pay', 'pay']);
     assert.deepStrictEqual(r.detached, ['S-pay', 'S-pay', 'S-pay'], 'every flat session is detached');
     assert.deepStrictEqual(r.open_sessions, []);
     assert.strictEqual(r.stderr, '');
+  });
+
+  test('frames (fake CDP): live frame identity — --frame / url= text matches the committed URL, not the src attribute', () => {
+    // The page owns the src attribute: a srcdoc decoy (or a frame navigated elsewhere) keeps
+    // src="https://js.stripe.com/..." while its document is something else.
+    const r = fake('frame_identity');
+    for (const key of ['decoy_flag', 'decoy_arrow']) {
+      const c = r[key];
+      assert.deepStrictEqual(c.res, ['ok', null], `${key}: ${c.stderr}`);
+      assert.deepStrictEqual(c.value_in, ['card'], `${key}: the card number goes to the frame whose committed URL matches`);
+      assert.deepStrictEqual(c.attached, ['card'], `${key}: one flat session for the out-of-process frame`);
+      assert.deepStrictEqual(c.open_sessions, [], `${key}: every session detached`);
+      assert.strictEqual(c.stderr, '', key);
+    }
+    const nav = r.navigated_flag;
+    assert.deepStrictEqual(nav.res, ['exit', 1], 'an iframe matched only by its src attribute is no match');
+    assert.deepStrictEqual(nav.value_in, [], 'nothing typed anywhere');
+    assert(/^Error: no iframe matches 'js\.stripe\.com' in top document/.test(nav.stderr), nav.stderr);
+    assert.deepStrictEqual(nav.open_sessions, []);
+    assert.deepStrictEqual(r.honest_fill.res, ['ok', null], r.honest_fill.stderr);
+    assert.deepStrictEqual(r.honest_fill.value_in, ['card']);
+  });
+
+  test('frames (fake CDP): live frame identity — an input step refuses (exit 2) when the routed frame changed after it was resolved', () => {
+    const r = fake('frame_identity');
+    for (const key of ['changed_fill_sel', 'changed_fill_index', 'changed_fill_url', 'changed_fill_arrow',
+      'changed_smart_fill', 'changed_smart_select']) {
+      const c = r[key];
+      assert.strictEqual(c.navigated, true, `${key}: the frame got a new loaderId after the route was resolved`);
+      assert.deepStrictEqual(c.res, ['exit', 2], `${key}: ${c.stderr}`);
+      assert.deepStrictEqual(c.value_in, [], `${key}: the value never left cdpilot`);
+      assert.deepStrictEqual(c.input, [], `${key}: no Input.* call`);
+      assert(/^Error: frame '.+' is no longer the document it was resolved to \(it navigated or was replaced\); nothing was typed\n$/
+        .test(c.stderr), `${key}: ${JSON.stringify(c.stderr)}`);
+      assert.deepStrictEqual(c.open_sessions, [], key);
+    }
   });
 
   test('frames (fake CDP): "Next >>>", "Home >>> Products" run as written; failure adds the note line', () => {

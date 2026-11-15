@@ -39,10 +39,14 @@ class Frame:
 
     def __init__(self, fid, origin="http://a.test", oop=False, elem_id="", name="",
                  src="", visible=True, box=(0, 0), finder=None, slow=False, children=(),
-                 wrappers=(), scale=1.0):
+                 wrappers=(), scale=1.0, url=None):
         self.fid, self.origin, self.oop = fid, origin, oop
         self.wrappers = list(wrappers)  # selectors of elements around the <iframe>
         self.elem_id, self.name, self.src, self.visible = elem_id, name, src, visible
+        # The committed URL (Page.getFrameTree); None: the src attribute, else the origin. A
+        # frame navigated away, or a srcdoc frame, has a src attribute that says something else.
+        self.url = url
+        self.loader = "L-" + fid  # loaderId: a new document (navigation) gets a new one
         self.box, self.finder, self.slow = box, finder or {}, slow
         self.children = list(children)
         self.ctx = None
@@ -96,6 +100,9 @@ class Browser:
         self.frame_list_iso_exception = False
         self.frame_list_iso_error = 0
         self.custom_frame_list = None
+        # Page.getFrameTree lists only the frames of the session's own process, as Chrome does
+        # (an out-of-process child is the root of its own target's tree). False: every frame.
+        self.tree_local_only = False
         # The browser routes mouse input into out-of-process frames by its own
         # copy of the layout: while route_stale > 0 every mouse event goes
         # elsewhere (into `misrouted`, never reaching a frame); each answered
@@ -207,8 +214,10 @@ class Browser:
             return ok({})
         if method == "Page.getFrameTree":
             def make_node(f):
-                return {"frame": {"id": f.fid, "url": f.src or f.origin, "loaderId": "L-" + f.fid},
-                        "childFrames": [make_node(c) for c in f.children]}
+                url = f.url if f.url is not None else (f.src or f.origin)
+                kids = [c for c in f.children if not (self.tree_local_only and c.oop)]
+                return {"frame": {"id": f.fid, "url": url, "loaderId": f.loader},
+                        "childFrames": [make_node(c) for c in kids]}
             return ok({"frameTree": make_node(root)})
         if method == "Runtime.evaluate" and p.get("expression") == "document":
             ctx = p.get("contextId", root.ctx)
@@ -666,6 +675,88 @@ def scenario_routing(mod):
     res["stderr"] = err
     res["seen"] = seen
     return res
+
+
+CARD_NUMBER = "4242 4242 4242 4242"
+
+
+def value_frames(b, value):
+    """The frame of every CDP message that carried `value` (a flat session "S-<frame>", a
+    context id, or the top page), in order."""
+    out = []
+    for m in b.log:
+        if value not in json.dumps(m):
+            continue
+        sid, ctx = m.get("sessionId"), (m.get("params") or {}).get("contextId")
+        out.append(sid[2:] if sid else (b.ctx[ctx].fid if ctx in b.ctx else "top"))
+    return out
+
+
+def scenario_frame_identity(mod):
+    """--frame / url= match the frame's committed URL (Page.getFrameTree), not its src attribute;
+    an input step refuses (exit 2) when the routed frame is no longer the document resolved."""
+    def stripe_page():
+        # The first iframe's src attribute says js.stripe.com, but its document is a srcdoc of the
+        # page's own (a fake card form); the second is the real card frame (out of process).
+        return Frame("top", children=[
+            Frame("decoy", elem_id="decoy", src="https://js.stripe.com/v3/card.html", url="about:srcdoc"),
+            Frame("card", origin="https://js.stripe.com", oop=True, elem_id="stripe-card",
+                  src="https://js.stripe.com/v3/card.html", box=(5, 7)),
+        ])
+
+    def navigated_page():
+        # The only iframe kept its src attribute while it navigated to another site.
+        return Frame("top", children=[
+            Frame("card", origin="https://evil.test", oop=True, elem_id="card",
+                  src="https://js.stripe.com/v3/card.html", url="https://evil.test/card.html"),
+        ])
+
+    def honest_page():
+        return Frame("top", children=[
+            Frame("card", elem_id="card", src="http://a.test/inner.html", box=(100, 1000)),
+        ])
+
+    fill = lambda target: mod.cmd_fill(target, CARD_NUMBER, None, False, False)  # noqa: E731
+    out = {}
+    for key, page, flag, run_cmd, target, navigate in [
+        ("decoy_flag", stripe_page, "js.stripe.com", fill, "#cardnumber", None),
+        ("decoy_arrow", stripe_page, None, fill, "url=js.stripe.com >>> #cardnumber", None),
+        ("navigated_flag", navigated_page, "js.stripe.com", fill, "#cardnumber", None),
+        ("honest_fill", honest_page, "#card", fill, "#cardnumber", None),
+        # the frame navigates (new loaderId, same URL) after the route was resolved
+        ("changed_fill_sel", honest_page, "#card", fill, "#cardnumber", "card"),
+        ("changed_fill_index", honest_page, "0", fill, "#cardnumber", "card"),
+        ("changed_fill_url", honest_page, "inner.html", fill, "#cardnumber", "card"),
+        ("changed_fill_arrow", honest_page, None, fill, "#card >>> #cardnumber", "card"),
+        ("changed_smart_fill", honest_page, "0", lambda t: mod.cmd_smart_fill(t, CARD_NUMBER),
+         "Card number", "card"),
+        ("changed_smart_select", honest_page, None, lambda t: mod.cmd_smart_select(t, CARD_NUMBER),
+         "#card >>> Card number", "card"),
+    ]:
+        async def body(b, flag=flag, run_cmd=run_cmd, target=target, navigate=navigate):
+            b.tree_local_only = True
+            fired = []
+            real_gpw = mod.get_page_ws
+
+            def gpw(*a, **k):  # the first page lookup after the route was resolved: navigate
+                if navigate and not fired and mod._FRAME_ROUTE.get() is not None:
+                    fired.append(True)
+                    b.frames[navigate].loader += "-2"
+                return real_gpw(*a, **k)
+            mod.get_page_ws = gpw
+            mod._FRAME_FLAG = flag
+            try:
+                res = await call(run_cmd, target)
+            finally:
+                mod._FRAME_FLAG = None
+                mod.get_page_ws = real_gpw
+            return {"res": res, "value_in": value_frames(b, CARD_NUMBER), "navigated": bool(fired),
+                    "input": [m["method"] for m in b.log if m["method"].startswith("Input.")],
+                    "attached": list(b.attached), "open_sessions": sorted(b.sessions)}
+        _, res, stdout, err = run(mod, page(), body)
+        res.update({"stdout": stdout, "stderr": err})
+        out[key] = res
+    return out
 
 
 def scenario_literal(mod):
@@ -1877,6 +1968,7 @@ def scenario_framehop_isolated(mod):
 SCENARIOS = {
     "commands": scenario_commands,
     "routing": scenario_routing,
+    "frame_identity": scenario_frame_identity,
     "literal": scenario_literal,
     "pool_restore": scenario_pool_restore,
     "smart_order": scenario_smart_order,
