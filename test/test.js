@@ -773,6 +773,72 @@ test('captcha commands are in NO_CONTROL_CMDS (no glow interference)', () => {
   assert(m[1].includes("'captcha-wait'"), 'captcha-wait should bypass control wrapper');
 });
 
+test('captcha-solve: page-chosen image URL is fetched only from public http(s) hosts, redirects re-checked, 2 MiB cap', () => {
+  const { spawnSync } = require('child_process');
+  const script = `
+import importlib.util, socket, threading, http.server, sys
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(path.join(__dirname, '..', 'src', 'cdpilot.py'))})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+def refused(url):
+    try:
+        mod._captcha_fetch_page_image_sync(url, timeout=3)
+    except ValueError:
+        return True
+    except Exception as e:
+        print("unexpected", type(e).__name__, e); return False
+    return False
+
+for u in ["file:///etc/hosts", "ftp://example.com/x.png", "data:image/png;base64,AAAA",
+          "http://127.0.0.1/x.png", "http://10.0.0.1/x.png", "http://169.254.169.254/latest/meta-data/",
+          "http://[::1]/x.png", "http://0.0.0.0/x.png", "http://192.168.1.1/x.png", "http://[::ffff:127.0.0.1]/x.png"]:
+    assert refused(u), "must refuse " + u
+
+# public-looking host through a stubbed resolver (no network)
+real = socket.getaddrinfo
+def fake(host, port, *a, **k):
+    if host == "img.example.test":
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+    if host == "mixed.example.test":
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+    return real(host, port, *a, **k)
+socket.getaddrinfo = fake
+assert mod._captcha_img_url_ok("https://img.example.test/c.png")
+assert not mod._captcha_img_url_ok("https://mixed.example.test/c.png"), "every resolved address must be checked"
+socket.getaddrinfo = real
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path == "/redir":
+            self.send_response(302); self.send_header("Location", "http://127.0.0.1:1/secret"); self.end_headers()
+        elif self.path == "/big":
+            self.send_response(200); self.end_headers(); self.wfile.write(b"x" * (3 * 1024 * 1024))
+        else:
+            self.send_response(200); self.end_headers(); self.wfile.write(b"IMG")
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+port = srv.server_address[1]
+orig = mod._captcha_img_host_ok
+# loopback allowed ONLY for the test server itself; everything else keeps the real check
+mod._captcha_img_host_ok = lambda h, p: True if (h, p) == ("127.0.0.1", port) else orig(h, p)
+base = "http://127.0.0.1:%d" % port
+assert mod._captcha_fetch_page_image_sync(base + "/ok") == b"IMG"
+assert refused(base + "/redir"), "redirect to loopback must fail closed"
+assert refused(base + "/big"), "body over 2 MiB must be refused"
+srv.shutdown()
+
+import asyncio
+assert asyncio.run(mod._fetch_image_bytes("ws://x", "file:///etc/hosts")) is None
+assert mod._captcha_safe_origin("http://a.example/p/q?token=1") == "http://a.example"
+print("OK")
+`;
+  const r = spawnSync('/opt/homebrew/bin/python3.13', ['-c', script], { encoding: 'utf-8', timeout: 30000 });
+  assert.strictEqual(r.status, 0, (r.stdout || '') + (r.stderr || ''));
+  assert(r.stdout.includes('OK'), r.stdout);
+});
+
 // ── captcha-solve (Amazon classic + provider abstraction) ──
 
 test('captcha-solve: cmd_captcha_solve defined + dispatched', () => {
@@ -3148,6 +3214,47 @@ test('test runner: trace bundle format — meta.json + steps.jsonl referenced', 
   const binContent = fs.readFileSync(path.join(__dirname, '..', 'bin', 'cdpilot.js'), 'utf-8');
   assert(binContent.includes('meta.json'), 'Should write meta.json');
   assert(binContent.includes('steps.jsonl'), 'Should write steps.jsonl');
+});
+
+test('test runner: trace dirs 0700, trace files 0600, typed values redacted in steps.jsonl', () => {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-trace-sec-'));
+  try {
+    const spec = path.join(tmp, 'secret.cdpt.js');
+    fs.writeFileSync(spec, "test('typed', async (t) => { t.fill('#pw', 'hunter2-SECRET'); });\n");
+    const traceDir = path.join(tmp, 'traces', 'run1');
+    const r = spawnSync('sh', ['-c', `umask 000; exec node "${CLI}" --internal-test-runner "${spec}" --trace-dir="${traceDir}"`], {
+      encoding: 'utf-8', timeout: 30000,
+      env: { ...process.env, CDP_PORT: '19587', CDPILOT_NO_AUTOLAUNCH: '1', CDPILOT_HOME: path.join(tmp, 'home') },
+    });
+    const mode = (p) => (fs.statSync(p).mode & 0o777).toString(8);
+    assert.strictEqual(mode(traceDir), '700', 'trace dir mode ' + mode(traceDir));
+    assert.strictEqual(mode(path.join(traceDir, 'screenshots')), '700');
+    assert.strictEqual(mode(path.join(traceDir, 'a11y')), '700');
+    assert.strictEqual(mode(path.join(traceDir, 'meta.json')), '600');
+    assert.strictEqual(mode(path.join(traceDir, 'steps.jsonl')), '600');
+    const steps = fs.readFileSync(path.join(traceDir, 'steps.jsonl'), 'utf-8');
+    const all = steps + fs.readFileSync(path.join(traceDir, 'meta.json'), 'utf-8') + (r.stdout || '');
+    assert(!all.includes('hunter2-SECRET'), 'typed value leaked into trace/output');
+    assert(steps.includes('fill #pw «redacted:14 chars»'), steps);
+  } finally {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
+  }
+});
+
+test('test runner: trace viewer renders step.action with textContent, not innerHTML', () => {
+  const m = PY_CONTENT.match(/TRACE_VIEWER_HTML = """([\s\S]*?)"""/);
+  assert(m, 'TRACE_VIEWER_HTML should exist');
+  assert(!/s\.action[^;\n]*\+|innerHTML[^\n]*s\.action/.test(m[1]), 'step.action must not be concatenated into HTML');
+  assert(/act\.textContent = s\.action/.test(m[1]), 'step.action should be set via textContent');
+});
+
+test('launch: new Chrome profile directories are created private (0700)', () => {
+  assert(!/os\.makedirs\((PROFILE_DIR|profile_dir), exist_ok=True\)/.test(PY_CONTENT),
+    'profile dirs must not use bare os.makedirs');
+  assert(/_makedirs_private\(PROFILE_DIR\)/.test(PY_CONTENT) && /_makedirs_private\(profile_dir\)/.test(PY_CONTENT),
+    'profile dirs should use _makedirs_private');
 });
 
 test('test runner: trace clean handles d/h/m suffixes', () => {

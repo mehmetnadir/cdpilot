@@ -14,6 +14,9 @@ All notable changes to cdpilot will be documented in this file.
 - **Cookie auto-save matches cookie domains on a dot boundary.** A cookie for `ank.com` is no longer saved for `bank.com`.
 - **`blog regenerate` validates the slug and keeps the post on failure.** A slug that is not lowercase kebab-case exits 2; the old post is moved aside and restored if publishing fails.
 - **MCP `browser_screenshot_diff` reads only inside the screenshot folder.** Paths outside it return an error; the CLI command still accepts any path.
+- **`captcha-solve` no longer fetches whatever image URL the page names.** The Amazon captcha image is downloaded only over http or https from public addresses (loopback, private, link-local and reserved addresses are refused, every redirect is checked again) and is capped at 2 MiB; a refused fetch reports `image_fetch_failed` with only the scheme and host.
+- **Test traces are private and no longer store typed values.** Trace folders are created 0700 and their files 0600; `fill`/`type` values are recorded as `redacted:N chars`, and the trace viewer shows step text as plain text.
+- **New Chrome profile folders are created 0700.**
 
 ### Changed
 - **`blog publish` / `blog regenerate` read their output folder from `CDPILOT_BLOG_DIR`.** The folder was a hard-coded maintainer path; without the variable both commands now exit 2 with a message and write nothing. `day-NNN` sources are looked up in `CDPILOT_BLOG_PLAN_DIR` (default: the current directory). Maintainer notes, social-media drafts and the X bot are no longer in the repository.
