@@ -342,9 +342,15 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
 
   Hosts compare case-insensitively, as the browser reports them (an IDN host
   in punycode). The first matching frame in page order is used. A bare
-  `--frame` value is tried as a CSS selector and an iframe `name`/`id` before
-  URL text, and the page sets those too: for a card or sign-in frame write
-  `--frame url=js.stripe.com`.
+  `--frame` value that names a host (`js.stripe.com`, `stripe.com/v3`,
+  `https://…`) is URL text first: a frame on that host wins over a CSS
+  selector or iframe `name`/`id` match, which the page sets
+  (`<iframe id="js.stripe.com">`). Only when no frame's URL matches is it
+  tried as a selector, then a `name`/`id`, so `--frame iframe.card` still
+  works; that fallback can still pick a frame the page made while the real
+  one is missing, so for a card or sign-in frame write
+  `--frame url=js.stripe.com`. Other bare values (`#card`, `card-frame`) are
+  a selector, then a `name`/`id`, then URL text.
   `>>>` inside quotes or `[...]` is literal. A selector that matches an
   element *wrapping* an iframe (Stripe's `#card-element`) enters the iframe
   inside it and says so on stderr:

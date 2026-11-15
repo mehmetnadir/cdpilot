@@ -6013,6 +6013,21 @@ print(json.dumps([_frame_url_text_match(u, v) for u, v in json.load(sys.stdin)])
     cases.forEach((c, i) => assert.strictEqual(got[i], c[1], `${JSON.stringify(c[0])}`));
   });
 
+  test('frames: a --frame value that names a host is URL text first (selectors with # [ space never are)', () => {
+    const src = 'import re as _re\n' + pyFuncs(['_frame_url_text_names_host']) + `
+import json, sys
+print(json.dumps([_frame_url_text_names_host(v) for v in json.load(sys.stdin)]))
+`;
+    const cases = [
+      ['js.stripe.com', true], ['stripe.com/v3', true], ['https://js.stripe.com/v3', true],
+      ['127.0.0.1:8762', true], ['iframe.card', true], ['#card', false], ['iframe#card', false],
+      ['card-frame', false], ['/pay.html', false], ['localhost:8762', false], ['0', false],
+      ["iframe[title='a.b']", false], ['div.box > iframe', false], ['js.stripe.com?x', false],
+    ];
+    const got = pyCases(src, cases);
+    cases.forEach((c, i) => assert.strictEqual(got[i], c[1], c[0]));
+  });
+
   test('frames: rewrite sends Runtime/DOM into the frame and maps mouse x/y by the frame scale and offset', () => {
     const src = extractPyFunc(PY_CONTENT, '_frame_route_rewrite');
     assert(src, '_frame_route_rewrite must be extractable');
@@ -6153,6 +6168,30 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.deepStrictEqual(q.res, ['exit', 1], 'decoys alone: no frame matches');
     assert.deepStrictEqual(q.value_in, [], 'nothing typed anywhere');
     assert(/^Error: no iframe matches 'js\.stripe\.com' in top document/.test(q.stderr), q.stderr);
+  });
+
+  test('frames (fake CDP): live frame identity — a host-shaped --frame value matches by URL before a page-set id, name or selector', () => {
+    // The page sets ids, names and elements: <iframe id="js.stripe.com"> and a
+    // <js class="stripe com"> wrapper (the CSS selector js.stripe.com) around an <iframe>.
+    const r = fake('frame_identity');
+    for (const key of ['attr_decoy_flag', 'attr_id_flag']) {
+      const a = r[key];
+      assert.deepStrictEqual(a.res, ['ok', null], `${key}: ${a.stderr}`);
+      assert.deepStrictEqual(a.value_in, ['card'], `${key}: the frame on that host wins`);
+      assert.strictEqual(a.stderr, '', `${key}: no wrapper note, the decoy was not used`);
+      assert.deepStrictEqual(a.open_sessions, [], key);
+    }
+    const s = r.dotted_selector_flag;
+    assert.deepStrictEqual(s.res, ['ok', null], s.stderr);
+    assert.deepStrictEqual(s.value_in, ['card'], 'no host is iframe.card: still a selector');
+    assert.strictEqual(s.stderr, '');
+    // Residual (README: prefer url=): with no frame on that host the old order still applies,
+    // selector (a wrapper) first, then name/id.
+    const w = r.attr_decoy_only;
+    assert.deepStrictEqual(w.value_in, ['wrapdecoy'], 'no js.stripe.com frame: the selector match');
+    assert.strictEqual(w.stderr,
+      "note: 'js.stripe.com' is not an iframe; using the iframe inside it\n");
+    assert.deepStrictEqual(r.attr_id_only.value_in, ['iddecoy'], 'then the iframe id');
   });
 
   test('frames (fake CDP): live frame identity — an input step refuses (exit 2) when the routed frame changed after it was resolved', () => {
