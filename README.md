@@ -318,13 +318,33 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
 - Works for `click`, `fill`, `type`, `submit`, `hover`, `dblclick`, `rightclick`,
   `smart-click`, `smart-fill`, `smart-select` and `frame list|eval|shadow`.
 - A frame hop is a CSS selector, a 0-based index, a `name`/`id`, or
-  `url=<URL substring>`. `--frame` also takes a bare URL substring.
+  `url=<URL text>`. `--frame` also takes bare URL text.
   URL text is matched against each frame's current URL as the browser
   reports it (`Page.getFrameTree`; an out-of-process frame's own target),
   never against the `src` attribute, which the page sets: a `srcdoc` frame,
-  or a frame that navigated elsewhere, does not match by its `src`. The
-  first matching frame in page order is used. The text may appear anywhere
-  in the URL, query string included.
+  or a frame that navigated elsewhere, does not match by its `src`. Only
+  `http`/`https` frames match (never `about:`, `data:`, `blob:`,
+  `javascript:` or `srcdoc` frames), and the query string and `#fragment`
+  are never part of the match: the page sets those too, so a same-origin
+  `<iframe src="/pixel?js.stripe.com">` or `about:blank#js.stripe.com` placed
+  before the card frame does not match `js.stripe.com`.
+  - A host (it has a dot and no `/`: `js.stripe.com`, `127.0.0.1:8762`)
+    matches the frame's host or a subdomain of it: `stripe.com` matches
+    `js.stripe.com`, not `evilstripe.com` or `stripe.com.evil.test`. A port,
+    when given, must match too.
+  - A host and a path (`stripe.com/v3`): that host rule, and the frame's
+    path starts with `/v3`. `https://js.stripe.com/v3`: that scheme, host
+    and port exactly, and the path starts with `/v3`.
+  - Anything else (`/checkout/embed`, `localhost:8762`) matches as a
+    substring of `scheme://host[:port]/path`. A frame the page made can match
+    such text, so name a card or sign-in frame by its host. A file name is a
+    path: `url=/card.html` (`url=card.html` is read as a host).
+
+  Hosts compare case-insensitively, as the browser reports them (an IDN host
+  in punycode). The first matching frame in page order is used. A bare
+  `--frame` value is tried as a CSS selector and an iframe `name`/`id` before
+  URL text, and the page sets those too: for a card or sign-in frame write
+  `--frame url=js.stripe.com`.
   `>>>` inside quotes or `[...]` is literal. A selector that matches an
   element *wrapping* an iframe (Stripe's `#card-element`) enters the iframe
   inside it and says so on stderr:
@@ -341,6 +361,11 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
   or was replaced in between, the command exits 2 and types nothing:
   `Error: frame 'iframe#card' is no longer the document it was resolved to
   (it navigated or was replaced); nothing was typed`.
+- Inside a frame, `fill` and `type` set the value in one step, also with
+  `--entropy=on` or when adaptive mode turned humanized typing on for the
+  site: key events go wherever focus is, and a script of the page around the
+  frame could focus its own field between keys. stderr says so:
+  `note: humanized typing (--entropy) is off inside a frame: the value is set in one step …`.
 - **Shadow DOM support**: `>>>` hops also pierce open shadow roots (`host.shadowRoot.querySelector(next)`).
   Chains mix freely with iframes: `cdpilot click "iframe#pay >>> my-card >>> button.inner"` or
   `cdpilot click "my-app >>> my-panel >>> input"`. A closed shadow root is unreachable by design
