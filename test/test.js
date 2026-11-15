@@ -2572,9 +2572,11 @@ print(json.dumps(out))
   let res = null;
   function get() {
     if (!res) {
+      // PYTHONIOENCODING: the harness reads the payloads with json.load(sys.stdin), and a
+      // Windows pipe decodes with the ANSI code page (U+2028 arrived as "â€¨").
       res = JSON.parse(execFileSync(PYB, ['-c', PYSRC, PY_PATH], {
         input: JSON.stringify(PAYLOADS), encoding: 'utf-8', timeout: 60000,
-        env: { ...process.env, CDPILOT_LOG: '0',
+        env: { ...process.env, CDPILOT_LOG: '0', PYTHONIOENCODING: 'utf-8',
                CDPILOT_HOME: fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-jsinj-')) },
       }).trim().split('\n').pop());
     }
@@ -3819,11 +3821,13 @@ test('test runner: trace dirs 0700, trace files 0600, typed values redacted in s
       env: { ...process.env, CDP_PORT: '19587', CDPILOT_NO_AUTOLAUNCH: '1', CDPILOT_HOME: path.join(tmp, 'home') },
     });
     const mode = (p) => (fs.statSync(p).mode & 0o777).toString(8);
-    assert.strictEqual(mode(traceDir), '700', 'trace dir mode ' + mode(traceDir));
-    assert.strictEqual(mode(path.join(traceDir, 'screenshots')), '700');
-    assert.strictEqual(mode(path.join(traceDir, 'a11y')), '700');
-    assert.strictEqual(mode(path.join(traceDir, 'meta.json')), '600');
-    assert.strictEqual(mode(path.join(traceDir, 'steps.jsonl')), '600');
+    if (process.platform !== 'win32') {  // Windows has no POSIX modes (Node reports 666)
+      assert.strictEqual(mode(traceDir), '700', 'trace dir mode ' + mode(traceDir));
+      assert.strictEqual(mode(path.join(traceDir, 'screenshots')), '700');
+      assert.strictEqual(mode(path.join(traceDir, 'a11y')), '700');
+      assert.strictEqual(mode(path.join(traceDir, 'meta.json')), '600');
+      assert.strictEqual(mode(path.join(traceDir, 'steps.jsonl')), '600');
+    }
     const steps = fs.readFileSync(path.join(traceDir, 'steps.jsonl'), 'utf-8');
     const all = steps + fs.readFileSync(path.join(traceDir, 'meta.json'), 'utf-8') + (r.stdout || '');
     assert(!all.includes('hunter2-SECRET'), 'typed value leaked into trace/output');
@@ -4079,7 +4083,7 @@ print(json.dumps([f(c) for c in cases]))
 print(f('http://proxy:8080'), f('proxy:8080'), repr(f('')))
 print(m._proxy_launch_line('user:SECRET@proxy:8080'))
 `);
-  const lines = r.stdout.trim().split('\n');
+  const lines = r.stdout.trim().split(/\r?\n/);  // Windows text-mode stdout ends lines with \r\n
   const out = JSON.parse(lines[0]);
   for (const o of out) {
     assert(!/SECRET|SE#|SE\/|SE\?|CRET|user|ss@|:p@|u:p/.test(o.replace('***:***@', '')), `leak: ${o}`);
@@ -16977,7 +16981,10 @@ def no_browser(*_a, **_k):  # the control wrapper swallows it; the command runs 
 mod.get_page_ws = no_browser
 warm = mod.MCPServer.__new__(mod.MCPServer)
 marked = dict(os.environ, CDPILOT_MCP_SESSION="1", CDPILOT_MCP_TOOL_CALL="1")
-res = {k: list(mod.MCPServer._run_warm(warm, argv, e)) for k, argv, e in [
+# None: the call runs fresh by rule (on Windows always: the warm path is POSIX-only) and the
+# caller spawns a process.
+res = {k: (lambda ran: None if ran is None else list(ran))(mod.MCPServer._run_warm(warm, argv, e))
+       for k, argv, e in [
     ("go", ["go", "file:///etc/hosts"], marked),
     ("act", ["agent", "act", "--url=file:///etc/hosts"], marked),
     ("plain", ["go", "file:///etc/hosts"], dict(os.environ))]}
@@ -16989,10 +16996,18 @@ print(json.dumps({"argv": out, "warm": res}))
            CDPILOT_HOME: fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-mcpargv-')) } });
   assert.strictEqual(r.status, 0, r.stderr);
   const { argv: o, warm } = JSON.parse(r.stdout.trim().split('\n').pop());
-  for (const k of ['go', 'act']) {
-    assert(warm[k][0] === 2 && warm[k][2].includes('refused: MCP tools open only'), `warm ${k}: ${JSON.stringify(warm[k])}`);
+  if (process.platform === 'win32') {
+    // No warm path on Windows: _run_warm hands every call to a fresh process, where the
+    // destination rule is covered by 'mcp url gate at the destination (fake browser)'.
+    assert.deepStrictEqual(warm, { go: null, act: null, plain: null }, `win32 warm: ${JSON.stringify(warm)}`);
+  } else {
+    for (const k of ['go', 'act']) {
+      assert(warm[k] && warm[k][0] === 2 && warm[k][2].includes('refused: MCP tools open only'),
+        `warm ${k}: ${JSON.stringify(warm[k])}`);
+    }
+    assert(warm.plain && !warm.plain[2].includes('refused: MCP'),
+      `warm without the marker: ${JSON.stringify(warm.plain)}`);
   }
-  assert(!warm.plain[2].includes('refused: MCP'), `warm without the marker: ${JSON.stringify(warm.plain)}`);
   const acts = o.slice(0, 5);
   acts.forEach((c, i) => {
     assert.strictEqual(c.parsed.url, null, `${JSON.stringify(cases[i][1])} became a url: ${JSON.stringify(c.argv)}`);
