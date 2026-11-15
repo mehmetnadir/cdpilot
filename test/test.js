@@ -5941,11 +5941,14 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
         `http://127.0.0.1:${p1}/top.html?child=${encodeURIComponent(child)}`]) {
         c('go', url);
         c('agent', 'reset');
-        // top.html: [0] hidden-frame, [1] iframe#card (below the fold; inner.html, OOPIF with ?child=)
+        // top.html has one iframe: [0] iframe#card (below the fold; inner.html, OOPIF with ?child=)
         let fr = null;
+        let last = null;
         for (let i = 0; i < 20 && !(fr && fr.actions && fr.actions.some((a) => a.name === 'Card number')); i++) {
-          fr = JSON.parse(c('agent', 'observe', '--frame', '1').stdout || '{}');
+          last = c('agent', 'observe', '--frame', '0');
+          fr = JSON.parse(last.stdout || '{}');
         }
+        if (!fr.actions) fr.stderr = last && last.stderr;
         const field = (fr.actions || []).find((a) => a.name === 'Card number' && a.role === 'textbox');
         assert(field, `iframe#card lists the card field (${url}): ${JSON.stringify(fr)}`);
         const r = c('agent', 'act', '--ref', field.ref, '--action', 'fill', '--text', '4242 4242');
