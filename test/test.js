@@ -1497,6 +1497,13 @@ acts = mod._snapshot_to_actions([node("textbox", "Password", 1, "hunter2"), node
                                  node("textbox", "One-time code", 3, "123456"), node("textbox", "Password", 4, "")], state)
 vals = {a["name"] + str(a["backend_node_id"]): a.get("value") for a in acts}
 assert vals == {"Password1": "«masked»", "Keyword2": "cdpilot", "One-time code3": "«masked»", "Password4": ""}, vals
+# a value typed by agent run from --var or the environment is masked in a field with any name
+mod._AGENT_TYPED_SECRETS.add("tok-9f3a7c21")
+acts = mod._snapshot_to_actions([node("textbox", "Code", 5, "tok-9f3a7c21"), node("textbox", "Key", 6, "pre-tok-9f3a7c21-post"),
+                                 node("textbox", "Search", 7, "cdpilot"), node("textbox", "Password", 8, "hunter2")], {"actions_map": {}, "ref_counter": 0})
+vals = {a["name"]: a.get("value") for a in acts}
+assert vals == {"Code": "«masked»", "Key": "«masked»", "Search": "cdpilot", "Password": "«masked»"}, vals
+mod._AGENT_TYPED_SECRETS.clear()
 print("ok")
 `;
   const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
@@ -3755,6 +3762,33 @@ test('v0.7.0: _proxy_redact masks credentials in URL', () => {
   const m = PY_CONTENT.match(/def _proxy_redact[\s\S]{0,1000}?(?=\ndef )/);
   assert(m, '_proxy_redact body required');
   assert(/\*\*\*/.test(m[0]), 'must replace credentials with ***');
+});
+
+test('proxy: launch output never carries proxy credentials (pool and CHROME_PROXY)', () => {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-proxyleak-'));
+  const url = 'http://u:SECRETDUMMY@127.0.0.1:1';
+  const base = { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0', CDPILOT_NO_AUTOLAUNCH: '1' };
+  delete base.CHROME_PROXY;
+  const py = process.platform === 'win32' ? 'python' : 'python3';
+  for (const args of [['proxy', 'add', 'leak', url], ['proxy', 'use', 'leak']]) {
+    const r = spawnSync(py, ['-I', PY_PATH, ...args], { encoding: 'utf8', timeout: 30000, env: base });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  }
+  const script = `
+import importlib.util
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+print(mod._proxy_launch_line(mod.get_proxy_config()))
+`;
+  for (const extra of [{}, { CHROME_PROXY: url }]) {
+    const r = spawnSync(py, ['-I', '-c', script], { encoding: 'utf8', timeout: 30000, env: { ...base, ...extra } });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert(!r.stdout.includes('SECRETDUMMY'), `credentials leaked: ${r.stdout}`);
+    assert(r.stdout.includes('***:***@127.0.0.1:1'), r.stdout);
+  }
+  assert(/print\(_proxy_launch_line\(proxy\)\)/.test(PY_CONTENT), 'cmd_launch must print through the redacting helper');
 });
 
 test('v0.7.0: cmd_proxy supports add/remove/use/list/show subcommands', () => {
@@ -11140,6 +11174,39 @@ print("ok %.1f" % best)
       ok(['agent', 'flow', 'delete', 'acts_only']);
       assert.strictEqual(cli(['agent', 'run', 'inbox_triage'], env).status, 2);
       assert(!('known_flows' in JSON.parse(ok(['agent', 'observe']).stdout)));
+    } finally { fake.stop(); }
+  });
+
+  test('learned flows (fake browser): agent run masks every typed --var value in the drift output and agent-state.json, whatever the field is named', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const flowPath = path.join(home, 'projects', 'proj', 'flows', 'mask_run.json');
+      const statePath = path.join(home, 'projects', 'proj', 'agent-state.json');
+      fs.mkdirSync(path.dirname(flowPath), { recursive: true });
+      const dummy = 'tok-4f9a1c7e5b2d';   // token-shaped, typed into "Search" (a name the secret-field rule does not match)
+      const rec = { host: 'user.example', origin: 'https://user.example' };
+      fs.writeFileSync(flowPath, JSON.stringify({
+        version: 1, name: 'mask_run', host: 'user.example', vars: { q: { step: 2 }, password: { step: 3 } },
+        steps: [
+          { n: 1, kind: 'go', url: 'https://user.example/inbox' },
+          { n: 2, kind: 'act', action: 'fill', anchor: { role: 'textbox', name: 'Search', nth: 0 }, text: '{{q}}', before: rec, after: { host: 'user.example' } },
+          { n: 3, kind: 'act', action: 'fill', anchor: { role: 'textbox', name: 'Password', nth: 0 }, text: '{{password}}', before: rec, after: { host: 'user.example' } },
+          { n: 4, kind: 'act', action: 'click', anchor: { role: 'button', name: 'No such button', nth: 0 }, before: rec, after: { host: 'user.example' } },
+        ],
+      }));
+      const r = cli(['agent', 'run', 'mask_run', '--var', `q=${dummy}`, '--var', 'password=hunter2-pw'], env);
+      assert.strictEqual(r.status, 4, `drift exit ${r.status}: ${r.stdout}${r.stderr}`);
+      const d = JSON.parse(r.stdout);
+      assert(d.status === 'drift' && d.step === 4, r.stdout);
+      assert(!r.stdout.includes(dummy) && !r.stdout.includes('hunter2-pw'), `typed value in drift output: ${r.stdout}`);
+      const state = fs.readFileSync(statePath, 'utf-8');
+      assert(!state.includes(dummy) && !state.includes('hunter2-pw'), 'typed value in agent-state.json');
+      const search = d.actions.find((a) => a.name === 'Search');
+      const pwd = d.actions.find((a) => a.name === 'Password');
+      assert(search && pwd, JSON.stringify(d.actions));
     } finally { fake.stop(); }
   });
 

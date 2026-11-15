@@ -7,6 +7,8 @@ All notable changes to cdpilot will be documented in this file.
 ### Security
 - **Files with page content or cookies are owner-only.** A new `CDPILOT_HOME` (and the directories created under it) is 0700; an existing directory keeps its mode. `watch` creates its folders 0700 and writes screencast frames 0600. `cookies save <file>` writes the export 0600.
 - **Default outputs in `/tmp` cannot be pre-seeded by another local user.** `shot`, `shot --annotate`, `pdf`, `debug` and `describe` outputs (and the MCP `browser_screenshot`) are opened without following a symlink, as 0600 for a new file. If the output path is a symlink or a file you do not own, the command stops with an error instead of writing. The default paths are unchanged, and overwriting your own earlier file still works.
+- **`launch` no longer prints proxy credentials.** The `Proxy:` line masks the user name and password of a pool or `CHROME_PROXY` value (the browser still gets the full URL). The MCP `browser_launch` result carried that line to the model.
+- **`agent run` masks every value it types from `--var` or `CDPILOT_VAR_*`.** A field with an ordinary name ("Code", "Key") no longer shows the typed secret in drift output, run output or `agent-state.json`; the descriptor value becomes the same masked marker as in secret-named fields.
 
 ### Changed
 - **`blog publish` / `blog regenerate` read their output folder from `CDPILOT_BLOG_DIR`.** The folder was a hard-coded maintainer path; without the variable both commands now exit 2 with a message and write nothing. `day-NNN` sources are looked up in `CDPILOT_BLOG_PLAN_DIR` (default: the current directory). Maintainer notes, social-media drafts and the X bot are no longer in the repository.
