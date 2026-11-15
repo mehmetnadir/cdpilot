@@ -834,7 +834,78 @@ assert asyncio.run(mod._fetch_image_bytes("ws://x", "file:///etc/hosts")) is Non
 assert mod._captcha_safe_origin("http://a.example/p/q?token=1") == "http://a.example"
 print("OK")
 `;
-  const r = spawnSync('/opt/homebrew/bin/python3.13', ['-c', script], { encoding: 'utf-8', timeout: 30000 });
+  const r = spawnSync(process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3'),
+    ['-c', script], { encoding: 'utf-8', timeout: 30000 });
+  assert.strictEqual(r.status, 0, (r.stdout || '') + (r.stderr || ''));
+  assert(r.stdout.includes('OK'), r.stdout);
+});
+
+test('captcha-solve: image fetch checks the address it actually connected to (DNS rebinding), every hop, before TLS', () => {
+  const { spawnSync } = require('child_process');
+  const script = `
+import importlib.util, socket, threading, http.server
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+def server(redirect_to=None):
+    hits = []
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            hits.append(self.path)
+            if redirect_to:
+                self.send_response(302); self.send_header("Location", redirect_to()); self.end_headers()
+            else:
+                self.send_response(200); self.end_headers(); self.wfile.write(b"IMG")
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1], hits
+
+# TTL-0 rebinding (no network): a name's first answer is public, every later one is loopback
+real = socket.getaddrinfo
+seen = set()
+def rebinding(host, port, *a, **k):
+    if isinstance(host, str) and host.endswith(".rebind.test"):
+        ip = "127.0.0.1" if host in seen else "93.184.216.34"
+        seen.add(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+    return real(host, port, *a, **k)
+socket.getaddrinfo = rebinding
+
+def outcome(url):
+    try:
+        return mod._captcha_fetch_page_image_sync(url, timeout=3)
+    except ValueError:
+        return "refused"
+    except Exception as e:
+        return "error %s: %s" % (type(e).__name__, e)
+
+target, tport, thits = server()
+# 1) the name check sees a public address, the connection lands on loopback: no request is sent
+r = outcome("http://a.rebind.test:%d/x" % tport)
+assert r == "refused" and thits == [], ("first hop", r, thits)
+# 2) https: refused after the TCP connect, before the TLS handshake (a plain-HTTP server would fail TLS)
+r = outcome("https://b.rebind.test:%d/x" % tport)
+assert r == "refused" and thits == [], ("https", r, thits)
+# 3) a later hop: the first hop is an allowed server, its redirect target rebinds to loopback
+hop, hport, hhits = server(lambda: "http://c.rebind.test:%d/secret" % tport)
+orig = mod._captcha_img_host_ok
+mod._captcha_img_host_ok = lambda h, p: True if (h, p) == ("127.0.0.1", hport) else orig(h, p)
+r = outcome("http://127.0.0.1:%d/hop" % hport)
+assert r == "refused" and hhits == ["/hop"] and thits == [], ("redirect hop", r, hhits, thits)
+# 4) env/system proxies are not used for this fetch (the peer would be the proxy)
+import os
+for k in ("no_proxy", "NO_PROXY"):
+    os.environ.pop(k, None)
+os.environ["http_proxy"] = os.environ["HTTP_PROXY"] = "http://127.0.0.1:%d" % tport
+target2, t2port, t2hits = server()
+mod._captcha_img_host_ok = lambda h, p: True if (h, p) == ("127.0.0.1", t2port) else orig(h, p)
+r = outcome("http://127.0.0.1:%d/direct" % t2port)
+assert r == b"IMG" and t2hits == ["/direct"] and thits == [], ("proxy", r, t2hits, thits)
+print("OK")
+`;
+  const py = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const r = spawnSync(py, ['-c', script], { encoding: 'utf-8', timeout: 30000 });
   assert.strictEqual(r.status, 0, (r.stdout || '') + (r.stderr || ''));
   assert(r.stdout.includes('OK'), r.stdout);
 });
@@ -3895,7 +3966,8 @@ print([f('bank.com', 'ank.com'), f('bank.com', '.bank.com'), f('www.bank.com', '
        f('bank.com', 'bank.com'), f('bank.com', '')])
 `;
   const home = secHome();
-  const r = require('child_process').spawnSync('python3', ['-c', py],
+  const r = require('child_process').spawnSync(
+    process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3'), ['-c', py],
     { encoding: 'utf-8', env: secEnv(home) });
   assert.strictEqual(r.stdout.trim(), '[False, True, True, True, False]', r.stdout + r.stderr);
 });

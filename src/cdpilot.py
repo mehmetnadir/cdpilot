@@ -12771,11 +12771,41 @@ def _captcha_safe_origin(url: str) -> str:
 def _captcha_fetch_page_image_sync(url: str, timeout: int = 15,
                                    max_bytes: int = _CAPTCHA_IMG_MAX_BYTES) -> bytes:
     """Fetch an image URL chosen by the PAGE: http/https only, public hosts only
-    (every redirect hop re-checked), body capped. Raises ValueError on refusal."""
+    (every redirect hop re-checked), body capped. Raises ValueError on refusal.
+
+    The name check before each hop is a fast path. The connect resolves the name
+    again, and a TTL-0 answer can change in between (DNS rebinding), so the address
+    actually connected to is checked too, right after the TCP connect and before any
+    byte is sent. urllib opens a new connection for every hop. Env/system proxies
+    are not used: through a proxy the peer is the proxy, not the image host."""
+    import http.client as _hc
     import urllib.request as _ureq
 
     if not _captcha_img_url_ok(url):
         raise ValueError('url_refused')
+
+    class _PeerChecked(_hc.HTTPConnection):
+        def connect(self):
+            super().connect()
+            peer = self.sock.getpeername()
+            # numeric address: getaddrinfo does no lookup, same rule as the name check
+            if not _captcha_img_host_ok(peer[0], peer[1]):
+                self.sock.close()
+                self.sock = None
+                raise ValueError('peer_refused')
+
+    # MRO: _PeerCheckedTLS -> HTTPSConnection -> _PeerChecked -> HTTPConnection, so
+    # HTTPSConnection.connect()'s super().connect() runs the check before the TLS handshake.
+    class _PeerCheckedTLS(_hc.HTTPSConnection, _PeerChecked):
+        pass
+
+    class _Http(_ureq.HTTPHandler):
+        def do_open(self, http_class, req, **kw):
+            return super().do_open(_PeerChecked, req, **kw)
+
+    class _Https(_ureq.HTTPSHandler):
+        def do_open(self, http_class, req, **kw):
+            return super().do_open(_PeerCheckedTLS, req, **kw)
 
     class _Guard(_ureq.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -12783,7 +12813,7 @@ def _captcha_fetch_page_image_sync(url: str, timeout: int = 15,
                 raise ValueError('redirect_refused')
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-    opener = _ureq.build_opener(_Guard)
+    opener = _ureq.build_opener(_ureq.ProxyHandler({}), _Http, _Https, _Guard)
     with opener.open(_ureq.Request(url), timeout=timeout) as resp:
         body = resp.read(max_bytes + 1)
     if len(body) > max_bytes:
