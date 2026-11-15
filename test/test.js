@@ -2191,6 +2191,158 @@ test('--ladder flag plumbed through click dispatch', () => {
   assert(m, "click dispatch must extract --ladder= flag and pass to cmd_click");
 });
 
+// ── JS injection: a flow / MCP / frame string stays data in the page script ──
+// Fake CDP captures the generated Runtime.evaluate expression; node's vm runs it
+// against a stub document. Each payload tries to leave a JS string literal
+// (' " \ </script> newline ${} `) and call pwn().
+(function () {
+  const { execFileSync } = require('child_process');
+  const vm = require('vm');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const PAYLOADS = [
+    `[a="'+pwn()+'"]`, '"+pwn()+"', "\\'+pwn()+'", '\\"+pwn()+"',
+    '</script><script>pwn()</script>', "a\n'+pwn()+'\nb", '${pwn()}`+pwn()+`', "a\u2028'+pwn()+'",
+  ];
+  const PYSRC = String.raw`
+import asyncio, contextlib, importlib.util, io, json, sys, types
+sys.modules["websockets"] = types.ModuleType("websockets")
+spec = importlib.util.spec_from_file_location("cdpilot_jsinj", sys.argv[1])
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+mod.get_page_ws = lambda *a, **k: ("ws://fake/devtools/page/1", {})
+mod.cdp_get = lambda *a, **k: []
+sent = []
+async def fake_send(ws, msgs, *a, **k):
+    for m in msgs:
+        if len(m) > 2 and isinstance(m[2], dict) and "expression" in m[2]:
+            sent.append(m[2]["expression"])
+    return {msgs[0][0]: {"result": {"value": False}}}
+mod.cdp_send = fake_send
+def run(coro):
+    sent.clear()
+    o = io.StringIO()
+    with contextlib.redirect_stdout(o), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            asyncio.run(coro)
+        except SystemExit:
+            pass
+    return list(sent), o.getvalue()
+def smart(x):
+    async def fake_smart(ws, js, *a, **k):
+        return json.dumps({"found": True, "x": x, "y": 3, "tag": "a", "text": "t", "score": 100})
+    mod._smart_eval = fake_smart
+    return run(mod.cmd_smart_click("t"))
+calls = []
+def mcp(args):
+    global srv
+    if "srv" not in globals():
+        srv = mod.MCPServer("all")  # sets IS_MCP_SESSION: only after the command runs
+        srv._run_warm = lambda cli_args, env: (calls.append(list(cli_args)), (0, "ok", ""))[1]
+    calls.clear()
+    srv._execute_tool(1, "browser_extract", args)
+    return calls[-1] if calls else None
+out = {"count": [], "ladder": [], "extract": [], "smart": [], "move": []}
+for p in json.load(sys.stdin):
+    out["count"].append(run(mod.cmd_assert_count(p, 2))[0])
+    out["ladder"].append(run(mod._resolve_selector_ladder("ws://fake", p, ["stable-attr"]))[0])
+    out["extract"].append(run(mod.cmd_extract("a", "attrs=" + p + ",href"))[0])
+    out["smart"].append(smart(p))
+    out["move"].append(run(mod._vfx_move_cursor("ws://fake", p, 7))[0])
+out["smart_num"] = smart(10.5)
+out["mcp"] = {f: mcp({"selector": "a", "format": f}) for f in
+              ["json", "list", "text", "attrs=x", "attrs=\"+pwn()+\"", "--attrs=href", "csv"]}
+out["mcp"]["none"] = mcp({"selector": "a"})
+print(json.dumps(out))
+`;
+  let res = null;
+  function get() {
+    if (!res) {
+      res = JSON.parse(execFileSync(PYB, ['-c', PYSRC, PY_PATH], {
+        input: JSON.stringify(PAYLOADS), encoding: 'utf-8', timeout: 60000,
+        env: { ...process.env, CDPILOT_LOG: '0',
+               CDPILOT_HOME: fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-jsinj-')) },
+      }).trim().split('\n').pop());
+    }
+    return res;
+  }
+  // Compile (a SyntaxError means the payload broke the literal) and run in a fresh context.
+  function runJs(js, env) {
+    const box = Object.assign({ pwned: 0 }, env);
+    box.pwn = () => { box.pwned++; return ''; };
+    box.window = box;
+    vm.createContext(box);
+    const value = new vm.Script(js).runInContext(box, { timeout: 2000 });
+    return { value, pwned: box.pwned };
+  }
+
+  test('js-injection: assert-count keeps the selector as data in its PASS/FAIL message', () => {
+    get().count.forEach((js, i) => {
+      const p = PAYLOADS[i];
+      for (const n of [2, 3]) {
+        const seen = [];
+        const r = runJs(js, { document: { querySelectorAll: (s) => { seen.push(s); return { length: n }; } } });
+        assert.strictEqual(r.pwned, 0, `payload ${JSON.stringify(p)} ran code`);
+        assert.strictEqual(seen[0], p, 'querySelectorAll gets the selector as written');
+        assert.strictEqual(r.value, n === 2 ? `PASS: Found 2 element(s) matching "${p}" (expected 2)`
+          : `FAIL: Expected 2 "${p}" but found 3`);
+      }
+    });
+  });
+
+  test('js-injection: selector ladder stable-attr passes the value as one CSS string, never JS source', () => {
+    get().ladder.forEach((exprs, i) => {
+      const p = PAYLOADS[i];
+      assert.strictEqual(exprs.length, 4, 'data-testid, data-cy, name, id');
+      exprs.forEach((js, j) => {
+        const seen = [];
+        const r = runJs(js, { document: { querySelector: (s) => { seen.push(s); return null; } } });
+        assert.strictEqual(r.pwned, 0, `payload ${JSON.stringify(p)} ran code`);
+        assert.strictEqual(r.value, false);
+        const attr = ['data-testid', 'data-cy', 'name', 'id'][j];
+        assert.strictEqual(seen[0], `[${attr}="${p.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`);
+      });
+    });
+  });
+
+  test('js-injection: extract --attrs= names stay data (keys and getAttribute arguments)', () => {
+    get().extract.forEach((js, i) => {
+      const p = PAYLOADS[i];
+      const asked = [];
+      const el = { getAttribute: (n) => { asked.push(n); return 'v:' + n; } };
+      const r = runJs(js, { document: { querySelectorAll: () => [el] } });
+      assert.strictEqual(r.pwned, 0, `payload ${JSON.stringify(p)} ran code`);
+      assert.deepStrictEqual(asked, [p, 'href']);
+      assert.deepStrictEqual(JSON.parse(r.value), [{ [p]: 'v:' + p, href: 'v:href' }]);
+    });
+  });
+
+  test('js-injection: MCP browser_extract passes only the schema formats (json, list) to the CLI', () => {
+    const m = get().mcp;
+    assert.deepStrictEqual(m.json, ['extract', 'a', '--json']);
+    assert.deepStrictEqual(m.list, ['extract', 'a', '--list']);
+    for (const k of ['text', 'attrs=x', 'attrs="+pwn()+"', '--attrs=href', 'csv', 'none']) {
+      assert.deepStrictEqual(m[k], ['extract', 'a'], `format ${k}`);
+    }
+  });
+
+  test('js-injection: smart-click / visual cursor take numbers only (a frame-reported x is never JS source)', () => {
+    const g = get();
+    g.smart.forEach(([exprs, out], i) => {
+      const p = PAYLOADS[i];
+      assert.deepStrictEqual(exprs, [], `payload ${JSON.stringify(p)}: no visual-feedback script`);
+      assert(out.includes('Clicked: A "t" (score:100)'), out);
+    });
+    g.move.forEach((exprs) => assert.deepStrictEqual(exprs, []));
+    const [exprs, out] = g.smart_num;
+    assert.strictEqual(exprs.length, 1, 'numbers still draw the ripple');
+    const calls = [];
+    const vfx = { moveCursor: (x, y) => calls.push(['m', x, y]), ripple: (x, y) => calls.push(['r', x, y]) };
+    const r = runJs(exprs[0], { __cdpilot_vfx: vfx });
+    assert.strictEqual(r.pwned, 0);
+    assert.deepStrictEqual(calls, [['m', 10.5, 3], ['r', 10.5, 3]]);
+    assert(out.includes('Clicked: A "t"'), out);
+  });
+})();
+
 // ── Behavioral Entropy ──
 
 test('ENTROPY_CONFIG_FILE is declared alongside other config files', () => {
