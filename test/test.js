@@ -5321,7 +5321,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     const f = r.frame_not_found_sanitize;
     assert.deepStrictEqual(f.res, ['exit', 1]);
     assert(/no iframe matches 'missing_frame'/.test(f.stderr), 'reports no iframe matches');
-    assert(!f.stderr.includes('\U000e0041'), 'stripped tag characters');
+    assert(!f.stderr.includes('\u{E0041}') && !f.stderr.includes('\u{E0042}'), `stripped tag characters: ${JSON.stringify(f.stderr)}`);
     const m = f.stderr.match(/\[0\] ([^;\)]+)/);
     assert(m && m[1].length <= 60, `frame label in error must be at most 60 chars, got ${m ? m[1].length : 0}`);
   });

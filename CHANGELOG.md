@@ -6,7 +6,7 @@ All notable changes to cdpilot will be documented in this file.
 
 ### Fixed
 - **`frame list` numbers `<frame>` elements too**, as `--frame <i>` does, so a listed index is the one `--frame` resolves (iframe-only pages print the same list as before).
-- **Frame-not-found error message sanitizes iframe id and name.** The list of available frames in the `no iframe matches` error message truncates `id` and `name` strings to 60 characters and strips invisible and tag characters.
+- **Frame-not-found error message sanitizes iframe id and name.** The list of available frames in the `no iframe matches` error message strips Unicode tag characters (and the other hidden characters agent output removes) from `id` and `name` and cuts them to 60 characters.
 
 ### Security
 - **The first hop of every `--frame` / `>>>` route and `frame list` resolves in an isolated world.** The iframe index and selector lookup now evaluates `_FRAME_OWNER_JS` and `_FRAME_LIST_JS` in cdpilot's isolated world (`Page.createIsolatedWorld`, matching the `frames` hint), protecting against pages that monkey-patch `document.querySelectorAll` to point to a different frame. If isolated world creation fails, resolution falls back to the main world.
