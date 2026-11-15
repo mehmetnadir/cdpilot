@@ -126,6 +126,17 @@ def handle_ws(conn, path, headers, bound_port):
                     reply = {"id": mid, "result": {"result": {"type": "string", "value": val}}}
                 else:
                     reply = {"id": mid, "result": {"result": {"type": "string", "value": "ok"}}}
+            elif method == "Page.getLayoutMetrics":
+                dpr = float(os.environ.get("FAKE_DPR", "1"))
+                reply = {
+                    "id": mid,
+                    "result": {
+                        "contentSize": {"x": 0, "y": 0, "width": 800 * dpr, "height": 600 * dpr},
+                        "cssContentSize": {"x": 0, "y": 0, "width": 800, "height": 600},
+                        "cssLayoutViewport": {"pageX": 0, "pageY": 0, "clientWidth": 800, "clientHeight": 600},
+                        "cssVisualViewport": {"pageX": 0, "pageY": 0, "clientWidth": 800, "clientHeight": 600},
+                    },
+                }
             elif method == "Page.captureScreenshot":
                 reply = {"id": mid, "result": {"data": base64.b64encode(png_header(*shot_size(p))).decode()}}
             elif method == "Target.getTargets":

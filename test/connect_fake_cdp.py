@@ -466,6 +466,10 @@ def answer(msg, path):
                                       for x in PAGES if listed(x, targets=True)]}
     elif method == "Page.getFrameTree":
         result = {"frameTree": {"frame": {"id": "F1", "url": "https://user.example/inbox"}}}
+    elif method == "Page.createIsolatedWorld":
+        if os.environ.get("FAKE_CDP_ISO_ERROR") == "1":
+            return {"id": msg.get("id"), "error": {"code": -32000, "message": "isolated world error"}}, events
+        result = {"executionContextId": 999}
     elif method == "DOM.getDocument":
         result = {"root": {"nodeId": 1, "backendNodeId": 1}}
     elif method == "DOMSnapshot.captureSnapshot" and os.environ.get("FAKE_CDP_SNAPSHOT") == "error":
@@ -580,6 +584,15 @@ def handle_ws(conn, path, headers):
         entry = {"ws": path, "method": msg.get("method"), "t": round(time.monotonic() * 1000, 1)}
         # What an injection would carry, by the markers in cdpilot's scripts.
         params = msg.get("params") or {}
+        if "contextId" in params:
+            entry["contextId"] = params["contextId"]
+        if msg.get("method") == "Page.createIsolatedWorld":
+            if "worldName" in params:
+                entry["worldName"] = params["worldName"]
+            if "frameId" in params:
+                entry["frameId"] = params["frameId"]
+        if "cdpilot-agent-frames" in (params.get("expression") or ""):
+            entry["frames_probe"] = True
         text = str(params.get("expression") or "") + str(params.get("source") or "")
         tags = [tag for tag, marker in (("glow", "cdpilot-glow-overlay"),
                                         ("input-blocker", "overlay.id = 'cdpilot-input-blocker'"),

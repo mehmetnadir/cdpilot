@@ -7,6 +7,9 @@ All notable changes to cdpilot will be documented in this file.
 ### Fixed
 - **MCP `browser_agent_find` searches a text that starts with `--`.** The text was passed as a plain CLI word, so `--max 5` or `--rows` was read as a flag and dropped (usage error, or every entry of the role). The tool now passes it after `--`, and `agent find -- <text>` takes the word after `--` as the text (jury note, 0.9.9).
 
+### Security
+- **Two page reads no longer run in the page's own JavaScript.** The `agent observe` iframe probe (`frames`: cover, blocking) runs in cdpilot's isolated world (`Page.createIsolatedWorld`), so a page that replaces `getBoundingClientRect` or `elementFromPoint` cannot hide a covering iframe or invent one; the screenshot's CSS-pixel scale and viewport come from `Page.getLayoutMetrics` instead of `devicePixelRatio` / `scrollX` / `innerWidth`. An `element` crop still reads the element's box in the page (jury note, 0.9.9).
+
 ## [0.9.9] - 2026-11-15
 
 ### Added

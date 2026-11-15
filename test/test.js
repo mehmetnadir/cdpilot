@@ -8483,7 +8483,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     try {
       const home = mkHome();
       writeRegistry(home, { proj: externalEntry(fake.port) });
-      return fn(isoEnv(home, fake.port, 'proj'));
+      return fn(isoEnv(home, fake.port, 'proj'), fake);
     } finally { fake.stop(); }
   };
 
@@ -8643,6 +8643,35 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
       assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
       const d = JSON.parse(cli(['agent', 'observe', '--diff'], env).stdout);
       assert(d.frames && /--frame 2/.test(d.frames_hint), JSON.stringify(d));
+    });
+  });
+
+  test('agent observe (fake browser): frames probe runs in isolated world with contextId', () => {
+    const frames = [{ i: 0, origin: 'https://test.example', w: 300, h: 200, cover: 0.1, blocking: true }];
+    withFake({ FAKE_CDP_FRAMES: JSON.stringify(frames) }, (env, fake) => {
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const snap = JSON.parse(cli(['agent', 'observe'], env).stdout);
+      assert.strictEqual(snap.frames.length, 1);
+
+      const entries = fake.entries();
+      const isoWorld = entries.find((e) => e.method === 'Page.createIsolatedWorld');
+      assert(isoWorld, 'Page.createIsolatedWorld must be called for frames probe');
+      assert.strictEqual(isoWorld.worldName, 'cdpilot');
+      assert.strictEqual(isoWorld.frameId, 'F1');
+
+      const probeEval = entries.find((e) => e.method === 'Runtime.evaluate' && e.frames_probe);
+      assert(probeEval, 'frames probe Runtime.evaluate must be sent');
+      assert.strictEqual(probeEval.contextId, 999, 'frames probe must carry isolated world contextId');
+    });
+  });
+
+  test('agent observe (fake browser): frames probe returns empty when isolated world fails', () => {
+    const frames = [{ i: 0, origin: 'https://test.example', w: 300, h: 200, cover: 0.1, blocking: true }];
+    withFake({ FAKE_CDP_FRAMES: JSON.stringify(frames), FAKE_CDP_ISO_ERROR: '1' }, (env) => {
+      assert.strictEqual(cli(['agent', 'act', '--url', 'https://user.example/inbox'], env).status, 0);
+      const snap = JSON.parse(cli(['agent', 'observe'], env).stdout);
+      assert.strictEqual(snap.frames, undefined, 'frames must be absent/empty when isolated world fails');
+      assert.strictEqual(snap.frames_hint, undefined);
     });
   });
 
@@ -18350,6 +18379,11 @@ print("OK")
       assert.strictEqual(r.status, 0, r.stderr || r.stdout);
 
       const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const evalDpr = logs.find((l) => l.method === 'Runtime.evaluate' && (l.params.expression || '').includes('devicePixelRatio'));
+      assert.strictEqual(evalDpr, undefined, 'CSS mode must not query devicePixelRatio via Runtime.evaluate');
+      const metricsCall = logs.find((l) => l.method === 'Page.getLayoutMetrics');
+      assert(metricsCall, 'CSS mode must query Page.getLayoutMetrics');
+
       const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
       assert(shotCall, 'Page.captureScreenshot must be called');
       assert.strictEqual(shotCall.params.format, 'png');
@@ -18364,6 +18398,11 @@ print("OK")
       assert.strictEqual(r.status, 0, r.stderr || r.stdout);
 
       const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const evalDpr = logs.find((l) => l.method === 'Runtime.evaluate' && (l.params.expression || '').includes('devicePixelRatio'));
+      assert.strictEqual(evalDpr, undefined, 'CSS mode must not query devicePixelRatio via Runtime.evaluate');
+      const metricsCall = logs.find((l) => l.method === 'Page.getLayoutMetrics');
+      assert(metricsCall, 'CSS mode must query Page.getLayoutMetrics');
+
       const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
       assert(shotCall, 'Page.captureScreenshot must be called');
       assert(shotCall.params.clip, 'DPR 2 must have clip parameter');
@@ -18382,6 +18421,11 @@ print("OK")
       assert.strictEqual(r.status, 0, r.stderr || r.stdout);
 
       const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const evalDpr = logs.find((l) => l.method === 'Runtime.evaluate' && (l.params.expression || '').includes('devicePixelRatio'));
+      assert.strictEqual(evalDpr, undefined, 'device mode must not query devicePixelRatio via Runtime.evaluate');
+      const metricsCall = logs.find((l) => l.method === 'Page.getLayoutMetrics');
+      assert.strictEqual(metricsCall, undefined, 'device mode must not query Page.getLayoutMetrics');
+
       const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
       assert(shotCall, 'Page.captureScreenshot must be called');
       assert.strictEqual(shotCall.params.clip, undefined, '--hidpi must not have clip scale');
@@ -18395,6 +18439,11 @@ print("OK")
       assert.strictEqual(r.status, 0, r.stderr || r.stdout);
 
       const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const evalDpr = logs.find((l) => l.method === 'Runtime.evaluate' && (l.params.expression || '').includes('devicePixelRatio'));
+      assert.strictEqual(evalDpr, undefined, 'device mode must not query devicePixelRatio via Runtime.evaluate');
+      const metricsCall = logs.find((l) => l.method === 'Page.getLayoutMetrics');
+      assert.strictEqual(metricsCall, undefined, 'device mode must not query Page.getLayoutMetrics');
+
       const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
       assert(shotCall, 'Page.captureScreenshot must be called');
       assert.strictEqual(shotCall.params.clip, undefined, 'CDPILOT_SHOT_SCALE=device must not have clip scale');
