@@ -3614,10 +3614,13 @@ def _create_session_window():
             _save_sessions(sessions)
         return target_id
 
-    # Check existing tabs — reuse if already open
+    # Check existing tabs — reuse if already open, but never an environment-value
+    # run's tab (a project marker names it, live run or not): a new tab instead
     tabs = cdp_get("/json")
     if tabs:
-        pages = [t for t in tabs if t.get("type") == "page" and not _is_canvas_page(t)]
+        run_tabs = _env_run_marker_tabs()
+        pages = [t for t in tabs if t.get("type") == "page" and not _is_canvas_page(t)
+                 and t.get("id") not in run_tabs]
         if pages:
             # A page is already open, no need to create a new tab
             target_id = pages[0].get("id")
@@ -3858,6 +3861,9 @@ def get_page_ws(prefer_url=None):
     needs to address the just-created tab without polluting the CWD-keyed
     session state (which would be a race condition between concurrent calls).
     """
+    # A run that typed an environment value and died before its finally (a
+    # timeout, a kill) left its tab open: close it first (2026-11-15 review).
+    _env_run_sweep()
     tabs = get_tabs()
     pages = [t for t in tabs if t.get("type") == "page"]
 
@@ -3952,7 +3958,10 @@ def get_page_ws(prefer_url=None):
               "your tabs were left untouched.", file=sys.stderr)
         sys.exit(1)
 
-    # Fallback: use any available page
+    # Fallback: use any available page, never an environment-value run's tab
+    # (a project marker names it: its field may hold the typed value)
+    run_tabs = _env_run_marker_tabs()
+    pages = [p for p in pages if p.get("id") not in run_tabs]
     if pages:
         if prefer_url:
             for p in pages:
@@ -20305,31 +20314,111 @@ async def cmd_agent_flow_delete(name):
 # it returns. A page that tab opens (openerId) refuses the value; a live watch
 # daemon refuses the run, and `watch start` refuses while one is active (marker).
 ENV_RUN_MARKER_PREFIX = 'env-run-'
+# This process's environment-value run: its marker path, start time and tab id,
+# set by _env_run_begin (the tab as soon as it exists), cleared by _env_run_end.
+# The --timeout watchdog reads it: os._exit skips the finally that closes the tab.
+_ENV_RUN_LIVE = {}
+ENV_TAB_EXIT_CLOSE_S = 5.0  # the watchdog's budget for closing that tab
 
 
 def _env_run_marker_dir():
     return os.path.join(CDPILOT_HOME, 'projects', PROJECT_ID or _get_project_id())
 
 
-def _env_run_active():
-    """Pid of a live environment-value run of this project (its marker), or
-    None. A marker whose process is gone is stale and ignored."""
+def _env_run_markers():
+    """(path, data) of every environment-value run marker of this project."""
     d = _env_run_marker_dir()
     try:
         names = sorted(os.listdir(d))
     except OSError:
-        return None
+        return []
+    out = []
     for n in names:
         if not (n.startswith(ENV_RUN_MARKER_PREFIX) and n.endswith('.json')):
             continue
         try:
             with open(os.path.join(d, n)) as f:
-                pid = json.load(f).get('pid')
-        except (OSError, ValueError, AttributeError):
+                data = json.load(f)
+        except (OSError, ValueError):
             continue
-        if _pid_alive(pid):
-            return int(pid)
+        if isinstance(data, dict):
+            out.append((os.path.join(d, n), data))
+    return out
+
+
+def _env_run_active():
+    """Pid of a live environment-value run of this project (its marker), or
+    None. A marker whose process is gone is stale and ignored."""
+    for _path, data in _env_run_markers():
+        if _pid_alive(data.get('pid')):
+            return int(data['pid'])
     return None
+
+
+def _env_run_marker_tabs():
+    """Ids of the tabs the project's markers name, live run or not: never a
+    session tab or a fallback page (_create_session_window, get_page_ws)."""
+    return {d['tab'] for _p, d in _env_run_markers() if isinstance(d.get('tab'), str) and d['tab']}
+
+
+def _env_run_record_tab(tid):
+    """Record the run's tab in this process's live state and its marker (0600)
+    as soon as the tab exists; None once it is confirmed closed."""
+    _ENV_RUN_LIVE['tab'] = tid
+    path = _ENV_RUN_LIVE.get('marker')
+    if not path:
+        return
+    data = {'pid': os.getpid(), 'started': _ENV_RUN_LIVE.get('started')}
+    if tid:
+        data['tab'] = tid
+    try:
+        _atomic_write_json(path, data)
+    except OSError:
+        pass
+
+
+def _env_run_sweep():
+    """Close the tab of every marker of this project whose run is gone (killed
+    by a timeout or a signal before its finally), then remove the marker. A
+    live run's marker is never touched; a tab not confirmed closed keeps its
+    marker for the next sweep. In a connected browser only a tab cdpilot opened
+    there (_external_own_tabs) is closed."""
+    for path, data in _env_run_markers():
+        if _pid_alive(data.get('pid')):
+            continue
+        tid = data.get('tab')
+        if isinstance(tid, str) and tid and not (_is_external() and tid not in _external_own_tabs()):
+            if not _env_tab_close(tid, _env_tab_popups(tid) or ()):
+                continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _env_run_close_on_exit(budget_s=ENV_TAB_EXIT_CLOSE_S):
+    """For the --timeout watchdog, whose os._exit skips the finally that runs
+    _env_run_end: close this process's run tab (and the pages it opened) and
+    remove the marker once the tab is gone. Bounded by budget_s; a tab not
+    confirmed closed keeps its marker, so the next command closes it."""
+    tab, marker = _ENV_RUN_LIVE.get('tab'), _ENV_RUN_LIVE.get('marker')
+    if not (tab or marker):
+        return
+
+    def _close():
+        closed = True
+        if tab:
+            popups = _env_tab_popups(tab)
+            closed = _env_tab_close(tab, popups or ())
+        if closed and marker:
+            try:
+                os.remove(marker)
+            except OSError:
+                pass
+
+    worker = threading.Thread(target=_close, daemon=True)
+    worker.start()
+    worker.join(budget_s)
 
 
 def _env_tab_popups(tid):
@@ -20352,14 +20441,27 @@ def _env_tab_popups(tid):
 
 
 def _env_tab_close(tid, popups=()):
-    """Close the run's tab, and the pages it opened, by id on the browser socket."""
-    for t in list(popups) + [tid]:
-        _browser_ws_call('Target.closeTarget', {'targetId': t}, timeout=5)
-    if _is_external():
+    """Close the run's tab, and the pages it opened, by id on the browser socket,
+    then check with Target.getTargets that the tab is gone (one retry). True
+    when it is; False when the browser still lists it or does not answer."""
+    gone = False
+    for _attempt in range(2):
+        for t in list(popups) + [tid]:
+            _browser_ws_call('Target.closeTarget', {'targetId': t}, timeout=5)
+        for i in range(8):  # a page closes asynchronously: give it a moment
+            infos = (_browser_ws_call('Target.getTargets', {}, timeout=5) or {}).get('targetInfos')
+            gone = isinstance(infos, list) and not any(x.get('targetId') == tid for x in infos)
+            if gone or not isinstance(infos, list):
+                break
+            time.sleep(0.05 + 0.05 * i)
+        if gone:
+            break
+    if gone and _is_external():
         guid, tabs = _external_tabs_load()
         if tid in tabs:
             _external_tabs_save(guid, tabs - {tid})
     cdp_cache_invalidate()
+    return gone
 
 
 def _env_tab_open():
@@ -20380,13 +20482,15 @@ def _env_tab_open():
             params['browserContextId'] = ctx  # a context of its own (context pool), not the default one
         tid = (_browser_ws_call('Target.createTarget', params) or {}).get('targetId')
         _mark_owned_tab(tid)
+    if tid:
+        _env_run_record_tab(tid)  # in the marker before anything else can fail
     for _ in range(30 if tid else 0):  # a CDPILOT_TARGET pin reads the /json listing (get_page_ws)
         if any(t.get('id') == tid for t in cdp_get('/json', no_cache=True) or []):
             cdp_cache_invalidate()
             return tid
         time.sleep(0.2)
-    if tid:
-        _env_tab_close(tid)
+    if tid and _env_tab_close(tid):
+        _env_run_record_tab(None)  # closed: _env_run_end has nothing left to close
     print(json.dumps({'error': "could not open a tab of the run's own for the environment value; nothing typed"}),
           file=sys.stderr)
     sys.exit(1)
@@ -20399,12 +20503,15 @@ def _env_run_begin(st):
     _env_run_end undoes; the caller runs _env_run_end in a finally."""
     st['pin'] = os.environ.get('CDPILOT_TARGET')
     path = os.path.join(_env_run_marker_dir(), f'{ENV_RUN_MARKER_PREFIX}{os.getpid()}.json')
+    started = int(time.time())
     try:
-        _atomic_write_json(path, {'pid': os.getpid(), 'started': int(time.time())})
+        _atomic_write_json(path, {'pid': os.getpid(), 'started': started})
     except OSError as e:
         print(json.dumps({'error': f'cannot write {path}: {e}; nothing typed'}), file=sys.stderr)
         sys.exit(1)
     st['marker'] = path
+    _ENV_RUN_LIVE.clear()
+    _ENV_RUN_LIVE.update(marker=path, started=started)
     watch = _watch_load_state()
     pid = watch.get('pid') if isinstance(watch, dict) else None
     if pid and _watch_pid_alive(pid):
@@ -20414,6 +20521,8 @@ def _env_run_begin(st):
               file=sys.stderr)
         sys.exit(2)
     st['tab'] = _env_tab_open()
+    if _ENV_RUN_LIVE.get('tab') != st['tab']:  # _env_tab_open records it as soon as it exists
+        _env_run_record_tab(st['tab'])
     os.environ['CDPILOT_TARGET'] = st['tab']
     cdp_cache_invalidate()
 
@@ -20433,20 +20542,36 @@ def _env_tab_popup_refusal(st):
 def _env_run_end(st):
     """After a run _env_run_begin started, success or failure: close its tab and
     every page that tab opened, undo the pin, remove the marker. Exit 2 when the
-    tab had opened a page the run did not already refuse for."""
-    popups = None
+    tab is not confirmed closed (its marker stays: the next command closes it,
+    _env_run_sweep), or when it had opened a page the run did not already
+    refuse for."""
+    popups, closed = None, True
+    # a tab _env_tab_open made but exited before returning (and could not confirm closed)
+    left = _ENV_RUN_LIVE.get('tab') if st.get('marker') and not st.get('tab') else None
     if st.get('tab'):
         popups = _env_tab_popups(st['tab'])
-        _env_tab_close(st['tab'], popups or ())
+        closed = _env_tab_close(st['tab'], popups or ())
         if st.get('pin') is None:
             os.environ.pop('CDPILOT_TARGET', None)
         else:
             os.environ['CDPILOT_TARGET'] = st['pin']
+    elif left:
+        closed = _env_tab_close(left)
+    tab = st.get('tab') or left
     if st.get('marker'):
+        _ENV_RUN_LIVE.clear()
+    if st.get('marker') and closed:
         try:
             os.remove(st['marker'])
         except OSError:
             pass
+    if not closed:
+        print(json.dumps({'error': f"the run's own tab {tab} is not confirmed closed (the browser still lists it "
+                                   'or did not answer); the typed environment value may still be in its field',
+                          'tab': tab, 'hint': f'close that tab (cdpilot close-tab {tab}); the next cdpilot command '
+                                              'in this project tries again'}),
+              file=sys.stderr)
+        sys.exit(2)
     if popups and not st.get('popups_refused'):
         print(json.dumps({'error': "the run's own tab opened another page while it ran; both are closed, but "
                                    'that page could have read the typed environment value',
@@ -20488,9 +20613,11 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
         return await _agent_run_flow(name, var_values=var_values, dry_run=dry_run, full=full, rows=rows,
                                      objects=objects, all_=all_, trust_flow=trust_flow, env_run=env_run)
     finally:
-        if env_run.get('tab'):
-            _agent_refs_forget()
-        _env_run_end(env_run)
+        try:
+            if env_run.get('tab'):
+                _agent_refs_forget()
+        finally:  # an exception there (agent-state.json not an object) must not leave the tab open
+            _env_run_end(env_run)
 
 
 async def _agent_run_flow(name, var_values=None, dry_run=False, full=False, rows=False, objects=False, all_=False,
@@ -23396,6 +23523,10 @@ class MCPServer:
             if fresh:  # a run in this process wrote its own line at its end (exit 130)
                 _slog_record_external(cli_args, TIMEOUT_EXIT_CODE, started, int((time.monotonic() - t0) * 1000),
                                       f"MCP tool call timed out ({self.TOOL_TIMEOUT_S}s); the command was killed", via)
+                try:  # the killed child skipped its finally: the tab of an environment-value run it began
+                    _env_run_sweep()
+                except Exception:
+                    pass
             return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Error: Command timed out ({self.TOOL_TIMEOUT_S}s)"}], "isError": True}}
         except Exception as e:
             _slog_record_external(cli_args, 1, started, int((time.monotonic() - t0) * 1000),
@@ -24532,6 +24663,34 @@ def _cmd_watch_daemon_entry():
             pass
 
 
+def _watch_refuse_late_env_run(proc):
+    """After `watch start` saved its daemon's pid: an environment-value run
+    writes its marker, then reads the watch state, so one that read it before
+    that pid was saved has its marker by now. If such a run is active, stop the
+    daemon just started (`proc`), drop its frames and state, exit 2 (at worst
+    both refuse; never both run)."""
+    run_pid = _env_run_active()
+    if not run_pid:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    fdir = _watch_frames_dir()
+    for name in (os.listdir(fdir) if os.path.isdir(fdir) else []):
+        if name.endswith('.jpg'):
+            try:
+                os.remove(os.path.join(fdir, name))
+            except OSError:
+                pass
+    _watch_clear_state()
+    print(json.dumps({'error': f'a run that types an environment value started in this project (pid {run_pid}); '
+                               'watch stopped and does not start while it types',
+                      'hint': 'start watch after that run ends'}), file=sys.stderr)
+    sys.exit(2)
+
+
 def cmd_watch_start(*args):
     """Start screencast capture in a background daemon.
 
@@ -24553,6 +24712,8 @@ def cmd_watch_start(*args):
         _mcp_url_gate("browser_watch_start", _url)
     # A replay / agent run typing a CDPILOT_VAR_* value in this project: no
     # screencast while it types (its marker, _env_run_begin; 2026-11-15 audit).
+    # A dead run's tab is closed first (_env_run_sweep), never filmed.
+    _env_run_sweep()
     run_pid = _env_run_active()
     if run_pid:
         print(json.dumps({'error': f'a run that types an environment value is active in this project (pid {run_pid}); '
@@ -24668,6 +24829,7 @@ def cmd_watch_start(*args):
     )
     state['pid'] = proc.pid
     _watch_save_state(state)
+    _watch_refuse_late_env_run(proc)
 
     # Wait briefly for the daemon to confirm screencast start
     confirmed = False
@@ -25131,6 +25293,10 @@ def _arm_timeout_watchdog(seconds, cmd):
             pass
         try:  # os._exit skips `finally`: an input blocker opened for a click
             _blocker_restore_on_exit()
+        except Exception:
+            pass
+        try:  # ... and the tab an environment-value run typed in (_env_run_end)
+            _env_run_close_on_exit()
         except Exception:
             pass
         try:  # os._exit skips atexit: write the session log line here
