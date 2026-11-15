@@ -128,8 +128,23 @@ def handle_ws(conn, path, headers, bound_port):
                     else:
                         reply = {"id": mid, "result": {"result": {"type": "number", "value": dpr}}}
                 elif "resolveSelector" in expr:
-                    val = json.dumps({"x": 100, "y": 200, "width": 200, "height": 200, "shadowHost": None})
-                    reply = {"id": mid, "result": {"result": {"type": "string", "value": val}}}
+                    # element crop: the page's main world may lie (FAKE_MAIN_RECT=1); cdpilot's isolated
+                    # world (contextId 77) sees the real rect; FAKE_NO_WORLD=1: the world is unusable;
+                    # missing / not found selector returns null
+                    if (
+                        os.environ.get("FAKE_NO_ELEM") == "1"
+                        or "missing" in expr.lower()
+                        or "notfound" in expr.lower()
+                        or "not-found" in expr.lower()
+                    ):
+                        reply = {"id": mid, "result": {"result": {"type": "object", "subtype": "null", "value": None}}}
+                    elif p.get("contextId") is not None and os.environ.get("FAKE_NO_WORLD") == "1":
+                        reply = {"id": mid, "error": {"code": -32000, "message": "Cannot find context"}}
+                    else:
+                        rect = {"x": 100, "y": 200, "width": 200, "height": 200, "shadowHost": None}
+                        if p.get("contextId") is None and os.environ.get("FAKE_MAIN_RECT") == "1":
+                            rect = {"x": 999, "y": 999, "width": 50, "height": 50, "shadowHost": None}
+                        reply = {"id": mid, "result": {"result": {"type": "string", "value": json.dumps(rect)}}}
                 else:
                     reply = {"id": mid, "result": {"result": {"type": "string", "value": "ok"}}}
             elif method == "Page.getLayoutMetrics":

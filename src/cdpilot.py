@@ -8042,8 +8042,22 @@ async def cmd_shot(output=None, quality=None, element=None, fmt=None, hidpi=Fals
           }});
         }})()
         """
-        cr = await cdp_send(ws, [(2, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
-        rect_str = cr.get(2, {}).get("result", {}).get("value")
+        try:
+            ctx = await _isolated_world(ws, "cdpilot")
+        except Exception:
+            ctx = None
+        rect_str = None
+        for c in ((ctx,) if ctx else ()) + (None,):
+            p_ev = {"expression": js, "returnByValue": True}
+            if c:
+                p_ev["contextId"] = c
+            try:
+                cr = await cdp_send(ws, [(2, "Runtime.evaluate", p_ev)])
+                rect_str = ((cr.get(2) or {}).get("result") or {}).get("value")
+            except Exception:
+                rect_str = None
+            if rect_str:
+                break
         if rect_str:
             rect = json.loads(rect_str)
             if rect.get("shadowHost"):

@@ -18837,6 +18837,75 @@ print("OK")
     });
   });
 
+  // Element crop tests (isolated world vs main world spoofing)
+  test('screenshot: fake CDP - element crop uses isolated world when main world lies (FAKE_MAIN_RECT=1)', () => {
+    runWithFakeCdp(1, { FAKE_MAIN_RECT: '1' }, ({ home, logFile, env }) => {
+      const outPng = path.join(home, 'crop_iso.png');
+      const r = spawnSync(process.execPath, [CLI, 'shot', outPng, '--element=#target'], {
+        env, encoding: 'utf-8', timeout: 10000,
+      });
+      assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+
+      const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const evalCrop = logs.filter(
+        (l) => l.method === 'Runtime.evaluate' && (l.params.expression || '').includes('resolveSelector')
+      );
+      assert(evalCrop.length >= 1, 'Crop expression must be evaluated');
+      assert.strictEqual(evalCrop[0].params.contextId, 77, 'Crop expression must run in isolated world (contextId 77)');
+
+      const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
+      assert(shotCall, 'Page.captureScreenshot must be called');
+      assert(shotCall.params.clip, 'Element crop must provide clip parameter');
+      assert.strictEqual(shotCall.params.clip.x, 100, 'Must use genuine rect.x (100), not spoofed (999)');
+      assert.strictEqual(shotCall.params.clip.y, 200, 'Must use genuine rect.y (200), not spoofed (999)');
+      assert.strictEqual(shotCall.params.clip.width, 200, 'Must use genuine rect.width (200), not spoofed (50)');
+      assert.strictEqual(shotCall.params.clip.height, 200, 'Must use genuine rect.height (200), not spoofed (50)');
+    });
+  });
+
+  test('screenshot: fake CDP - element crop falls back to main world when no isolated world', () => {
+    runWithFakeCdp(1, { FAKE_MAIN_RECT: '1', FAKE_NO_WORLD: '1' }, ({ home, logFile, env }) => {
+      const outPng = path.join(home, 'crop_fallback.png');
+      const r = spawnSync(process.execPath, [CLI, 'shot', outPng, '--element=#target'], {
+        env, encoding: 'utf-8', timeout: 10000,
+      });
+      assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+
+      const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const evalCrop = logs.filter(
+        (l) => l.method === 'Runtime.evaluate' && (l.params.expression || '').includes('resolveSelector')
+      );
+      assert.strictEqual(evalCrop.length, 2, 'Should attempt isolated world first, then fall back to main world');
+      assert.strictEqual(evalCrop[0].params.contextId, 77, 'First attempt must use isolated world (contextId 77)');
+      assert.strictEqual(evalCrop[1].params.contextId, undefined,
+        'Fallback attempt must use main world (no contextId)');
+
+      const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
+      assert(shotCall, 'Page.captureScreenshot must be called');
+      assert(shotCall.params.clip, 'Element crop must provide clip parameter');
+      assert.strictEqual(shotCall.params.clip.x, 999, 'Fallback uses main world rect.x');
+      assert.strictEqual(shotCall.params.clip.y, 999, 'Fallback uses main world rect.y');
+      assert.strictEqual(shotCall.params.clip.width, 50, 'Fallback uses main world rect.width');
+      assert.strictEqual(shotCall.params.clip.height, 50, 'Fallback uses main world rect.height');
+    });
+  });
+
+  test('screenshot: fake CDP - element crop missing selector falls back to full page', () => {
+    runWithFakeCdp(1, {}, ({ home, logFile, env }) => {
+      const outPng = path.join(home, 'crop_missing.png');
+      const r = spawnSync(process.execPath, [CLI, 'shot', outPng, '--element=#missing'], {
+        env, encoding: 'utf-8', timeout: 10000,
+      });
+      assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+      assert(r.stderr.includes('Element not found: #missing, taking full page'), `stderr must warn: ${r.stderr}`);
+
+      const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
+      assert(shotCall, 'Page.captureScreenshot must be called');
+      assert.strictEqual(shotCall.params.clip, undefined, 'Missing selector must take full page (no clip)');
+    });
+  });
+
   // 3. Çıktı satırı biçimi testi
   test('screenshot: output format preserves prefix and appends px and vision tokens', () => {
     runWithFakeCdp(2, {}, ({ home, env }) => {

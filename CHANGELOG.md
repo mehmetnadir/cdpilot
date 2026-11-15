@@ -2,6 +2,11 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Security
+- **Element bounding box for `shot --element=<selector>` is read in an isolated world.** A page that overrides `getBoundingClientRect`, `scrollX`, `scrollY`, or `scrollIntoView` can no longer tamper with element crop coordinates or detect automation through those methods; falls back to the main world if the isolated world cannot be created.
+
 ## [0.9.10] - 2026-11-15
 
 ### Added
