@@ -189,7 +189,7 @@ tools (navigate, click, fill, content, screenshot, eval, wait_for, assert, tabs,
 plus `browser_tools`. The agent calls `browser_tools` with `list` to see the other
 tools, or `enable` to add some (the server sends `tools/list_changed`). `--tools a,b,c`
 picks tools by name; `all` (default) is unchanged. Schema size of `tools/list`
-(tiktoken `o200k_base`, compact JSON, measured 15.11.2026 after the description diet): `all` = 50 tools = 5,422 tokens,
+(tiktoken `o200k_base`, compact JSON, measured 15.11.2026, after the `browser_connect` opt-in text): `all` = 50 tools = 5,422 tokens,
 of which the five `browser_agent_*` tools are 1,061; `core` = 11 tools = 1,076 tokens.
 The three `browser_canvas_*` tools are listed only while a live canvas is open (`cdpilot canvas open`), and never under `core`; `tools/list_changed` follows when the first canvas opens or the last one closes.
 
@@ -308,7 +308,7 @@ cdpilot click "iframe[title='Secure card payment'] >>> button#pay-btn"
 # Nested frames: outermost first
 cdpilot click "iframe.checkout >>> iframe.card >>> button"
 
-# --frame <selector|index|url-substring>, nestable with >>>
+# --frame <selector|index|name|url=text>, nestable with >>>
 cdpilot click --frame 0 "button.submit"                   # first iframe (same order as `frame list`)
 cdpilot fill  --frame "url=js.stripe.com" "input[name=cardnumber]" "4242424242424242"
 cdpilot frame list --frame "#card"                        # iframes inside that frame
@@ -1641,6 +1641,9 @@ print(result.stdout)
 | `CDPILOT_GO_FAST` | unset | `1` = `go` ends the settle 30 ms after a quiet load (no request in flight at the load event, none started within 30 ms) instead of 100 ms of event silence; off with `--network`, `--har`, `--console` and after a WebSocket |
 | `CDPILOT_AGENT_ORIGINS` | unset | Hosts an agent may navigate to (comma-separated, subdomains included, `host:port` for another port); a target outside gets `guard` `outside_origins` |
 | `CDPILOT_LOG` | `1` | `0` = do not write the session log (`cdpilot log`) |
+| `CDPILOT_MCP_ALLOW_FILE` | unset | `1` = MCP tools may also open `file:` URLs (default: http, https and about:blank only) |
+| `CDPILOT_MCP_ALLOW_CONNECT` | unset | `1` = MCP `browser_connect` may move the project to another browser (with `--auto`, your own logged-in browser) |
+| `CDPILOT_MCP_ALLOW_VARS` | unset | `1` = MCP flows may type `CDPILOT_VAR_*` values (the model could read a typed value back) |
 | `CDPILOT_LOG_DAYS` | `14` | Days of session log to keep; older day files are deleted on the first write of a day (`0` keeps all) |
 
 ## How It Works
@@ -1735,6 +1738,7 @@ Future paid offerings:
 - **Isolated browser profile** — cdpilot runs in `~/.cdpilot/profile`, separate from your daily browser. Your cookies, passwords, and history are never exposed.
 - **No arbitrary file access** — MCP screenshot filenames are sanitized and restricted to the screenshots directory. Path traversal is blocked.
 - **Safe CSS selectors** — All selectors passed to `querySelector` are JSON-escaped to prevent injection.
+- **No terminal escapes from pages** — on a terminal, page text (titles, console messages, extracted text, `run`/`replay` step output) shows control characters as `\x1b`-style text, so a page cannot move your cursor, rewrite earlier lines or set the window title; piped output is unchanged.
 - **No network exposure** — CDP listens on `127.0.0.1` only. Remote connections are not possible by default.
 - **One dependency** — zero npm packages; the Python side needs only `websockets`. A one-package supply chain is small enough to audit.
 

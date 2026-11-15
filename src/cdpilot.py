@@ -136,7 +136,7 @@ Exit codes: 0 ok, 1 error (batch / run: a step failed), 124 --timeout;
   4 agent run: drift (page observation on stdout).
 """
 
-__version__ = "0.9.12"
+__version__ = "0.9.13"
 
 import asyncio
 import struct
@@ -4584,12 +4584,12 @@ def _extract_frame_flag(args):
         if a == "--frame" or a.startswith("--frame="):
             if a == "--frame":
                 if i + 1 >= len(args):
-                    raise ValueError("--frame needs a value: <selector|index|url-substring>")
+                    raise ValueError("--frame needs a value: <selector|index|name|url=text>")
                 value, i = args[i + 1], i + 2
             else:
                 value, i = a.split("=", 1)[1], i + 1
             if not value.strip():
-                raise ValueError("--frame needs a value: <selector|index|url-substring>")
+                raise ValueError("--frame needs a value: <selector|index|name|url=text>")
             continue
         rest.append(a)
         i += 1
@@ -22179,7 +22179,7 @@ async def cmd_scroll_to(selector, entropy=None):
 async def cmd_frame(subcmd, *subcmd_args):
     """iframe and Shadow DOM access.
 
-    `list`, `eval` and `shadow` take `--frame <selector|index|url-substring>`
+    `list`, `eval` and `shadow` take `--frame <selector|index|name|url=text>`
     (nest with `>>>`): eval then runs in that frame's own page context (main
     world), same-origin or cross-origin; without it they act on the top page.
     """
@@ -31360,7 +31360,7 @@ def _cli_main():
     if cmd == 'open':
         cmd = 'go'
 
-    # `--frame <selector|index|url-substring>` runs an element command inside
+    # `--frame <selector|index|name|url=text>` runs an element command inside
     # an iframe; same as writing the selector as "<frame> >>> <selector>".
     if cmd in FRAME_AWARE_CMDS:
         try:

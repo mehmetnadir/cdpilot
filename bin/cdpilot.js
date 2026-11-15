@@ -841,7 +841,7 @@ function showHelp() {
     keys <combo>       Keyboard shortcut
     Inside an iframe:  click "iframe#card >>> input[name=cardnumber]"
                        (nest: "iframe.a >>> iframe.b >>> button") or
-                       --frame <selector|index|url-substring>; same-origin and
+                       --frame <selector|index|name|url=text>; same-origin and
                        cross-origin frames. With no match in the page,
                        smart-click searches all frames, smart-fill and
                        smart-select only frames of the page's origin.
