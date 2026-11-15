@@ -1578,6 +1578,80 @@ print("ok")
   assert(/^ok/m.test(r.stdout), r.stdout);
 });
 
+test('learned flows (unit): typed_nodes mask a typed --var value per document, bounded; a masked field\'s inner text leaves the snapshot; diff never prints it', () => {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-typednodes-'));
+  const script = `
+import importlib.util
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+def node(i, role, name, bid, value=None, kids=()):
+    n = {"nodeId": str(i), "ignored": False, "role": {"value": role}, "name": {"value": name}, "backendDOMNodeId": bid}
+    if value is not None:
+        n["value"] = {"value": value}
+    if kids:
+        n["childIds"] = [str(k) for k in kids]
+    return n
+# scope: the page's origin and the AX root (the document node); a record applies to its own document only
+page = [node(1, "RootWebArea", "Inbox", 900, kids=[2, 5, 7]), node(2, "textbox", "Code", 5, "tok-7f3a9c", kids=[3]),
+        node(3, "generic", "", 6, kids=[4]), node(4, "StaticText", "tok-7f3a9c", 7),
+        node(5, "textbox", "Subject", 8, "weekly", kids=[6]), node(6, "StaticText", "weekly", 9),
+        node(7, "combobox", "Card number", 10, "Visa", kids=[8]), node(8, "option", "Visa", 11)]
+scope = mod._agent_typed_scope("https://user.example/inbox?x=1", page)
+assert scope == ("https://user.example", 900), scope
+assert mod._agent_typed_scope("https://user.example/", page[1:]) == ("https://user.example", None)
+state = {"actions_map": {}, "ref_counter": 0}
+mod._agent_typed_add(state, [5], scope)
+assert state["typed_nodes"] == [{"origin": "https://user.example", "doc": 900, "bids": [5]}], state
+assert mod._agent_typed_bids(state, scope) == {5}
+assert mod._agent_typed_bids(state, ("https://user.example", 901)) == set()   # another document
+assert mod._agent_typed_bids(state, ("https://other.example", 900)) == set()  # another origin
+for bad in (5, "x", [5, {"origin": "https://user.example", "doc": 900, "bids": 7}]):   # a malformed file
+    assert mod._agent_typed_bids({"typed_nodes": bad}, scope) == set(), bad
+    mod._agent_typed_add({"typed_nodes": bad}, [5], scope)
+# bounded: AGENT_TYPED_MAX ids per document, AGENT_TYPED_DOCS documents, oldest dropped
+mod._agent_typed_add(state, list(range(100, 100 + mod.AGENT_TYPED_MAX + 5)), scope)
+assert len(mod._agent_typed_bids(state, scope)) == mod.AGENT_TYPED_MAX and 5 not in mod._agent_typed_bids(state, scope)
+for d in range(mod.AGENT_TYPED_DOCS):
+    mod._agent_typed_add(state, [1], ("https://user.example", 1000 + d))
+assert len(state["typed_nodes"]) == mod.AGENT_TYPED_DOCS and mod._agent_typed_bids(state, scope) == set(), state["typed_nodes"]
+# a typed node's value is masked whatever the field is named, its inner text (Chrome's inner editor)
+# leaves the snapshot, so it is no text-anchor entry and not in \`text\`; an unmasked field keeps it; an
+# option below a masked select stays
+typed = {5}
+kept = mod._agent_mask_inner(page, typed)
+assert [n["nodeId"] for n in kept] == ["1", "2", "5", "6", "7", "8"], [n["nodeId"] for n in kept]
+acts = mod._snapshot_to_actions(kept, {"actions_map": {}, "ref_counter": 0}, typed)
+vals = {a["name"]: a.get("value") for a in acts}
+assert vals["Code"] == "«masked»" and vals["Subject"] == "weekly" and vals["Card number"] == "«masked»", vals
+assert "tok-7f3a9c" not in repr(acts) and "Visa" in [a["name"] for a in acts], acts
+assert "tok-7f3a9c" not in mod._extract_text_summary(kept) and "weekly" in mod._extract_text_summary(kept)
+assert mod._agent_mask_inner(page, set())[3]["nodeId"] == "4", "no mask, nothing dropped"
+# an empty typed field shows ""; this process's typed values add the fields holding them to \`typed\`
+acts = mod._snapshot_to_actions([node(2, "textbox", "Code", 5, "")], {"actions_map": {}, "ref_counter": 0}, {5})
+assert acts[0]["value"] == "", acts
+mod._AGENT_TYPED_SECRETS.add("tok-7f3a9c")
+seen = set()
+mod._snapshot_to_actions([node(2, "textbox", "Code", 5, "tok-7f3a9c"), node(5, "textbox", "Subject", 8, "weekly")],
+                         {"actions_map": {}, "ref_counter": 0}, seen)
+assert seen == {5}, seen
+mod._daemon_reset_state()   # the warm process: the in-memory set is per request; typed_nodes come from the file
+assert not mod._AGENT_TYPED_SECRETS
+# diff: masked on both sides is no change; filled it is «masked», emptied ""; never the value
+old = {"@1": {"ref": "@1", "role": "textbox", "name": "Code", "value": "«masked»", "backend_node_id": 5}}
+same = [dict(old["@1"])]
+assert mod._diff_snapshots(old, same)["value_changed"] == []
+assert mod._diff_snapshots(old, [dict(old["@1"], value="")])["value_changed"] == ["@1:''"]
+assert mod._diff_snapshots({"@1": dict(old["@1"], value="")}, same)["value_changed"] == ["@1:'«masked»'"]
+print("ok")
+`;
+  const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
+    { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
+  assert.strictEqual(r.status, 0, `typed_nodes unit test failed: ${r.stderr}`);
+  assert(/^ok/m.test(r.stdout), r.stdout);
+});
+
 test('agent observe text summary (unit): Chrome AX role StaticText feeds `text`, consecutive duplicates dropped, max_chars kept', () => {
   const { spawnSync } = require('child_process');
   const os = require('os');
@@ -2626,7 +2700,7 @@ test('_diff_snapshots uses set operations for efficiency (no O(n) .remove)', () 
 });
 
 test('_snapshot_to_actions assigns monotonically increasing ref IDs', () => {
-  assert(/def _snapshot_to_actions\(nodes,\s*state\)/.test(PY_CONTENT),
+  assert(/def _snapshot_to_actions\(nodes,\s*state(?:,\s*typed=None)?\)/.test(PY_CONTENT),
     "_snapshot_to_actions must be defined");
   assert(/ref_counter.*\+= 1/.test(PY_CONTENT),
     "_snapshot_to_actions must increment ref_counter for new elements");
@@ -11764,6 +11838,76 @@ print("ok %.1f" % best)
       const pwd = d.actions.find((a) => a.name === 'Password');
       assert(search && pwd, JSON.stringify(d.actions));
     } finally { fake.stop(); }
+  });
+
+  test('learned flows (fake browser): the mask of a typed --var value holds in later agent act / observe / find processes (typed_nodes in agent-state.json); a value the model types still shows', () => {
+    // T1 #4: the mask lived only in the `agent run` process. After drift the documented next step,
+    // `agent act --ref`, took a fresh snapshot with no mask, printed value_changed with the clear value
+    // and wrote it to agent-state.json. With FAKE_CDP_INNER_EDITOR=1 the fake also repeats a filled
+    // field's content below it, as Chrome does (inner editor StaticText): that copy must not come back
+    // as an entry, in `text` or in agent-state.json either.
+    const dummy = 'tok-7c41e9d2a5b3';   // a --var value typed into "Search", a name the secret-field rule does not match
+    const rec = { host: 'user.example', origin: 'https://user.example' };
+    const flow = JSON.stringify({
+      version: 1, name: 'mask_hold', host: 'user.example', vars: { q: { step: 2 } },
+      steps: [
+        { n: 1, kind: 'go', url: 'https://user.example/inbox' },
+        { n: 2, kind: 'act', action: 'fill', anchor: { role: 'textbox', name: 'Search', nth: 0 }, text: '{{q}}', before: rec, after: { host: 'user.example' } },
+        { n: 3, kind: 'act', action: 'click', anchor: { role: 'button', name: 'No such button', nth: 0 }, before: rec, after: { host: 'user.example' } },
+      ],
+    });
+    for (const inner of ['0', '1']) {
+      const fake = startFake('full', 'guid-user', { FAKE_CDP_SUBJECT: '1', FAKE_CDP_INNER_EDITOR: inner });
+      try {
+        const home = mkHome();
+        writeRegistry(home, { proj: externalEntry(fake.port) });
+        const env = isoEnv(home, fake.port, 'proj');
+        const ok = (args) => {
+          const r = cli(args, env);
+          assert.strictEqual(r.status, 0, `inner=${inner} ${args.join(' ')} exit ${r.status}: ${r.stderr}\n${r.stdout}`);
+          return r;
+        };
+        const flowPath = path.join(home, 'projects', 'proj', 'flows', 'mask_hold.json');
+        const statePath = path.join(home, 'projects', 'proj', 'agent-state.json');
+        const state = () => fs.readFileSync(statePath, 'utf-8');
+        const noSecret = (what, out) => {
+          assert(!out.includes(dummy), `inner=${inner}: typed value in ${what}: ${out}`);
+          assert(!state().includes(dummy), `inner=${inner}: typed value in agent-state.json after ${what}`);
+        };
+        fs.mkdirSync(path.dirname(flowPath), { recursive: true });
+        fs.writeFileSync(flowPath, flow);
+        const r = cli(['agent', 'run', 'mask_hold', '--var', `q=${dummy}`], env);
+        assert.strictEqual(r.status, 4, `inner=${inner} drift exit ${r.status}: ${r.stdout}${r.stderr}`);
+        noSecret('the drift output', r.stdout);
+        const search = JSON.parse(r.stdout).actions.find((a) => a.name === 'Search');
+        assert(search && search.value === '«masked»', r.stdout);
+        // later processes: act on the typed ref, then observe --diff, observe, observe --full, find
+        const act = ok(['agent', 'act', '--ref', search.ref, '--action', 'click']);
+        noSecret('agent act --ref', act.stdout);
+        assert(!JSON.parse(act.stdout).changed.value_changed.some((v) => v.startsWith(search.ref + ':')),
+          `masked before and after: no value change for the typed field: ${act.stdout}`);
+        for (const args of [['agent', 'observe', '--diff'], ['agent', 'observe'], ['agent', 'observe', '--full'],
+          ['agent', 'find', '7c41e9']]) {
+          noSecret(args.join(' '), ok(args).stdout);
+        }
+        const full = JSON.parse(ok(['agent', 'observe', '--full']).stdout);
+        assert.strictEqual(full.actions.find((a) => a.name === 'Search').value, '«masked»', JSON.stringify(full.actions));
+        const typed = JSON.parse(state()).typed_nodes;
+        assert(Array.isArray(typed) && typed.length === 1 && typed[0].origin === 'https://user.example'
+          && typed[0].bids.includes(104), `typed_nodes: ${JSON.stringify(typed)}`);
+        // a value the model types itself, into another ordinary field, still shows in the diff as before
+        const subject = full.actions.find((a) => a.name === 'Subject');
+        const filled = JSON.parse(ok(['agent', 'act', '--ref', subject.ref, '--action', 'fill', '--text', 'weekly report']).stdout);
+        assert(filled.changed.value_changed.includes(`${subject.ref}:'weekly report'`), JSON.stringify(filled.changed));
+        // another origin: the record is not applied there and stays for its own document only, so the
+        // page the value was typed into is still masked when the tab comes back to it (the fake keeps
+        // the field, like a page restored from the back/forward cache)
+        noSecret('agent act --url (another origin)', ok(['agent', 'act', '--url', 'https://example.com/']).stdout);
+        assert.deepStrictEqual(JSON.parse(state()).typed_nodes, typed, 'kept for its document, not grown');
+        noSecret('agent act --url (back)', ok(['agent', 'act', '--url', 'https://user.example/inbox']).stdout);
+        noSecret('agent observe (back)', ok(['agent', 'observe', '--full']).stdout);
+      } finally { fake.stop(); }
+    }
   });
 
   test('learned flows (fake browser): run sets a placeholder by one checked call on the node, never focus + insertText; an iframe node is refused (exit 2)', () => {

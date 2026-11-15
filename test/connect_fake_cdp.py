@@ -280,6 +280,21 @@ def ax_tree_for(url, values=None):
         to["value"] = {"type": "string", "value": "alice"}
         to["description"] = {"type": "computedString", "value": "Recipient"}
         tree = tree + [to]
+    if os.environ.get("FAKE_CDP_SUBJECT") == "1":
+        tree = tree + [node(61, "textbox", "Subject", 611, value="")]  # a second ordinary field
+    if os.environ.get("FAKE_CDP_INNER_EDITOR") == "1":
+        # text fields as Chrome reports them: a filled field repeats its content below it (the
+        # inner editor, generic -> StaticText)
+        out = []
+        for n in tree:
+            out.append(n)
+            v = (n.get("value") or {}).get("value")
+            if n["role"]["value"] == "textbox" and v:
+                i, b = int(n["nodeId"]), n["backendDOMNodeId"]
+                g, t = node(700 + i, "generic", "", 7000 + b), node(800 + i, "StaticText", v, 8000 + b)
+                n["childIds"], g["childIds"] = [g["nodeId"]], [t["nodeId"]]
+                out += [g, t]
+        tree = out
     return tree
 
 

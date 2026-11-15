@@ -16897,6 +16897,100 @@ def _agent_value_is_typed_secret(val):
     return any(val == t or (len(t) >= 4 and t in val) for t in _AGENT_TYPED_SECRETS)
 
 
+# The nodes such a value went into stay masked in later processes too (agent act / observe / find, the
+# MCP tools, the warm process), which never see _AGENT_TYPED_SECRETS: agent-state.json keeps their
+# backend ids as typed_nodes, a list of {origin, doc, bids} with one record per document (doc = backend
+# id of the AX root, the document node). A record applies only to its own document: a new document has
+# new nodes, and after a cross-origin navigation a new renderer process numbers its nodes from the start
+# again. It is kept (AGENT_TYPED_DOCS documents, AGENT_TYPED_MAX ids each, oldest dropped) after the
+# tab leaves: a page the back/forward cache restores is the same document, the value still in the field.
+AGENT_TYPED_DOCS = 8
+AGENT_TYPED_MAX = 64
+_AGENT_FIELD_ROLES = frozenset({'textbox', 'combobox', 'searchbox'})
+
+
+def _agent_typed_scope(url, nodes):
+    """(origin, doc) of a main-page snapshot: the page's origin and the backend id of its AX root
+    (RootWebArea; None when the tree has none)."""
+    doc = next((n.get('backendDOMNodeId') for n in nodes
+                if (n.get('role') or {}).get('value') == 'RootWebArea'), None)
+    return _agent_origin(url), doc
+
+
+def _agent_typed_recs(state):
+    """The well-formed typed_nodes records of `state` (anything else in the file is dropped)."""
+    recs = state.get('typed_nodes')
+    return [r for r in recs if isinstance(r, dict) and isinstance(r.get('bids'), list)] \
+        if isinstance(recs, list) else []
+
+
+def _agent_typed_bids(state, scope):
+    """The typed_nodes backend ids of the document `scope` names, as a set (empty when none)."""
+    for rec in _agent_typed_recs(state):
+        if (rec.get('origin'), rec.get('doc')) == tuple(scope):
+            return {b for b in rec['bids'] if isinstance(b, int)}
+    return set()
+
+
+def _agent_typed_add(state, bids, scope):
+    """Add `bids` to the typed_nodes record of `scope`, which becomes the newest record."""
+    recs = _agent_typed_recs(state)
+    cur = next((r for r in recs if (r.get('origin'), r.get('doc')) == tuple(scope)), None)
+    keep = [b for b in (cur or {}).get('bids') or () if isinstance(b, int)]
+    for b in bids:
+        if isinstance(b, int) and b not in keep:
+            keep.append(b)
+    recs = [r for r in recs if r is not cur]
+    recs.append({'origin': scope[0], 'doc': scope[1], 'bids': keep[-AGENT_TYPED_MAX:]})
+    state['typed_nodes'] = recs[-AGENT_TYPED_DOCS:]
+
+
+def _agent_typed_persist(bid, scope):
+    """Write to agent-state.json at once, before `agent run` sets a --var / CDPILOT_VAR_* value on node
+    `bid`: a run that fails or exits after the value is set must not leave the field unmasked for the
+    next command (as _agent_scrub_persist)."""
+    st = _load_agent_state()
+    _agent_typed_add(st, [bid], scope)
+    _save_agent_state(st)
+
+
+def _agent_value_masked(name, val, bid, typed=None):
+    """True when a field's value prints as «masked»: a non-empty value in a secret-named field, in a
+    node of `typed` (typed_nodes of this document), or equal to (containing) a value this process types."""
+    return bool(val) and bool(_AGENT_SECRET_FIELD_RE.search(name or '') or bid in (typed or ())
+                              or _agent_value_is_typed_secret(val))
+
+
+def _agent_mask_inner(nodes, typed=None):
+    """`nodes` without what lies below a field whose value is masked. Chrome repeats a text field's
+    content below it (the inner editor: generic → StaticText) and a contenteditable field holds it as
+    its own text: left in, the masked value comes back as a text-anchor entry (the output, actions_map
+    in agent-state.json), in `text` and in hidden_text. An interactive node below (an option of a
+    select) stays, with what lies below it."""
+    stack = []
+    for n in nodes:
+        raw = (n.get('role') or {}).get('value', '')
+        if not n.get('childIds') or AGENT_ROLE_NORMALIZE.get(raw, raw) not in _AGENT_FIELD_ROLES:
+            continue
+        name, val = (n.get('name') or {}).get('value') or '', (n.get('value') or {}).get('value')
+        if _agent_value_masked(name, val, n.get('backendDOMNodeId') or n.get('backendNodeId'), typed):
+            stack.extend(n['childIds'])
+    if not stack:
+        return nodes
+    by_id, gone = {n.get('nodeId'): n for n in nodes}, set()
+    while stack:
+        i = stack.pop()
+        c = by_id.get(i)
+        if c is None or i in gone:
+            continue
+        raw = (c.get('role') or {}).get('value', '')
+        if AGENT_ROLE_NORMALIZE.get(raw, raw) in AGENT_INTERACTIVE_ROLES:
+            continue
+        gone.add(i)
+        stack.extend(c.get('childIds') or ())
+    return [n for n in nodes if n.get('nodeId') not in gone]
+
+
 def _agent_state_path():
     return os.path.join(CDPILOT_HOME, 'projects', PROJECT_ID, 'agent-state.json')
 
@@ -17540,8 +17634,10 @@ def _extract_text_summary(nodes, max_chars=2000, skip=(), drop=None):
     return summary[:max_chars]
 
 
-def _snapshot_to_actions(nodes, state):
-    """Convert AXTree nodes to numbered action list. Updates state in place."""
+def _snapshot_to_actions(nodes, state, typed=None):
+    """Convert AXTree nodes to numbered action list. Updates state in place.
+    `typed` (a set): backend ids whose value is masked whatever the field is named (typed_nodes of
+    this document); a field holding a value this process types is added to it."""
     amap = state['actions_map']
     # Build reverse map: backend_node_id -> existing @ref
     bid_to_ref = {v['backend_node_id']: k for k, v in amap.items()}
@@ -17584,15 +17680,34 @@ def _snapshot_to_actions(nodes, state):
         if role in ('textbox', 'combobox', 'searchbox'):
             val = node.get('value', {}).get('value')
             if val is not None:
-                action['value'] = '«masked»' if (val and (_AGENT_SECRET_FIELD_RE.search(name)
-                                                          or _agent_value_is_typed_secret(val))) else val
+                if typed is not None and _agent_value_is_typed_secret(val):
+                    typed.add(bid)
+                action['value'] = '«masked»' if _agent_value_masked(name, val, bid, typed) else val
         new_actions.append(action)
 
     return new_actions
 
 
+def _agent_actions(page, nodes, state):
+    """(nodes, actions) of a main-page snapshot of the tab `page`, masks applied: a node `agent run`
+    typed a --var / CDPILOT_VAR_* value into stays masked in every later command (typed_nodes of this
+    document), and what Chrome repeats below a masked field leaves `nodes`. Updates state in place."""
+    scope = _agent_typed_scope((page or {}).get('url', ''), nodes)
+    typed = _agent_typed_bids(state, scope)
+    nodes = _agent_mask_inner(nodes, typed)
+    known = len(typed)
+    actions = _snapshot_to_actions(nodes, state, typed)
+    if len(typed) > known:  # a field holding a value this run types (copied, or echoed by the site)
+        _agent_typed_add(state, sorted(typed), scope)
+    return nodes, actions
+
+
 def _diff_snapshots(old_map, new_actions):
-    """Compute added/removed/value_changed between old state map and new actions."""
+    """Compute added/removed/value_changed between old state map and new actions.
+    A masked value (secret-named field, typed_nodes) is «masked» on both sides: while the field holds
+    a value no change is reported, filled it reports «masked», emptied ''; never the value. Telling
+    two masked values apart would need a hash of the secret on disk, and a short one (a PIN) can be
+    read back from its hash; refs added and removed and an emptied field still show the page moving."""
     new_map = {a['ref']: a for a in new_actions}
     old_refs = set(old_map.keys())
     new_refs = set(new_map.keys())
@@ -18382,7 +18497,7 @@ async def _agent_full_snapshot():
     _AGENT_LAST_FRAMES = await _agent_probe_frames(ws_url)
     nodes = res.get(1, {}).get('nodes', [])
     state = _load_agent_state()
-    actions = _snapshot_to_actions(nodes, state)
+    nodes, actions = _agent_actions(page, nodes, state)
     # Rebuild actions_map from new actions
     state['actions_map'] = {a['ref']: a for a in actions}
     vis = {}
@@ -19966,6 +20081,9 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
             # The value is set on the resolved node in one call that checks the
             # node and its page first (_VAR_TARGET_FN): no focus + insertText,
             # which typed into whatever had focus (2026-11-11 review).
+            # On disk before the value is set: later commands mask this node (typed_nodes).
+            _agent_typed_persist(match['backend_node_id'],
+                                 _agent_typed_scope(page.get('url', ''), last_nodes))
             why = await _agent_type_placeholder(match['ref'], text_in, _agent_origin(page.get('url', '')), amap,
                                                 from_env=step['n'] in env_by_step)
             if why:
