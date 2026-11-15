@@ -19320,7 +19320,7 @@ def _mcp_tool_call() -> bool:
     CDPILOT_MCP_TOOL_CALL=1 for each (child process and warm run alike) and nothing
     else does. Not CDPILOT_MCP_SESSION: `cdpilot run` sets that for every script
     line, and users set it to keep the visual layer on."""
-    return os.environ.get('CDPILOT_MCP_TOOL_CALL') == '1'
+    return os.environ.get(MCP_TOOL_CALL_ENV) == '1'
 
 
 def _env_var_value(name: str) -> str | None:
@@ -22909,12 +22909,13 @@ class MCPServer:
         try:
             env = os.environ.copy()
             env["CDPILOT_MCP_SESSION"] = "1"
-            env["CDPILOT_MCP_TOOL_CALL"] = "1"  # only a tool call has it (flow provenance, _mcp_tool_call)
             if _env_vars_blocked():  # defence in depth: _env_var_value refuses them too
                 for k in [k for k in env if k.upper().startswith("CDPILOT_VAR_")
                           and k.upper() != AGENT_VAR_HOSTS_ENV]:
                     del env[k]
-            env[MCP_TOOL_CALL_ENV] = "1"  # the URL rule where the URL is opened (_mcp_url_gate)
+            # Only a tool call has it: the URL rule where the URL is opened (_mcp_url_gate),
+            # the CDPILOT_VAR gate (_env_vars_blocked) and flow provenance (_mcp_tool_call).
+            env[MCP_TOOL_CALL_ENV] = "1"
             env[SLOG_VIA_ENV] = via
             # Both ends in UTF-8: with the locale default a child writing one
             # code page and a parent reading another raised here, and the
