@@ -16255,7 +16255,8 @@ async def cmd_run_script(script_path):
             result = subprocess.run(
                 [sys.executable, __file__] + parts,
                 capture_output=True, text=True, timeout=30,
-                env={**os.environ, "CDPILOT_MCP_SESSION": "1"}
+                # A recording keeps the `run <script>` step only (RECORD_SKIP_ENV).
+                env={**os.environ, "CDPILOT_MCP_SESSION": "1", RECORD_SKIP_ENV: "1"}
             )
             output = result.stdout.strip()
             if output:
@@ -24754,6 +24755,9 @@ SLOG_SKIP_CMDS = frozenset({'mcp', 'serve', 'log', 'help', '--help', '-h', 'bot-
 RECORD_SKIP_CMDS = frozenset({'record', 'replay', 'log', 'help', '--help', '-h',
                               'version', '--version', '-v', 'status', 'health',
                               'mcp', 'serve', 'bot-auth', 'setup', 'connect', 'disconnect'})
+# Set by `cdpilot run` for its script lines: the `run <script>` step is recorded, its
+# lines are not (a replay of the flow runs the script, and so each line, again).
+RECORD_SKIP_ENV = 'CDPILOT_RECORD_SKIP'
 SLOG_CMD_ALIASES = {'open': 'go', '--version': 'version', '-v': 'version'}
 SLOG_VALUE_CMDS = frozenset({'fill', 'type'})  # <selector> <value...>, flags anywhere
 SLOG_VALUE_CMD_FLAGS = frozenset({'--no-heal'})  # their bare flags; --name=value is kept
@@ -25605,7 +25609,7 @@ def _slog_begin(argv):
                    DAEMON_SERVE_FLAG):
             return
         slog_wants = _slog_enabled() and cmd not in SLOG_SKIP_CMDS
-        rec_wants = _record_active() and cmd not in RECORD_SKIP_CMDS and os.environ.get("CDPILOT_REPLAY_ACTIVE") != "1"
+        rec_wants = _record_active() and cmd not in RECORD_SKIP_CMDS and _record_skip_reason() is None
         if not slog_wants and not rec_wants:
             return
         _SLOG.update(active=True, done=False, cmd=cmd, args=list(argv[1:]),
@@ -25693,7 +25697,7 @@ def _slog_record_external(argv, code, started, duration_ms, error, via):
         if _slog_enabled() and cmd not in SLOG_SKIP_CMDS:
             _slog_append(_slog_build_entry(cmd, argv[1:], code, duration_ms, started,
                                            error=error, via=via))
-        if _record_active() and cmd not in RECORD_SKIP_CMDS and os.environ.get("CDPILOT_REPLAY_ACTIVE") != "1":
+        if _record_active() and cmd not in RECORD_SKIP_CMDS and _record_skip_reason(via) is None:
             _record_hook_step(cmd, argv[1:], code)
     except Exception as e:
         _slog_warn(e)
@@ -25932,9 +25936,62 @@ def _record_active():
     return os.path.isfile(_record_active_path())
 
 
-def _record_hook_step(cmd, args, code):
-    """Append a step to active recording if one is in progress."""
+def _record_skip_reason(via=None):
+    """Why this process writes no step to the active recording, or None. A recording
+    holds the operator's own commands: not a replay's steps (CDPILOT_REPLAY_ACTIVE=1),
+    not the lines of a `cdpilot run` script (RECORD_SKIP_ENV=1; its `run` step is
+    recorded), not an MCP tool call (MCP_TOOL_CALL_ENV=1, child or warm run) nor the
+    MCP server's own line for a call that timed out or raised (_slog_record_external:
+    the server process, via "mcp:<tool>"; the marker is only in the call's env copy).
+    CDPILOT_MCP_SESSION=1 alone (users set it for the visual layer) does not count."""
     if os.environ.get("CDPILOT_REPLAY_ACTIVE") == "1":
+        return "replay step"
+    if os.environ.get(RECORD_SKIP_ENV) == "1":
+        return "script line"
+    if (MCP_SERVER_PROCESS or os.environ.get(MCP_TOOL_CALL_ENV) == "1"
+            or str(via or "").startswith("mcp:")):
+        return "MCP tool call"
+    return None
+
+
+def _record_lock_acquire():
+    """Take the recording's lock (flock on active.json.lock): the step writer, `record
+    stop` and `record cancel` take turns, so a stop is never followed by a writer that
+    read active.json before it. Returns the open lock file; None without flock
+    (Windows) or without a record directory, and the caller runs unlocked."""
+    try:
+        import fcntl
+        lock_file = open(_record_active_path() + ".lock", "w")
+    except (ImportError, OSError):
+        return None
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+    except OSError:
+        lock_file.close()
+        return None
+    return lock_file
+
+
+def _record_lock_release(lock_file):
+    """Release what _record_lock_acquire took. The lock file stays: removing it would
+    let a writer waiting on the old file and one opening a new file hold it at once."""
+    if lock_file is None:
+        return
+    try:
+        import fcntl
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        lock_file.close()
+    except Exception:
+        pass
+
+
+def _record_hook_step(cmd, args, code):
+    """Append a step to the active recording if one is in progress, this process may
+    write one (_record_skip_reason) and it runs in the project that started it."""
+    if _record_skip_reason():
         return
     cmd = SLOG_CMD_ALIASES.get(cmd, cmd)
     if cmd in RECORD_SKIP_CMDS:
@@ -25942,22 +25999,15 @@ def _record_hook_step(cmd, args, code):
     active_path = _record_active_path()
     if not os.path.isfile(active_path):
         return
-    lock_path = active_path + ".lock"
-    lock_file = None
-    has_flock = False
-    try:
-        import fcntl
-        lock_file = open(lock_path, "w")
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        has_flock = True
-    except (ImportError, OSError):
-        pass
-
+    lock_file = _record_lock_acquire()
     try:
         if not os.path.isfile(active_path):
             return
         with open(active_path, "r", encoding="utf-8") as f:
             state = json.load(f)
+        owner = state.get("project_id")  # absent: started before recordings were bound
+        if owner and owner != PROJECT_ID:
+            return  # another project's command (its terminal or its MCP server)
         started_at = state.get("started_at")
         t_ms = 0
         if started_at:
@@ -25988,17 +26038,14 @@ def _record_hook_step(cmd, args, code):
         fd, tmp_file = tempfile.mkstemp(prefix=".active-", suffix=".tmp", dir=tmp_dir)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
+        if not os.path.isfile(active_path):  # stopped meanwhile by something without the lock
+            os.remove(tmp_file)
+            return
         os.replace(tmp_file, active_path)
     except Exception as e:
         _slog_warn(e)  # one stderr line, like a failed session-log write; never changes the command's exit code
     finally:
-        if has_flock and lock_file:
-            try:
-                import fcntl
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-                lock_file.close()
-            except Exception:
-                pass
+        _record_lock_release(lock_file)
 
 
 def _record_slug_from_selector(sel):
@@ -26336,6 +26383,7 @@ def cmd_record_start(*args):
     state = {
         "name": name,
         "started_at": now.isoformat(),
+        "project_id": PROJECT_ID,  # only this project's commands are recorded (_record_hook_step)
         "steps": [],
         "vars": {}
     }
@@ -26359,7 +26407,8 @@ def cmd_record_status(*args):
         name = state.get("name") or "(unnamed)"
         steps = state.get("steps") or []
         started_at = state.get("started_at") or ""
-        print(f"Recording active: {name} ({len(steps)} steps, started {started_at})")
+        project = f", project {state['project_id']}" if state.get("project_id") else ""
+        print(f"Recording active: {name} ({len(steps)} steps, started {started_at}{project})")
     except Exception as e:
         print(f"cdpilot: error reading active recording: {e}", file=sys.stderr)
         sys.exit(1)
@@ -26367,6 +26416,15 @@ def cmd_record_status(*args):
 
 def cmd_record_cancel(*args):
     """Cancel and discard the active recording session."""
+    lock_file = _record_lock_acquire()  # a step writer finishes first, then finds no recording
+    try:
+        _record_cancel_locked()
+    finally:
+        _record_lock_release(lock_file)
+
+
+def _record_cancel_locked():
+    """cmd_record_cancel with the recording's lock held."""
     active_path = _record_active_path()
     if not os.path.isfile(active_path):
         print("No recording active.")
@@ -26376,9 +26434,6 @@ def cmd_record_cancel(*args):
             state = json.load(f)
         name = state.get("name") or "(unnamed)"
         os.remove(active_path)
-        lock_path = active_path + ".lock"
-        if os.path.isfile(lock_path):
-            os.remove(lock_path)
         print(f"Recording cancelled: {name}")
     except Exception as e:
         print(f"cdpilot: error cancelling recording: {e}", file=sys.stderr)
@@ -26407,6 +26462,15 @@ def cmd_record_stop(*args):
             sys.exit(2)
         i += 1
 
+    lock_file = _record_lock_acquire()  # a step writer finishes first, then finds no recording
+    try:
+        _record_stop_locked(save_path)
+    finally:
+        _record_lock_release(lock_file)
+
+
+def _record_stop_locked(save_path):
+    """cmd_record_stop with the recording's lock held: emit the flow, remove active.json."""
     active_path = _record_active_path()
     if not os.path.isfile(active_path):
         print("cdpilot: no recording active", file=sys.stderr)
@@ -26478,18 +26542,12 @@ def cmd_record_stop(*args):
 
         try:
             os.remove(active_path)
-            lock_path = active_path + ".lock"
-            if os.path.isfile(lock_path):
-                os.remove(lock_path)
         except OSError:
             pass
         print(f"Saved flow to {save_path}")
     else:
         try:
             os.remove(active_path)
-            lock_path = active_path + ".lock"
-            if os.path.isfile(lock_path):
-                os.remove(lock_path)
         except OSError:
             pass
         print(json.dumps(flow_data, indent=2, ensure_ascii=False))
