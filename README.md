@@ -149,6 +149,15 @@ Other schemes (`file:`, `chrome:`, `javascript:`, `data:` ...) come back as an e
 hint: a model steered by page text must not open local files and read them back. Start the
 server with `CDPILOT_MCP_ALLOW_FILE=1` to allow `file:` too. The CLI (`cdpilot go`) opens any URL.
 
+### Your own browser over MCP
+
+The MCP `browser_connect` tool is refused (error with a hint) unless the server runs with
+`CDPILOT_MCP_ALLOW_CONNECT=1`. A connect moves every later cdpilot call of the project, MCP and
+CLI, into that browser with its cookies and logins, and a model steered by page text must not
+decide that. Run `cdpilot connect` yourself in a terminal instead: MCP tools then work in that
+browser. `browser_disconnect` needs no opt-in. While a browser is connected, `browser_tabs` lists
+only the tabs cdpilot opened in it and counts yours; `cdpilot tabs` in a terminal lists every tab.
+
 ### Smaller MCP tool list
 
 `cdpilot mcp --tools core` (or `CDPILOT_MCP_TOOLS=core`; the flag wins) lists 10 core
@@ -156,8 +165,8 @@ tools (navigate, click, fill, content, screenshot, eval, wait_for, assert, tabs,
 plus `browser_tools`. The agent calls `browser_tools` with `list` to see the other
 tools, or `enable` to add some (the server sends `tools/list_changed`). `--tools a,b,c`
 picks tools by name; `all` (default) is unchanged. Schema size of `tools/list`
-(tiktoken `o200k_base`, compact JSON, measured 15.11.2026 after the description diet): `all` = 50 tools = 5,434 tokens,
-of which the five `browser_agent_*` tools are 1,061; `core` = 11 tools = 1,088 tokens.
+(tiktoken `o200k_base`, compact JSON, measured 15.11.2026 after the description diet): `all` = 50 tools = 5,422 tokens,
+of which the five `browser_agent_*` tools are 1,061; `core` = 11 tools = 1,076 tokens.
 The three `browser_canvas_*` tools are listed only while a live canvas is open (`cdpilot canvas open`), and never under `core`; `tools/list_changed` follows when the first canvas opens or the last one closes.
 
 ### Agent mode over MCP
@@ -1337,6 +1346,10 @@ cdpilot connect --auto        # or: find it via a DevToolsActivePort file
 cdpilot go https://example.com/dashboard
 cdpilot disconnect            # close cdpilot's own tab, forget it; the browser keeps running
 ```
+
+Over MCP, `browser_connect` works only when the server runs with `CDPILOT_MCP_ALLOW_CONNECT=1`
+([Your own browser over MCP](#your-own-browser-over-mcp)); a browser you connect from the
+terminal serves MCP tools without it.
 
 Since Chrome 136, `--remote-debugging-port` is ignored on the default profile,
 so the separate `--user-data-dir` is required. `connect --auto` reads the

@@ -69,6 +69,9 @@ Environment:
   CDPILOT_MCP_ALLOW_FILE=1  Let `cdpilot mcp` tools open file: URLs (MCP opens
                        only http, https and about:blank by default; the CLI
                        opens any URL)
+  CDPILOT_MCP_ALLOW_CONNECT=1  Let the MCP browser_connect tool connect this
+                       project to your own browser (refused by default; the
+                       CLI `cdpilot connect` always works)
   CDPILOT_NO_AUTOLAUNCH=1  Do not start the browser when a page command
                        finds it not running (print the error instead)
   CDPILOT_IDLE_CLOSE   Minutes without a cdpilot command or page change before
@@ -7820,12 +7823,23 @@ def cmd_tabs(reap=False, max_tabs=1, include_real=False, dry_run=False):
         return
     tabs = get_tabs()
     pages = [t for t in tabs if t.get("type") == "page"]
+    hidden = 0
+    if IS_MCP_SESSION and _is_external():
+        # A connected browser's other tabs are the user's own (mail, bank): over
+        # MCP (a model page text can steer) list only the tabs cdpilot opened
+        # there. No MCP tool picks a tab by index or id, so nothing is lost.
+        own = _external_own_tabs()
+        hidden = sum(1 for p in pages if p.get("id") not in own)
+        pages = [p for p in pages if p.get("id") in own]
     for i, p in enumerate(pages):
         url = p.get("url", "")
         icon = "🔵" if url.startswith("chrome://") else "🟢"
         print(f"  {icon} [{i}] {p.get('title', '')[:70]}")
         print(f"       {url[:120]}")
     print(f"\n{len(pages)} pages, {len(tabs)} targets")
+    if hidden:
+        print(f"{hidden} tab(s) of your connected browser not listed over MCP "
+              "(`cdpilot tabs` in a terminal lists them)")
 
 
 async def cmd_go(url):
@@ -22133,6 +22147,15 @@ async def cmd_tools_call(name, call_args, frame=None):
 MCP_URL_TOOLS = ("browser_navigate", "browser_console", "browser_network",
                  "browser_agent_act", "browser_watch_start")
 MCP_ALLOW_FILE_ENV = "CDPILOT_MCP_ALLOW_FILE"
+# MCP browser_connect needs the operator's opt-in: a connect writes a registry
+# entry that moves every later cdpilot call of this project (MCP and CLI) into
+# the user's own browser, cookies and logins included, until `disconnect`. A
+# model that page text can steer must not decide that. The CLI is the operator's.
+MCP_ALLOW_CONNECT_ENV = "CDPILOT_MCP_ALLOW_CONNECT"
+MCP_CONNECT_REFUSAL = (
+    "refused: browser_connect needs the operator's opt-in (it moves every later call of "
+    "this project into that browser, with its cookies and logins). Run `cdpilot connect` "
+    f"yourself in a terminal, or start the MCP server with {MCP_ALLOW_CONNECT_ENV}=1.")
 
 
 def _mcp_url_refusal(tool_name: str, url: object) -> str | None:
@@ -22407,7 +22430,7 @@ class MCPServer:
              "inputSchema": {"type": "object", "properties": {"tier": {"type": "string", "enum": ["regular", "stealth", "undetected"], "description": "Stealth tier to set ('regular', 'stealth', 'undetected'). Omit to read current tier."}}}},
             {"name": "browser_log", "description": "Read this project's local session log (read-only; reading does not add to it). Records commands, redacted secrets and inputs, exit codes, durations, URLs, titles, summaries, errors, and output files. Formats: 'table' (default compact table), 'md' (Markdown report of visits, actions, errors, files), or 'json' (raw JSON lines). Covers today unless 'days' is specified. Call it when a browser task is finished to report what was done.",
              "inputSchema": {"type": "object", "properties": {"format": {"type": "string", "enum": ["table", "md", "json"], "description": "Output format ('table', 'md', or 'json')."}, "days": {"type": "integer", "minimum": 1, "description": "Include the last N days (1 = today)."}}}},
-            {"name": "browser_connect", "description": "Connect to user's existing Chrome/Chromium browser for human-in-the-loop automation (CAPTCHAs, login); the user starts it with --remote-debugging-port=<p> --user-data-dir=<dir>. Accepts a CDP port, ws:// URL, or '--auto' (scans DevToolsActivePort); requires 127.0.0.1/localhost. Registered as external: cdpilot never closes, kills, or injects into it (browser_close only disconnects). chrome://inspect is not supported (exit 2).",
+            {"name": "browser_connect", "description": "Connect this project to a Chrome/Chromium the user started with --remote-debugging-port=<p> --user-data-dir=<dir> (CAPTCHAs, logins); 127.0.0.1/localhost only. Refused unless this server runs with CDPILOT_MCP_ALLOW_CONNECT=1 (or the user runs `cdpilot connect`). Then every tool runs in that browser, with its cookies and logins, until browser_disconnect; cdpilot never closes it.",
              "inputSchema": {"type": "object", "properties": {"target": {"type": "string", "description": "CDP port number, ws:// URL, or '--auto' to auto-detect."}}, "required": ["target"]}},
             {"name": "browser_disconnect", "description": "Disconnect from connected external browser, removing its registration while leaving the browser running. Only way to drop connection.",
              "inputSchema": {"type": "object", "properties": {}}},
@@ -22529,6 +22552,9 @@ class MCPServer:
                 + (["--frame", a["frame"]] if a.get("frame") else []))
         if tool_name not in tool_map:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}}
+        if tool_name == "browser_connect" and os.environ.get(MCP_ALLOW_CONNECT_ENV, "").strip() != "1":
+            return {"jsonrpc": "2.0", "id": req_id, "result": {
+                "content": [{"type": "text", "text": MCP_CONNECT_REFUSAL}], "isError": True}}
         if tool_name in MCP_URL_TOOLS and args.get("url"):
             why = _mcp_url_refusal(tool_name, args["url"])
             if why:
