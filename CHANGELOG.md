@@ -6,11 +6,12 @@ All notable changes to cdpilot will be documented in this file.
 
 ### Fixed
 - **Frame fallback notes appear on every request in a warm process.** With `CDPILOT_DAEMON=1` or a warm MCP process, the stderr notes for an isolated-world fallback were printed only for the first request; each request now starts fresh, like a one-shot command.
-- **A stale isolated world no longer gives a false "no iframe matches".** When the first-hop lookup in cdpilot's isolated world returns a CDP error or an exception, the lookup runs once with the page's own JS (with the fallback note) instead of reporting that the page has no iframes. A clean "not found" is not retried.
+- **A stale isolated world context is re-created instead of downgrading to page JavaScript.** When the first-hop frame lookup in cdpilot's isolated world encounters a missing execution context (such as after navigation), the isolated world is re-established and retried once. An evaluation exception fails closed with an error and never falls back to the page's own JavaScript. A clean "not found" is not retried.
 
 ### Security
-- **`frame list` cleans what the page controls.** Tag characters (and the other hidden characters agent output removes) are stripped from each frame's `src`, `name` and `id`; `name` and `id` are cut to 60 characters, `src` stays at 80. Pages with plain names print the same list.
+- **`frame list` cleans page-controlled attributes and prevents line forgery.** Tag characters and invisible characters are stripped; newlines and other control characters turn into single spaces so a crafted frame name cannot inject fake lines. Frame `name` and `id` are truncated to 60 characters, `src` to 80 characters. Frame labels in error messages and route headers are cleaned and truncated to 60 characters as well. Pages with plain names print the same list.
 - **The closed-shadow-root check of a `>>>` chain runs in cdpilot's isolated world** on the top document, so the page's own JS cannot change its result.
+- **Element crop evaluation exceptions fail closed.** An evaluation error in the isolated world when finding an element's bounding box for `shot --element` falls back to a full-page capture rather than falling back to the page's own JavaScript context.
 
 ## [0.9.11] - 2026-11-15
 

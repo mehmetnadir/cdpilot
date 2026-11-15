@@ -149,6 +149,7 @@ import re as _re
 import secrets
 import glob
 import datetime
+import unicodedata
 import concurrent.futures
 import tempfile
 import contextlib
@@ -4589,6 +4590,24 @@ async def _frame_cdp(route, commands, timeout=10):
     return {ids[k]: v for k, v in res.items() if k in ids}
 
 
+def _frame_label(value, limit):
+    """Clean page-controlled label: strip tag characters, convert control / line separator
+    characters (Cc, Cf, Zl, Zp) to single spaces, and truncate to limit characters."""
+    s = "" if value is None else str(value)
+    s = _strip_tag_chars(s)[0]
+    s = "".join(" " if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch for ch in s)
+    return s[:limit]
+
+
+def _frame_avail_labels(frames):
+    """`[i] label; ...` for a not-found message; non-dict entries are skipped, every field is cleaned."""
+    if not isinstance(frames, list):
+        return ""
+    return "; ".join(f"[{_frame_label(f.get('index'), 10)}] "
+                     f"{_frame_label(f.get('id') or f.get('name') or f.get('src'), 60)}"
+                     for f in frames if isinstance(f, dict))
+
+
 def _frame_lookup_fallback_note():
     """One stderr note per command when a first-hop lookup runs in the page's own JS."""
     if not _FRAME_LOOKUP_FALLBACK_NOTED[0]:
@@ -4608,9 +4627,14 @@ async def _frame_first_hop_world(route):
     return ctx
 
 
-async def _frame_list(route, context_id=None):
-    if context_id is None and not route.chain:
+_FRAME_DEFAULT_CTX = object()
+
+
+async def _frame_list(route, context_id=_FRAME_DEFAULT_CTX):
+    if context_id is _FRAME_DEFAULT_CTX and not route.chain:
         context_id = await _frame_first_hop_world(route)
+    elif context_id is _FRAME_DEFAULT_CTX:
+        context_id = None
     params = route.eval_params(_FRAME_LIST_JS)
     if context_id is not None:
         params["contextId"] = context_id
@@ -4723,15 +4747,34 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
         cmds.append((3, "Runtime.evaluate", p3, route.session_id))
     r = await _frame_cdp(route, cmds)
     reply1 = r.get(1) or {}
-    if lookup_ctx is not None and (_cdp_error_reply(reply1) or reply1.get("exceptionDetails")):
-        _frame_lookup_fallback_note()
-        lookup_ctx = None
-        p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False)
-        cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
-        if hop["kind"] in ("auto", "sel"):
-            p3 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)")
-            cmds.append((3, "Runtime.evaluate", p3, route.session_id))
-        r = await _frame_cdp(route, cmds)
+    if lookup_ctx is not None and _cdp_error_reply(reply1):
+        route.worlds.pop((None, None), None)
+        lookup_ctx = await _frame_first_hop_world(route)
+        if lookup_ctx is not None:
+            p1["contextId"] = lookup_ctx
+            cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
+            if hop["kind"] in ("auto", "sel"):
+                p3 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)")
+                p3["contextId"] = lookup_ctx
+                cmds.append((3, "Runtime.evaluate", p3, route.session_id))
+            r = await _frame_cdp(route, cmds)
+            reply1 = r.get(1) or {}
+        else:
+            _frame_lookup_fallback_note()
+            p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False)
+            cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
+            if hop["kind"] in ("auto", "sel"):
+                p3 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)")
+                cmds.append((3, "Runtime.evaluate", p3, route.session_id))
+            r = await _frame_cdp(route, cmds)
+            reply1 = r.get(1) or {}
+    if lookup_ctx is not None and reply1.get("exceptionDetails"):
+        det = reply1["exceptionDetails"]
+        exc = ((det.get("exception") or {}).get("description")
+               or (det.get("exception") or {}).get("value")
+               or det.get("text") or "unknown error")
+        exc_str = str(exc).splitlines()[0].strip()[:120]
+        raise _FrameError(f"frame lookup failed in cdpilot's isolated world: {exc_str}")
     obj = r.get(1, {}).get("result", {})
     oid = obj.get("objectId")
     shown = f"#{hop['value']}" if hop["kind"] == "index" else hop["value"]
@@ -4739,8 +4782,7 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
         if missing_ok:
             return False
         frames = await _frame_list(route, context_id=lookup_ctx)
-        labels = [_strip_tag_chars(f.get("id") or f.get("name") or f.get("src") or "")[0][:60] for f in frames]
-        avail = "; ".join(f"[{f['index']}] {lbl}" for f, lbl in zip(frames, labels))
+        avail = _frame_avail_labels(frames)
         raise _FrameError(f"no iframe matches '{shown}' in {route.describe()}"
                           + (f" (frames: {avail})" if avail else " (it has no iframes)"))
     d = await _frame_cdp(route, [(2, "DOM.describeNode", {"objectId": oid}, route.session_id)])
@@ -4752,7 +4794,7 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     src = next((attrs[i + 1] for i in range(0, len(attrs) - 1, 2) if attrs[i] == "src"), "")
     sid, ctx, isolated = await _frame_context_for(route, frame_id, node, allow_oopif)
     route.chain.append((route.session_id, oid))
-    route.labels.append(obj.get("description") or shown)
+    route.labels.append(_frame_label(obj.get("description") or shown, 60))
     route.session_id, route.context_id, route.src = sid, ctx, src
     route.frame_id, route.isolated = frame_id, isolated
     if isolated and not _FRAME_ISOLATED_NOTED[0]:
@@ -5108,8 +5150,7 @@ async def _frame_resolve_target(ws_url, flag_hops, target, kind="css"):
                 return route, rem_selector, None
             else:
                 frames = await _frame_list(route)  # isolated world only when route is at the top document
-                labels = [_strip_tag_chars(f.get("id") or f.get("name") or f.get("src") or "")[0][:60] for f in frames]
-                avail = "; ".join(f"[{f['index']}] {lbl}" for f, lbl in zip(frames, labels))
+                avail = _frame_avail_labels(frames)
                 raise _FrameError(f"no iframe matches '{hop_name}' in {route.describe()}"
                                   + (f" (frames: {avail})" if avail else " (it has no iframes)"))
         return route, inner, None
@@ -8109,8 +8150,9 @@ async def cmd_shot(output=None, quality=None, element=None, fmt=None, hidpi=Fals
                 reply = cr.get(2) or {}
             except Exception:
                 reply = {}
-            broken = (not reply) or _cdp_error_reply(reply) or bool(reply.get("exceptionDetails"))
-            if broken:
+            if reply.get("exceptionDetails"):
+                use_main = False
+            elif (not reply) or _cdp_error_reply(reply):
                 use_main = True
             else:
                 rect_str = (reply.get("result") or {}).get("value")
@@ -20865,22 +20907,51 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
             p["contextId"] = ctx
         res = await cdp_send(ws_url, [(1, "Runtime.evaluate", p)])
         reply = res.get(1) or {}
-        if ctx is not None and (_cdp_error_reply(reply) or reply.get("exceptionDetails")):
-            _frame_lookup_fallback_note()  # a stale world: read the page's own JS, never a false "No iframes"
-            res = await cdp_send(ws_url, [(2, "Runtime.evaluate", {"expression": _FRAME_LIST_JS, "returnByValue": True})])
-            reply = res.get(2) or {}
+        if ctx is not None and _cdp_error_reply(reply):
+            try:
+                ctx = await _isolated_world(ws_url, "cdpilot")
+            except Exception:
+                ctx = None
+            if ctx is not None:
+                p["contextId"] = ctx
+                res = await cdp_send(ws_url, [(2, "Runtime.evaluate", p)])
+                reply = res.get(2) or {}
+                if _cdp_error_reply(reply):
+                    _frame_lookup_fallback_note()
+                    res = await cdp_send(ws_url, [(3, "Runtime.evaluate",
+                                                   {"expression": _FRAME_LIST_JS, "returnByValue": True})])
+                    reply = res.get(3) or {}
+            else:
+                _frame_lookup_fallback_note()
+                res = await cdp_send(ws_url, [(2, "Runtime.evaluate",
+                                               {"expression": _FRAME_LIST_JS, "returnByValue": True})])
+                reply = res.get(2) or {}
         elif ctx is None:
             _frame_lookup_fallback_note()
-        frames = reply.get("result", {}).get("value", [])
-        if not frames:
+        if ctx is not None and reply.get("exceptionDetails"):
+            print("Error: frame list failed in cdpilot's isolated world", file=sys.stderr)
+            sys.exit(1)
+        frames = reply.get("result", {}).get("value")
+        if not isinstance(frames, list):
+            frames = []
+        valid_frames = []
+        for f in frames:
+            if not isinstance(f, dict):
+                continue
+            try:
+                idx = int(f.get("index"))
+            except (TypeError, ValueError):
+                continue
+            valid_frames.append((idx, f))
+        if not valid_frames:
             print("No iframes found on page.")
         else:
-            print(f"iframes ({len(frames)}):")
-            for f in frames:
-                src = _strip_tag_chars(f.get("src") or "")[0][:80]
-                name = _strip_tag_chars(f.get("name") or "")[0][:60]
-                fid = _strip_tag_chars(f.get("id") or "")[0][:60]
-                print(f"  [{f['index']}] src={src} name={name} id={fid}")
+            print(f"iframes ({len(valid_frames)}):")
+            for idx, f in valid_frames:
+                src = _frame_label(f.get("src"), 80)
+                name = _frame_label(f.get("name"), 60)
+                fid = _frame_label(f.get("id"), 60)
+                print(f"  [{idx}] src={src} name={name} id={fid}")
 
     elif subcmd == "list":
         ctx = None
@@ -20895,17 +20966,28 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
         if ctx is not None:
             p["contextId"] = ctx
         res = await cdp_send(ws_url, [(1, "Runtime.evaluate", p)])
-        frames = res.get(1, {}).get("result", {}).get("value", [])
-        if not frames:
+        frames = res.get(1, {}).get("result", {}).get("value")
+        if not isinstance(frames, list):
+            frames = []
+        valid_frames = []
+        for f in frames:
+            if not isinstance(f, dict):
+                continue
+            try:
+                idx = int(f.get("index"))
+            except (TypeError, ValueError):
+                continue
+            valid_frames.append((idx, f))
+        if not valid_frames:
             print(f"No iframes found in {route.describe()}.")
         else:
-            print(f"iframes in {route.describe()} ({len(frames)}):")
-            for f in frames:
+            print(f"iframes in {route.describe()} ({len(valid_frames)}):")
+            for idx, f in valid_frames:
                 hidden = "" if f.get("visible", True) else " (hidden)"
-                src = _strip_tag_chars(f.get("src") or "")[0][:80]
-                name = _strip_tag_chars(f.get("name") or "")[0][:60]
-                fid = _strip_tag_chars(f.get("id") or "")[0][:60]
-                print(f"  [{f['index']}] src={src} name={name} id={fid}{hidden}")
+                src = _frame_label(f.get("src"), 80)
+                name = _frame_label(f.get("name"), 60)
+                fid = _frame_label(f.get("id"), 60)
+                print(f"  [{idx}] src={src} name={name} id={fid}{hidden}")
 
     elif subcmd == "eval":
         if not subcmd_args:
