@@ -4,8 +4,9 @@
 
 Page text that carries ESC, other C0 controls, DEL and C1 (0x80-0x9F) reaches the
 page-text commands (content, html, go, network, a11y, a11y-snapshot, describe, tabs,
-console, debug, storage, eval, the assert family, check, WebMCP tools list / call, the
-test reporter). Every command
+console, debug, storage, eval, the assert family, check, wait, wait-for, wait-for-text,
+extract, observe, frame eval / shadow, WebMCP tools list / call, the test reporter
+and its JUnit output). Every command
 runs twice: once with stdout and stderr that say they are a terminal (isatty() is
 True) and once piped (plain text streams). A third pass writes `content` to a real
 pseudo-terminal (Unix), and the warm path (_daemon_execute) runs with the
@@ -160,6 +161,28 @@ def scenario_commands(mod):
     return out
 
 
+def scenario_followup(mod):
+    """wait, wait-for, wait-for-text, extract, observe, frame eval / shadow."""
+    out = {}
+
+    def val(v):
+        return lambda: STATE.update(value=v, exception=None)
+
+    out["wait"] = both(mod, mod.cmd_wait, "#x", setup=val({"out": "Found: DIV " + ESC + "[8mhidden"}))
+    out["wait_for"] = both(mod, mod.cmd_wait_for, "#x", setup=val({"out": "FOUND: DIV \"" + ESC + "[8m\x9b\""}))
+    out["wait_for_text"] = both(mod, mod.cmd_wait_for_text, "t", setup=val("FOUND: \"" + ESC + "]0;x\x07\""))
+    out["extract"] = both(mod, mod.cmd_extract, "p", setup=val("row " + ESC + "[8m\x9b2J"))
+    out["extract_list"] = both(mod, mod.cmd_extract, "p", "list", setup=val("1. " + ESC + "[2K"))
+    rows = [{"tag": "p", "text": "x" + ESC + "y\x7fz\x9bw"}]
+    out["extract_json"] = both(mod, mod.cmd_extract, "p", "json", setup=val(json.dumps(rows, ensure_ascii=False)))
+    out["extract_json_expected_pipe"] = json.dumps(rows, indent=2, ensure_ascii=False) + "\n"
+    out["extract_json_value"] = rows
+    out["observe"] = both(mod, mod.cmd_observe, setup=val("CLICK  #b  \"" + ESC + "[8mBuy\""))
+    out["frame_eval"] = both(mod, mod.cmd_frame, "eval", "x", setup=val("v" + ESC + "[8mhidden"))
+    out["frame_shadow"] = both(mod, mod.cmd_frame, "shadow", "#h", setup=val("<p>" + ESC + "]52;c;eA==\x07</p>"))
+    return out
+
+
 def scenario_webmcp(mod):
     out = {}
     tools = [{"name": "buy" + ESC + "[8m", "title": "Buy" + ESC + "]0;pwned\x07", "description": "d\x9b2J",
@@ -188,8 +211,8 @@ def scenario_webmcp(mod):
     return out
 
 
-def scenario_reporter(mod):
-    """cmd_test's default reporter: the test file's error text comes from the page."""
+def _reporter(mod, reporter, tail="", name="t" + ESC + "[8m"):
+    """cmd_test with one reporter: the test file's error text comes from the page."""
     import subprocess
     d = tempfile.mkdtemp(prefix="cdpilot-termout-t-")
     f = os.path.join(d, "a.cdpt.js")
@@ -197,14 +220,34 @@ def scenario_reporter(mod):
         fh.write("// fake\n")
     data = {"passed": 1, "failed": 1, "tests": [
         {"name": "ok", "status": "passed", "duration_ms": 1},
-        {"name": "t" + ESC + "[8m", "status": "failed", "duration_ms": 2,
-         "error": "FAIL: " + ESC + "]52;c;aGk=\x07 got " + ESC + "[8mhidden"}]}
+        {"name": name, "status": "failed", "duration_ms": 2,
+         "error": "FAIL: " + ESC + "]52;c;aGk=\x07 got " + ESC + "[8mhidden" + tail}]}
     real = subprocess.run
     subprocess.run = lambda *a, **k: types.SimpleNamespace(stdout=json.dumps(data), stderr="", returncode=1)
     try:
-        return both(mod, mod.cmd_test, [f])
+        return both(mod, mod.cmd_test, [f], False, 1, reporter)
     finally:
         subprocess.run = real
+
+
+def scenario_reporter(mod):
+    """The default reporter."""
+    return _reporter(mod, "default")
+
+
+def scenario_reporter_junit(mod):
+    """The JUnit reporter: XML 1.0 has no control characters, so its output must parse either way."""
+    import xml.etree.ElementTree as ET
+    # the test name is the test author's (not page text) and stays as it is
+    got = _reporter(mod, "junit", "\x9b\x7f\x01 & <b>", name="checkout works")
+    for tag in ("tty", "pipe"):
+        try:
+            root = ET.fromstring(got[tag]["stdout"])
+            got[tag]["failure"] = [e.text for e in root.iter("failure")]
+            got[tag]["xml_ok"] = True
+        except ET.ParseError as e:
+            got[tag]["xml_ok"] = str(e)
+    return got
 
 
 def scenario_pty(mod):
@@ -311,8 +354,10 @@ def scenario_helper(mod):
 
 SCENARIOS = {
     "commands": scenario_commands,
+    "followup": scenario_followup,
     "webmcp": scenario_webmcp,
     "reporter": scenario_reporter,
+    "reporter_junit": scenario_reporter_junit,
     "pty": scenario_pty,
     "daemon": scenario_daemon,
     "agent_json": scenario_agent_json,

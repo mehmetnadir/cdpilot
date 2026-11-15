@@ -12984,6 +12984,48 @@ print(json.dumps(out))
       + `    ${E}[31mFAIL: ${E}]52;c;aGk=\x07 got ${E}[8mhidden${E}[0m\n\n  1 passed, 1 failed\n`);
   });
 
+  test('terminal output (fake CDP, in-process): JUnit output escapes control characters in the page error text always (invalid in XML 1.0); the XML parses, & and < still round-trip', () => {
+    const j = termScenario('reporter_junit');
+    const failure = 'FAIL: \\x1b]52;c;aGk=\\x07 got \\x1b[8mhidden\\x9b\\x7f\\x01 & <b>';
+    for (const t of ['tty', 'pipe']) {
+      assert.deepStrictEqual(j[t].res, ['exit', 1], t);
+      assert.strictEqual(j[t].xml_ok, true, `${t}: ${j[t].xml_ok}\n${JSON.stringify(j[t].stdout)}`);
+      assert(!TERM_RAW.test(j[t].stdout), `${t}: ${JSON.stringify(j[t].stdout)}`);
+      assert.deepStrictEqual(j[t].failure, [failure], t);
+    }
+    assert(j.pipe.stdout.includes('<testcase name="checkout works" time="0.002">'), j.pipe.stdout);
+  });
+
+  test('terminal output (fake CDP, in-process): wait, wait-for, wait-for-text, extract (text, list, JSON), observe, frame eval and frame shadow show page control characters as \\xNN on a terminal; piped output is byte-identical', () => {
+    const c = termScenario('followup');
+    for (const [k, v] of Object.entries(c)) {
+      if (!v || !v.tty) continue;
+      for (const s of ['stdout', 'stderr']) {
+        assert(!TERM_RAW.test(v.tty[s]), `${k} ${s} on a terminal: ${JSON.stringify(v.tty[s])}`);
+      }
+      assert(/\\x(1b|9b)|\\u00(7f|9b)/.test(v.tty.stdout), `${k}: the escape is shown: ${JSON.stringify(v.tty)}`);
+      assert(TERM_RAW.test(v.pipe.stdout), `${k}: piped keeps the page's bytes: ${JSON.stringify(v.pipe)}`);
+      assert.deepStrictEqual(v.tty.res, v.pipe.res, `${k}: same exit either way`);
+    }
+    const pairs = {
+      wait: [`Found: DIV ${E}[8mhidden\n`, 'Found: DIV \\x1b[8mhidden\n'],
+      wait_for: [`FOUND: DIV "${E}[8m\x9b"\n`, 'FOUND: DIV "\\x1b[8m\\x9b"\n'],
+      wait_for_text: [`FOUND: "${E}]0;x\x07"\n`, 'FOUND: "\\x1b]0;x\\x07"\n'],
+      extract: [`row ${E}[8m\x9b2J\n`, 'row \\x1b[8m\\x9b2J\n'],
+      extract_list: [`1. ${E}[2K\n`, '1. \\x1b[2K\n'],
+      observe: [`=== What you can do on this page ===\n\nCLICK  #b  "${E}[8mBuy"\n`,
+        '=== What you can do on this page ===\n\nCLICK  #b  "\\x1b[8mBuy"\n'],
+      frame_eval: [`Result: v${E}[8mhidden\n`, 'Result: v\\x1b[8mhidden\n'],
+      frame_shadow: [`<p>${E}]52;c;eA==\x07</p>\n`, '<p>\\x1b]52;c;eA==\\x07</p>\n'],
+    };
+    for (const [k, [pipe, tty]] of Object.entries(pairs)) {
+      assert.strictEqual(c[k].pipe.stdout, pipe, `${k} piped`);
+      assert.strictEqual(c[k].tty.stdout, tty, `${k} on a terminal`);
+    }
+    assert.strictEqual(c.extract_json.pipe.stdout, c.extract_json_expected_pipe);
+    assert.deepStrictEqual(JSON.parse(c.extract_json.tty.stdout), c.extract_json_value, 'extract --json on a terminal still parses');
+  });
+
   test('terminal output (fake CDP, in-process): a real pseudo-terminal; the warm path follows the launcher tty / etty flags for that request only; _term_text keeps tab, newline, CRLF, Turkish letters and emoji', () => {
     const h = termScenario('helper');
     assert.deepStrictEqual(h, {
