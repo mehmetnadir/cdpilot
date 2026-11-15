@@ -7056,6 +7056,11 @@ def _proxy_set_active(name_or_none):
     return True
 
 
+def _proxy_launch_line(proxy):
+    """The `launch` status line for a proxy; credentials never reach stdout."""
+    return f'  Proxy: {_proxy_redact(proxy)}'
+
+
 def _proxy_redact(url):
     """Strip credentials from a proxy URL for safe display."""
     if not url:
@@ -7656,7 +7661,7 @@ def cmd_launch(auto=False, idle_close=None):
     proxy = get_proxy_config()
     if proxy:
         chrome_args.append(f'--proxy-server={proxy}')
-        print(f'  Proxy: {proxy}')
+        print(_proxy_launch_line(proxy))
 
     # Headless
     if get_headless_config():
@@ -16626,6 +16631,17 @@ _AGENT_SECRET_FIELD_RE = _re.compile(
     _re.I)
 
 
+# Values `agent run` types from --var / CDPILOT_VAR_*: any descriptor value equal to
+# (or, from 4 chars, containing) one of them is masked, whatever the field is named.
+_AGENT_TYPED_SECRETS = set()
+
+
+def _agent_value_is_typed_secret(val):
+    if not val or not isinstance(val, str):
+        return False
+    return any(val == t or (len(t) >= 4 and t in val) for t in _AGENT_TYPED_SECRETS)
+
+
 def _agent_state_path():
     return os.path.join(CDPILOT_HOME, 'projects', PROJECT_ID, 'agent-state.json')
 
@@ -17313,7 +17329,8 @@ def _snapshot_to_actions(nodes, state):
         if role in ('textbox', 'combobox', 'searchbox'):
             val = node.get('value', {}).get('value')
             if val is not None:
-                action['value'] = '«masked»' if (val and _AGENT_SECRET_FIELD_RE.search(name)) else val
+                action['value'] = '«masked»' if (val and (_AGENT_SECRET_FIELD_RE.search(name)
+                                                          or _agent_value_is_typed_secret(val))) else val
         new_actions.append(action)
 
     return new_actions
@@ -19582,6 +19599,9 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
             err['refused'] = refused
         print(json.dumps(err), file=sys.stderr)
         sys.exit(2)
+
+    _AGENT_TYPED_SECRETS.update(v for v in cli_values.values() if v)
+    _AGENT_TYPED_SECRETS.update(v for d in env_by_step.values() for v in d.values() if v)
 
     def subst(s, step_n=None):
         env_here = env_by_step.get(step_n, {})  # a go step (None) never gets an environment value

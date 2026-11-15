@@ -4,6 +4,10 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- **`launch` no longer prints proxy credentials.** The `Proxy:` line masks the user name and password of a pool or `CHROME_PROXY` value (the browser still gets the full URL). The MCP `browser_launch` result carried that line to the model.
+- **`agent run` masks every value it types from `--var` or `CDPILOT_VAR_*`.** A field with an ordinary name ("Code", "Key") no longer shows the typed secret in drift output, run output or `agent-state.json`; the descriptor value becomes the same masked marker as in secret-named fields.
+
 ### Changed
 - **`blog publish` / `blog regenerate` read their output folder from `CDPILOT_BLOG_DIR`.** The folder was a hard-coded maintainer path; without the variable both commands now exit 2 with a message and write nothing. `day-NNN` sources are looked up in `CDPILOT_BLOG_PLAN_DIR` (default: the current directory). Maintainer notes, social-media drafts and the X bot are no longer in the repository.
 
