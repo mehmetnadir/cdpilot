@@ -9795,7 +9795,8 @@ c0 = time.process_time(); vp = mod._agent_text_view(P, {"labels": {300000 + i: O
 c_view = time.process_time() - c0
 fp = mod._agent_text_fields(vp, P, {}, {})
 assert vp["removed"] == 5000 and fp["hidden_removed"] == 5000 and fp["text"] == "" and "hidden_note" not in fp, fp["text"][:200]
-assert c_view < 0.1, "5,000 removed nodes under one paragraph took %.3f s CPU" % c_view
+# 0.4 s: a shared CI runner measured 0.105 s (CI 43658299970); the quadratic version took 1.03 s
+assert c_view < 0.4, "5,000 removed nodes under one paragraph took %.3f s CPU" % c_view
 print("perf 5000 removed under one paragraph: %.3f s CPU" % c_view)
 few = [T(2, " ".join(J % i for i in range(40)) + " Order total 49.99", "paragraph", kids=tuple(range(400000, 400041)))]
 few += [T(400000 + i, J % i) for i in range(40)] + [T(400040, "Order total 49.99")]
@@ -9820,11 +9821,11 @@ for ch in (198, 199, 200):
 cyc = [T(1, "x " + PAY, "heading", kids=(2,)), T(2, "", "generic", kids=(1, 3)), T(3, PAY)]   # a malformed tree: a cycle
 assert mod._agent_text_view(cyc, {"labels": {3: OFF}})["text"] == ""
 # Y2: long names cost nothing: a 100,000-char visible run with two long removed texts (different first letters),
-# and 64 nested headings of 5,000 chars each (round 2: 1.79 s and 6.93 s CPU)
+# and 64 nested headings of 5,000 chars each (round 2: 1.79 s and 6.93 s CPU; bound 0.4 s, CI runners are slower)
 la, lb = "a" * 20000 + " " + PAY, "b " + PAY + " " + "b" * 8
 lng = [T(2, "a" * 100000 + " " + la + " " + lb, "heading", kids=(3, 4, 5)), T(3, "a" * 100000), T(4, la), T(5, lb)]
 c0 = time.process_time(); vl = mod._agent_text_view(lng, {"labels": {4: OFF, 5: OFF}}); c_long = time.process_time() - c0
-assert vl["removed"] == 2 and "attacker@" not in vl["text"] and vl["text"] == "a" * 2000 and c_long < 0.1, (vl["removed"], c_long)
+assert vl["removed"] == 2 and "attacker@" not in vl["text"] and vl["text"] == "a" * 2000 and c_long < 0.4, (vl["removed"], c_long)
 texts = [(PAY + " %d " % i) + ("x%d " % i) * 1250 for i in range(64)]
 nest = []
 for i in range(64):
@@ -9832,7 +9833,7 @@ for i in range(64):
              T(5001 + 2 * i, texts[i])]
 c0 = time.process_time(); vn = mod._agent_text_view(nest, {"labels": {5001 + 2 * i: OFF for i in range(64)}})
 c_nest = time.process_time() - c0
-assert vn["removed"] == 64 and vn["text"] == "" and c_nest < 0.1, (vn["removed"], c_nest)
+assert vn["removed"] == 64 and vn["text"] == "" and c_nest < 0.4, (vn["removed"], c_nest)
 print("perf long names: 100k run %.3f s, 64 nested headings %.3f s CPU" % (c_long, c_nest))
 # round 2 (item 3): a heading, link or button whose name CONTAINS a text cut from below it gets why
 for role in ("heading", "link", "button"):
