@@ -7144,21 +7144,25 @@ def _proxy_launch_line(proxy):
 
 
 def _proxy_redact(url):
-    """Strip credentials from a proxy URL for safe display."""
+    """Strip credentials from a proxy URL for safe display.
+
+    Everything before the last '@' is masked, so a scheme-less value, an
+    unencoded '#', '/' or '?' in the password, or an invalid port cannot leak.
+    Never returns the raw input when it holds credentials.
+    """
     if not url:
         return ''
-    try:
-        from urllib.parse import urlparse, urlunparse
-        p = urlparse(url)
-        if p.username or p.password:
-            host = p.hostname or ''
-            if p.port:
-                host = f"{host}:{p.port}"
-            netloc = f"***:***@{host}"
-            return urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+    url = str(url)
+    scheme, sep, rest = url.partition('://')
+    if not sep:
+        scheme, rest = '', url
+    else:
+        scheme += sep
+    userinfo, at, tail = rest.rpartition('@')
+    if not at:
         return url
-    except Exception:
-        return url
+    return f"{scheme}***:***@{tail}"
+
 
 def get_headless_config():
     """Return whether headless mode is active."""
@@ -9678,7 +9682,7 @@ def _cookie_domain_matches(host, domain):
     return bool(d) and (h == d or h.endswith('.' + d))
 
 
-_COOKIES_HOST_RE = _re.compile(r'^[A-Za-z0-9][A-Za-z0-9.\-]*([:_][0-9]{1,5})?$')
+_COOKIES_HOST_RE = _re.compile(r'^[A-Za-z0-9][A-Za-z0-9._\-]*([:_][0-9]{1,5})?$')
 
 
 def _cookies_host_valid(host):
@@ -9687,12 +9691,35 @@ def _cookies_host_valid(host):
 
 
 def _cookies_safe_host(host):
-    """Make a hostname safe for use as a filesystem directory name."""
-    safe = host.replace(':', '_').replace('/', '_')
-    if not _cookies_host_valid(host):
-        print(f"Error: invalid host for the cookie store: {host!r}", file=sys.stderr)
-        sys.exit(2)
+    """Directory name for a host: replace(':', '_'); ValueError if unsafe."""
+    name = host or ''
+    safe = name.replace(':', '_').replace('/', '_')
+    # IPv6 literal -> 'v6_...'; IDN -> punycode.
+    if name.startswith('['):
+        name = 'v6_' + name.replace('[', '').replace(']', '')
+    elif name.count(':') > 1:
+        name = 'v6_' + name
+    try:
+        name.encode('ascii')
+    except UnicodeEncodeError:
+        try:
+            name = name.encode('idna').decode('ascii')
+        except UnicodeError:
+            raise ValueError(f"invalid host for the cookie store: {host!r}")
+    safe = name.replace(':', '_').replace('/', '_')
+    if '/' in name or not _cookies_host_valid(safe):
+        raise ValueError(f"invalid host for the cookie store: {host!r}")
     return safe
+
+
+def _cookies_cli_host(host):
+    """The explicit `cookies ... --host` branch: an unusable name exits 2."""
+    try:
+        _cookies_safe_host(host)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+    return host
 
 
 def _cookies_host_dir(host):
@@ -9861,7 +9888,7 @@ async def cmd_cookies(*args):
     if sub == 'save':
         # Per-host mode: cookies save --host <hostname>
         if len(args) >= 3 and args[1] == '--host':
-            host = args[2]
+            host = _cookies_cli_host(args[2])
             ws, _ = get_page_ws()
             r = await cdp_send(ws, [(1, "Network.getCookies", {})])
             all_c = _cdp_reply(r, 1, "Network.getCookies", 15).get("cookies", [])
@@ -9901,7 +9928,7 @@ async def cmd_cookies(*args):
             sys.exit(1)
         # Per-host mode: cookies load --host <hostname>
         if len(args) >= 3 and args[1] == '--host':
-            host = args[2]
+            host = _cookies_cli_host(args[2])
             cookies = _load_host_cookies(host)
             if not cookies:
                 print(f"No valid cached cookies for {host}", file=sys.stderr)
@@ -9973,7 +10000,7 @@ async def cmd_cookies(*args):
 
     if sub == 'clear':
         if len(args) >= 3 and args[1] == '--host':
-            shutil.rmtree(_cookies_host_dir(args[2]), ignore_errors=True)
+            shutil.rmtree(_cookies_host_dir(_cookies_cli_host(args[2])), ignore_errors=True)
             print(f"Cleared cookies for {args[2]}")
         elif len(args) >= 2 and args[1] == '--all':
             shutil.rmtree(COOKIES_DIR, ignore_errors=True)
@@ -10059,6 +10086,7 @@ async def cmd_cookies(*args):
         if not host:
             print(f"Cannot parse hostname from: {args[1]}", file=sys.stderr)
             return
+        _cookies_cli_host(host)
         cookies = _load_host_cookies(host)
         if not cookies:
             print(f"No cached cookies for {host}")
@@ -11003,8 +11031,8 @@ def cmd_ext_remove(ext_id):
             print('   Restart the browser (stop → launch).')
             return
 
-    if not _re.fullmatch(r'[a-p]{32}', ext_id):
-        print(f"Error: not a Chrome extension id (32 characters a-p): {ext_id}", file=sys.stderr)
+    if not _re.fullmatch(r'[0-9a-p]{32}', ext_id):
+        print(f"Error: not a Chrome extension id (32 characters 0-9 or a-p): {ext_id}", file=sys.stderr)
         sys.exit(2)
     ext_root = os.path.realpath(os.path.join(PROFILE_DIR, "Default", "Extensions"))
     ext_dir = os.path.realpath(os.path.join(ext_root, ext_id))
@@ -22565,7 +22593,11 @@ class MCPServer:
             shot_root = os.path.realpath(SCREENSHOT_DIR)
             for key in ("path1", "path2"):
                 p = os.path.realpath(os.path.join(shot_root, str(args.get(key, ""))))
-                if p == shot_root or os.path.commonpath([shot_root, p]) != shot_root:
+                try:
+                    outside = p == shot_root or os.path.commonpath([shot_root, p]) != shot_root
+                except ValueError:  # e.g. another drive on Windows
+                    outside = True
+                if outside:
                     return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{
                         "type": "text",
                         "text": f"Error: {key} must be inside {SCREENSHOT_DIR}"}], "isError": True}}

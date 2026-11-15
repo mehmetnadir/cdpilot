@@ -3795,6 +3795,96 @@ test('security: cookies clear --host rejects dot-dot and keeps CDPILOT_HOME', ()
   assert(!fs.existsSync(hostDir), 'normal host store is cleared');
 });
 
+function secPy(home, body) {
+  const py = `
+import importlib.util, sys, json
+s = importlib.util.spec_from_file_location('cdp', ${JSON.stringify(PY_PATH)})
+m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+${body}
+`;
+  return require('child_process').spawnSync('python3', ['-c', py],
+    { encoding: 'utf-8', env: secEnv(home) });
+}
+
+test('security: ext-remove accepts the md5-hex ids ext-install creates', () => {
+  const home = secHome();
+  const extRoot = path.join(home, 'profile', 'Default', 'Extensions');
+  const id = require('crypto').createHash('md5').update('/some/x.crx').digest('hex').slice(0, 32);
+  fs.mkdirSync(path.join(extRoot, id, '1.0'), { recursive: true });
+  const ok = secCli(home, ['ext-remove', id]);
+  assert.strictEqual(ok.status, 0, `md5 id exit ${ok.status}: ${ok.stderr}`);
+  assert(!fs.existsSync(path.join(extRoot, id)), 'md5-id extension dir is removed');
+  for (const bad of ['../x', '/etc', id + 'a', id.slice(1)]) {
+    assert.strictEqual(secCli(home, ['ext-remove', bad]).status, 2, `'${bad}' must exit 2`);
+  }
+});
+
+test('security: _proxy_redact never returns credentials (scheme-less, odd password chars, bad port)', () => {
+  const r = secPy(secHome(), `
+f = m._proxy_redact
+cases = ['user:SECRET@proxy:8080', 'http://user:SE#CRET@proxy:8080', 'http://user:SE/CRET@proxy:8080',
+         'http://user:SE?CRET@proxy:8080', 'http://user:SECRET@proxy:notaport', 'http://u:p@h:99999999',
+         'socks5://user:p@ss@proxy:1080']
+print(json.dumps([f(c) for c in cases]))
+print(f('http://proxy:8080'), f('proxy:8080'), repr(f('')))
+print(m._proxy_launch_line('user:SECRET@proxy:8080'))
+`);
+  const lines = r.stdout.trim().split('\n');
+  const out = JSON.parse(lines[0]);
+  for (const o of out) {
+    assert(!/SECRET|SE#|SE\/|SE\?|CRET|user|ss@|:p@|u:p/.test(o.replace('***:***@', '')), `leak: ${o}`);
+    assert(o.includes('***:***@'), `not masked: ${o}`);
+  }
+  assert.strictEqual(lines[1], "http://proxy:8080 proxy:8080 ''");
+  assert(!lines[2].includes('SECRET'), lines[2]);
+});
+
+test('security: MCP browser_screenshot_diff answers with an error when commonpath raises', () => {
+  const r = secPy(secHome(), `
+import os
+def boom(paths): raise ValueError("Paths don't have the same drive")
+os.path.commonpath = boom
+srv = m.MCPServer.__new__(m.MCPServer)
+res = srv._execute_tool(7, 'browser_screenshot_diff', {'path1': 'a.png', 'path2': 'b.png'})
+print(json.dumps(res))
+`);
+  assert.strictEqual(r.status, 0, r.stderr);
+  const res = JSON.parse(r.stdout.trim().split('\n').pop());
+  assert.strictEqual(res.id, 7);
+  assert.strictEqual(res.result.isError, true);
+});
+
+test('security: go auto-cookie path skips (no exit) for IDN, ::1 and underscore hosts; explicit --host still exits 2', () => {
+  const home = secHome();
+  const r = secPy(home, `
+out = {}
+for h in ['bücher.de', '::1', '[::1]:8080', 'my_host.example', 'example.com:8080']:
+    try:
+        d = m._cookies_host_dir(h)
+        out[h] = d.startswith(m.COOKIES_DIR)
+    except SystemExit:
+        out[h] = 'EXIT'
+    except Exception as e:
+        out[h] = type(e).__name__
+for h in ['..', '.', '', '.x', 'a/b', '../x']:
+    try:
+        m._cookies_safe_host(h); out[h] = 'ok'
+    except ValueError:
+        out[h] = 'ValueError'
+print(json.dumps(out))
+`);
+  assert.strictEqual(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout.trim().split('\n').pop());
+  for (const h of ['bücher.de', '::1', '[::1]:8080', 'my_host.example', 'example.com:8080']) {
+    assert.strictEqual(out[h], true, `${h}: ${out[h]}`);
+  }
+  for (const h of ['..', '.', '', '.x', 'a/b', '../x']) assert.strictEqual(out[h], 'ValueError', `${h}: ${out[h]}`);
+  for (const sub of [['save'], ['load'], ['clear']]) {
+    const c = secCli(home, ['cookies', ...sub, '--host', '..']);
+    assert.strictEqual(c.status, 2, `cookies ${sub} --host .. exit ${c.status}`);
+  }
+});
+
 test('security: cookie auto-save domain match needs a dot boundary', () => {
   const py = `
 import importlib.util
