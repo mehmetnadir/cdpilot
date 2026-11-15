@@ -153,6 +153,7 @@ import unicodedata
 import concurrent.futures
 import tempfile
 import contextlib
+import stat
 import contextvars
 import functools
 import io
@@ -236,7 +237,7 @@ def _save_registry(projects):
     write (os.replace is atomic on both POSIX and Windows).
     """
     reg_dir = os.path.dirname(REGISTRY_FILE)
-    os.makedirs(reg_dir, exist_ok=True)
+    _makedirs_private(reg_dir)
     fd, tmp_path = tempfile.mkstemp(prefix='.registry-', suffix='.tmp', dir=reg_dir)
     try:
         with os.fdopen(fd, 'w') as f:
@@ -250,13 +251,76 @@ def _save_registry(projects):
         raise
 
 
+def _makedirs_private(path):
+    """makedirs for a directory that holds private data: every directory this
+    call creates is 0700 (chmod after the fact, so the umask cannot loosen it).
+    A directory that already exists keeps its mode, a user-chosen one included."""
+    missing = []
+    cur = os.path.abspath(path)
+    while cur and not os.path.isdir(cur):
+        missing.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    for d in reversed(missing):
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            continue
+        if os.name != "nt":
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
+    os.makedirs(path, exist_ok=True)
+
+
+def _open_output_fd(path, append=False):
+    """Open `path` for writing as a private output file; returns a binary file object.
+
+    POSIX: O_NOFOLLOW (a symlink planted at the path is refused) and mode 0600 for
+    a new file; an existing file must be a regular file owned by this user, so a
+    file another local user pre-created in a shared directory such as /tmp is not
+    written. Raises OSError when refused. Windows keeps the plain open().
+    """
+    if os.name == "nt":
+        return open(path, "ab" if append else "wb")
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    if append:
+        flags |= os.O_APPEND
+    fd = os.open(path, flags, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise PermissionError(
+                f"refusing to write {path}: not a regular file owned by you")
+        if not append:
+            os.ftruncate(fd, 0)
+        return os.fdopen(fd, "ab" if append else "wb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_output(path):
+    """_open_output_fd for commands: a refusal is a clear error and exit 1."""
+    try:
+        return _open_output_fd(path)
+    except OSError as e:
+        print(f"Cannot write {path}: {e.strerror or e} "
+              "(symlink, or not a file you own; choose another output path)",
+              file=sys.stderr)
+        sys.exit(1)
+
+
 @contextlib.contextmanager
 def _registry_lock():
     """Exclusive lock around a registry read-modify-write (another cdpilot
     process may register at the same moment; without it one of the two
     writes, e.g. a connect's `external` flag, was silently lost). Best
     effort: if the lock file cannot be opened the block still runs."""
-    os.makedirs(os.path.dirname(REGISTRY_FILE), exist_ok=True)
+    _makedirs_private(os.path.dirname(REGISTRY_FILE))
     try:
         fd = os.open(REGISTRY_FILE + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
     except OSError:
@@ -8197,7 +8261,7 @@ async def cmd_shot(output=None, quality=None, element=None, fmt=None, hidpi=Fals
     mode = "device" if hidpi else None
     data = await _capture(ws, fmt, quality=quality, clip_css=clip_css, mode=mode)
     if data:
-        with open(output, "wb") as f:
+        with _open_output(output) as f:
             f.write(data)
         size_kb = len(data) / 1024
         try:
@@ -8288,7 +8352,7 @@ async def cmd_shot_annotated(output=None):
     })])
 
     if data:
-        with open(output, "wb") as f:
+        with _open_output(output) as f:
             f.write(data)
         print(f"{output} ({badge_count} badge)")
     else:
@@ -9767,7 +9831,7 @@ async def cmd_cookies(*args):
             d = domain_filter.lstrip('.')
             cookies = [c for c in cookies
                        if c.get('domain', '').lstrip('.').endswith(d)]
-        with open(out_path, 'w') as f:
+        with io.TextIOWrapper(_open_output(out_path), encoding='utf-8') as f:
             json.dump(cookies, f, indent=2)
         print(f'Saved {len(cookies)} cookies -> {out_path}')
         return
@@ -10342,7 +10406,7 @@ async def cmd_debug(url=None):
     try:
         data = await _capture(ws, "png")
         if data:
-            with open(shot_path, "wb") as f:
+            with _open_output(shot_path) as f:
                 f.write(data)
             print(f"  {shot_path}")
     except:
@@ -11198,7 +11262,7 @@ async def cmd_pdf(output=None):
     })], timeout=30)
     b64 = r.get(1, {}).get('data', '')
     if b64:
-        with open(output, 'wb') as f:
+        with _open_output(output) as f:
             f.write(base64.b64decode(b64))
         print(f'PDF saved: {output}')
     else:
@@ -14993,7 +15057,7 @@ async def cmd_describe():
     shot_path = f"{SCREENSHOT_DIR}/cdpilot-describe-{ts}.png"
     shot_data = await _capture(ws_url, "png", capture_beyond_viewport=False)
     if shot_data:
-        with open(shot_path, "wb") as f:
+        with _open_output(shot_path) as f:
             f.write(shot_data)
         print(f"Saved: {shot_path}")
     else:
@@ -23064,9 +23128,9 @@ def _watch_load_state():
 
 
 def _watch_save_state(state):
-    os.makedirs(_watch_dir(), exist_ok=True)
+    _makedirs_private(_watch_dir())
     tmp = _watch_state_path() + '.tmp'
-    with open(tmp, 'w') as f:
+    with io.TextIOWrapper(_open_output_fd(tmp), encoding='utf-8') as f:
         json.dump(state, f, indent=2)
     os.replace(tmp, _watch_state_path())
 
@@ -23228,7 +23292,7 @@ async def _watch_daemon_run(url, fps, quality, max_width, retention_s,
     import websockets
 
     fdir = _watch_frames_dir()
-    os.makedirs(fdir, exist_ok=True)
+    _makedirs_private(fdir)
 
     # Launch browser if needed (the daemon is forked by `watch start`, a page
     # command, so it follows the same CDPILOT_NO_AUTOLAUNCH switch).
@@ -23315,12 +23379,13 @@ async def _watch_daemon_run(url, fps, quality, max_width, retention_s,
             if raw:
                 fpath = os.path.join(fdir, f"{ts_ms}.jpg")
                 try:
-                    with open(fpath, 'wb') as f:
+                    with _open_output_fd(fpath) as f:
                         f.write(raw)
                     # Append to index (best-effort; missing entries are fine,
                     # query falls back to scanning the dir directly)
                     try:
-                        with open(_watch_index_path(), 'a') as idx:
+                        with io.TextIOWrapper(_open_output_fd(_watch_index_path(), append=True),
+                                              encoding='utf-8') as idx:
                             idx.write(json.dumps({
                                 "ts_ms": ts_ms,
                                 "filename": f"{ts_ms}.jpg",
@@ -23468,7 +23533,7 @@ def cmd_watch_start(*args):
         if url == '-':
             url = ''
 
-    os.makedirs(_watch_frames_dir(), exist_ok=True)
+    _makedirs_private(_watch_frames_dir())
     state = {
         'url': url,
         'fps': fps,

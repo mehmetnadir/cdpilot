@@ -4,6 +4,10 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- **Files with page content or cookies are owner-only.** A new `CDPILOT_HOME` (and the directories created under it) is 0700; an existing directory keeps its mode. `watch` creates its folders 0700 and writes screencast frames 0600. `cookies save <file>` writes the export 0600.
+- **Default outputs in `/tmp` cannot be pre-seeded by another local user.** `shot`, `shot --annotate`, `pdf`, `debug` and `describe` outputs (and the MCP `browser_screenshot`) are opened without following a symlink, as 0600 for a new file. If the output path is a symlink or a file you do not own, the command stops with an error instead of writing. The default paths are unchanged, and overwriting your own earlier file still works.
+
 ### Changed
 - **`blog publish` / `blog regenerate` read their output folder from `CDPILOT_BLOG_DIR`.** The folder was a hard-coded maintainer path; without the variable both commands now exit 2 with a message and write nothing. `day-NNN` sources are looked up in `CDPILOT_BLOG_PLAN_DIR` (default: the current directory). Maintainer notes, social-media drafts and the X bot are no longer in the repository.
 
