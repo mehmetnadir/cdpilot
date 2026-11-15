@@ -1723,6 +1723,106 @@ print("ok")
   assert(/^ok/m.test(r.stdout), r.stdout);
 });
 
+test('learned flows (unit): the inner text of a typed node leaves the snapshot whatever its role (a number field is a spinbutton); a secret-named spinbutton is masked too', () => {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-typedrole-'));
+  const script = `
+import importlib.util, json
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+def node(i, role, name, bid, value=None, kids=()):
+    n = {"nodeId": str(i), "ignored": False, "role": {"value": role}, "name": {"value": name}, "backendDOMNodeId": bid}
+    if value is not None:
+        n["value"] = {"value": value}
+    if kids:
+        n["childIds"] = [str(k) for k in kids]
+    return n
+# <input type=number> is a spinbutton with Chrome's inner editor below it (generic -> StaticText); a
+# contenteditable the run typed into is a generic node holding the text itself
+page = [node(1, "RootWebArea", "Inbox", 1, kids=[2, 5, 7, 10]),
+        node(2, "spinbutton", "Code", 10, "4821", kids=[3]), node(3, "generic", "", 11, kids=[4]),
+        node(4, "StaticText", "4821", 12),
+        node(5, "generic", "", 30, kids=[6]), node(6, "StaticText", "zq-note-5521", 31),
+        node(7, "spinbutton", "PIN", 40, "2468", kids=[8]), node(8, "generic", "", 41, kids=[9]),
+        node(9, "StaticText", "2468", 42),
+        node(10, "spinbutton", "Quantity", 50, "7315", kids=[11]), node(11, "StaticText", "7315", 51)]
+state = {"actions_map": {}, "ref_counter": 0,
+         "typed_nodes": [{"origin": "https://user.example", "doc": 1, "bids": [10, 30]}]}
+nodes, acts = mod._agent_actions({"url": "https://user.example/inbox"}, page, state)
+out, text = json.dumps(acts), mod._extract_text_summary(nodes)
+for secret in ("4821", "zq-note-5521", "2468"):
+    assert secret not in out and secret not in text, (secret, out, text)
+assert "7315" in text, ("an ordinary number field keeps its text", text)
+assert {a["name"] for a in acts} >= {"Code", "PIN", "Quantity"}, out
+print("ok")
+`;
+  const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
+    { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
+  assert.strictEqual(r.status, 0, `typed role unit test failed: ${r.stderr}`);
+  assert(/^ok/m.test(r.stdout), r.stdout);
+});
+
+test('learned flows (unit): saving agent-state.json keeps the typed_nodes another process wrote since this one loaded it; the caps still drop the oldest', () => {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-typedrace-'));
+  const script = `
+import importlib.util, json
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+def disk():
+    with open(mod._agent_state_path()) as f:
+        return json.load(f)
+o, scope = "https://user.example", ("https://user.example", 900)
+a = mod._load_agent_state()                      # process A (an observe) loads the state
+b = mod._load_agent_state()                      # process B (agent run) loads it, marks a typed node, saves
+mod._agent_typed_add(b, [77], scope)
+mod._save_agent_state(b)
+mod._agent_typed_add(a, [5], scope)              # A: a node of the same document, and another document
+mod._agent_typed_add(a, [9], ("https://other.example", 1))
+a["step"] = 3
+mod._save_agent_state(a)
+d = disk()
+assert mod._agent_typed_bids(d, scope) == {5, 77}, d["typed_nodes"]
+assert mod._agent_typed_bids(d, ("https://other.example", 1)) == {9}, d["typed_nodes"]
+assert d["step"] == 3 and a["typed_nodes"] == d["typed_nodes"], d
+c = mod._load_agent_state()                      # a document only the other writer has
+b = mod._load_agent_state()
+mod._agent_typed_add(b, [88], ("https://b.example", 2))
+mod._save_agent_state(b)
+mod._save_agent_state(c)
+assert mod._agent_typed_bids(disk(), ("https://b.example", 2)) == {88}, disk()["typed_nodes"]
+# one writer at the caps: the oldest document (and id) it dropped stays dropped
+mod.PROJECT_ID = "capcase"                       # a fresh agent-state.json
+s = mod._load_agent_state()
+for i in range(mod.AGENT_TYPED_DOCS):
+    mod._agent_typed_add(s, list(range(mod.AGENT_TYPED_MAX)) if i == 0 else [1], (o, 2000 + i))
+mod._save_agent_state(s)
+s = mod._load_agent_state()
+mod._agent_typed_add(s, [mod.AGENT_TYPED_MAX], (o, 2000))  # id 0 of document 2000 drops out
+mod._agent_typed_add(s, [1], (o, 3000))          # document 2001 drops out
+mod._save_agent_state(s)
+docs = [r["doc"] for r in disk()["typed_nodes"]]
+assert len(docs) == mod.AGENT_TYPED_DOCS and 2001 not in docs and 3000 in docs and 2000 in docs, docs
+assert 0 not in mod._agent_typed_bids(disk(), (o, 2000)), "the dropped id came back"
+# another writer adds a document while this one is at the cap: that document stays, the oldest goes
+x = mod._load_agent_state()
+y = mod._load_agent_state()
+mod._agent_typed_add(y, [1], (o, 4000))
+mod._save_agent_state(y)
+mod._agent_typed_add(x, [1], (o, 5000))
+mod._save_agent_state(x)
+docs = [r["doc"] for r in disk()["typed_nodes"]]
+assert len(docs) == mod.AGENT_TYPED_DOCS and 4000 in docs and 5000 in docs, docs
+print("ok")
+`;
+  const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
+    { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
+  assert.strictEqual(r.status, 0, `typed_nodes race unit test failed: ${r.stderr}`);
+  assert(/^ok/m.test(r.stdout), r.stdout);
+});
+
 test('agent observe text summary (unit): Chrome AX role StaticText feeds `text`, consecutive duplicates dropped, max_chars kept', () => {
   const { spawnSync } = require('child_process');
   const os = require('os');
@@ -3987,6 +4087,17 @@ print(m._proxy_launch_line('user:SECRET@proxy:8080'))
   }
   assert.strictEqual(lines[1], "http://proxy:8080 proxy:8080 ''");
   assert(!lines[2].includes('SECRET'), lines[2]);
+});
+
+test('security: _proxy_redact keeps only a real scheme before "://" (a user name or password there is masked too)', () => {
+  const r = secPy(secHome(), `
+f = m._proxy_redact
+print(json.dumps([f(c) for c in ['u:pa://ss@host:8080', 'user:se://cret@h:1', 'HTTP://u:p@h', 'socks5h://user:pw@h:1080',
+                                 'a-b+c.d://x:y@h', '1x://u:p@h']]))
+`);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.deepStrictEqual(JSON.parse(r.stdout.trim()), ['***:***@host:8080', '***:***@h:1', 'HTTP://***:***@h',
+    'socks5h://***:***@h:1080', 'a-b+c.d://***:***@h', '***:***@h']);
 });
 
 test('security: MCP browser_screenshot_diff answers with an error when commonpath raises', () => {
@@ -12439,6 +12550,78 @@ print("ok %.1f" % best)
     } finally { fake.stop(); }
   });
 
+  test('learned flows (fake browser): replaying an MCP-written flow from the terminal (--trust-flow, or a flow with no value) keeps its provenance — `agent flow save` afterwards still says written_by mcp', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const mcpEnv = { ...env, CDPILOT_MCP_SESSION: '1', CDPILOT_MCP_TOOL_CALL: '1' };  // an MCP tool call
+      const read = (n) => JSON.parse(fs.readFileSync(path.join(home, 'projects', 'proj', 'flows', `${n}.json`), 'utf-8'));
+      const ok = (args, e) => {
+        const r = cli(args, e || env);
+        assert.strictEqual(r.status, 0, `${args.join(' ')} exit ${r.status}: ${r.stderr}\n${r.stdout}`);
+        return r;
+      };
+      const observe = (e) => Object.fromEntries(JSON.parse(ok(['agent', 'observe'], e).stdout).actions.map((a) => [a.name, a]));
+      ok(['agent', 'act', '--url', 'https://user.example/inbox'], mcpEnv);
+      ok(['agent', 'act', '--ref', observe(mcpEnv).Password.ref, '--action', 'fill', '--text', 'model-made-up'], mcpEnv);
+      assert.strictEqual(JSON.parse(ok(['agent', 'flow', 'save', 'login'], mcpEnv).stdout).written_by, 'mcp');
+      ok(['agent', 'act', '--url', 'https://user.example/inbox'], mcpEnv);
+      ok(['agent', 'act', '--ref', observe(mcpEnv).Archive.ref, '--action', 'click'], mcpEnv);
+      assert.strictEqual(JSON.parse(ok(['agent', 'flow', 'save', 'archive'], mcpEnv).stdout).written_by, 'mcp');
+      // the operator navigates in the terminal (the trail's last navigation is the terminal's), vouches
+      // for the flow's origins and runs it, then saves the trail (as after a drift repair)
+      ok(['agent', 'act', '--url', 'https://user.example/inbox']);
+      assert.strictEqual(JSON.parse(ok(['agent', 'run', 'login', '--var', 'password=zq-trusted-7731', '--trust-flow']).stdout).status, 'ok');
+      const resaved = JSON.parse(ok(['agent', 'flow', 'save', 'login']).stdout);
+      assert.deepStrictEqual([resaved.written_by, read('login').written_by], ['mcp', 'mcp'], JSON.stringify(resaved));
+      const copy = JSON.parse(ok(['agent', 'flow', 'save', 'login_copy']).stdout);
+      assert.strictEqual(copy.written_by, 'mcp', `the model chose those pages, under any name: ${JSON.stringify(copy)}`);
+      // a flow with no value needs no flag; its replayed steps keep the mark too
+      ok(['agent', 'act', '--url', 'https://user.example/inbox']);
+      assert.strictEqual(JSON.parse(ok(['agent', 'run', 'archive']).stdout).status, 'ok');
+      assert.strictEqual(JSON.parse(ok(['agent', 'flow', 'save', 'archive_copy']).stdout).written_by, 'mcp');
+      // the terminal's own acts after that are the terminal's again
+      ok(['agent', 'act', '--url', 'https://user.example/inbox']);
+      ok(['agent', 'act', '--ref', observe(env).Archive.ref, '--action', 'click']);
+      assert.strictEqual(JSON.parse(ok(['agent', 'flow', 'save', 'mine']).stdout).written_by, 'cli');
+    } finally { fake.stop(); }
+  });
+
+  test('learned flows (fake browser): the drift hint over MCP for a terminal flow says to save under another name (`agent flow save <new-name>`), which an MCP session may do; its own flow and the terminal keep `agent flow save <name>`', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const mcpEnv = { ...env, CDPILOT_MCP_SESSION: '1', CDPILOT_MCP_TOOL_CALL: '1' };  // an MCP tool call
+      const flows = path.join(home, 'projects', 'proj', 'flows');
+      fs.mkdirSync(flows, { recursive: true });
+      const rec = { host: 'user.example', origin: 'https://user.example' };
+      const flow = (name, by) => JSON.stringify({
+        version: 1, name, host: 'user.example', vars: {}, ...(by ? { written_by: by } : {}),
+        steps: [{ n: 1, kind: 'go', url: 'https://user.example/inbox' },
+          { n: 2, kind: 'act', action: 'click', anchor: { role: 'button', name: 'No such button', nth: 0 }, before: rec, after: { host: 'user.example' } }],
+      });
+      fs.writeFileSync(path.join(flows, 'term.json'), flow('term', 'cli'));
+      fs.writeFileSync(path.join(flows, 'legacy.json'), flow('legacy'));   // no written_by: the terminal's
+      fs.writeFileSync(path.join(flows, 'own.json'), flow('own', 'mcp'));
+      const hint = (name, e) => {
+        const r = cli(['agent', 'run', name], e);
+        assert.strictEqual(r.status, 4, `${name}: drift exit ${r.status}: ${r.stdout}${r.stderr}`);
+        return JSON.parse(r.stdout).hint;
+      };
+      for (const name of ['term', 'legacy']) {
+        const h = hint(name, mcpEnv);
+        assert(h.includes('save it under another name (`agent flow save <new-name>`)') && !h.includes(`agent flow save ${name}`),
+          `${name} over MCP: ${h}`);
+      }
+      assert(/agent flow save own$/.test(hint('own', mcpEnv)), 'an MCP session re-saves its own flow');
+      assert(/agent flow save term$/.test(hint('term', env)), 'the terminal may re-save its flow');
+    } finally { fake.stop(); }
+  });
+
   test('mcp: browser_agent_observe/act/flow_save/run map to the agent commands (fake browser)', () => {
     // The MCP path is how most models use cdpilot: the four tools wrap the
     // agent commands; a drift or a missing flow comes back as isError with the
@@ -13709,6 +13892,32 @@ print(json.dumps(out))
       assert.strictEqual(c.status, 0, c.stdout + c.stderr);
       assert(c.stdout.includes('https://user.example/inbox') && c.stdout.includes('https://cdpilot-own.example/'),
         `the operator's \`cdpilot tabs\` lists every tab: ${c.stdout}`);
+    } finally { fake.stop(); }
+  });
+
+  test('mcp external tabs: the filter keys on the MCP tool-call marker — the terminal, CDPILOT_MCP_SESSION=1 alone (visual layer) and a `run` script line list every tab; CDPILOT_MCP_TOOL_CALL=1 lists only cdpilot\'s own', () => {
+    const fake = startFake('full', 'guid-tabs-marker');
+    try {
+      const home = mkHome();
+      writeRegistry(home, { tabsproj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'tabsproj');
+      const hint = /\d+ tab\(s\) of your connected browser not listed over MCP/;
+      for (const [extra, hides] of [[{}, false], [{ CDPILOT_MCP_SESSION: '1' }, false],
+        [{ CDPILOT_MCP_TOOL_CALL: '1' }, true], [{ CDPILOT_MCP_SESSION: '1', CDPILOT_MCP_TOOL_CALL: '1' }, true]]) {
+        const c = cli(['tabs'], { ...env, ...extra });
+        const label = JSON.stringify(extra);
+        assert.strictEqual(c.status, 0, `${label}: ${c.stdout}${c.stderr}`);
+        if (hides) {
+          assert(!c.stdout.includes('user.example') && hint.test(c.stdout), `${label}: a user tab listed for a tool call: ${c.stdout}`);
+        } else {
+          assert(c.stdout.includes('https://user.example/inbox') && !hint.test(c.stdout), `${label}: the terminal lists every tab: ${c.stdout}`);
+        }
+      }
+      const script = path.join(home, 'tabs.cdp');
+      fs.writeFileSync(script, 'tabs\n');
+      const s = cli(['run', script], env);
+      assert.strictEqual(s.status, 0, s.stdout + s.stderr);
+      assert(s.stdout.includes('https://user.example/inbox') && !hint.test(s.stdout), `a run script line lists every tab: ${s.stdout}`);
     } finally { fake.stop(); }
   });
 
