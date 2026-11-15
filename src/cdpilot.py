@@ -4551,6 +4551,7 @@ class _FrameRoute:
         child.chain, child.labels, child.src = list(self.chain), list(self.labels), self.src
         child.frame_id = self.frame_id
         child.deadline, child.isolated = self.deadline, self.isolated
+        child.worlds = self.worlds  # same socket and sessions: one isolated world per (session, frame)
         return child
 
     def describe(self):
@@ -4588,16 +4589,28 @@ async def _frame_cdp(route, commands, timeout=10):
     return {ids[k]: v for k, v in res.items() if k in ids}
 
 
+def _frame_lookup_fallback_note():
+    """One stderr note per command when a first-hop lookup runs in the page's own JS."""
+    if not _FRAME_LOOKUP_FALLBACK_NOTED[0]:
+        _FRAME_LOOKUP_FALLBACK_NOTED[0] = True
+        print("note: cdpilot's isolated world was not available; the frame was looked up with the page's own JS",
+              file=sys.stderr)
+
+
+async def _frame_first_hop_world(route):
+    """Isolated-world context for a lookup in the top document (route has no hops), or None (with the note)."""
+    try:
+        ctx = await _frame_world(route, None, None)
+    except Exception:
+        ctx = None
+    if ctx is None:
+        _frame_lookup_fallback_note()
+    return ctx
+
+
 async def _frame_list(route, context_id=None):
     if context_id is None and not route.chain:
-        try:
-            context_id = await _frame_world(route, None, None)
-        except Exception:
-            context_id = None
-        if context_id is None and not _FRAME_LOOKUP_FALLBACK_NOTED[0]:
-            _FRAME_LOOKUP_FALLBACK_NOTED[0] = True
-            print("note: cdpilot's isolated world was not available; the frame was looked up with the page's own JS",
-                  file=sys.stderr)
+        context_id = await _frame_first_hop_world(route)
     params = route.eval_params(_FRAME_LIST_JS)
     if context_id is not None:
         params["contextId"] = context_id
@@ -4688,24 +4701,16 @@ async def _frame_context_for(route, frame_id, node, allow_oopif=True):
     raise _FrameError(f"cannot enter frame {frame_id} (no execution context, no target)")
 
 
-async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oopif=True, lookup_ctx=None):
+async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oopif=True):
     """Descend one hop: route now points at the child frame.
 
     Returns True, or False when no element matches the hop and missing_ok.
     A hop that matched an element wrapping the iframe (Stripe's
     #card-element) still works, with one stderr note.
     """
-    if lookup_ctx is not None:
-        assert not route.chain, "lookup_ctx is only valid for the first hop"
-    elif not route.chain:
-        try:
-            lookup_ctx = await _frame_world(route, None, None)
-        except Exception:
-            lookup_ctx = None
-        if lookup_ctx is None and not _FRAME_LOOKUP_FALLBACK_NOTED[0]:
-            _FRAME_LOOKUP_FALLBACK_NOTED[0] = True
-            print("note: cdpilot's isolated world was not available; the frame was looked up with the page's own JS",
-                  file=sys.stderr)
+    # The top document's lookup runs in cdpilot's isolated world: a page that replaces
+    # querySelectorAll cannot point an index or selector at another frame.
+    lookup_ctx = await _frame_first_hop_world(route) if not route.chain else None
     args = f"{json.dumps(hop['kind'])}, {json.dumps(hop['value'])}"
     p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False)
     if lookup_ctx is not None:
@@ -4974,16 +4979,7 @@ async def _probe_route_hop(route, hop):
     Returns (kind, oid, node_info):
       kind: 'frame', 'shadow_open', 'shadow_closed', or 'none'.
     """
-    lookup_ctx = None
-    if not route.chain:
-        try:
-            lookup_ctx = await _frame_world(route, None, None)
-        except Exception:
-            lookup_ctx = None
-        if lookup_ctx is None and not _FRAME_LOOKUP_FALLBACK_NOTED[0]:
-            _FRAME_LOOKUP_FALLBACK_NOTED[0] = True
-            print("note: cdpilot's isolated world was not available; the frame was looked up with the page's own JS",
-                  file=sys.stderr)
+    lookup_ctx = await _frame_first_hop_world(route) if not route.chain else None
     args = f"{json.dumps(hop['kind'])}, {json.dumps(hop['value'])}"
     # 1. First see if _FRAME_OWNER_JS matches an iframe (same-process or out-of-process)
     p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false)", by_value=False)
@@ -5094,8 +5090,7 @@ async def _frame_resolve_target(ws_url, flag_hops, target, kind="css"):
                 rem_selector = " >>> ".join(names[i:] + [inner])
                 return route, rem_selector, None
             else:
-                list_ctx = await _frame_world(route, None, None) if not route.chain else None
-                frames = await _frame_list(route, context_id=list_ctx)
+                frames = await _frame_list(route)  # top document: isolated world (_frame_list)
                 labels = [_strip_tag_chars(f.get("id") or f.get("name") or f.get("src") or "")[0][:60] for f in frames]
                 avail = "; ".join(f"[{f['index']}] {lbl}" for f, lbl in zip(frames, labels))
                 raise _FrameError(f"no iframe matches '{hop_name}' in {route.describe()}"
@@ -5284,8 +5279,7 @@ async def _frame_search(ws_url, probe_js, act_js, label, same_origin_only=False,
                 stopped = True
                 break
             parent = queue.pop(0)
-            list_ctx = await _frame_world(parent, None, None) if not parent.chain else None
-            kids = [f["index"] for f in await _frame_list(parent, context_id=list_ctx) if f.get("visible")]
+            kids = [f["index"] for f in await _frame_list(parent) if f.get("visible")]
             known += len(kids)
             for idx in kids:
                 if searched >= max_frames:
@@ -20853,7 +20847,14 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
         if ctx is not None:
             p["contextId"] = ctx
         res = await cdp_send(ws_url, [(1, "Runtime.evaluate", p)])
-        frames = res.get(1, {}).get("result", {}).get("value", [])
+        reply = res.get(1) or {}
+        if ctx is not None and (_cdp_error_reply(reply) or reply.get("exceptionDetails")):
+            _frame_lookup_fallback_note()  # a stale world: read the page's own JS, never a false "No iframes"
+            res = await cdp_send(ws_url, [(2, "Runtime.evaluate", {"expression": _FRAME_LIST_JS, "returnByValue": True})])
+            reply = res.get(2) or {}
+        elif ctx is None:
+            _frame_lookup_fallback_note()
+        frames = reply.get("result", {}).get("value", [])
         if not frames:
             print("No iframes found on page.")
         else:
