@@ -2017,7 +2017,7 @@ test('cmd_cookies save: writes JSON array via Network.getCookies', () => {
 {
   const fsperm = (() => {
     const { spawnSync } = require('child_process');
-    const r = spawnSync(process.platform === 'win32' ? 'python' : '/opt/homebrew/bin/python3.13', [path.join(__dirname, 'fsperm_check.py'), PY_PATH],
+    const r = spawnSync(process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3'), [path.join(__dirname, 'fsperm_check.py'), PY_PATH],
       { encoding: 'utf-8', timeout: 60000 });
     try { return JSON.parse(r.stdout.trim().split('\n').pop()); } catch (e) { return { crash: `${r.stdout}${r.stderr}` }; }
   })();
