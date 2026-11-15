@@ -451,7 +451,7 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
 
   test(
     'daemon: _daemon_reset_state resets frame note flags ' +
-      '(_FRAME_ISOLATED_NOTED, _FRAME_LOOKUP_FALLBACK_NOTED)',
+      '(_FRAME_ISOLATED_NOTED, _FRAME_LOOKUP_FALLBACK_NOTED, _SHOT_LOOKUP_FALLBACK_NOTED)',
     () => {
       const PYB = (typeof PY_BIN !== 'undefined' && PY_BIN) || 'python3';
       const script = [
@@ -460,10 +460,12 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
         'import cdpilot as c',
         'c._FRAME_ISOLATED_NOTED[0] = True',
         'c._FRAME_LOOKUP_FALLBACK_NOTED[0] = True',
+        'c._SHOT_LOOKUP_FALLBACK_NOTED[0] = True',
         'c._daemon_reset_state()',
         'assert c._FRAME_ISOLATED_NOTED[0] is False, "_FRAME_ISOLATED_NOTED not reset"',
         'assert c._FRAME_LOOKUP_FALLBACK_NOTED[0] is False, ' +
           '"_FRAME_LOOKUP_FALLBACK_NOTED not reset"',
+        'assert c._SHOT_LOOKUP_FALLBACK_NOTED[0] is False, "_SHOT_LOOKUP_FALLBACK_NOTED not reset"',
         'print("RESET-STATE-OK")',
       ].join('\n');
       const r = spawnSync(PYB, ['-c', script], { encoding: 'utf-8', timeout: 20000 });
@@ -5418,6 +5420,44 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert(nCase.desc && nCase.desc.length <= 60,
       `route.describe() must be <= 60 chars, got ${nCase.desc ? nCase.desc.length : 0}`);
     assert(!nCase.desc.includes('\n'), `route.describe() must not contain newlines: ${nCase.desc}`);
+
+    // (o) frame list: isolated evaluate exceptionDetails -> "frame list failed in cdpilot's isolated world", exit 1
+    const oCase = r.frame_list_iso_exception;
+    assert.deepStrictEqual(oCase.res, ['exit', 1]);
+    assert(oCase.stderr.includes("frame list failed in cdpilot's isolated world"),
+      `stderr must report isolated world failure, got: ${oCase.stderr}`);
+    assert.strictEqual(oCase.list_evals, 1, 'no main world retry on exceptionDetails');
+
+    // (p) frame list CDP context error -> world recreated once, second eval in new context, stdout correct
+    const pCase = r.frame_list_iso_error_retry;
+    assert.deepStrictEqual(pCase.res, ['ok', null]);
+    assert.strictEqual(pCase.top_world_calls, 2, 'Page.createIsolatedWorld called second time for top frame');
+    assert.strictEqual(pCase.list_evals, 2, 'retried evaluate with fresh isolated context');
+    assert(pCase.isolated.includes(pCase.eval_contexts[0]), 'first eval in isolated world');
+    assert(pCase.isolated.includes(pCase.eval_contexts[1]), 'second eval in new isolated world');
+    assert.notStrictEqual(pCase.eval_contexts[0], pCase.eval_contexts[1], 'new isolated context allocated');
+    assert(pCase.stdout.includes('[0] src=http://a.test/f0.html name= id=f0'), 'f0 listed correctly');
+    assert(pCase.stdout.includes('[1] src=http://a.test/f1.html name= id=f1'), 'f1 listed correctly');
+    const pNotes = (pCase.stderr.match(notePattern) || []).length;
+    assert.strictEqual(pNotes, 0, `no fallback note when isolated world was successfully re-created, got ${pNotes}`);
+
+    // (q) frame list double context error -> main world + note, message does not say "isolated world"
+    const qCase = r.frame_list_iso_error_fallback;
+    assert.deepStrictEqual(qCase.res, ['ok', null]);
+    const qNotes = (qCase.stderr.match(notePattern) || []).length;
+    assert.strictEqual(qNotes, 1, `fallback note must be printed once, got: ${qCase.stderr}`);
+    assert(!qCase.stderr.includes("frame list failed in cdpilot's isolated world"),
+      `stderr must not report isolated world failure, got: ${qCase.stderr}`);
+    assert(qCase.stdout.includes('[0] src=http://a.test/f0.html name= id=f0'), 'f0 listed in main world fallback');
+    assert(qCase.stdout.includes('[1] src=http://a.test/f1.html name= id=f1'), 'f1 listed in main world fallback');
+    assert.strictEqual(qCase.list_evals, 3, 'two isolated attempts, then one main-world read');
+    assert.strictEqual(qCase.eval_contexts[2], null, 'the third read runs in the main world (no contextId)');
+
+    // (r) _frame_search skips invalid children list without traceback
+    const rCase = r.frame_search_invalid_children;
+    assert.strictEqual(rCase.stderr, '', `no traceback on stderr: ${rCase.stderr}`);
+    assert.strictEqual(rCase.res, null, 'search returned null on invalid children without crashing');
+    assert.strictEqual(rCase.res2, null, 'search returned null on non-list children without crashing');
   });
 
   test('frames (fake CDP): click is one click; real mouse input with --entropy=on and in frames', () => {
@@ -15235,9 +15275,13 @@ print(json.dumps({"har1": har1, "har2": har2, "har3": har3}))
   }
 
   function runCli(args, env) {
+    const t0 = Date.now();
     const r = spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf-8', timeout: 15000 });
     return {
       status: r.status,
+      signal: r.signal,
+      error: r.error ? r.error.code || String(r.error) : null,
+      duration_ms: Date.now() - t0,
       stdout: r.stdout || '',
       stderr: r.stderr || '',
     };
@@ -16240,11 +16284,18 @@ print(json.dumps(res))
       carried = run2.filter((x) => x.watch).map((x) => x.method);
       assert.deepStrictEqual(carried, ['Runtime.callFunctionOn'], JSON.stringify(carried));
       // the child alone, in strict mode: no humanized typing, no frame (refused before any lookup)
-      const strict = { ...fakeEnv(home, fake.port), CDPILOT_REPLAY_STRICT_TARGET: '1', CDPILOT_REPLAY_ALLOWED_HOSTS: 'example.com' };
+      // CI 15.11: one child printed the refusal and was still running at the 15 s kill (status 143). A child
+      // that hangs dumps its Python stacks to stderr at 11 s, so the next failure names the place.
+      const hangDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-hang-'));
+      fs.writeFileSync(path.join(hangDir, 'sitecustomize.py'),
+        'import faulthandler, sys\nfaulthandler.dump_traceback_later(11, exit=False, file=sys.stderr)\n');
+      const strict = { ...fakeEnv(home, fake.port), CDPILOT_REPLAY_STRICT_TARGET: '1',
+        CDPILOT_REPLAY_ALLOWED_HOSTS: 'example.com', PYTHONPATH: hangDir };
       for (const args of [['fill', '#pw', 'x', '--entropy=on'], ['type', 'iframe#w >>> #pw', 'x'],
         ['smart-fill', 'Password', 'x', '--frame', '#w'], ['smart-select', 'Main >>> Country', 'x']]) {
         r = runCli(args, strict);
-        assert.strictEqual(r.status, 2, `${args.join(' ')}: ${r.stdout}${r.stderr}`);
+        assert.strictEqual(r.status, 2, `${args.join(' ')}: status=${r.status} signal=${r.signal} `
+          + `error=${r.error} (${r.duration_ms}ms): ${r.stdout}${r.stderr}`);
         assert(/refused \(environment value\): never (with humanized typing|inside a frame)/.test(r.stderr), r.stderr);
       }
     } finally {
@@ -18806,9 +18857,13 @@ print(json.dumps(out))
   }
 
   function runCli(args, env) {
+    const t0 = Date.now();
     const r = spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf-8', timeout: 15000 });
     return {
       status: r.status,
+      signal: r.signal,
+      error: r.error ? r.error.code || String(r.error) : null,
+      duration_ms: Date.now() - t0,
       stdout: r.stdout || '',
       stderr: r.stderr || '',
     };
@@ -19071,6 +19126,9 @@ print("OK")
         env, encoding: 'utf-8', timeout: 10000,
       });
       assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+      const note = "note: cdpilot's isolated world was not available; the element box was read with the page's own JS";
+      const matches = (r.stderr.match(new RegExp(note.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+      assert.strictEqual(matches, 1, `fallback note must be printed once, got: ${r.stderr}`);
 
       const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
       const evalCrop = logs.filter(
