@@ -13295,6 +13295,19 @@ print(json.dumps(out))
     assert.deepStrictEqual(j.names, ['ok', 'checkout "a" & <b>']);
   });
 
+  test('terminal output (fake CDP, in-process): JUnit output escapes U+FFFE, U+FFFF and lone surrogates (invalid in XML 1.0) as \\uXXXX in the failure text and the test name; on a strict UTF-8 stream nothing raises and the XML parses', () => {
+    const j = termScenario('reporter_junit_codepoints');
+    assert(!j.raised, `the JUnit writer raised: ${j.raised}`);
+    const odd = '\\ufffea\\uffffb\\ud800c\\udfff';
+    for (const t of ['tty', 'pipe']) {
+      assert.deepStrictEqual(j[t].res, ['exit', 1], t);
+      assert.strictEqual(j[t].xml_ok, true, `${t}: ${j[t].xml_ok}\n${JSON.stringify(j[t].stdout)}`);
+      assert.deepStrictEqual(j[t].failure, [`FAIL: \\x1b]52;c;aGk=\\x07 got \\x1b[8mhidden${odd}`], t);
+      assert.deepStrictEqual(j[t].names, ['ok', `n${odd}`], t);
+      assert(!/[\u{d800}-\u{dfff}\u{fffe}\u{ffff}]/u.test(j[t].stdout), `${t}: ${JSON.stringify(j[t].stdout)}`);
+    }
+  });
+
   test('terminal output (fake CDP, in-process): wait, wait-for, wait-for-text, extract (text, list, JSON), observe, frame eval and frame shadow show page control characters as \\xNN on a terminal; piped output is byte-identical', () => {
     const c = termScenario('followup');
     for (const [k, v] of Object.entries(c)) {
@@ -13323,6 +13336,82 @@ print(json.dumps(out))
     }
     assert.strictEqual(c.extract_json.pipe.stdout, c.extract_json_expected_pipe);
     assert.deepStrictEqual(JSON.parse(c.extract_json.tty.stdout), c.extract_json_value, 'extract --json on a terminal still parses');
+  });
+
+  // the generic checks: nothing raw on a terminal, the escape is shown, piped keeps the bytes, same exit
+  const termEscapedEverywhere = (c) => {
+    for (const [k, v] of Object.entries(c)) {
+      if (!v || !v.tty) continue;
+      for (const s of ['stdout', 'stderr']) {
+        assert(!TERM_RAW.test(v.tty[s]), `${k} ${s} on a terminal: ${JSON.stringify(v.tty[s])}`);
+      }
+      assert(/\\x(1b|9b)|\\u00(7f|9b)/.test(v.tty.stdout + v.tty.stderr), `${k}: the escape is shown: ${JSON.stringify(v.tty)}`);
+      assert(TERM_RAW.test(v.pipe.stdout + v.pipe.stderr), `${k}: piped keeps the page's bytes: ${JSON.stringify(v.pipe)}`);
+      assert.deepStrictEqual(v.tty.res, v.pipe.res, `${k}: same exit either way`);
+    }
+  };
+
+  test('terminal output (fake CDP, in-process): click (fast path, frame path, their error lines), fill, submit, smart-click, dismiss, smart-fill, smart-select, tab switch / close and the pointer-click note show page control characters as \\xNN on a terminal; piped output is byte-identical', () => {
+    const c = termScenario('act');
+    termEscapedEverywhere(c);
+    const EV = `Pay${E}]52;c;eA==\x07${E}[8m hidden\x9b`;
+    const EVT = 'Pay\\x1b]52;c;eA==\\x07\\x1b[8m hidden\\x9b';
+    const both = (f) => [f(EV, `${E}[8m`, `${E}[2J`, '\x9b'), f(EVT, '\\x1b[8m', '\\x1b[2J', '\\x9b')];
+    const cases = {  // scenario: [stream, (page text) => expected line(s)]
+      click: ['stdout', (x) => `Clicked: BUTTON ${x}\n`],
+      click_error: ['stderr', (x) => `Error: Error: ${x}\n`],
+      click_timeout: ['stderr', (x) => `Timeout waiting for: ${x}\n`],
+      click_frame: ['stdout', (x) => `Clicked: BUTTON ${x}\n`],
+      click_frame_missing: ['stderr', (x) => `Timeout waiting for: ${x}\n`],
+      fill: ['stdout', (x) => `Filled: INPUT = ${x}\n`],
+      submit: ['stdout', (x) => `Submit clicked: ${x}\n`],
+      smart_click: ['stdout', (x) => `Clicked: BUTTON "${x}" (score:100)\n  Also found: a "${x}" (score:60)\n`],
+      dismiss: ['stdout', (x) => `Dismissed: BUTTON "${x}" (pattern: "no thanks", score: 85)\nTotal dismissed: 1\n`],
+      smart_fill: ['stdout', (x) => `Filled: INPUT[text] "${x}" = v (score:100)\n`],
+      smart_select: ['stdout', (x, h) => `Selected: "${x}" (value=v${h})\n`],
+      smart_select_missing: ['stderr', (x) => `Option "L" not found. Available: ${x}, M\n`],
+      tab_switch: ['stdout', (x, h, j, c1) => `Switched to tab: Tab${h}hidden${c1}\n  URL: https://x.test/a${j}\n`],
+      tab_close: ['stdout', (x, h, j, c1) => `Tab closed: Tab${h}hidden${c1}\n`],
+      pointer_note: ['stderr', (x, h, j, c1) => `note: #b is covered by div#x${h}.c${c1} at the click point; used a script click\n`],
+    };
+    for (const [k, [s, f]] of Object.entries(cases)) {
+      const [pipe, tty] = both(f);
+      assert.strictEqual(c[k].pipe[s], pipe, `${k} piped`);
+      assert.strictEqual(c[k].tty[s], tty, `${k} on a terminal`);
+    }
+  });
+
+  test('terminal output (fake CDP, in-process): cookies, eval-batch, multi-eval, tls-check, friction, captcha-check, twitter analytics, intercept, run (step output) and replay (step error) escape page control characters on a terminal, JSON still parses; piped output is byte-identical', () => {
+    const c = termScenario('sweep');
+    termEscapedEverywhere(c);
+    assert.deepStrictEqual(JSON.parse(c.eval_batch.tty.stdout), c.eval_batch_value, 'eval-batch JSON on a terminal still parses');
+    assert(c.eval_batch.pipe.stdout.includes('"value": "x\\u001by\x7fz\x9bw\u2028v"'), c.eval_batch.pipe.stdout);
+    assert(c.cookies.tty.stdout.startsWith('  🔒 sid\\x1b[8m') && c.cookies.tty.stdout.includes('= v\\x1b]52;c;eA==\\x07\\x9b'),
+      c.cookies.tty.stdout);
+    assert(c.cookies.pipe.stdout.includes(`= v${E}]52;c;eA==\x07\x9b`), c.cookies.pipe.stdout);
+    assert.strictEqual(c.multi_eval.tty.stdout, '  [Tab\\x1b[8mhidden\\x9b] → v\\x1b[8m\\x9b\n\nExecuted on 1 tabs\n');
+    assert.strictEqual(c.multi_eval.pipe.stdout, `  [Tab${E}[8mhidden\x9b] → v${E}[8m\x9b\n\nExecuted on 1 tabs\n`);
+    assert.deepStrictEqual(JSON.parse(c.tls_json.tty.stdout), c.tls_json_value, 'tls-check --json on a terminal still parses');
+    assert.strictEqual(c.tls_text.tty.stdout, 'not json \\x1b[8m\\x9b\n');
+    assert(c.tls.tty.stdout.includes('  JA3:        771,\\x1b[8m\n  JA3 hash:   h\\x9b\n  JA4:        x13d\\x7f\n'
+      + '  H2 akamai:  2:0\\x9b\n'), c.tls.tty.stdout);
+    for (const k of ['friction', 'captcha_check', 'twitter_analytics']) {
+      assert.deepStrictEqual(JSON.parse(c[k].tty.stdout), JSON.parse(c[k].pipe.stdout), `${k}: the same JSON value on a terminal`);
+    }
+    assert.deepStrictEqual(c.captcha_check.tty.res, ['exit', 3]);
+    for (const line of ['  Blocked: https://x.test/blocked\\x1b[8m\n', '  Headers added: https://x.test/hdr\\x9b\n',
+      '  Mocked: https://x.test/mock\\x1b]0;x\\x07 → ']) {
+      assert(c.intercept.tty.stdout.includes(line), `intercept: ${line}\n${c.intercept.tty.stdout}`);
+    }
+    assert(c.intercept.pipe.stdout.includes(`  Blocked: https://x.test/blocked${E}[8m\n`), c.intercept.pipe.stdout);
+    assert(c.run_script.tty.stdout.startsWith('[1] content\n     body \\x1b[8mhidden\\x9b\n[2] click #b\n'
+      + '     NOT CLICKED (exit 3): note: covered by div#x\\x1b[8m\n[3] click #c\n     ERROR: Error: \\x1b]0;x\\x07\n'),
+    c.run_script.tty.stdout);
+    assert(c.run_script.pipe.stdout.startsWith(`[1] content\n     body ${E}[8mhidden\x9b\n`), c.run_script.pipe.stdout);
+    assert.deepStrictEqual(c.run_script.tty.res, ['exit', 1]);
+    assert.strictEqual(c.replay.tty.stderr, 'Error: \\x1b[8mhidden\\x9b\n');
+    assert.strictEqual(c.replay.pipe.stderr, `Error: ${E}[8mhidden\x9b\n`);
+    assert(/^\[1\/1\] click #r \.\.\. failed \(1\)/.test(c.replay.tty.stdout), c.replay.tty.stdout);
   });
 
   test('terminal output (fake CDP, in-process): a real pseudo-terminal; the warm path follows the launcher tty / etty flags for that request only; _term_text keeps tab, newline, CRLF, Turkish letters and emoji', () => {
