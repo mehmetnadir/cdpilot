@@ -39,9 +39,10 @@ class Frame:
 
     def __init__(self, fid, origin="http://a.test", oop=False, elem_id="", name="",
                  src="", visible=True, box=(0, 0), finder=None, slow=False, children=(),
-                 wrappers=(), scale=1.0, url=None, fragment=None):
+                 wrappers=(), scale=1.0, url=None, fragment=None, selectors=()):
         self.fid, self.origin, self.oop = fid, origin, oop
         self.wrappers = list(wrappers)  # selectors of elements around the <iframe>
+        self.selectors = list(selectors)  # other CSS selectors that match the <iframe> itself
         self.elem_id, self.name, self.src, self.visible = elem_id, name, src, visible
         # The committed URL (Page.getFrameTree); None: the src attribute, else the origin. A
         # frame navigated away, or a srcdoc frame, has a src attribute that says something else.
@@ -145,6 +146,8 @@ class Browser:
             return (kids[value] if 0 <= value < len(kids) else None), False
         for c in kids:
             if value == "iframe" or (c.elem_id and value in ("#" + c.elem_id, "iframe#" + c.elem_id)):
+                return c, False
+            if value in c.selectors:
                 return c, False
         for c in kids:
             if value in c.wrappers:
@@ -742,6 +745,24 @@ def scenario_frame_identity(mod):
     def fragment_decoy():
         return Frame("top", origin="https://shop.example", children=[blank_decoy(), card_frame()])
 
+    def attr_decoys(real=True, wrapper=True):
+        # Page-set attributes ahead of the real card frame: <iframe id="js.stripe.com"> and a
+        # <js class="stripe com"> element (the CSS selector js.stripe.com) around an <iframe>.
+        return Frame("top", origin="https://shop.example", children=[
+            Frame("iddecoy", origin="https://shop.example", elem_id="js.stripe.com",
+                  src="/a", url="https://shop.example/a"),
+        ] + ([Frame("wrapdecoy", origin="https://shop.example", elem_id="w",
+                    wrappers=["js.stripe.com"], src="/b", url="https://shop.example/b")]
+             if wrapper else []) + ([card_frame()] if real else []))
+
+    def dotted_selector_page():
+        # A host-shaped --frame value that is a CSS selector of the frame: no frame's host
+        # matches it, so it still selects the <iframe class="card">.
+        return Frame("top", children=[
+            Frame("card", elem_id="card", selectors=["iframe.card"], src="http://a.test/inner.html",
+                  box=(100, 1000)),
+        ])
+
     def lookalike_page():
         # Hosts that contain "stripe.com" without being stripe.com or a subdomain of it.
         return Frame("top", origin="https://shop.example", children=[
@@ -768,6 +789,14 @@ def scenario_frame_identity(mod):
         ("fragment_decoy_flag", fragment_decoy, "js.stripe.com", fill, "#cardnumber", None),
         ("query_only", lambda: query_decoys(False), "js.stripe.com", fill, "#cardnumber", None),
         ("lookalike_flag", lookalike_page, "stripe.com", fill, "#cardnumber", None),
+        # a host-shaped --frame value: URL text first, then selector, then name/id
+        ("attr_decoy_flag", attr_decoys, "js.stripe.com", fill, "#cardnumber", None),
+        ("attr_id_flag", lambda: attr_decoys(True, False), "js.stripe.com", fill, "#cardnumber",
+         None),
+        ("attr_decoy_only", lambda: attr_decoys(False), "js.stripe.com", fill, "#cardnumber", None),
+        ("attr_id_only", lambda: attr_decoys(False, False), "js.stripe.com", fill, "#cardnumber",
+         None),
+        ("dotted_selector_flag", dotted_selector_page, "iframe.card", fill, "#cardnumber", None),
         # the frame navigates (new loaderId, same URL) after the route was resolved
         ("changed_fill_sel", honest_page, "#card", fill, "#cardnumber", "card"),
         ("changed_fill_index", honest_page, "0", fill, "#cardnumber", "card"),

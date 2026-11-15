@@ -4905,6 +4905,17 @@ def _frame_url_text_match(url, value):
     return value in f"{scheme}://{shown_host}{'' if port is None else ':' + str(port)}{path}"
 
 
+def _frame_url_text_names_host(value):
+    """Whether URL text names a host (_frame_url_text_match's js.stripe.com, stripe.com/v3 and
+    https://js.stripe.com/v3 forms): only frames on that host can match it."""
+    if not isinstance(value, str) or "?" in value or "#" in value:
+        return False
+    if _re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", value):
+        return True
+    hm = _re.fullmatch(r"([^:@\[\]\s]+)(?::(\d+))?", value.partition("/")[0])
+    return bool(hm and "." in hm.group(1))
+
+
 async def _frame_url_match(route, value, lookup_ctx, allow_oopif=True):
     """The first <iframe>/<frame> in DOM order whose committed URL the URL text `value`
     names (_frame_url_text_match: http(s) only, by host or path, never query or fragment),
@@ -4955,7 +4966,10 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     #card-element) still works, with one stderr note. URL text (url=, or a
     --frame value no selector or name/id matched) is matched against each
     frame's committed URL, never its src attribute (_frame_url_match,
-    _frame_url_text_match).
+    _frame_url_text_match). A --frame value that names a host (js.stripe.com)
+    is URL text first: a frame on that host wins over a selector or name/id
+    match, which the page sets (<iframe id="js.stripe.com">); the selector and
+    name/id are used only when no frame's URL matches (iframe.card).
     route.src / route.loader_id are the frame's committed URL and loaderId as
     resolved: _frame_input_guard reads them again before anything is typed.
     """
@@ -4964,10 +4978,13 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     lookup_ctx = await _frame_first_hop_world(route) if not route.chain else None
     kind = hop["kind"]
     js_kind = "index" if kind == "index" else "sel"  # --frame ('auto'): selector, wrapper, name/id
+    url_first = kind == "auto" and _frame_url_text_names_host(hop["value"])
+    sel_scroll = scroll and not url_first  # url_first: scroll only the frame that wins (below)
     r = {}
     if kind != "url":  # url=: committed URLs only (below)
         args = f"{json.dumps(js_kind)}, {json.dumps(hop['value'])}"
-        p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False)
+        p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(sel_scroll)})",
+                               by_value=False)
         if lookup_ctx is not None:
             p1["contextId"] = lookup_ctx
         cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
@@ -4992,7 +5009,8 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
                 reply1 = r.get(1) or {}
             else:
                 _frame_lookup_fallback_note()
-                p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False)
+                p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(sel_scroll)})",
+                                       by_value=False)
                 cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
                 if js_kind == "sel":
                     p3 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)")
@@ -5010,14 +5028,14 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     oid = obj.get("objectId")
     node = own = None
     by_url = False
-    if not oid and kind in ("auto", "url"):
+    if kind == "url" or (kind == "auto" and (url_first or not oid)):
         hit = await _frame_url_match(route, hop["value"], lookup_ctx, allow_oopif)
-        if hit is not None:
+        if hit is not None:  # url_first: a frame on that host wins over the selector match
             oid, obj, node, own = hit
             by_url = True
-            if scroll:
-                await _frame_cdp(route, [(6, "Runtime.callFunctionOn", {
-                    "objectId": oid, "functionDeclaration": _FRAME_SCROLL_FN}, route.session_id)])
+    if oid and scroll and (by_url or url_first):  # not scrolled by the lookup above
+        await _frame_cdp(route, [(6, "Runtime.callFunctionOn", {
+            "objectId": oid, "functionDeclaration": _FRAME_SCROLL_FN}, route.session_id)])
     shown = f"#{hop['value']}" if kind == "index" else hop["value"]
     if not oid:
         if missing_ok:
@@ -5048,7 +5066,7 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
         print(f"note: frame '{route.labels[-1]}': its page context was not reachable; using an isolated"
               " world (same DOM, no page JS globals)", file=sys.stderr)
     route.dirty = True
-    if r.get(3, {}).get("result", {}).get("value") is True:
+    if not by_url and r.get(3, {}).get("result", {}).get("value") is True:
         print(f"note: '{hop['value']}' is not an iframe; using the iframe inside it", file=sys.stderr)
     return True
 
