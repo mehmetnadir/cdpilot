@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **`blog publish` / `blog regenerate` read their output folder from `CDPILOT_BLOG_DIR`.** The folder was a hard-coded maintainer path; without the variable both commands now exit 2 with a message and write nothing. `day-NNN` sources are looked up in `CDPILOT_BLOG_PLAN_DIR` (default: the current directory). Maintainer notes, social-media drafts and the X bot are no longer in the repository.
+
 ### Fixed
 - **Smart commands no longer stop with a traceback on unexpected frame data.** When the list of iframes read inside a child frame comes back malformed (the page can change what that script sees), the search skips the bad entries.
 - **`shot --element` says when it falls back to the page's own JavaScript.** If cdpilot's isolated world is not available, the element box is read with the page's JS and a one-line note goes to stderr.

@@ -3281,6 +3281,22 @@ test('blog: sync_cmds dispatcher includes blog entry routing to _dispatch_blog_c
   assert(PY_CONTENT.includes('_dispatch_blog_cmd(args)'), 'blog entry should call _dispatch_blog_cmd');
 });
 
+test('blog: publish/regenerate without CDPILOT_BLOG_DIR exit 2 and write nothing', () => {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-blogdir-'));
+  const env = { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0', CDPILOT_NO_AUTOLAUNCH: '1',
+    CDP_PORT: '19231' };
+  delete env.CDPILOT_BLOG_DIR;
+  delete env.CDPILOT_BLOG_PLAN_DIR;
+  for (const args of [['blog', 'publish', 'day-001'], ['blog', 'regenerate', 'some-post']]) {
+    const r = spawnSync(process.execPath, [CLI, ...args], { env, cwd: home, encoding: 'utf-8', timeout: 15000 });
+    assert.strictEqual(r.status, 2, `${args.join(' ')}: status ${r.status} stderr ${r.stderr}`);
+    assert(r.stderr.includes('CDPILOT_BLOG_DIR'), `${args.join(' ')}: names the variable`);
+  }
+  assert(!PY_CONTENT.includes('/Users/'), 'no absolute home path in src/cdpilot.py');
+});
+
 // ── Bug regression: PROJECT_ID=None path in _log_heal / _resolve_project_config ──
 
 test('_resolve_project_config returns non-None project_id even in manual-override mode', () => {
@@ -4668,6 +4684,7 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
   // screenshots" a11y-snapshot claim had no measurement behind it. These drafts
   // are pre-launch (unlike twitter-launch-thread.md, which is historical and
   // excluded) so any recurrence of the old numbers must be caught before posting.
+  // The drafts are maintainer-local (git-ignored) since 0.9.10: check the ones present.
   const files = [
     'hackernews-post.md',
     'reddit-posts.md',
@@ -4676,7 +4693,9 @@ test('metadata: launch drafts do not repeat the corrected 0.9.1 numbers', () => 
   ];
   const banned = /50 ?KB|500x|40\+ commands/;
   for (const f of files) {
-    const txt = fs.readFileSync(path.join(root, 'docs', f), 'utf8');
+    const p = path.join(root, 'docs', f);
+    if (!fs.existsSync(p)) continue;
+    const txt = fs.readFileSync(p, 'utf8');
     assert(!banned.test(txt), `docs/${f} repeats a corrected 0.9.1 number (50KB/50 KB/500x/40+ commands)`);
   }
 });

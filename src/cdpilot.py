@@ -22698,11 +22698,11 @@ def cmd_trace_dispatch(args):
 
 # ─── Blog Publish Namespace ───────────────────────────────────────────────────
 
-BLOG_DIR = '/path/to/cdpilot-site/content/blog'
+# Output directory for `blog publish` / `regenerate` (a site's content/blog folder).
+BLOG_DIR = os.environ.get('CDPILOT_BLOG_DIR', '')
 
-# day-NNN.md master plan file lookup (relative to cdpilot project root)
-_BLOG_DAY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                              '.claude', 'docs', 'twitter-master-plan', 'days')
+# day-NNN.md plan file lookup; unset = the current directory.
+_BLOG_DAY_DIR = os.environ.get('CDPILOT_BLOG_PLAN_DIR', '')
 
 
 def _blog_slugify(text):
@@ -22988,6 +22988,11 @@ def _dispatch_blog_cmd(args):
         print("  cdpilot blog list", file=sys.stderr)
         print("  cdpilot blog regenerate cdp-websocket-session-init", file=sys.stderr)
         sys.exit(0)
+
+    if sub in ('publish', 'regenerate') and not BLOG_DIR:
+        print("Error: set CDPILOT_BLOG_DIR to the blog content folder "
+              "(for example <site>/content/blog).", file=sys.stderr)
+        sys.exit(2)
 
     if sub == 'publish':
         if len(args) < 2:
