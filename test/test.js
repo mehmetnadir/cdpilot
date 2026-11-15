@@ -20797,17 +20797,19 @@ print(json.dumps(out))
         ...Object.fromEntries(Object.entries(envExtra).filter(([k]) => k.startsWith('FAKE_'))) },
       stdio: 'ignore',
     });
+    // Wait for a whole port number, not just the file: under load the Python
+    // start takes seconds, and the file can exist before its content is written.
     let port = null;
     const start = Date.now();
-    while (!fs.existsSync(portFile) && Date.now() - start < 5000) {
-      try { require('child_process').execSync('sleep 0.05'); } catch (_) {}
-    }
-    if (fs.existsSync(portFile)) {
-      port = parseInt(fs.readFileSync(portFile, 'utf-8').trim(), 10);
+    while (!port && Date.now() - start < 20000) {
+      if (fs.existsSync(portFile)) {
+        port = parseInt(fs.readFileSync(portFile, 'utf-8').trim(), 10) || null;
+      }
+      if (!port) { try { require('child_process').execSync('sleep 0.05'); } catch (_) {} }
     }
     if (!port) {
       try { fakeProc.kill('SIGKILL'); } catch (_) {}
-      throw new Error('shot_fake_cdp failed to start');
+      throw new Error('shot_fake_cdp failed to start within 20 s');
     }
 
     const reg = {
