@@ -150,7 +150,26 @@ def handle_ws(conn, path, headers, bound_port):
                         p.get("contextId") is not None
                         and os.environ.get("FAKE_ISO_NULL") == "1"
                     )
-                    if is_missing or is_iso_null:
+                    is_iso_exc = (
+                        p.get("contextId") is not None
+                        and os.environ.get("FAKE_ISO_EXC") == "1"
+                    )
+                    if is_iso_exc:
+                        reply = {
+                            "id": mid,
+                            "result": {
+                                "result": {
+                                    "type": "object",
+                                    "subtype": "error",
+                                    "description": "TypeError: querySelectorAll clobbered",
+                                },
+                                "exceptionDetails": {
+                                    "text": "Uncaught TypeError",
+                                    "exception": {"description": "TypeError: querySelectorAll clobbered"},
+                                },
+                            },
+                        }
+                    elif is_missing or is_iso_null:
                         reply = {"id": mid, "result": {"result": {"type": "object", "subtype": "null", "value": None}}}
                     elif p.get("contextId") is not None and os.environ.get("FAKE_NO_WORLD") == "1":
                         reply = {"id": mid, "error": {"code": -32000, "message": "Cannot find context"}}

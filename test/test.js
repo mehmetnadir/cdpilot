@@ -5348,15 +5348,17 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     const m = f.stderr.match(/\[0\] ([^;\)]+)/);
     assert(m && m[1].length <= 60, `frame label in error must be at most 60 chars, got ${m ? m[1].length : 0}`);
 
-    // (g) owner_iso_error falls back to main world and prints fallback note once
+    // (g) owner_iso_error retries in fresh isolated world, resolves frame, no main world eval
     const g = r.owner_iso_error_fallback;
     assert.deepStrictEqual(g.res[0], 'ok');
     assert.strictEqual(g.res[1], 'f0|#target');
-    assert.strictEqual(g.owner_evals, 2, 'retried in main world after isolated world error');
+    assert.strictEqual(g.owner_evals, 2, 'retried in fresh isolated world after context error');
     assert(g.isolated.includes(g.eval_contexts[0]), 'first eval in isolated world');
-    assert.strictEqual(g.eval_contexts[1], null, 'second eval in main world (no contextId)');
+    assert(g.isolated.includes(g.eval_contexts[1]), 'second eval in new isolated world');
+    assert.notStrictEqual(g.eval_contexts[0], g.eval_contexts[1], 'new isolated context allocated');
+    assert.strictEqual(g.top_world_calls, 2, 'Page.createIsolatedWorld called second time for top frame');
     const gNotes = (g.stderr.match(notePattern) || []).length;
-    assert.strictEqual(gNotes, 1, `fallback note must be printed once, got ${gNotes}`);
+    assert.strictEqual(gNotes, 0, `no fallback note when isolated world was successfully re-created, got ${gNotes}`);
 
     // (h) clean not found in isolated world does not retry in main world
     const h = r.clean_not_found_single_eval;
@@ -5385,6 +5387,37 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
         `shadow evaluate contextId ${ctx} must be isolated (${j.isolated})`
       );
     }
+
+    // (k) owner_iso_exception fails closed with exit 1, isolated world message, no main world eval
+    const k = r.owner_iso_exception;
+    assert.deepStrictEqual(k.res, ['exit', 1]);
+    assert(/isolated world/.test(k.stderr), `stderr must mention isolated world: ${k.stderr}`);
+    assert.strictEqual(k.owner_evals, 1, 'no retry in main world on exceptionDetails');
+    assert(!k.eval_contexts.includes(null), 'must not evaluate in main world');
+
+    // (l) frame list controls sanitize: \n, \x1b, \u2028 converted to space, no forged lines, exactly 3 lines
+    const l = r.frame_list_controls_sanitize;
+    assert.deepStrictEqual(l.res, ['ok', null]);
+    const lLines = l.stdout.trim().split('\n');
+    assert.strictEqual(lLines.length, 3, `frame list must have exactly 3 lines, got ${lLines.length}: ${l.stdout}`);
+    assert(!l.stdout.includes('\x1b'), `ESC must be replaced by space: ${JSON.stringify(l.stdout)}`);
+    assert(!l.stdout.includes('\u2028'), `U+2028 must be replaced by space: ${JSON.stringify(l.stdout)}`);
+    assert(!l.stdout.includes('evil\n'), `no forged lines: ${JSON.stringify(l.stdout)}`);
+
+    // (m) frame list invalid entries: non-dict, non-int index skipped without traceback
+    const mCase = r.frame_list_invalid_entries;
+    assert.deepStrictEqual(mCase.res, ['ok', null]);
+    assert.strictEqual(mCase.stderr, '', `no traceback on stderr: ${mCase.stderr}`);
+    assert(mCase.stdout.includes("[0] src=12345 name={'obj': 'val'} id="), `formatted valid entry: ${mCase.stdout}`);
+    assert(!mCase.stdout.includes('bad_index'), `non-int index entry skipped: ${mCase.stdout}`);
+
+    // (n) 300-char multiline description truncated to <= 60 chars and newlines removed in route label
+    const nCase = r.route_describe_long_sanitize;
+    assert.deepStrictEqual(nCase.res, ['exit', 1]);
+    assert(!nCase.stderr.includes('\n_'), `no newlines in route description: ${nCase.stderr}`);
+    assert(nCase.desc && nCase.desc.length <= 60,
+      `route.describe() must be <= 60 chars, got ${nCase.desc ? nCase.desc.length : 0}`);
+    assert(!nCase.desc.includes('\n'), `route.describe() must not contain newlines: ${nCase.desc}`);
   });
 
   test('frames (fake CDP): click is one click; real mouse input with --entropy=on and in frames', () => {
@@ -19093,6 +19126,28 @@ print("OK")
       const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
       assert(shotCall, 'Page.captureScreenshot must be called');
       assert.strictEqual(shotCall.params.clip, undefined, 'Clean null must take full page (no clip)');
+    });
+  });
+
+  test('screenshot: fake CDP - element crop isolated exceptionDetails does not fall back to main world', () => {
+    runWithFakeCdp(1, { FAKE_MAIN_RECT: '1', FAKE_ISO_EXC: '1' }, ({ home, logFile, env }) => {
+      const outPng = path.join(home, 'crop_iso_exc.png');
+      const r = spawnSync(process.execPath, [CLI, 'shot', outPng, '--element=#target'], {
+        env, encoding: 'utf-8', timeout: 10000,
+      });
+      assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+      assert(r.stderr.includes('Element not found: #target, taking full page'), `stderr must warn: ${r.stderr}`);
+
+      const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const evalCrop = logs.filter(
+        (l) => l.method === 'Runtime.evaluate' && (l.params.expression || '').includes('resolveSelector')
+      );
+      assert.strictEqual(evalCrop.length, 1, 'Crop expression must run exactly once (no fallback to main world)');
+      assert.strictEqual(evalCrop[0].params.contextId, 77, 'Crop expression must run in isolated world');
+
+      const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
+      assert(shotCall, 'Page.captureScreenshot must be called');
+      assert.strictEqual(shotCall.params.clip, undefined, 'Isolated exception must take full page (no clip)');
     });
   });
 

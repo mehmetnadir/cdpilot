@@ -92,6 +92,8 @@ class Browser:
         self.reverse_main_index = bool(os.environ.get("CDPILOT_FAKE_REVERSE_FRAMES"))
         self.isolated_fail = False
         self.owner_iso_error = False
+        self.owner_iso_exception = False
+        self.custom_frame_list = None
         # The browser routes mouse input into out-of-process frames by its own
         # copy of the layout: while route_stale > 0 every mouse event goes
         # elsewhere (into `misrouted`, never reaching a frame); each answered
@@ -285,9 +287,25 @@ class Browser:
                 frame = self.ctx.get(p["contextId"])
                 if frame is None or frame not in self.process(root):
                     return err("Cannot find context with specified id")
+                if self.owner_iso_exception and p["contextId"] in self.isolated:
+                    expr = p.get("expression", "")
+                    if expr.startswith("(" + self.mod._FRAME_OWNER_JS + ")("):
+                        return ok({
+                            "result": {"type": "object", "subtype": "error",
+                                       "description": "TypeError: querySelectorAll clobbered"},
+                            "exceptionDetails": {
+                                "text": "Uncaught TypeError: querySelectorAll clobbered",
+                                "exception": {"description": "TypeError: querySelectorAll clobbered"}
+                            }
+                        })
                 if self.owner_iso_error and p["contextId"] in self.isolated:
                     expr = p.get("expression", "")
                     if expr.startswith("(" + self.mod._FRAME_OWNER_JS + ")("):
+                        self.owner_iso_error = False
+                        # Context destroyed; next Page.createIsolatedWorld call allocates fresh context
+                        for k, v in list(self.isolated_worlds.items()):
+                            if v == p["contextId"]:
+                                del self.isolated_worlds[k]
                         return err("Cannot find context with specified id")
             return self.evaluate(frame, p.get("expression", ""), ok, p)
         return ok({})
@@ -367,6 +385,8 @@ class Browser:
                                   "description": "iframe#" + f.elem_id if f.elem_id else "iframe",
                                   "objectId": "owner:" + f.fid}})
         if expr == self.mod._FRAME_LIST_JS:
+            if self.custom_frame_list is not None:
+                return value(self.custom_frame_list)
             kids = (list(reversed(frame.children))
                     if (self.reverse_main_index and params.get("contextId") not in self.isolated)
                     else frame.children)
@@ -1621,7 +1641,7 @@ def scenario_framehop_isolated(mod):
     res_f.update({"stdout": stdout_f, "stderr": stderr_f})
     out["frame_not_found_sanitize"] = res_f
 
-    # 5.g: owner_iso_error falls back to main world and prints fallback note once
+    # 5.g: owner_iso_error retries in fresh isolated world, resolves frame, no main world eval
     async def body_g(b):
         b.owner_iso_error = True
         if hasattr(mod, "_FRAME_LOOKUP_FALLBACK_NOTED"):
@@ -1633,6 +1653,8 @@ def scenario_framehop_isolated(mod):
             mod._FRAME_FLAG = None
         owner_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
                        and mod._FRAME_OWNER_JS in m.get("params", {}).get("expression", "")]
+        top_world_calls = [m for m in b.log if m.get("method") == "Page.createIsolatedWorld"
+                           and m.get("params", {}).get("frameId") == "top"]
         where = [m for m in b.log
                  if str(m.get("params", {}).get("expression", "")).startswith("WHERE:")]
         return {
@@ -1640,6 +1662,7 @@ def scenario_framehop_isolated(mod):
             "where": where[-1].get("params", {}).get("expression") if where else None,
             "owner_evals": len(owner_evals),
             "eval_contexts": [m["params"].get("contextId") for m in owner_evals],
+            "top_world_calls": len(top_world_calls),
             "isolated": sorted(b.isolated),
         }
     b_g, res_g, stdout_g, stderr_g = run(mod, top, body_g)
@@ -1694,6 +1717,66 @@ def scenario_framehop_isolated(mod):
     b_j, res_j, stdout_j, stderr_j = run(mod, top, body_j)
     res_j.update({"stdout": stdout_j, "stderr": stderr_j})
     out["closed_shadow_isolated"] = res_j
+
+    # 5.k: owner_iso_exception fails closed with exit 1, isolated world message, no main world eval
+    async def body_k(b):
+        b.owner_iso_exception = True
+        mod._FRAME_FLAG = "0"
+        try:
+            res = await call(cmd, "#target")
+        finally:
+            mod._FRAME_FLAG = None
+        owner_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                       and mod._FRAME_OWNER_JS in m.get("params", {}).get("expression", "")]
+        return {
+            "res": res,
+            "owner_evals": len(owner_evals),
+            "eval_contexts": [m["params"].get("contextId") for m in owner_evals],
+        }
+    b_k, res_k, stdout_k, stderr_k = run(mod, top, body_k)
+    res_k.update({"stdout": stdout_k, "stderr": stderr_k})
+    out["owner_iso_exception"] = res_k
+
+    # 5.l: frame list controls sanitize: \n, \x1b, \u2028 converted to space, no forged lines, exactly 3 lines
+    evil_name = "x\n  [0] src=evil name= id=\x1b[31mred\u2028newline"
+    top_evil = Frame(
+        "top", children=[
+            Frame("f_evil", elem_id="id1", name=evil_name),
+            Frame("f_second", elem_id="id2", name="second_frame")
+        ]
+    )
+    async def body_l(b):
+        res = await call(mod.cmd_frame, "list")
+        return {"res": res}
+    b_l, res_l, stdout_l, stderr_l = run(mod, top_evil, body_l)
+    res_l.update({"stdout": stdout_l, "stderr": stderr_l})
+    out["frame_list_controls_sanitize"] = res_l
+
+    # 5.m: frame list invalid entries: non-dict, non-int index skipped without traceback
+    async def body_m(b):
+        b.custom_frame_list = [
+            "not a dict",
+            {"index": "bad_index", "name": "bad"},
+            {"index": 0, "src": 12345, "name": {"obj": "val"}, "id": None}
+        ]
+        res = await call(mod.cmd_frame, "list")
+        return {"res": res}
+    b_m, res_m, stdout_m, stderr_m = run(mod, top, body_m)
+    res_m.update({"stdout": stdout_m, "stderr": stderr_m})
+    out["frame_list_invalid_entries"] = res_m
+
+    # 5.n: 300-char multiline description truncated to <= 60 chars and newlines removed in route label
+    long_desc_id = "desc_\n_" + "z" * 300
+    top_desc = Frame("top", children=[Frame("f_desc", elem_id=long_desc_id)])
+    async def body_n(b):
+        route = await mod._frame_route_open(WS, [{"kind": "index", "value": 0}])
+        desc = route.describe()
+        await mod._frame_route_close(route)
+        res = await call(cmd, f"#{long_desc_id} >>> missing >>> #target")
+        return {"res": res, "desc": desc}
+    b_n, res_n, stdout_n, stderr_n = run(mod, top_desc, body_n)
+    res_n.update({"stdout": stdout_n, "stderr": stderr_n})
+    out["route_describe_long_sanitize"] = res_n
 
     return out
 
