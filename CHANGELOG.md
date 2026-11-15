@@ -7,6 +7,9 @@ All notable changes to cdpilot will be documented in this file.
 ### Fixed
 - **MCP `browser_agent_find` searches a text that starts with `--`.** The text was passed as a plain CLI word, so `--max 5` or `--rows` was read as a flag and dropped (usage error, or every entry of the role). The tool now passes it after `--`, and `agent find -- <text>` takes the word after `--` as the text (jury note, 0.9.9).
 
+### Security
+- **`agent observe --frame` text gets the same protection as the main page.** Its `text` went out as the raw AX text: an offscreen/tiny injection line in an iframe stayed in it, and hosts named only in the iframe's hidden text never reached the guard. The frame's own document is now probed (DOMSnapshot in its session) and its text passes the hidden-text cut (`hidden_removed`, `injection_suspect`, `hidden_check: unavailable` when the probe fails) and feeds `url_from_hidden` (jury note, 0.9.9).
+
 ## [0.9.9] - 2026-11-15
 
 ### Added

@@ -17668,7 +17668,7 @@ def _agent_text_fields(view, nodes, state, out):
     return out
 
 
-async def _agent_hidden_refs(ws_url, nodes, actions, vis=None):
+async def _agent_hidden_refs(ws_url, nodes, actions, vis=None, send=None):
     """Refs the default output leaves out. Interactive roles and landmarks stay;
     other entries (StaticText, cell, ListMarker …) stay only when clickable (see
     _agent_clickable_bids). Fail open: when the one DOMSnapshot call errors, times
@@ -17688,8 +17688,11 @@ async def _agent_hidden_refs(ws_url, nodes, actions, vis=None):
         if texts:
             params['includeBlendedBackgroundColors'] = True
         try:
-            r = await cdp_send(ws_url, [(1, 'DOMSnapshot.captureSnapshot', params)], timeout=2)
-            res = r.get(1)
+            if send is not None:
+                r = await send([(1, 'DOMSnapshot.captureSnapshot', params)])
+            else:
+                r = await cdp_send(ws_url, [(1, 'DOMSnapshot.captureSnapshot', params)], timeout=2)
+            res = r.get(1) if isinstance(r, dict) else None
         except Exception:
             res = None
         if not _agent_snapshot_valid(res):
@@ -18046,10 +18049,16 @@ async def cmd_agent_observe_frame(frame, full=False, all_=False):
     except _FrameError as e:
         print(json.dumps({'error': str(e)}), file=sys.stderr)
         sys.exit(1)
+    vis = {}
     try:
         nodes = await _agent_frame_nodes(route)
         frame_id, src = route.frame_id, route.src
         loader_id, live_url = await _agent_frame_identity(route)
+        # the hidden-text probe in the frame's own document: its session (OOPIF) or the page's
+        sid = route.session_id
+        await _agent_hidden_refs(
+            ws_url, nodes, [], vis=vis,
+            send=lambda cmds: _frame_cdp(route, [(c[0], c[1], c[2], sid) for c in cmds], timeout=2))
     finally:
         await _frame_route_close(route)
     # provenance = where the frame IS (live URL), not what its src attribute said
@@ -18067,17 +18076,16 @@ async def cmd_agent_observe_frame(frame, full=False, all_=False):
                   'loader_id': loader_id, 'frame_url': live_url})
         kept[a['ref']] = a
     state['frame_actions'] = dict(list(kept.items())[-2000:])
-    _save_agent_state(state)
     shown, trunc = _agent_cap_list(
         [_agent_out_entry({k: v for k, v in a.items() if k in ('ref', 'role', 'name', 'value')}, full)
          for a in actions], limit)
     res = {'url': _agent_page_url(page, state), 'frame': origin, 'frame_index': int(frame),
-           'actions': shown, 'text': _extract_text_summary(nodes)}
+           'actions': shown, 'text': ''}
     if trunc:
         res['truncated'] = trunc
-    suspects = _agent_injection_scan(nodes)
-    if suspects:
-        res['injection_suspect'] = suspects
+    view = _agent_text_view(nodes, vis)
+    _agent_text_fields(view, nodes, state, res)
+    _save_agent_state(state)
     res['token_estimate'] = _estimate_tokens(res)
     _agent_json(res)
 
