@@ -7920,31 +7920,33 @@ async def _capture(ws, fmt, quality=None, clip_css=None, mode=None, capture_beyo
         b64 = r.get(1, {}).get("result", {}).get("data", "") or r.get(1, {}).get("data", "")
         return base64.b64decode(b64) if b64 else None
 
-    # mode == "css": query devicePixelRatio
+    # mode == "css": query DPR and viewport via Page.getLayoutMetrics
     dpr = 1.0
     scroll_x = 0.0
     scroll_y = 0.0
     inner_w = 0.0
     inner_h = 0.0
-    eval_js = """(function() {
-      return JSON.stringify({
-        dpr: window.devicePixelRatio || 1,
-        x: window.scrollX || 0,
-        y: window.scrollY || 0,
-        width: window.innerWidth || 0,
-        height: window.innerHeight || 0
-      });
-    })()"""
     try:
-        cr = await cdp_send(ws, [(1, "Runtime.evaluate", {"expression": eval_js, "returnByValue": True})])
-        ev_val = cr.get(1, {}).get("result", {}).get("value")
-        if ev_val:
-            info = json.loads(ev_val) if isinstance(ev_val, str) else ev_val
-            dpr = float(info.get("dpr", 1) or 1)
-            scroll_x = float(info.get("x", 0) or 0)
-            scroll_y = float(info.get("y", 0) or 0)
-            inner_w = float(info.get("width", 0) or 0)
-            inner_h = float(info.get("height", 0) or 0)
+        mr = await cdp_send(ws, [(1, "Page.getLayoutMetrics", {})])
+        m = mr.get(1, {})
+        if "result" in m and isinstance(m["result"], dict):
+            m = m["result"]
+        cs = m.get("contentSize") or {}
+        ccs = m.get("cssContentSize") or {}
+        cs_w = float(cs.get("width") or 0)
+        ccs_w = float(ccs.get("width") or 0)
+        if cs_w > 0 and ccs_w > 0:
+            dpr = cs_w / ccs_w
+        else:
+            dpr = 1.0
+
+        vv = m.get("cssVisualViewport") or m.get("visualViewport") or {}
+        scroll_x = float(vv.get("pageX", vv.get("x", 0)) or 0)
+        scroll_y = float(vv.get("pageY", vv.get("y", 0)) or 0)
+
+        lv = m.get("cssLayoutViewport") or m.get("layoutViewport") or {}
+        inner_w = float(lv.get("clientWidth", lv.get("width", 0)) or 0)
+        inner_h = float(lv.get("clientHeight", lv.get("height", 0)) or 0)
     except Exception:
         dpr = 1.0
 
@@ -17827,11 +17829,23 @@ def _agent_cap_diff(diff, limit, url_changed=False):
     return out, (_agent_truncated(shown, total) if shown < total else None)
 
 
+async def _isolated_world(ws, world_name="cdpilot"):
+    """contextId of an isolated world in the page's top frame, or None. Errors propagate
+    (the caller decides: WebMCP reports them, the frames probe falls back to [])."""
+    r = await cdp_send(ws, [(1, "Page.getFrameTree", {})])
+    fid = (((r.get(1) or {}).get("frameTree") or {}).get("frame") or {}).get("id")
+    if not fid:
+        return None
+    r = await cdp_send(ws, [(2, "Page.createIsolatedWorld", {
+        "frameId": fid, "worldName": world_name, "grantUniveralAccess": True})])
+    return (r.get(2) or {}).get("executionContextId")
+
+
 # Visible iframes of the main document, for the `frames` hint of `agent observe`.
-# One evaluate, no per-frame call. Index = `frame list` order (same selector).
-# cover = share of the viewport the frame's visible part fills; blocking = the
-# frame is what elementFromPoint finds at >= 3 of 5 points (centre + 4 inset
-# corners of its visible part), i.e. it sits on top of the page.
+# One evaluate in an isolated world, no per-frame call. Index = `frame list` order
+# (same selector). cover = share of the viewport the frame's visible part fills;
+# blocking = the frame is what elementFromPoint finds at >= 3 of 5 points (centre + 4
+# inset corners of its visible part), i.e. it sits on top of the page.
 _AGENT_FRAMES_JS = r"""
 /*cdpilot-agent-frames*/(function () {
   var vw = window.innerWidth || document.documentElement.clientWidth, vh = window.innerHeight || document.documentElement.clientHeight;
@@ -17874,11 +17888,31 @@ def _agent_want_frames():
         _AGENT_WANT_FRAMES[0] = False
 
 
-def _agent_frames_cmd():
-    """The frames probe as an extra command of the snapshot request (only when observe/run want it)."""
+def _agent_frames_cmd(context_id=None):
+    """The frames probe as a command for the isolated world (only when observe/run want it)."""
     if not _AGENT_WANT_FRAMES[0]:
         return []
-    return [(2, 'Runtime.evaluate', {'expression': _AGENT_FRAMES_JS, 'returnByValue': True})]
+    params = {'expression': _AGENT_FRAMES_JS, 'returnByValue': True}
+    if context_id is not None:
+        params['contextId'] = context_id
+    return [(2, 'Runtime.evaluate', params)]
+
+
+async def _agent_probe_frames(ws_url):
+    """Probe visible iframes in an isolated world; returns list of frame dicts ([] on failure)."""
+    if not _AGENT_WANT_FRAMES[0]:
+        return []
+    try:
+        ctx_id = await _isolated_world(ws_url, "cdpilot")
+        if not ctx_id:
+            return []
+        cmds = _agent_frames_cmd(ctx_id)
+        if not cmds:
+            return []
+        res = await cdp_send(ws_url, cmds)
+        return _agent_frames_from_reply(res.get(2))
+    except Exception:
+        return []
 
 
 def _agent_frames_from_reply(reply):
@@ -17916,8 +17950,8 @@ async def _agent_full_snapshot():
     global _AGENT_LAST_FRAMES
     ws_url, page = get_page_ws()
     await cdp_send(ws_url, [(0, 'Accessibility.enable', {})])
-    res = await cdp_send(ws_url, [(1, 'Accessibility.getFullAXTree', {})] + _agent_frames_cmd())
-    _AGENT_LAST_FRAMES = _agent_frames_from_reply(res.get(2))
+    res = await cdp_send(ws_url, [(1, 'Accessibility.getFullAXTree', {})])
+    _AGENT_LAST_FRAMES = await _agent_probe_frames(ws_url)
     nodes = res.get(1, {}).get('nodes', [])
     state = _load_agent_state()
     actions = _snapshot_to_actions(nodes, state)
@@ -21327,13 +21361,7 @@ async def _webmcp_world(ws):
     replace results or watch the calls. The same worldName returns the same
     world, so asking again for the call step is cheap.
     """
-    r = await cdp_send(ws, [(1, "Page.getFrameTree", {})])
-    fid = (((r.get(1) or {}).get("frameTree") or {}).get("frame") or {}).get("id")
-    if not fid:
-        return None
-    r = await cdp_send(ws, [(2, "Page.createIsolatedWorld", {
-        "frameId": fid, "worldName": "cdpilot", "grantUniveralAccess": True})])
-    return (r.get(2) or {}).get("executionContextId")
+    return await _isolated_world(ws, "cdpilot")
 
 
 async def _webmcp_eval(ws, expression, timeout=15, isolated=True):
