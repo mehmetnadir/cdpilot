@@ -7614,7 +7614,7 @@ def cmd_launch(auto=False, idle_close=None):
         CHROME_BIN = bin_path
         print(f'Browser found: {bin_path}')
 
-    os.makedirs(PROFILE_DIR, exist_ok=True)
+    _makedirs_private(PROFILE_DIR)
 
     proj_label = f' [{PROJECT_ID}]' if PROJECT_ID else ''
     print(f'Launching browser (isolated session, port {CDP_PORT}){proj_label}...')
@@ -7647,7 +7647,7 @@ def cmd_launch(auto=False, idle_close=None):
     else:
         # Default: chrome and unknown chromium-based browsers
         profile_dir = PROFILE_DIR + '-chrome'
-    os.makedirs(profile_dir, exist_ok=True)
+    _makedirs_private(profile_dir)
     _sanitize_profile_state(profile_dir)
 
     chrome_args = [
@@ -12672,6 +12672,80 @@ async def _captcha_urlopen_async(url: str, data: bytes = None, headers: dict = N
     return await loop.run_in_executor(None, _sync)
 
 
+_CAPTCHA_IMG_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _captcha_img_host_ok(host: str, port) -> bool:
+    """True only when every address `host` resolves to is a public unicast one."""
+    import ipaddress as _ip
+    import socket as _sock
+    if not host:
+        return False
+    try:
+        infos = _sock.getaddrinfo(host, port, type=_sock.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        addr = info[4][0].split('%', 1)[0]
+        try:
+            ip = _ip.ip_address(addr)
+        except ValueError:
+            return False
+        if getattr(ip, 'ipv4_mapped', None) is not None:
+            ip = ip.ipv4_mapped
+        if (ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast
+                or ip.is_reserved or ip.is_unspecified or not ip.is_global):
+            return False
+    return True
+
+
+def _captcha_img_url_ok(url: str) -> bool:
+    import urllib.parse as _up
+    try:
+        u = _up.urlsplit(url)
+        port = u.port
+    except ValueError:
+        return False
+    if u.scheme not in ('http', 'https'):
+        return False
+    return _captcha_img_host_ok(u.hostname, port or (443 if u.scheme == 'https' else 80))
+
+
+def _captcha_safe_origin(url: str) -> str:
+    """scheme://host only, for error output (never echo a page-chosen path/query)."""
+    import urllib.parse as _up
+    try:
+        u = _up.urlsplit(url)
+        return f'{u.scheme}://{u.hostname or ""}'[:120]
+    except ValueError:
+        return ''
+
+
+def _captcha_fetch_page_image_sync(url: str, timeout: int = 15,
+                                   max_bytes: int = _CAPTCHA_IMG_MAX_BYTES) -> bytes:
+    """Fetch an image URL chosen by the PAGE: http/https only, public hosts only
+    (every redirect hop re-checked), body capped. Raises ValueError on refusal."""
+    import urllib.request as _ureq
+
+    if not _captcha_img_url_ok(url):
+        raise ValueError('url_refused')
+
+    class _Guard(_ureq.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not _captcha_img_url_ok(newurl):
+                raise ValueError('redirect_refused')
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = _ureq.build_opener(_Guard)
+    with opener.open(_ureq.Request(url), timeout=timeout) as resp:
+        body = resp.read(max_bytes + 1)
+    if len(body) > max_bytes:
+        raise ValueError('image_too_large')
+    return body
+
+
 # ─── 2captcha provider ────────────────────────────────────────────────────
 
 async def _solve_2captcha(api_key: str, captcha_type: str, site_key: str, url: str, **kwargs) -> dict:
@@ -13325,11 +13399,12 @@ async def _detect_amazon_captcha(ws_url: str) -> dict:
 
 
 async def _fetch_image_bytes(ws_url: str, img_src: str) -> bytes | None:
-    """Download the captcha image bytes. Uses urllib (image URLs are public CDN)."""
+    """Download the captcha image bytes. The URL is page-chosen: guarded fetch (public http/https only, size cap)."""
     if not img_src:
         return None
     try:
-        return await _captcha_urlopen_async(img_src, timeout=15)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _captcha_fetch_page_image_sync, img_src)
     except Exception:
         return None
 
@@ -13506,7 +13581,8 @@ async def cmd_captcha_solve(provider=None):
     input_id = amz.get('input_id', 'captchacharacters')
     img_bytes = await _fetch_image_bytes(ws, img_src)
     if not img_bytes:
-        print(json.dumps({'solved': False, 'error': 'image_fetch_failed', 'img_src': img_src}, ensure_ascii=False))
+        print(json.dumps({'solved': False, 'error': 'image_fetch_failed',
+                          'img_src': _captcha_safe_origin(img_src)}, ensure_ascii=False))
         sys.exit(1)
 
     solution = None
@@ -21213,7 +21289,7 @@ async def cmd_download(subcmd, *subcmd_args):
                 "params": {"behavior": "allow", "downloadPath": download_dir}}))
             await asyncio.wait_for(ws.recv(), timeout=5)
         cfg = {"downloadPath": download_dir}
-        os.makedirs(PROFILE_DIR, exist_ok=True)
+        _makedirs_private(PROFILE_DIR)
         with open(DOWNLOAD_CONFIG_FILE, "w") as f:
             json.dump(cfg, f, indent=2)
         print(f"Download directory: {download_dir}")
@@ -22530,7 +22606,13 @@ TRACE_VIEWER_HTML = """
                 steps.forEach((s, i) => {
                     const div = document.createElement('div');
                     div.className = 'step';
-                    div.innerHTML = '<div style="font-size:11px;color:#adb5bd;margin-bottom:2px">STEP ' + (i+1) + '</div><div style="font-size:14px">' + (s.action || 'Navigation') + '</div>';
+                    const lbl = document.createElement('div');
+                    lbl.style.cssText = 'font-size:11px;color:#adb5bd;margin-bottom:2px';
+                    lbl.textContent = 'STEP ' + (i+1);
+                    const act = document.createElement('div');
+                    act.style.cssText = 'font-size:14px';
+                    act.textContent = s.action || 'Navigation';
+                    div.append(lbl, act);
                     div.onclick = () => selectStep(i);
                     list.appendChild(div);
                 });

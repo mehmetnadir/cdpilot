@@ -19,6 +19,9 @@ All notable changes to cdpilot will be documented in this file.
 - **The selector ladder's stable-attribute step (`data-testid`, `data-cy`, `name`, `id`) passes the value as one CSS string.** A quote in a `click` / `fill` / `type` / `hover` / `submit` target can no longer run script in the page; a backslash or quote in the value now matches the attribute literally.
 - **`extract --attrs=` passes the attribute names as data**, and the MCP `browser_extract` tool passes on only the formats its schema lists (`json`, `list`; anything else is plain text).
 - **The visual-feedback cursor takes numbers only.** smart-click's frame search returns a frame's own answer; a cross-origin frame could put script in the reported position and have it run in the top page.
+- **`captcha-solve` no longer fetches whatever image URL the page names.** The Amazon captcha image is downloaded only over http or https from public addresses (loopback, private, link-local and reserved addresses are refused, every redirect is checked again) and is capped at 2 MiB; a refused fetch reports `image_fetch_failed` with only the scheme and host.
+- **Test traces are private and no longer store typed values.** Trace folders are created 0700 and their files 0600; `fill`/`type` values are recorded as `redacted:N chars`, and the trace viewer shows step text as plain text.
+- **New Chrome profile folders are created 0700.**
 
 ### Changed
 - **`blog publish` / `blog regenerate` read their output folder from `CDPILOT_BLOG_DIR`.** The folder was a hard-coded maintainer path; without the variable both commands now exit 2 with a message and write nothing. `day-NNN` sources are looked up in `CDPILOT_BLOG_PLAN_DIR` (default: the current directory). Maintainer notes, social-media drafts and the X bot are no longer in the repository.

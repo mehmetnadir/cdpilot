@@ -1022,17 +1022,39 @@ function showHelp() {
 
 // ── Internal Test Runner ──
 
+// Commands whose arguments at these indexes are free text the user typed (possibly
+// credentials). The trace keeps the command, never the typed value.
+const TRACE_VALUE_ARGS = { fill: [1], type: [1], 'smart-fill': [1], 'smart-select': [1], select: [1], keys: [0] };
+
+function traceRedactArgs(cmd, cargs) {
+  const idx = TRACE_VALUE_ARGS[cmd] || [];
+  return cargs.map((a, i) => (idx.includes(i) ? '\u00abredacted:' + String(a).length + ' chars\u00bb' : String(a)));
+}
+
+function traceRedactText(cmd, cargs, text) {
+  let out = String(text);
+  for (const i of (TRACE_VALUE_ARGS[cmd] || [])) {
+    const v = cargs[i] === undefined ? '' : String(cargs[i]);
+    if (v) out = out.split(v).join('\u00abredacted:' + v.length + ' chars\u00bb');
+  }
+  return out;
+}
+
 function runInternalTestRunner(testFile, traceDir, traceMode, grepPattern) {
   if (traceDir) {
-    fs.mkdirSync(path.join(traceDir, 'screenshots'), { recursive: true });
-    fs.mkdirSync(path.join(traceDir, 'a11y'), { recursive: true });
+    // Trace dirs and files hold typed values, page content and screenshots: owner only.
+    fs.mkdirSync(path.join(traceDir, 'screenshots'), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.join(traceDir, 'a11y'), { recursive: true, mode: 0o700 });
+    for (const d of [traceDir, path.join(traceDir, 'screenshots'), path.join(traceDir, 'a11y')]) {
+      try { fs.chmodSync(d, 0o700); } catch (_) { /* best effort (Windows) */ }
+    }
   }
 
   const metaPath = traceDir ? path.join(traceDir, 'meta.json') : null;
   const stepsPath = traceDir && traceMode !== 'off' ? path.join(traceDir, 'steps.jsonl') : null;
 
   const meta = { name: path.basename(testFile), started_at: new Date().toISOString(), status: 'running', tests: [] };
-  if (metaPath) fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+  if (metaPath) { fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), { mode: 0o600 }); try { fs.chmodSync(metaPath, 0o600); } catch (_) { /* best effort */ } }
 
   const testQueue = [];
   global.test = (name, fn) => testQueue.push({ name, fn });
@@ -1054,7 +1076,7 @@ function runInternalTestRunner(testFile, traceDir, traceMode, grepPattern) {
   const makeT = () => {
     const runCmd = (cmd, ...cargs) => {
       const padded = String(stepIdx).padStart(3, '0');
-      const step = { action: cmd + ' ' + cargs.join(' '), ts_ms: Date.now(), duration_ms: 0, error: null };
+      const step = { action: cmd + ' ' + traceRedactArgs(cmd, cargs).join(' '), ts_ms: Date.now(), duration_ms: 0, error: null };
       const t0 = Date.now();
       try {
         const quoted = cargs.map(a => JSON.stringify(String(a))).join(' ');
@@ -1064,7 +1086,7 @@ function runInternalTestRunner(testFile, traceDir, traceMode, grepPattern) {
           timeout: 30000,
         });
         step.duration_ms = Date.now() - t0;
-        if (stepsPath) fs.appendFileSync(stepsPath, JSON.stringify(step) + '\n');
+        if (stepsPath) fs.appendFileSync(stepsPath, JSON.stringify(step) + '\n', { mode: 0o600 });
         // Screenshot after each step (best-effort — no browser = skipped)
         if (traceDir && traceMode !== 'off') {
           try {
@@ -1075,8 +1097,8 @@ function runInternalTestRunner(testFile, traceDir, traceMode, grepPattern) {
         stepIdx++;
       } catch (err) {
         step.duration_ms = Date.now() - t0;
-        step.error = err.stderr ? err.stderr.toString().trim() : err.message;
-        if (stepsPath) fs.appendFileSync(stepsPath, JSON.stringify(step) + '\n');
+        step.error = traceRedactText(cmd, cargs, err.stderr ? err.stderr.toString().trim() : err.message);
+        if (stepsPath) fs.appendFileSync(stepsPath, JSON.stringify(step) + '\n', { mode: 0o600 });
         stepIdx++;
         throw new Error(`${cmd} failed: ${step.error}`);
       }
