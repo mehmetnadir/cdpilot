@@ -9298,9 +9298,9 @@ async def cmd_wait(selector, timeout=5):
     if isinstance(val, dict):
         if val.get("shadowHost"):
             _maybe_print_shadow_note(selector, val["shadowHost"])
-        print(val.get("out", "?"))
+        print(_tty_text(val.get("out", "?")))
     else:
-        print(val or "?")
+        print(_tty_text(val or "?"))
 
 
 async def cmd_batch():
@@ -15433,11 +15433,11 @@ async def cmd_extract(selector, output_format="text"):
         # Pretty print JSON
         try:
             parsed = json.loads(result)
-            print(json.dumps(parsed, indent=2, ensure_ascii=False))
+            print(_tty_json(json.dumps(parsed, indent=2, ensure_ascii=False)))
         except (json.JSONDecodeError, TypeError):
-            print(result)
+            print(_tty_text(result))
     else:
-        print(result)
+        print(_tty_text(result))
 
 
 async def cmd_observe():
@@ -15505,7 +15505,7 @@ async def cmd_observe():
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
     result = _cdp_reply(r, 1, "Runtime.evaluate", 15).get("result", {}).get("value", "No interactive elements found")
     print(f"=== What you can do on this page ===\n")
-    print(result)
+    print(_tty_text(result))
 
 
 # ─── Smart Commands (LLM-free intelligence) ───
@@ -16397,9 +16397,9 @@ async def cmd_wait_for(selector, timeout_ms=5000):
     if isinstance(val, dict):
         if val.get("shadowHost"):
             _maybe_print_shadow_note(selector, val["shadowHost"])
-        print(val.get("out", "ERROR"))
+        print(_tty_text(val.get("out", "ERROR")))
     else:
-        print(val or "ERROR")
+        print(_tty_text(val or "ERROR"))
 
 
 async def cmd_wait_for_text(text, timeout_ms=5000):
@@ -16443,7 +16443,7 @@ async def cmd_wait_for_text(text, timeout_ms=5000):
     """
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})], timeout=max(15, timeout_ms // 1000 + 5))
     result = r.get(1, {}).get("result", {}).get("value", "ERROR")
-    print(result)
+    print(_tty_text(result))
 
 
 async def cmd_check(checks_json=None):
@@ -21908,7 +21908,7 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
             print(f"Error: {val}", file=sys.stderr)
             sys.exit(1)
         else:
-            print(f"Result: {val.get('result', {}).get('value', val)}")
+            print(f"Result: {_tty_text(val.get('result', {}).get('value', val))}")
 
     elif subcmd == "shadow":
         if not subcmd_args:
@@ -21918,7 +21918,7 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
         js = f"(function(){{ var el=document.querySelector({json.dumps(selector)}); if(!el) return 'Element not found'; if(!el.shadowRoot) return 'No shadow root'; return el.shadowRoot.innerHTML.substring(0,3000); }})()"
         res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
         val = res.get(1, {}).get("result", {}).get("value", "")
-        print(val or "(empty)")
+        print(_tty_text(val or "(empty)"))
 
     else:
         print("Usage: frame [list|eval <js>|shadow <selector>] [--frame <selector|index|url>]")
@@ -23482,7 +23482,8 @@ def cmd_test(files=None, watch=False, parallel=1, reporter='default', trace='def
                 for t in r.get('tests', []):
                     lines.append(f'  <testcase name="{t.get("name", "")}" time="{t.get("duration_ms", 0)/1000:.3f}">')
                     if t.get('status') != 'passed':
-                        err = (t.get('error') or '').replace('&', '&amp;').replace('<', '&lt;')
+                        # page text: control characters are invalid in XML 1.0, so always \xNN here
+                        err = _term_text(t.get('error') or '').replace('&', '&amp;').replace('<', '&lt;')
                         lines.append(f'    <failure>{err}</failure>')
                     lines.append('  </testcase>')
             lines.append('</testsuites>')
