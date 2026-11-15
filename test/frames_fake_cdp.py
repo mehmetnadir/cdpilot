@@ -91,6 +91,7 @@ class Browser:
         self.next_ctx = [900]
         self.reverse_main_index = bool(os.environ.get("CDPILOT_FAKE_REVERSE_FRAMES"))
         self.isolated_fail = False
+        self.owner_iso_error = False
         # The browser routes mouse input into out-of-process frames by its own
         # copy of the layout: while route_stale > 0 every mouse event goes
         # elsewhere (into `misrouted`, never reaching a frame); each answered
@@ -237,7 +238,12 @@ class Browser:
             self.sessions.pop(p.get("sessionId"), None)
             return ok({})
         if method == "DOM.describeNode":
-            f = self.owner(p.get("objectId"))
+            oid = p.get("objectId")
+            if oid == "node:closed-host":
+                return ok({
+                    "node": {"nodeName": "DIV", "shadowRoots": [{"shadowRootType": "closed"}]}
+                })
+            f = self.owner(oid)
             if f is None:
                 return err("Could not find node with given id")
             node = {"nodeName": "IFRAME", "frameId": f.fid, "attributes": ["id", f.elem_id, "src", f.src]}
@@ -279,6 +285,10 @@ class Browser:
                 frame = self.ctx.get(p["contextId"])
                 if frame is None or frame not in self.process(root):
                     return err("Cannot find context with specified id")
+                if self.owner_iso_error and p["contextId"] in self.isolated:
+                    expr = p.get("expression", "")
+                    if expr.startswith("(" + self.mod._FRAME_OWNER_JS + ")("):
+                        return err("Cannot find context with specified id")
             return self.evaluate(frame, p.get("expression", ""), ok, p)
         return ok({})
 
@@ -413,6 +423,14 @@ class Browser:
             return ok({"result": {"type": "boolean", "value": True}})
         if "__cdpilot_waitFor(" in expr:  # cmd_click / cmd_fill script
             return self.click_script(frame, expr, params, ok)
+        if "res ? res.failedHop : null" in expr:
+            if "closed-host" in expr:
+                return ok({"result": {"type": "string", "value": "closed-host"}})
+            return ok({"result": {"type": "object", "subtype": "null", "value": None}})
+        if "res ? res.el : null" in expr:
+            if "closed-host" in expr:
+                return ok({"result": {"type": "object", "objectId": "node:closed-host"}})
+            return ok({"result": {"type": "object", "subtype": "null", "value": None}})
         if expr == "HANG":
             return []
         if expr == "NOISY":  # events interleaved before the reply, as a live page sends them
@@ -1071,6 +1089,8 @@ def scenario_timeout_restore(mod):
             os.dup2(saved_fd2, 2)
             os.close(saved_fd2)
             os._exit, mod.subprocess.Popen = real_exit, real_popen
+            if mod._TIMEOUT_WATCH.get("timer"):
+                mod._TIMEOUT_WATCH["timer"].cancel()
         fd2.seek(0)
         res["fd2"] = fd2.read().decode()
     res.update({"blocker": b.blocker_log, "stderr": err})
@@ -1326,6 +1346,8 @@ def scenario_timeout_hold(mod):
                 os.close(saved_fd2)
                 os._exit, mod.subprocess.Popen = real_exit, real_popen
                 mod.get_visual_config = real_visual
+                if mod._TIMEOUT_WATCH.get("timer"):
+                    mod._TIMEOUT_WATCH["timer"].cancel()
             fd2.seek(0)
             res["fd2"] = fd2.read().decode()
         res.update({"stderr": err})
@@ -1598,6 +1620,80 @@ def scenario_framehop_isolated(mod):
     b_f, res_f, stdout_f, stderr_f = run(mod, top_f, body_f)
     res_f.update({"stdout": stdout_f, "stderr": stderr_f})
     out["frame_not_found_sanitize"] = res_f
+
+    # 5.g: owner_iso_error falls back to main world and prints fallback note once
+    async def body_g(b):
+        b.owner_iso_error = True
+        if hasattr(mod, "_FRAME_LOOKUP_FALLBACK_NOTED"):
+            mod._FRAME_LOOKUP_FALLBACK_NOTED[0] = False
+        mod._FRAME_FLAG = "0"
+        try:
+            res = await call(cmd, "#target")
+        finally:
+            mod._FRAME_FLAG = None
+        owner_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                       and mod._FRAME_OWNER_JS in m.get("params", {}).get("expression", "")]
+        where = [m for m in b.log
+                 if str(m.get("params", {}).get("expression", "")).startswith("WHERE:")]
+        return {
+            "res": res,
+            "where": where[-1].get("params", {}).get("expression") if where else None,
+            "owner_evals": len(owner_evals),
+            "eval_contexts": [m["params"].get("contextId") for m in owner_evals],
+            "isolated": sorted(b.isolated),
+        }
+    b_g, res_g, stdout_g, stderr_g = run(mod, top, body_g)
+    res_g.update({"stdout": stdout_g, "stderr": stderr_g})
+    out["owner_iso_error_fallback"] = res_g
+
+    # 5.h: clean not found in isolated world does not retry in main world (evals == 1)
+    async def body_h(b):
+        mod._FRAME_FLAG = "99"
+        try:
+            res = await call(cmd, "#target")
+        finally:
+            mod._FRAME_FLAG = None
+        owner_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                       and mod._FRAME_OWNER_JS in m.get("params", {}).get("expression", "")]
+        return {
+            "res": res,
+            "owner_evals": len(owner_evals),
+        }
+    b_h, res_h, stdout_h, stderr_h = run(mod, top, body_h)
+    res_h.update({"stdout": stdout_h, "stderr": stderr_h})
+    out["clean_not_found_single_eval"] = res_h
+
+    # 5.i: frame list stdout sanitizes tag chars and cuts id/name to 60, src to 80
+    long_tag_id = "frame_" + "\U000e0041\U000e0042" + "x" * 200
+    top_list_sanitize = Frame(
+        "top", children=[Frame("f_clean", elem_id=long_tag_id, name="clean_name")]
+    )
+    async def body_i(b):
+        res = await call(mod.cmd_frame, "list")
+        return {"res": res}
+    b_i, res_i, stdout_i, stderr_i = run(mod, top_list_sanitize, body_i)
+    res_i.update({"stdout": stdout_i, "stderr": stderr_i})
+    out["frame_list_stdout_sanitize"] = res_i
+
+    # 5.j: _check_chain_closed_shadow evaluates with isolated world contextId when not route.chain
+    async def body_j(b):
+        route = mod._FrameRoute(WS)
+        mod._frame_pool_pin(route)
+        err_msg = None
+        try:
+            await mod._check_chain_closed_shadow(route, ["closed-host", "button"])
+        except mod._FrameError as e:
+            err_msg = str(e)
+        evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                 and "__cdpilot_walkHops" in m.get("params", {}).get("expression", "")]
+        return {
+            "err": err_msg,
+            "eval_contexts": [m["params"].get("contextId") for m in evals],
+            "isolated": sorted(b.isolated),
+        }
+    b_j, res_j, stdout_j, stderr_j = run(mod, top, body_j)
+    res_j.update({"stdout": stdout_j, "stderr": stderr_j})
+    out["closed_shadow_isolated"] = res_j
 
     return out
 

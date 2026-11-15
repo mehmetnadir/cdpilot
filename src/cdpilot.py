@@ -4722,6 +4722,16 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
             p3["contextId"] = lookup_ctx
         cmds.append((3, "Runtime.evaluate", p3, route.session_id))
     r = await _frame_cdp(route, cmds)
+    reply1 = r.get(1) or {}
+    if lookup_ctx is not None and (_cdp_error_reply(reply1) or reply1.get("exceptionDetails")):
+        _frame_lookup_fallback_note()
+        lookup_ctx = None
+        p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False)
+        cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
+        if hop["kind"] in ("auto", "sel"):
+            p3 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)")
+            cmds.append((3, "Runtime.evaluate", p3, route.session_id))
+        r = await _frame_cdp(route, cmds)
     obj = r.get(1, {}).get("result", {})
     oid = obj.get("objectId")
     shown = f"#{hop['value']}" if hop["kind"] == "index" else hop["value"]
@@ -5016,12 +5026,16 @@ async def _check_chain_closed_shadow(route, names):
     """Check if any subsequent hop in names has a closed shadow root."""
     if len(names) <= 1:
         return
+    lookup_ctx = await _frame_first_hop_world(route) if not route.chain else None
     chk_closed_js = f"""(function () {{
       {_SHADOW_QUERY_JS}
       var res = __cdpilot_walkHops(document, {json.dumps(names)});
       return res ? res.failedHop : null;
     }})()"""
-    r_chk = await _frame_cdp(route, [(1, "Runtime.evaluate", route.eval_params(chk_closed_js, by_value=True), route.session_id)])
+    p1 = route.eval_params(chk_closed_js, by_value=True)
+    if lookup_ctx is not None:
+        p1["contextId"] = lookup_ctx
+    r_chk = await _frame_cdp(route, [(1, "Runtime.evaluate", p1, route.session_id)])
     failed_hop = r_chk.get(1, {}).get("result", {}).get("value")
     if failed_hop:
         idx = names.index(failed_hop) if failed_hop in names else len(names) - 1
@@ -5031,7 +5045,10 @@ async def _check_chain_closed_shadow(route, names):
           var res = __cdpilot_walkHops(document, {json.dumps(sub_hops)});
           return res ? res.el : null;
         }})()"""
-        r_nd = await _frame_cdp(route, [(2, "Runtime.evaluate", route.eval_params(get_node_js, by_value=False), route.session_id)])
+        p2 = route.eval_params(get_node_js, by_value=False)
+        if lookup_ctx is not None:
+            p2["contextId"] = lookup_ctx
+        r_nd = await _frame_cdp(route, [(2, "Runtime.evaluate", p2, route.session_id)])
         failed_oid = r_nd.get(2, {}).get("result", {}).get("objectId")
         if failed_oid:
             d_nd = await _frame_cdp(route, [(3, "DOM.describeNode", {"objectId": failed_oid, "depth": 1, "pierce": True}, route.session_id)])
@@ -20860,7 +20877,10 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
         else:
             print(f"iframes ({len(frames)}):")
             for f in frames:
-                print(f"  [{f['index']}] src={f['src'][:80]} name={f['name']} id={f['id']}")
+                src = _strip_tag_chars(f.get("src") or "")[0][:80]
+                name = _strip_tag_chars(f.get("name") or "")[0][:60]
+                fid = _strip_tag_chars(f.get("id") or "")[0][:60]
+                print(f"  [{f['index']}] src={src} name={name} id={fid}")
 
     elif subcmd == "list":
         ctx = None
@@ -20882,7 +20902,10 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
             print(f"iframes in {route.describe()} ({len(frames)}):")
             for f in frames:
                 hidden = "" if f.get("visible", True) else " (hidden)"
-                print(f"  [{f['index']}] src={f['src'][:80]} name={f['name']} id={f['id']}{hidden}")
+                src = _strip_tag_chars(f.get("src") or "")[0][:80]
+                name = _strip_tag_chars(f.get("name") or "")[0][:60]
+                fid = _strip_tag_chars(f.get("id") or "")[0][:60]
+                print(f"  [{f['index']}] src={src} name={name} id={fid}{hidden}")
 
     elif subcmd == "eval":
         if not subcmd_args:
@@ -26536,6 +26559,8 @@ def _daemon_reset_state():
     _AUTOLAUNCH.update(cmd=None, attempted=False, failure=None)
     for coll in (_CLICK_MISSES, _PRESS_MS_WARNED, _SHADOW_NOTES_PRINTED, _IDLE_WARNED):
         coll.clear()
+    _FRAME_ISOLATED_NOTED[0] = False
+    _FRAME_LOOKUP_FALLBACK_NOTED[0] = False
 
 
 def _daemon_exit_code(exc, err):

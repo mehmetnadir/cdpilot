@@ -2,6 +2,16 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **Frame fallback notes appear on every request in a warm process.** With `CDPILOT_DAEMON=1` or a warm MCP process, the stderr notes for an isolated-world fallback were printed only for the first request; each request now starts fresh, like a one-shot command.
+- **A stale isolated world no longer gives a false "no iframe matches".** When the first-hop lookup in cdpilot's isolated world returns a CDP error or an exception, the lookup runs once with the page's own JS (with the fallback note) instead of reporting that the page has no iframes. A clean "not found" is not retried.
+
+### Security
+- **`frame list` cleans what the page controls.** Tag characters (and the other hidden characters agent output removes) are stripped from each frame's `src`, `name` and `id`; `name` and `id` are cut to 60 characters, `src` stays at 80. Pages with plain names print the same list.
+- **The closed-shadow-root check of a `>>>` chain runs in cdpilot's isolated world** on the top document, so the page's own JS cannot change its result.
+
 ## [0.9.11] - 2026-11-15
 
 ### Changed

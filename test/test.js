@@ -448,6 +448,29 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
     assert.strictEqual(r.status, 0, r.stderr);
     assert(r.stdout.trim().endsWith('EXECUTOR-OK'), r.stdout);
   });
+
+  test(
+    'daemon: _daemon_reset_state resets frame note flags ' +
+      '(_FRAME_ISOLATED_NOTED, _FRAME_LOOKUP_FALLBACK_NOTED)',
+    () => {
+      const PYB = (typeof PY_BIN !== 'undefined' && PY_BIN) || 'python3';
+      const script = [
+        'import sys, os',
+        `sys.path.insert(0, ${JSON.stringify(path.join(__dirname, '..', 'src'))})`,
+        'import cdpilot as c',
+        'c._FRAME_ISOLATED_NOTED[0] = True',
+        'c._FRAME_LOOKUP_FALLBACK_NOTED[0] = True',
+        'c._daemon_reset_state()',
+        'assert c._FRAME_ISOLATED_NOTED[0] is False, "_FRAME_ISOLATED_NOTED not reset"',
+        'assert c._FRAME_LOOKUP_FALLBACK_NOTED[0] is False, ' +
+          '"_FRAME_LOOKUP_FALLBACK_NOTED not reset"',
+        'print("RESET-STATE-OK")',
+      ].join('\n');
+      const r = spawnSync(PYB, ['-c', script], { encoding: 'utf-8', timeout: 20000 });
+      assert.strictEqual(r.status, 0, r.stderr);
+      assert(r.stdout.trim().endsWith('RESET-STATE-OK'), r.stdout);
+    }
+  );
 })();
 
 
@@ -5324,6 +5347,44 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert(!f.stderr.includes('\u{E0041}') && !f.stderr.includes('\u{E0042}'), `stripped tag characters: ${JSON.stringify(f.stderr)}`);
     const m = f.stderr.match(/\[0\] ([^;\)]+)/);
     assert(m && m[1].length <= 60, `frame label in error must be at most 60 chars, got ${m ? m[1].length : 0}`);
+
+    // (g) owner_iso_error falls back to main world and prints fallback note once
+    const g = r.owner_iso_error_fallback;
+    assert.deepStrictEqual(g.res[0], 'ok');
+    assert.strictEqual(g.res[1], 'f0|#target');
+    assert.strictEqual(g.owner_evals, 2, 'retried in main world after isolated world error');
+    assert(g.isolated.includes(g.eval_contexts[0]), 'first eval in isolated world');
+    assert.strictEqual(g.eval_contexts[1], null, 'second eval in main world (no contextId)');
+    const gNotes = (g.stderr.match(notePattern) || []).length;
+    assert.strictEqual(gNotes, 1, `fallback note must be printed once, got ${gNotes}`);
+
+    // (h) clean not found in isolated world does not retry in main world
+    const h = r.clean_not_found_single_eval;
+    assert.strictEqual(
+      h.owner_evals, 1, 'clean not-found in isolated world must not retry in main world'
+    );
+
+    // (i) frame list stdout sanitizes tag characters and truncates id/name to 60, src to 80
+    const iCase = r.frame_list_stdout_sanitize;
+    assert.deepStrictEqual(iCase.res, ['ok', null]);
+    assert(!iCase.stdout.includes('\u{E0041}') && !iCase.stdout.includes('\u{E0042}'),
+      `stdout must not contain tag chars: ${JSON.stringify(iCase.stdout)}`);
+    const idMatch = iCase.stdout.match(/id=([^\s\n]+)/);
+    assert(
+      idMatch && idMatch[1].length <= 60,
+      `id in stdout must be <= 60 chars, got ${idMatch ? idMatch[1].length : 0}`
+    );
+
+    // (j) _check_chain_closed_shadow evaluates with isolated world contextId when not route.chain
+    const j = r.closed_shadow_isolated;
+    assert(/has a closed shadow root/.test(j.err), `expected closed shadow error, got ${j.err}`);
+    assert(j.eval_contexts.length >= 1, 'executed walkHops evaluation');
+    for (const ctx of j.eval_contexts) {
+      assert(
+        j.isolated.includes(ctx),
+        `shadow evaluate contextId ${ctx} must be isolated (${j.isolated})`
+      );
+    }
   });
 
   test('frames (fake CDP): click is one click; real mouse input with --entropy=on and in frames', () => {
