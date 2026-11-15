@@ -11,37 +11,23 @@ __pycache__/
 .env
 .npmrc
 .gitnexus
-.claude/docs/browserless-analysis.md
-# Twitter bot — credentials (ASLA commit etme)
-scripts/twitter-bot/*.env
-xbot/*.env
-xbot/telegram.env
-# Twitter bot — lokal profil yedek
-.cdpilot-backup-twitter-profile/
-# Claude runtime + local skill cache (not part of project)
-.claude/scheduled_tasks.lock
-.claude/skills/
 # Misplaced Next.js scaffolding from a wrong-cwd accident — real files live in cdpilot-site/
 content/
 src/app/
 src/components/
 src/lib/
 
-# Working reports (2026-09-27): raw third-party tweets, handles and competitor
-# probes. Kept locally for the team, never in the public repo.
-.claude/docs/*-ham/
-.claude/docs/mcp-dizin-hazirlik/
-.claude/docs/x-sorun-haritasi-*.md
-.claude/docs/cikis-ivmesi-analizi-*.md
-.claude/docs/geo-ai-oneri-denetimi-*.md
-.claude/docs/viral-icerik-plani-*.md
-.claude/docs/vaat-denetimi-*.md
-.claude/docs/mcp-dizin-denetimi-*.md
-
 # Local editor / agent-tool state
 .vscode/
 .antigravitycli/
-
-# local agent worktrees (Claude Agent tool, isolation: worktree) and lane test outputs
-.claude/worktrees/
 .lane-test*.out
+
+# Maintainers' local working files: agent notes, plans, measurements and the
+# account tooling. Never part of the public repository.
+.claude/
+xbot/
+.cdpilot-backup-twitter-profile/
+CLAUDE.md
+project-switch.md
+AGENTS.md
+GEMINI.md

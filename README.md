@@ -1109,7 +1109,7 @@ which nudges reCAPTCHA v3's behavioral score upward over time. Slow by
 design — run it ahead of a session, not inline.
 
 Public bot-detection panels, measured 2026-09-27, **headless** Brave (Chrome 154)
-([method and raw results](.claude/docs/stealth-panel-olcumu-2026-09-27.md)):
+([method and raw results](docs/measurements/stealth-panel-2026-09-27.md)):
 
 | `mode` | bot.sannysoft.com (31 rows) | incolumitas intoli | incolumitas fpscanner | incolumitas new-tests |
 |---|---|---|---|---|
@@ -1205,7 +1205,7 @@ Every cdpilot call is a fresh process: node starts (~0.1 s), Python imports the
 core (~0.15 s) and a CDP session is set up (~0.5 s) before the command itself
 runs — a browser paints a page in 20 ms, `cdpilot go` took about a second before
 0.9.6; now 0.5–0.8 s fresh and ~0.23–0.30 s with `CDPILOT_DAEMON=1`
-(measurements: `.claude/docs/perf-taban-2026-11-08.md`). With
+(measured on an Apple M1 Max, 2026-11-08). With
 `CDPILOT_DAEMON=1` the launcher keeps one warm Python process per project and
 environment and hands page commands to it over a Unix socket; the process keeps
 the module and its event loop between calls, so the second and later calls skip

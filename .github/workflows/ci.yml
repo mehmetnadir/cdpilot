@@ -48,7 +48,7 @@ jobs:
             node-version: 20
             python-version: '3.11'
           # The whole suite through the warm process (CDPILOT_DAEMON=1): the gate for
-          # making it the default (jury D-0042, 10.11.2026; .claude/docs/plan-daemon-insan-hizi.md §4).
+          # making it the default (jury D-0042, 10.11.2026).
           # A required job since 11.11: the +10 s per warm call on Linux (the request socket
           # stayed open while the watcher thread sat in recv) is fixed (2c9a401); 4b67663 ran
           # 209 s here vs 233 s fresh. Every test home starts its own daemon, so the idle

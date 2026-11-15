@@ -458,8 +458,7 @@ def _cleanup_registry():
 
     Called before every port allocation (see _allocate_port) so the
     registry never accumulates stale entries that starve the
-    9222-9322 port range — the root cause of the "No free port" failure
-    documented in .claude/docs/vaat-denetimi-2026-09-27.md.
+    9222-9322 port range — the root cause of a measured "No free port" failure.
     """
     with _registry_lock():
         registry = _load_registry()
@@ -10422,7 +10421,7 @@ def _reap_tabs(max_tabs=1, include_real=False, dry_run=False):
 
     A long-lived browser accumulates abandoned tabs: every client that opens a
     target and exits without closing it leaks one, and nothing collects them.
-    Measured on a long-running server 2026-08-30 — 513 pages, 506 of them about:blank, 12.7 GB
+    Measured on a server 2026-08-30 — 513 pages, 506 of them about:blank, 12.7 GB
     across 529 renderer processes, growing ~6/hour for three days on a box with
     47 GB total.
 
@@ -17375,7 +17374,7 @@ def _agent_clickable_bids(res, bids, where=None):
     pointer) or Chrome marks it isClickable, and no ancestor is a native
     interactive element (a[href], button, input, select, textarea, summary,
     label, [role=button|link|…]) — that one is already an entry of its own.
-    Rule measured in .claude/docs/olcum/observe-tiklanabilir-2026-11-11.md."""
+    Rule measured on real pages (2026-11-11)."""
     strings = res['strings']
 
     def s_(i):
@@ -17480,8 +17479,7 @@ def _agent_drop_container_names(nodes, actions, hidden):
 
 
 # ── Hidden text: what the AX tree keeps but the page does not show a person (2026-11-11, B1) ──
-# Design .claude/docs/enjeksiyon-yontem-tasarim.md §4.1, inventory .claude/docs/olcum/enjeksiyon-m0-2026-11-11.md,
-# jury D-0105. An AX text node gets a label from its layout (the same one DOMSnapshot call as the view):
+# Release jury D-0105. An AX text node gets a label from its layout (the same one DOMSnapshot call as the view):
 #   offscreen    its box lies outside the document's content area, or wholly outside (on an axis that clips)
 #                the box of the nearest ancestor with overflow hidden|clip that clips it (a carousel slide)
 #   tiny         font-size < 4 px, or a box of <= 4 px² (transform: scale(0) gives a 0 x 0 box)
@@ -18702,7 +18700,6 @@ async def cmd_agent_stats():
 # save` turns the trail into a flow file; `agent run` replays it with no model
 # in the loop and stops at the first step whose anchor the page no longer has
 # (exit 4, with the page's observation, so the model re-plans that one step).
-# Design and measurements: .claude/docs/plan-ogrenen-akis.md
 
 AGENT_TRAIL_MAX = 50
 AGENT_FLOW_VERSION = 1
@@ -18858,7 +18855,7 @@ def _agent_host_allowed(host, allowed):
     return bool(host) and any(host == a or host.endswith('.' + a.lstrip('.')) for a in allowed)
 
 
-# ── Action guard (2026-11-11, B1: warn only; design .claude/docs/enjeksiyon-yontem-tasarim.md §4.2, D-0105) ──
+# ── Action guard (2026-11-11, B1: warn only; D-0105) ──
 # Before an agent navigates (agent act --url, a go step of agent run) three rules look at the target URL:
 #   secret_in_url    it carries the value (>= 16 characters) of a cookie whose site (eTLD+1) is not the
 #                    target's; the cookies are those of the pages this agent has been on (J1-4)
@@ -26489,7 +26486,7 @@ def cmd_replay_dispatch(args):
 # environment and stdin; module state reset; exit-time hooks at request end;
 # the pooled CDP sockets closed at request end (their Page/Network/Emulation
 # state is session-bound and dies with a fresh process — see
-# _daemon_request_teardown). Design: .claude/docs/plan-daemon-insan-hizi.md
+# _daemon_request_teardown).
 #
 # Protocol (newline-delimited JSON, one request per connection):
 #   daemon → {"hello": 1, "version": ..., "pid": ...}
@@ -26981,8 +26978,7 @@ def _daemon_serve_entry(args):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Live canvas (`cdpilot canvas`) — v0. Plan: .claude/docs/plan-canli-tuval-uygulama.md,
-# frozen contract: .claude/docs/canvas-sozlesme-v0.md (day 0, 11.11). Each lane writes
+# Live canvas (`cdpilot canvas`) — v0, frozen contract from day 0 (11.11). Each lane writes
 # only inside its own region; the names below are the contract between regions.
 # ═══════════════════════════════════════════════════════════════════════════
 

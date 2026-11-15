@@ -102,7 +102,7 @@ test('bin: Python runs cdpilot.py via runpy (bytecode cached) and the interprete
 // environment over a Unix socket (src/cdpilot.py --_daemon-serve) and runs a
 // fresh process when there is none, it is busy, of another version, or refuses
 // the command. Browser-free here; the speed gate (`go` ≤ 150 ms warm) is
-// measured by hand against .claude/docs/perf-taban-2026-11-08.md.
+// measured by hand (2026-11-08 baseline).
 (() => {
   if (process.platform === 'win32') return;
   const osmod = require('os');
@@ -4563,7 +4563,7 @@ test('claims: README panel numbers are tied to a measurement file that backs the
   // link its evidence file, and the headline numbers must appear there.
   const root = path.join(__dirname, '..');
   const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
-  const m = readme.match(/\]\((\.claude\/docs\/stealth-panel-olcumu-(\d{4}-\d{2}-\d{2})\.md)\)/);
+  const m = readme.match(/\]\((docs\/measurements\/stealth-panel-(\d{4}-\d{2}-\d{2})\.md)\)/);
   assert(m, 'the README panel section must link a dated stealth-panel measurement file');
   const evidencePath = path.join(root, m[1]);
   assert(fs.existsSync(evidencePath), `${m[1]} must exist in the repo`);
@@ -7788,7 +7788,7 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
   test('log warm: gunluk-hata-sinifi.py counts paths/sessions, isolates warm-only classes and never prints planted URLs or args', () => {
     const py313 = spawnSync('python3.13', ['-I', '-V'], { encoding: 'utf-8', timeout: 10000 });
     if (py313.status !== 0) return;
-    const scriptPath = path.join(__dirname, '..', '.claude', 'docs', 'olcum', 'gunluk-hata-sinifi.py');
+    const scriptPath = path.join(__dirname, '..', 'scripts', 'olcum', 'gunluk-hata-sinifi.py');
     const home = newHome();
     const PLANTED_URL_A = 'https://planted-secret-alpha.example/login?tok=zz99';
     const PLANTED_URL_B = 'https://planted-secret-beta.example/orders/4421';
