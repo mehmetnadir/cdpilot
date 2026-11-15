@@ -6477,6 +6477,8 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       'case("bad_env", ["click"], {"CDPILOT_TIMEOUT": "soon"})',
       'case("missing", ["click", "--timeout"], {})',
       'case("lookalikes", ["eval", "f(\'--timeout 5\')", "--timeout-ms=5", "--timeouts"], {})',
+      'case("after_dashdash", ["agent", "find", "--", "--timeout", "0"], {})',
+      'case("before_dashdash", ["agent", "find", "--timeout", "4", "--", "--timeout=0"], {})',
       'mod.COMMANDS_WITH_OWN_TIMEOUT = frozenset({"fake-wait"})',
       'case("own", ["--timeout", "9", "fake-wait", "#x", "--timeout", "3"], {})',
       'print(json.dumps(out))',
@@ -6494,6 +6496,9 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     for (const k of ['bad', 'negative', 'bad_env', 'missing']) {
       assert.strictEqual(c[k], 'ValueError', `${k} must be rejected`);
     }
+    // T1 15.11: after `--` (following the command) everything is literal
+    assert.deepStrictEqual(c.after_dashdash, [null, ['agent', 'find', '--', '--timeout', '0']]);
+    assert.deepStrictEqual(c.before_dashdash, [4, ['agent', 'find', '--', '--timeout=0']]);
     assert.deepStrictEqual(c.lookalikes,
       [null, ['eval', "f('--timeout 5')", '--timeout-ms=5', '--timeouts']]);
     // A command that parses its own --timeout keeps it (its own value wins);
@@ -18607,7 +18612,9 @@ print(json.dumps(out))
     const logFile = path.join(home, 'cdp.log');
     const portFile = path.join(home, 'port.txt');
     const fakeProc = spawn(PYB, [path.join(__dirname, 'shot_fake_cdp.py'), portFile, logFile], {
-      env: { ...process.env, FAKE_DPR: String(dpr) },
+      // FAKE_* keys of envExtra steer the fake browser (FAKE_MAIN_DPR, FAKE_NO_WORLD)
+      env: { ...process.env, FAKE_DPR: String(dpr),
+        ...Object.fromEntries(Object.entries(envExtra).filter(([k]) => k.startsWith('FAKE_'))) },
       stdio: 'ignore',
     });
     let port = null;
@@ -18707,7 +18714,7 @@ print("OK")
 
       const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
       const evalDpr = logs.find((l) => l.method === 'Runtime.evaluate' && (l.params.expression || '').includes('devicePixelRatio'));
-      assert.strictEqual(evalDpr, undefined, 'CSS mode must not query devicePixelRatio via Runtime.evaluate');
+      assert(evalDpr && evalDpr.params.contextId === 77, 'CSS mode reads devicePixelRatio in the isolated world');
       const metricsCall = logs.find((l) => l.method === 'Page.getLayoutMetrics');
       assert(metricsCall, 'CSS mode must query Page.getLayoutMetrics');
 
@@ -18726,7 +18733,7 @@ print("OK")
 
       const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
       const evalDpr = logs.find((l) => l.method === 'Runtime.evaluate' && (l.params.expression || '').includes('devicePixelRatio'));
-      assert.strictEqual(evalDpr, undefined, 'CSS mode must not query devicePixelRatio via Runtime.evaluate');
+      assert(evalDpr && evalDpr.params.contextId === 77, 'CSS mode reads devicePixelRatio in the isolated world');
       const metricsCall = logs.find((l) => l.method === 'Page.getLayoutMetrics');
       assert(metricsCall, 'CSS mode must query Page.getLayoutMetrics');
 
@@ -18739,6 +18746,23 @@ print("OK")
       // clip 800x600 x scale 0.5 x DPR 2 = 800x600 image pixels.
       assert(r.stdout.includes(', 800x600 px, ~638 vision tokens'), `DPR 2 line: ${r.stdout}`);
     });
+  });
+
+  test('screenshot: fake CDP - a page that lies about devicePixelRatio does not change the scale; no isolated world -> the page value', () => {
+    // T1 15.11: Page.getLayoutMetrics carries no DPR (contentSize == cssContentSize in Chrome).
+    const scaleOf = (extra) => {
+      let clip;
+      runWithFakeCdp(2, extra, ({ home, logFile, env }) => {
+        const r = spawnSync(process.execPath, [CLI, 'shot', path.join(home, 's.png')], { env, encoding: 'utf-8', timeout: 10000 });
+        assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+        const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+        clip = (logs.find((l) => l.method === 'Page.captureScreenshot') || {}).params.clip;
+      });
+      return clip ? clip.scale : 1;
+    };
+    assert.strictEqual(scaleOf({ FAKE_MAIN_DPR: '1' }), 0.5, 'the main world says 1, the isolated world 2');
+    assert.strictEqual(scaleOf({ FAKE_NO_WORLD: '1' }), 0.5, 'no isolated world: the page value (2) is used');
+    assert.strictEqual(scaleOf({ FAKE_NO_WORLD: '1', FAKE_MAIN_DPR: '1' }), 1, 'no world and a page saying 1: no scale');
   });
 
   test('screenshot: fake CDP - --hidpi and CDPILOT_SHOT_SCALE=device disable scale', () => {

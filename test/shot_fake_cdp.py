@@ -118,9 +118,15 @@ def handle_ws(conn, path, headers, bound_port):
             if method == "Runtime.evaluate":
                 expr = p.get("expression", "")
                 if "devicePixelRatio" in expr:
+                    # the page's main world may lie (FAKE_MAIN_DPR); cdpilot's isolated world
+                    # (contextId 77) sees the real value; FAKE_NO_WORLD=1: the world is unusable
                     dpr = float(os.environ.get("FAKE_DPR", "1"))
-                    val = json.dumps({"dpr": dpr, "x": 0, "y": 0, "width": 800, "height": 600})
-                    reply = {"id": mid, "result": {"result": {"type": "string", "value": val}}}
+                    if p.get("contextId") is None:
+                        dpr = float(os.environ.get("FAKE_MAIN_DPR", dpr))
+                    if p.get("contextId") is not None and os.environ.get("FAKE_NO_WORLD") == "1":
+                        reply = {"id": mid, "error": {"code": -32000, "message": "Cannot find context"}}
+                    else:
+                        reply = {"id": mid, "result": {"result": {"type": "number", "value": dpr}}}
                 elif "resolveSelector" in expr:
                     val = json.dumps({"x": 100, "y": 200, "width": 200, "height": 200, "shadowHost": None})
                     reply = {"id": mid, "result": {"result": {"type": "string", "value": val}}}
@@ -131,12 +137,17 @@ def handle_ws(conn, path, headers, bound_port):
                 reply = {
                     "id": mid,
                     "result": {
-                        "contentSize": {"x": 0, "y": 0, "width": 800 * dpr, "height": 600 * dpr},
+                        # as Chrome reports it: both sizes in CSS pixels, whatever the DPR (T1 15.11)
+                        "contentSize": {"x": 0, "y": 0, "width": 800, "height": 600},
                         "cssContentSize": {"x": 0, "y": 0, "width": 800, "height": 600},
                         "cssLayoutViewport": {"pageX": 0, "pageY": 0, "clientWidth": 800, "clientHeight": 600},
                         "cssVisualViewport": {"pageX": 0, "pageY": 0, "clientWidth": 800, "clientHeight": 600},
                     },
                 }
+            elif method == "Page.getFrameTree":
+                reply = {"id": mid, "result": {"frameTree": {"frame": {"id": "TOPFRAME"}}}}
+            elif method == "Page.createIsolatedWorld":
+                reply = {"id": mid, "result": {"executionContextId": 77}}
             elif method == "Page.captureScreenshot":
                 reply = {"id": mid, "result": {"data": base64.b64encode(png_header(*shot_size(p))).decode()}}
             elif method == "Target.getTargets":
