@@ -3603,6 +3603,15 @@ test('test runner: trace clean handles d/h/m suffixes', () => {
   assert(PY_CONTENT.includes("'m': 60"), 'Should handle minute suffix');
 });
 
+test('test runner: cmd_test passes --trace-dir=<dir> and --grep=<text> in the form bin/cdpilot.js reads', () => {
+  // The runner parses only the joined form; '--trace-dir <dir>' left traces off.
+  assert(/f'--trace-dir=\{trace_dir\}'/.test(PY_CONTENT), 'cmd_test must pass --trace-dir=<dir>');
+  assert(/f'--grep=\{grep\}'/.test(PY_CONTENT), 'cmd_test must pass --grep=<text>');
+  assert(!/'--trace-dir', trace_dir/.test(PY_CONTENT), 'no split --trace-dir argument');
+  const binContent = fs.readFileSync(CLI, 'utf-8');
+  assert(binContent.includes("a.startsWith('--trace-dir=')") && binContent.includes("a.startsWith('--grep=')"));
+});
+
 test('test runner: fixture runs via --internal-test-runner (no browser)', () => {
   const { execSync: es } = require('child_process');
   const os = require('os');

@@ -22757,11 +22757,13 @@ def cmd_test(files=None, watch=False, parallel=1, reporter='default', trace='def
     def run_one(file):
         run_id = datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + os.path.basename(file).replace('.cdpt.js', '')
         trace_dir = os.path.join(TRACES_DIR, run_id)
-        cmd = ['node', bin_path, '--internal-test-runner', file, '--trace-dir', trace_dir, '--parallel', str(parallel)]
+        # bin/cdpilot.js reads --trace-dir=<dir> and --grep=<text> (one argument each);
+        # parallelism is handled here, across files.
+        cmd = ['node', bin_path, '--internal-test-runner', file, f'--trace-dir={trace_dir}']
         if trace == 'off':
             cmd.append('--trace=off')
         if grep:
-            cmd.extend(['--grep', grep])
+            cmd.append(f'--grep={grep}')
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             try:
