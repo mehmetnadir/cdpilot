@@ -87,6 +87,7 @@ class Browser:
         self.cancel_on = None
         self.opaque_ids = False   # remote-object ids without "<isolate>.<context>.<n>"
         self.isolated = set()     # context ids made by Page.createIsolatedWorld
+        self.isolated_worlds = {} # (sessionId, frameId, worldName) -> executionContextId
         self.next_ctx = [900]
         self.reverse_main_index = bool(os.environ.get("CDPILOT_FAKE_REVERSE_FRAMES"))
         self.isolated_fail = False
@@ -182,12 +183,19 @@ class Browser:
         if method == "Page.createIsolatedWorld":
             if self.isolated_fail:
                 return err("Cannot create isolated world")
-            f = self.frames.get(p.get("frameId"))
+            fid = p.get("frameId")
+            f = self.frames.get(fid)
             if f is None or f not in self.process(root):
                 return err("No frame for given id found")
+            wname = p.get("worldName", "")
+            wkey = (sid, fid, wname)
+            if wkey in self.isolated_worlds:
+                return ok({"executionContextId": self.isolated_worlds[wkey]})
             self.next_ctx[0] += 1
-            self.ctx[self.next_ctx[0]], self.isolated = f, self.isolated | {self.next_ctx[0]}
-            return ok({"executionContextId": self.next_ctx[0]})
+            cid = self.next_ctx[0]
+            self.isolated_worlds[wkey] = cid
+            self.ctx[cid], self.isolated = f, self.isolated | {cid}
+            return ok({"executionContextId": cid})
         if method == "Runtime.releaseObjectGroup":
             g = p.get("objectGroup")
             STATE["released"][g] = STATE["released"].get(g, 0) + 1
@@ -1474,6 +1482,126 @@ def scenario_agent_frame_isolated(mod):
     return out
 
 
+def scenario_framehop_isolated(mod):
+    """0.9.11 T1: every frame command's first hop, frame list, and error sanitation."""
+    top = Frame("top", children=[
+        Frame("f0", elem_id="f0", src="http://a.test/f0.html"),
+        Frame("f1", elem_id="f1", src="http://a.test/f1.html"),
+    ])
+    out = {}
+    seen = []
+    cmd = probe_command(mod, seen)
+
+    # 5.a: click --frame 0 <sel>: reverse_main_index mode resolves f0 (correct),
+    # and first hop's _FRAME_OWNER_JS evaluate goes with isolated context
+    async def body_a(b):
+        b.reverse_main_index = True
+        mod._FRAME_FLAG = "0"
+        try:
+            res = await call(cmd, "#target")
+        finally:
+            mod._FRAME_FLAG = None
+        owner_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                       and mod._FRAME_OWNER_JS in m.get("params", {}).get("expression", "")]
+        where = [m for m in b.log if str(m.get("params", {}).get("expression", "")).startswith("WHERE:")]
+        return {
+            "res": res,
+            "where": where[-1].get("params", {}).get("expression") if where else None,
+            "owner_evals": len(owner_evals),
+            "owner_ctx": owner_evals[0]["params"].get("contextId") if owner_evals else None,
+            "isolated": sorted(b.isolated),
+        }
+    b_a, res_a, stdout_a, stderr_a = run(mod, top, body_a)
+    res_a.update({"stdout": stdout_a, "stderr": stderr_a})
+    out["flag_index_isolated"] = res_a
+
+    # 5.b: '>>>' selector hop ('#f0 >>> <sel>') goes with isolated context on top doc (both p1 and p3)
+    async def body_b(b):
+        b.reverse_main_index = True
+        res = await call(cmd, "#f0 >>> #target")
+        owner_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                       and mod._FRAME_OWNER_JS in m.get("params", {}).get("expression", "")]
+        contexts = [m["params"].get("contextId") for m in owner_evals]
+        where = [m for m in b.log if str(m.get("params", {}).get("expression", "")).startswith("WHERE:")]
+        return {
+            "res": res,
+            "where": where[-1].get("params", {}).get("expression") if where else None,
+            "owner_evals": len(owner_evals),
+            "owner_contexts": contexts,
+            "isolated": sorted(b.isolated),
+        }
+    b_b, res_b, stdout_b, stderr_b = run(mod, top, body_b)
+    res_b.update({"stdout": stdout_b, "stderr": stderr_b})
+    out["arrow_hop_isolated"] = res_b
+
+    # 5.c (LOW-3): observe in isolated world (f0), then at act time world cannot be created (isolated_fail)
+    # and main world is reversed -> exit 1 stale-ref and clicks == []
+    async def body_c(b):
+        b.reverse_main_index = True
+        await mod.cmd_agent_observe_frame(0)
+        state = mod._load_agent_state()
+        fa_map = state.get("frame_actions") or {}
+        ref = next(iter(fa_map.keys()))
+        fa = fa_map[ref]
+        b.isolated_fail = True
+        b.log.clear()
+        ws_url = mod.get_page_ws()[0]
+        res = await call(mod._agent_perform_frame, ref, fa, "click", ws_url)
+        return {
+            "res": res,
+            "ref": ref,
+            "clicks": list(b.clicks),
+        }
+    b_c, res_c, stdout_c, stderr_c = run(mod, top, body_c)
+    res_c.update({"stdout": stdout_c, "stderr": stderr_c})
+    out["low3_stale_ref"] = res_c
+
+    # 5.d: stderr note printed exactly once when isolated world cannot be created
+    async def body_d(b):
+        b.isolated_fail = True
+        if hasattr(mod, "_FRAME_LOOKUP_FALLBACK_NOTED"):
+            mod._FRAME_LOOKUP_FALLBACK_NOTED[0] = False
+        res1 = await call(cmd, "#f0 >>> #target")
+        res2 = await call(cmd, "#f1 >>> #target")
+        return {"res1": res1, "res2": res2}
+    b_d, res_d, stdout_d, stderr_d = run(mod, top, body_d)
+    res_d.update({"stdout": stdout_d, "stderr": stderr_d})
+    out["fallback_stderr_note"] = res_d
+
+    # 5.e: frame list runs in isolated context
+    async def body_e(b):
+        b.reverse_main_index = True
+        res = await call(mod.cmd_frame, "list")
+        list_evals = [m for m in b.log if m.get("method") == "Runtime.evaluate"
+                      and (mod._FRAME_LIST_JS in m.get("params", {}).get("expression", "")
+                           or "querySelectorAll('iframe" in m.get("params", {}).get("expression", ""))]
+        return {
+            "res": res,
+            "list_evals": len(list_evals),
+            "list_ctx": list_evals[0]["params"].get("contextId") if list_evals else None,
+            "isolated": sorted(b.isolated),
+        }
+    b_e, res_e, stdout_e, stderr_e = run(mod, top, body_e)
+    res_e.update({"stdout": stdout_e, "stderr": stderr_e})
+    out["frame_list_isolated"] = res_e
+
+    # 5.f: 200 char id truncated to 60 chars and stripped of invisible/tag chars in frame not found error
+    long_tag_id = "frame_" + "\U000e0041\U000e0042" + "x" * 200
+    top_f = Frame("top", children=[Frame("f_long", elem_id=long_tag_id)])
+    async def body_f(b):
+        mod._FRAME_FLAG = "missing_frame"
+        try:
+            res = await call(cmd, "#btn")
+        finally:
+            mod._FRAME_FLAG = None
+        return {"res": res}
+    b_f, res_f, stdout_f, stderr_f = run(mod, top_f, body_f)
+    res_f.update({"stdout": stdout_f, "stderr": stderr_f})
+    out["frame_not_found_sanitize"] = res_f
+
+    return out
+
+
 SCENARIOS = {
     "commands": scenario_commands,
     "routing": scenario_routing,
@@ -1497,6 +1625,7 @@ SCENARIOS = {
     "timeout_hold": scenario_timeout_hold,
     "click_outcome": scenario_click_outcome,
     "agent_frame_isolated": scenario_agent_frame_isolated,
+    "framehop_isolated": scenario_framehop_isolated,
 }
 
 

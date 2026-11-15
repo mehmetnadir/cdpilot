@@ -5236,7 +5236,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
   test('frames (fake CDP): no usable main-world id: isolated world, one note line for every frame command', () => {
     // A V8 objectId format change would land every frame command here: say so.
     const r = fake('isolated_fallback');
-    assert.deepStrictEqual(r.eval.contexts, r.eval.isolated, 'eval ran in the isolated world');
+    assert(r.eval.isolated.includes(r.eval.contexts[0]), 'eval ran in the isolated world');
     assert.strictEqual(r.eval.stdout, 'Result: card|z\n');
     const note = "note: frame 'iframe#card': its page context was not reachable; using an isolated world"
       + ' (same DOM, no page JS globals)\n';
@@ -5273,6 +5273,57 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.strictEqual(act.frame_id, 'f0', 'act resolved the correct frame f0');
     assert(act.owner_ctx !== null && act.isolated.includes(act.owner_ctx),
       `act owner evaluate contextId ${act.owner_ctx} is an isolated world`);
+  });
+
+  test('frames (fake CDP): first hop of --frame / >>>, LOW-3 act fail-closed, isolated frame list, id truncation', () => {
+    const r = fake('framehop_isolated');
+
+    // (a) click --frame 0 <sel>: reverse_main_index resolves correct frame (f0); first hop in isolated world
+    const a = r.flag_index_isolated;
+    assert.deepStrictEqual(a.res[0], 'ok');
+    assert.strictEqual(a.res[1], 'f0|#target', 'resolved correct frame f0 in reverse mode');
+    assert(a.owner_evals >= 1, 'at least one _FRAME_OWNER_JS evaluate call');
+    assert(a.isolated.includes(a.owner_ctx),
+      `first hop owner evaluation contextId ${a.owner_ctx} must be in isolated worlds (${a.isolated})`);
+
+    // (b) '>>>' selector hop ('#f0 >>> <sel>') goes with isolated context on top doc (both p1 and p3)
+    const b = r.arrow_hop_isolated;
+    assert.deepStrictEqual(b.res[0], 'ok');
+    assert.strictEqual(b.res[1], 'f0|#target', 'resolved correct frame f0 via >>>');
+    assert(b.owner_evals >= 2, 'both probe and push _FRAME_OWNER_JS calls executed');
+    for (const ctx of b.owner_contexts) {
+      assert(b.isolated.includes(ctx),
+        `>>> owner evaluation contextId ${ctx} must be in isolated worlds (${b.isolated})`);
+    }
+
+    // (c) LOW-3: observe in isolated world (f0); act time isolated world fails & main reversed -> stale-ref exit & clicks == []
+    const c = r.low3_stale_ref;
+    assert.deepStrictEqual(c.res, ['exit', 1], 'act exited with code 1 when frame identity changed');
+    assert(/stale ref/i.test(c.stderr), `stderr must report stale ref, got: ${c.stderr}`);
+    assert.deepStrictEqual(c.clicks, [], 'no clicks made on any element when frame identity mismatched');
+
+    // (d) when isolated world cannot be created, stderr note is printed exactly once
+    const d = r.fallback_stderr_note;
+    const notePattern = /note: cdpilot's isolated world was not available; the frame was looked up with the page's own JS/g;
+    const matches = (d.stderr.match(notePattern) || []).length;
+    assert.strictEqual(matches, 1, `fallback stderr note must be printed exactly once across commands, got ${matches}`);
+
+    // (e) frame list runs in isolated context
+    const e = r.frame_list_isolated;
+    assert.deepStrictEqual(e.res, ['ok', null]);
+    assert(e.list_evals >= 1, 'frame list executed evaluate');
+    assert(e.isolated.includes(e.list_ctx),
+      `frame list evaluation contextId ${e.list_ctx} must be in isolated worlds (${e.isolated})`);
+    assert(e.stdout.includes('[0] src=http://a.test/f0.html name= id=f0'), 'f0 listed first');
+    assert(e.stdout.includes('[1] src=http://a.test/f1.html name= id=f1'), 'f1 listed second');
+
+    // (f) frame not found error truncates 200-char id to 60 chars and strips tag/invisible characters
+    const f = r.frame_not_found_sanitize;
+    assert.deepStrictEqual(f.res, ['exit', 1]);
+    assert(/no iframe matches 'missing_frame'/.test(f.stderr), 'reports no iframe matches');
+    assert(!f.stderr.includes('\U000e0041'), 'stripped tag characters');
+    const m = f.stderr.match(/\[0\] ([^;\)]+)/);
+    assert(m && m[1].length <= 60, `frame label in error must be at most 60 chars, got ${m ? m[1].length : 0}`);
   });
 
   test('frames (fake CDP): click is one click; real mouse input with --entropy=on and in frames', () => {
@@ -5853,6 +5904,7 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
   const assertOopifTarget = (cdpPort, p) => {
     const prefix = `http://localhost:${p}/`;
     let lastTypes = [];
+    let lastError = null;
     for (let i = 0; i < 10; i++) {
       try {
         const raw = execFileSync('curl', ['-s', `http://127.0.0.1:${cdpPort}/json/list`],
@@ -5863,12 +5915,15 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
           return;
         }
       } catch (e) {
-        // retry
+        lastError = e;
       }
-      execFileSync(PYB, ['-c', 'import time; time.sleep(0.2)'], { timeout: 2000 });
+      try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+      } catch (_) {}
     }
+    const errSuffix = lastError ? ` (last error: ${lastError.message || lastError})` : '';
     assert.fail(`Expected OOPIF target (type === 'iframe', url starting with ${prefix}) on port ${cdpPort}, ` +
-      `but found: ${JSON.stringify(lastTypes)}`);
+      `but found: ${JSON.stringify(lastTypes)}${errSuffix}`);
   };
   try {
     test('frames e2e: click/fill/type/smart-click in same-origin and cross-origin (OOPIF) iframes', () => {
@@ -18954,6 +19009,28 @@ print("OK")
       const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
       assert(shotCall, 'Page.captureScreenshot must be called');
       assert.strictEqual(shotCall.params.clip, undefined, 'Missing selector must take full page (no clip)');
+    });
+  });
+
+  test('screenshot: fake CDP - element crop clean null in isolated world does not fall back to lying main world (MEDIUM-1)', () => {
+    runWithFakeCdp(1, { FAKE_MAIN_RECT: '1', FAKE_ISO_NULL: '1' }, ({ home, logFile, env }) => {
+      const outPng = path.join(home, 'crop_iso_null.png');
+      const r = spawnSync(process.execPath, [CLI, 'shot', outPng, '--element=#notfound'], {
+        env, encoding: 'utf-8', timeout: 10000,
+      });
+      assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+      assert(r.stderr.includes('Element not found: #notfound, taking full page'), `stderr must warn: ${r.stderr}`);
+
+      const logs = fs.readFileSync(logFile, 'utf-8').trim().split('\n').map(JSON.parse);
+      const evalCrop = logs.filter(
+        (l) => l.method === 'Runtime.evaluate' && (l.params.expression || '').includes('resolveSelector')
+      );
+      assert.strictEqual(evalCrop.length, 1, 'Crop expression must run exactly once (no fallback to main world)');
+      assert.strictEqual(evalCrop[0].params.contextId, 77, 'Crop expression must run in isolated world (contextId 77)');
+
+      const shotCall = logs.find((l) => l.method === 'Page.captureScreenshot');
+      assert(shotCall, 'Page.captureScreenshot must be called');
+      assert.strictEqual(shotCall.params.clip, undefined, 'Clean null must take full page (no clip)');
     });
   });
 

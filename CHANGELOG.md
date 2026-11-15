@@ -4,9 +4,13 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`frame list` numbers `<frame>` elements too**, as `--frame <i>` does, so a listed index is the one `--frame` resolves (iframe-only pages print the same list as before).
+- **Frame-not-found error message sanitizes iframe id and name.** The list of available frames in the `no iframe matches` error message truncates `id` and `name` strings to 60 characters and strips invisible and tag characters.
+
 ### Security
-- **`agent observe --frame <i>` and frame-ref `agent act` resolve frame indices in an isolated world.** The iframe index lookup now evaluates `_FRAME_OWNER_JS` in cdpilot's isolated world (`Page.createIsolatedWorld`, matching the `frames` hint), protecting against pages that monkey-patch `document.querySelectorAll` to point to a different frame. If isolated world creation fails, resolution falls back to the main world; other `--frame` commands are unchanged.
-- **Element bounding box for `shot --element=<selector>` is read in an isolated world.** A page that overrides `getBoundingClientRect`, `scrollX`, `scrollY`, or `scrollIntoView` can no longer tamper with element crop coordinates or detect automation through those methods; falls back to the main world when the isolated world cannot be used or finds no element.
+- **The first hop of every `--frame` / `>>>` route and `frame list` resolves in an isolated world.** The iframe index and selector lookup now evaluates `_FRAME_OWNER_JS` and `_FRAME_LIST_JS` in cdpilot's isolated world (`Page.createIsolatedWorld`, matching the `frames` hint), protecting against pages that monkey-patch `document.querySelectorAll` to point to a different frame. If isolated world creation fails, resolution falls back to the main world.
+- **Element bounding box for `shot --element=<selector>` is read in an isolated world.** A page that overrides `getBoundingClientRect`, `scrollX`, `scrollY`, or `scrollIntoView` can no longer tamper with element crop coordinates or detect automation through those methods; falls back to the main world only when the isolated world cannot be used.
 
 ## [0.9.10] - 2026-11-15
 
