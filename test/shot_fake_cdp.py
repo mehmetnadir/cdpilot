@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import struct
@@ -130,13 +131,26 @@ def handle_ws(conn, path, headers, bound_port):
                 elif "resolveSelector" in expr:
                     # element crop: the page's main world may lie (FAKE_MAIN_RECT=1); cdpilot's isolated
                     # world (contextId 77) sees the real rect; FAKE_NO_WORLD=1: the world is unusable;
-                    # missing / not found selector returns null
-                    if (
+                    # FAKE_ISO_NULL=1: isolated world returns clean null;
+                    # missing / not found selector returns null (checked against selector, not entire expr)
+                    m_sel = re.search(r'__cdpilot_resolveSelector\(document,\s*("(?:[^"\\]|\\.)*")', expr)
+                    sel_str = ""
+                    if m_sel:
+                        try:
+                            sel_str = json.loads(m_sel.group(1)).lower()
+                        except Exception:
+                            sel_str = m_sel.group(1).lower()
+                    is_missing = (
                         os.environ.get("FAKE_NO_ELEM") == "1"
-                        or "missing" in expr.lower()
-                        or "notfound" in expr.lower()
-                        or "not-found" in expr.lower()
-                    ):
+                        or "missing" in sel_str
+                        or "notfound" in sel_str
+                        or "not-found" in sel_str
+                    )
+                    is_iso_null = (
+                        p.get("contextId") is not None
+                        and os.environ.get("FAKE_ISO_NULL") == "1"
+                    )
+                    if is_missing or is_iso_null:
                         reply = {"id": mid, "result": {"result": {"type": "object", "subtype": "null", "value": None}}}
                     elif p.get("contextId") is not None and os.environ.get("FAKE_NO_WORLD") == "1":
                         reply = {"id": mid, "error": {"code": -32000, "message": "Cannot find context"}}

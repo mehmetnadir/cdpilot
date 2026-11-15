@@ -4294,6 +4294,7 @@ MOUSE_PROBE_TRIES = 4
 # The isolated-world fallback note: once per process, i.e. once per CLI
 # command (MCP tool calls run the CLI as a subprocess too).
 _FRAME_ISOLATED_NOTED = [False]
+_FRAME_LOOKUP_FALLBACK_NOTED = [False]
 
 
 class _FrameError(Exception):
@@ -4588,6 +4589,15 @@ async def _frame_cdp(route, commands, timeout=10):
 
 
 async def _frame_list(route, context_id=None):
+    if context_id is None and not route.chain:
+        try:
+            context_id = await _frame_world(route, None, None)
+        except Exception:
+            context_id = None
+        if context_id is None and not _FRAME_LOOKUP_FALLBACK_NOTED[0]:
+            _FRAME_LOOKUP_FALLBACK_NOTED[0] = True
+            print("note: cdpilot's isolated world was not available; the frame was looked up with the page's own JS",
+                  file=sys.stderr)
     params = route.eval_params(_FRAME_LIST_JS)
     if context_id is not None:
         params["contextId"] = context_id
@@ -4685,14 +4695,27 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     A hop that matched an element wrapping the iframe (Stripe's
     #card-element) still works, with one stderr note.
     """
+    if lookup_ctx is not None:
+        assert not route.chain, "lookup_ctx is only valid for the first hop"
+    elif not route.chain:
+        try:
+            lookup_ctx = await _frame_world(route, None, None)
+        except Exception:
+            lookup_ctx = None
+        if lookup_ctx is None and not _FRAME_LOOKUP_FALLBACK_NOTED[0]:
+            _FRAME_LOOKUP_FALLBACK_NOTED[0] = True
+            print("note: cdpilot's isolated world was not available; the frame was looked up with the page's own JS",
+                  file=sys.stderr)
     args = f"{json.dumps(hop['kind'])}, {json.dumps(hop['value'])}"
     p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False)
     if lookup_ctx is not None:
         p1["contextId"] = lookup_ctx
     cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
     if hop["kind"] in ("auto", "sel"):
-        cmds.append((3, "Runtime.evaluate",
-                     route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)"), route.session_id))
+        p3 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)")
+        if lookup_ctx is not None:
+            p3["contextId"] = lookup_ctx
+        cmds.append((3, "Runtime.evaluate", p3, route.session_id))
     r = await _frame_cdp(route, cmds)
     obj = r.get(1, {}).get("result", {})
     oid = obj.get("objectId")
@@ -4701,7 +4724,8 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
         if missing_ok:
             return False
         frames = await _frame_list(route, context_id=lookup_ctx)
-        avail = "; ".join(f"[{f['index']}] {f['id'] or f['name'] or f['src'][:60]}" for f in frames)
+        labels = [_strip_tag_chars(f.get("id") or f.get("name") or f.get("src") or "")[0][:60] for f in frames]
+        avail = "; ".join(f"[{f['index']}] {lbl}" for f, lbl in zip(frames, labels))
         raise _FrameError(f"no iframe matches '{shown}' in {route.describe()}"
                           + (f" (frames: {avail})" if avail else " (it has no iframes)"))
     d = await _frame_cdp(route, [(2, "DOM.describeNode", {"objectId": oid}, route.session_id)])
@@ -4950,11 +4974,22 @@ async def _probe_route_hop(route, hop):
     Returns (kind, oid, node_info):
       kind: 'frame', 'shadow_open', 'shadow_closed', or 'none'.
     """
+    lookup_ctx = None
+    if not route.chain:
+        try:
+            lookup_ctx = await _frame_world(route, None, None)
+        except Exception:
+            lookup_ctx = None
+        if lookup_ctx is None and not _FRAME_LOOKUP_FALLBACK_NOTED[0]:
+            _FRAME_LOOKUP_FALLBACK_NOTED[0] = True
+            print("note: cdpilot's isolated world was not available; the frame was looked up with the page's own JS",
+                  file=sys.stderr)
     args = f"{json.dumps(hop['kind'])}, {json.dumps(hop['value'])}"
     # 1. First see if _FRAME_OWNER_JS matches an iframe (same-process or out-of-process)
-    r1 = await _frame_cdp(route, [(1, "Runtime.evaluate",
-                                   route.eval_params(f"({_FRAME_OWNER_JS})({args}, false)", by_value=False),
-                                   route.session_id)])
+    p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false)", by_value=False)
+    if lookup_ctx is not None:
+        p1["contextId"] = lookup_ctx
+    r1 = await _frame_cdp(route, [(1, "Runtime.evaluate", p1, route.session_id)])
     oid1 = r1.get(1, {}).get("result", {}).get("objectId")
     if oid1:
         d = await _frame_cdp(route, [(2, "DOM.describeNode", {"objectId": oid1}, route.session_id)])
@@ -4963,11 +4998,12 @@ async def _probe_route_hop(route, hop):
             return "frame", oid1, node
 
     # 2. Not an iframe: query the element itself in the current context
-    r2 = await _frame_cdp(route, [(3, "Runtime.evaluate",
-                                   route.eval_params(f"""(function () {{
-                                     try {{ return document.querySelector({json.dumps(hop['value'])}); }} catch (e) {{ return null; }}
-                                   }})()""", by_value=False),
-                                   route.session_id)])
+    p2 = route.eval_params(f"""(function () {{
+      try {{ return document.querySelector({json.dumps(hop['value'])}); }} catch (e) {{ return null; }}
+    }})()""", by_value=False)
+    if lookup_ctx is not None:
+        p2["contextId"] = lookup_ctx
+    r2 = await _frame_cdp(route, [(3, "Runtime.evaluate", p2, route.session_id)])
     oid2 = r2.get(3, {}).get("result", {}).get("objectId")
     if not oid2:
         return "none", None, {"found": False}
@@ -5058,8 +5094,10 @@ async def _frame_resolve_target(ws_url, flag_hops, target, kind="css"):
                 rem_selector = " >>> ".join(names[i:] + [inner])
                 return route, rem_selector, None
             else:
-                frames = await _frame_list(route)
-                avail = "; ".join(f"[{f['index']}] {f['id'] or f['name'] or f['src'][:60]}" for f in frames)
+                list_ctx = await _frame_world(route, None, None) if not route.chain else None
+                frames = await _frame_list(route, context_id=list_ctx)
+                labels = [_strip_tag_chars(f.get("id") or f.get("name") or f.get("src") or "")[0][:60] for f in frames]
+                avail = "; ".join(f"[{f['index']}] {lbl}" for f, lbl in zip(frames, labels))
                 raise _FrameError(f"no iframe matches '{hop_name}' in {route.describe()}"
                                   + (f" (frames: {avail})" if avail else " (it has no iframes)"))
         return route, inner, None
@@ -5246,7 +5284,8 @@ async def _frame_search(ws_url, probe_js, act_js, label, same_origin_only=False,
                 stopped = True
                 break
             parent = queue.pop(0)
-            kids = [f["index"] for f in await _frame_list(parent) if f.get("visible")]
+            list_ctx = await _frame_world(parent, None, None) if not parent.chain else None
+            kids = [f["index"] for f in await _frame_list(parent, context_id=list_ctx) if f.get("visible")]
             known += len(kids)
             for idx in kids:
                 if searched >= max_frames:
@@ -8051,17 +8090,28 @@ async def cmd_shot(output=None, quality=None, element=None, fmt=None, hidpi=Fals
         except Exception:
             ctx = None
         rect_str = None
-        for c in ((ctx,) if ctx else ()) + (None,):
-            p_ev = {"expression": js, "returnByValue": True}
-            if c:
-                p_ev["contextId"] = c
+        use_main = ctx is None
+        if ctx:
+            p_ev = {"expression": js, "returnByValue": True, "contextId": ctx}
             try:
                 cr = await cdp_send(ws, [(2, "Runtime.evaluate", p_ev)])
-                rect_str = ((cr.get(2) or {}).get("result") or {}).get("value")
+                reply = cr.get(2) or {}
+            except Exception:
+                reply = {}
+            broken = (not reply) or _cdp_error_reply(reply) or bool(reply.get("exceptionDetails"))
+            if broken:
+                use_main = True
+            else:
+                rect_str = (reply.get("result") or {}).get("value")
+        if use_main:
+            p_ev = {"expression": js, "returnByValue": True}
+            try:
+                cr = await cdp_send(ws, [(2, "Runtime.evaluate", p_ev)])
+                reply = cr.get(2) or {}
+                if not _cdp_error_reply(reply) and not reply.get("exceptionDetails"):
+                    rect_str = (reply.get("result") or {}).get("value")
             except Exception:
                 rect_str = None
-            if rect_str:
-                break
         if rect_str:
             rect = json.loads(rect_str)
             if rect.get("shadowHost"):
@@ -18079,17 +18129,7 @@ async def _agent_frame_open(ws_url, index, scroll=False):
     route = _FrameRoute(ws_url)
     try:
         _frame_pool_pin(route)
-        lookup_ctx = None
-        try:
-            r = await _frame_cdp(route, [(1, "Page.getFrameTree", {}, None)])
-            fid = (((r.get(1) or {}).get("frameTree") or {}).get("frame") or {}).get("id")
-            if fid:
-                r2 = await _frame_cdp(route, [(2, "Page.createIsolatedWorld", {
-                    "frameId": fid, "worldName": "cdpilot", "grantUniveralAccess": True}, None)])
-                lookup_ctx = (r2.get(2) or {}).get("executionContextId")
-        except Exception:
-            lookup_ctx = None
-        await _frame_route_push(route, {"kind": "index", "value": int(index)}, scroll=scroll, lookup_ctx=lookup_ctx)
+        await _frame_route_push(route, {"kind": "index", "value": int(index)}, scroll=scroll)
     except BaseException:
         await _frame_route_close(route)
         raise
@@ -20803,14 +20843,16 @@ async def cmd_frame(subcmd, *subcmd_args):
 
 async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
     if subcmd == "list" and route is None:
-        # Top page: unchanged output (iframes only, no visibility marker).
-        js = """(function(){
-            var iframes = document.querySelectorAll('iframe');
-            return Array.from(iframes).map(function(f, i){
-                return {index: i, src: f.src || '(no source)', name: f.name || '', id: f.id || ''};
-            });
-        })()"""
-        res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
+        # Top page: same lines as before (no visibility marker); <frame> elements are listed too, in the
+        # isolated world, so the index is the one `--frame <i>` resolves.
+        try:
+            ctx = await _isolated_world(ws_url, "cdpilot")
+        except Exception:
+            ctx = None
+        p = {"expression": _FRAME_LIST_JS, "returnByValue": True}
+        if ctx is not None:
+            p["contextId"] = ctx
+        res = await cdp_send(ws_url, [(1, "Runtime.evaluate", p)])
         frames = res.get(1, {}).get("result", {}).get("value", [])
         if not frames:
             print("No iframes found on page.")
@@ -20820,7 +20862,18 @@ async def _cmd_frame_run(ws_url, subcmd, subcmd_args, route):
                 print(f"  [{f['index']}] src={f['src'][:80]} name={f['name']} id={f['id']}")
 
     elif subcmd == "list":
-        res = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": _FRAME_LIST_JS, "returnByValue": True})])
+        ctx = None
+        if route and not route.chain:
+            try:
+                ctx = await _frame_world(route, None, None)
+            except Exception:
+                ctx = None
+        elif route and route.context_id is not None:
+            ctx = route.context_id
+        p = {"expression": _FRAME_LIST_JS, "returnByValue": True}
+        if ctx is not None:
+            p["contextId"] = ctx
+        res = await cdp_send(ws_url, [(1, "Runtime.evaluate", p)])
         frames = res.get(1, {}).get("result", {}).get("value", [])
         if not frames:
             print(f"No iframes found in {route.describe()}.")
