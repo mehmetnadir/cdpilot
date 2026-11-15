@@ -4323,7 +4323,9 @@ def _cdp_reply(r, cid, method, timeout=15):
 # given. contentDocument cannot be used (blocked cross-origin), so each hop
 # is resolved over CDP:
 #   1. find the <iframe> element in the current frame (CSS selector, index,
-#      name/id or src substring); DOM.describeNode gives its child frameId;
+#      name/id, or a substring of the frame's committed URL from
+#      Page.getFrameTree, never its src attribute); DOM.describeNode gives
+#      its child frameId;
 #   2. same-process frame -> its main-world execution context:
 #      DOM.resolveNode on the frame's document (from DOM.describeNode's
 #      contentDocument) gives a main-world object whose id carries the
@@ -4522,9 +4524,10 @@ def _parse_frame_hop(hop, implicit=False):
     """One hop -> {'kind': 'index'|'url'|'auto'|'sel', 'value': ...}.
 
     '2' = third <iframe>/<frame> of the document (same order as `frame list`);
-    'url=stripe.com' = src substring. Otherwise a CSS selector (or a wrapper
-    element around one iframe), then a name/id; `--frame` values ('auto')
-    also fall back to a src substring, hops written with `>>>` ('sel',
+    'url=stripe.com' = substring of the frame's committed URL (not its src
+    attribute). Otherwise a CSS selector (or a wrapper element around one
+    iframe), then a name/id; `--frame` values ('auto') also fall back to a
+    committed-URL substring, hops written with `>>>` ('sel',
     implicit=True) do not, so ordinary words are not mistaken for frames.
     """
     hop = hop.strip()
@@ -4563,7 +4566,11 @@ def _extract_frame_flag(args):
     return rest, value
 
 
-# Frame-owner element for one hop, looked up in the current document.
+# Frame-owner element for one hop, looked up in the current document:
+# 'index' = DOM order, 'sel' = a CSS selector (or a wrapper element around one
+# iframe), then an iframe name/id. URL text is never matched here: the src
+# attribute is the page's to set, not where the frame is (_frame_url_match
+# reads the committed URL from the browser).
 # wrappedOnly: return only whether the hop matched a wrapper element (not an
 # iframe itself) and the iframe inside it was taken.
 _FRAME_OWNER_JS = r"""
@@ -4573,23 +4580,21 @@ function (kind, value, scroll, wrappedOnly) {
   var el = null, wrapped = false;
   if (kind === 'index') {
     el = all[value] || null;
-  } else {
-    if (kind === 'auto' || kind === 'sel') {
-      var c = null;
-      try { c = document.querySelector(value); } catch (e) {}
-      // A wrapper such as <div id="card-element"> around the iframe counts too.
-      if (c) { el = isFrame(c) ? c : c.querySelector('iframe, frame'); wrapped = !!el && el !== c; }
-      if (!el) el = all.filter(function (f) { return f.name === value || f.id === value; })[0] || null;
-    }
-    if (!el && kind !== 'sel') {
-      el = all.filter(function (f) { return (f.src || '').indexOf(value) !== -1; })[0] || null;
-    }
+  } else if (kind === 'sel') {
+    var c = null;
+    try { c = document.querySelector(value); } catch (e) {}
+    // A wrapper such as <div id="card-element"> around the iframe counts too.
+    if (c) { el = isFrame(c) ? c : c.querySelector('iframe, frame'); wrapped = !!el && el !== c; }
+    if (!el) el = all.filter(function (f) { return f.name === value || f.id === value; })[0] || null;
   }
   if (wrappedOnly) return wrapped;
   if (el && scroll) { try { el.scrollIntoView({behavior: 'instant', block: 'nearest'}); } catch (e) {} }
   return el;
 }
 """
+# The same scroll, for an <iframe> _frame_url_match picked (this = the element).
+_FRAME_SCROLL_FN = ("function () { try { this.scrollIntoView({behavior: 'instant', block: 'nearest'}); }"
+                    " catch (e) {} }")
 
 # Frames of the current document, in `--frame <index>` order.
 _FRAME_LIST_JS = r"""
@@ -4629,8 +4634,10 @@ class _FrameRoute:
         self.context_id = None     # execution context there; None = session default
         self.chain = []            # [(session_id, iframe objectId)], outermost first
         self.labels = []           # "iframe#card" per hop, for messages
-        self.src = ""              # src of the innermost iframe
+        self.src = ""              # committed URL of the innermost frame as resolved ('' unknown)
+        self.loader_id = None      # its document's loaderId as resolved (None: unknown)
         self.sessions = sessions if sessions is not None else []  # to detach
+        self.attached = {}         # frame id -> flat session attached to read its URL
         self.xform = (1.0, 1.0, 0.0, 0.0)  # frame point -> page: (sx, sy, tx, ty)
         self.frame_id = None       # the frame's id (None: the top page)
         self.worlds = {}           # (session, frame id) -> isolated-world context id
@@ -4644,7 +4651,8 @@ class _FrameRoute:
         child = _FrameRoute(self.root_ws, self.sessions)
         child.session_id, child.context_id = self.session_id, self.context_id
         child.chain, child.labels, child.src = list(self.chain), list(self.labels), self.src
-        child.frame_id = self.frame_id
+        child.frame_id, child.loader_id = self.frame_id, self.loader_id
+        child.attached = self.attached  # same socket and sessions
         child.deadline, child.isolated = self.deadline, self.isolated
         child.worlds = self.worlds  # same socket and sessions: one isolated world per (session, frame)
         return child
@@ -4827,59 +4835,138 @@ async def _frame_context_for(route, frame_id, node, allow_oopif=True):
     raise _FrameError(f"cannot enter frame {frame_id} (no execution context, no target)")
 
 
+async def _frame_live(route, parent_sid, frame_id, own_sid=None, tree=None):
+    """(url, loaderId) of frame `frame_id` as the browser has it (Page.getFrameTree), never
+    from its <iframe>'s attributes. The tree of the session holding the <iframe> (parent_sid;
+    `tree`: that reply, already read) first; an out-of-process frame is the root of its own
+    flat session's tree (own_sid). The URL carries its #fragment (Frame.urlFragment), as a
+    src attribute would. (None, None) when the browser does not say."""
+    if tree is None:
+        r = await _frame_cdp(route, [(1, "Page.getFrameTree", {}, parent_sid)])
+        tree = r.get(1)
+    fr = _agent_frame_find(tree, frame_id)
+    if fr is None and own_sid and own_sid != parent_sid:
+        r = await _frame_cdp(route, [(2, "Page.getFrameTree", {}, own_sid)])
+        root = ((r.get(2) or {}).get("frameTree") or {}).get("frame") or {}
+        fr = root if root.get("id") == frame_id else None
+    fr = fr or {}
+    url = fr.get("url") if isinstance(fr.get("url"), str) else None
+    if url and isinstance(fr.get("urlFragment"), str):
+        url += fr["urlFragment"]
+    return url, fr.get("loaderId")
+
+
+async def _frame_url_match(route, value, lookup_ctx, allow_oopif=True):
+    """The first <iframe>/<frame> in DOM order whose committed URL contains `value`, or None.
+
+    Returns (objectId, remote object, DOM.describeNode node, flat session or None). The URL
+    is the browser's (_frame_live), never the src attribute: a page can give a srcdoc decoy,
+    or a frame it navigated elsewhere, any src it likes. An out-of-process frame gets a flat
+    session to read its own tree (kept on the route, detached at close; the match's session
+    is returned for the route to use).
+    """
+    tree, i = None, 0
+    while True:
+        p = route.eval_params(f"({_FRAME_OWNER_JS})(\"index\", {i}, false)", by_value=False)
+        if lookup_ctx is not None:
+            p["contextId"] = lookup_ctx
+        r = await _frame_cdp(route, [(1, "Runtime.evaluate", p, route.session_id)])
+        obj = (r.get(1) or {}).get("result") or {}
+        oid = obj.get("objectId")
+        if not oid or obj.get("subtype") != "node" or (r.get(1) or {}).get("exceptionDetails"):
+            return None
+        i += 1
+        d = await _frame_cdp(route, [(2, "DOM.describeNode", {"objectId": oid}, route.session_id)])
+        node = d.get(2, {}).get("node", {})
+        frame_id = node.get("frameId")
+        if not frame_id:
+            continue
+        if tree is None:
+            tree = (await _frame_cdp(route, [(3, "Page.getFrameTree", {}, route.session_id)])).get(3)
+        own = route.attached.get(frame_id)
+        if (own is None and allow_oopif and _agent_frame_find(tree, frame_id) is None
+                and not (node.get("contentDocument") or {}).get("backendNodeId")):
+            a = await _frame_cdp(route, [(4, "Target.attachToTarget", {"targetId": frame_id, "flatten": True})])
+            own = a.get(4, {}).get("sessionId")
+            if own:
+                route.sessions.append(own)
+                route.attached[frame_id] = own
+        url, _ = await _frame_live(route, route.session_id, frame_id, own, tree)
+        if url and value in url:
+            return oid, obj, node, own
+
+
 async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oopif=True):
     """Descend one hop: route now points at the child frame.
 
     Returns True, or False when no element matches the hop and missing_ok.
     A hop that matched an element wrapping the iframe (Stripe's
-    #card-element) still works, with one stderr note.
+    #card-element) still works, with one stderr note. URL text (url=, or a
+    --frame value no selector or name/id matched) is matched against each
+    frame's committed URL, never its src attribute (_frame_url_match).
+    route.src / route.loader_id are the frame's committed URL and loaderId as
+    resolved: _frame_input_guard reads them again before anything is typed.
     """
     # The top document's lookup runs in cdpilot's isolated world: a page that replaces
     # querySelectorAll cannot point an index or selector at another frame.
     lookup_ctx = await _frame_first_hop_world(route) if not route.chain else None
-    args = f"{json.dumps(hop['kind'])}, {json.dumps(hop['value'])}"
-    p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False)
-    if lookup_ctx is not None:
-        p1["contextId"] = lookup_ctx
-    cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
-    if hop["kind"] in ("auto", "sel"):
-        p3 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)")
-        if lookup_ctx is not None:
-            p3["contextId"] = lookup_ctx
-        cmds.append((3, "Runtime.evaluate", p3, route.session_id))
-    r = await _frame_cdp(route, cmds)
-    reply1 = r.get(1) or {}
-    if lookup_ctx is not None and _cdp_error_reply(reply1):
-        route.worlds.pop((None, None), None)
-        lookup_ctx = await _frame_first_hop_world(route)
+    kind = hop["kind"]
+    js_kind = "index" if kind == "index" else "sel"  # --frame ('auto'): selector, wrapper, name/id
+    r = {}
+    if kind != "url":  # url=: committed URLs only (below)
+        args = f"{json.dumps(js_kind)}, {json.dumps(hop['value'])}"
+        p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False)
         if lookup_ctx is not None:
             p1["contextId"] = lookup_ctx
-            cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
-            if hop["kind"] in ("auto", "sel"):
-                p3 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)")
+        cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
+        if js_kind == "sel":
+            p3 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)")
+            if lookup_ctx is not None:
                 p3["contextId"] = lookup_ctx
-                cmds.append((3, "Runtime.evaluate", p3, route.session_id))
-            r = await _frame_cdp(route, cmds)
-            reply1 = r.get(1) or {}
-        else:
-            _frame_lookup_fallback_note()
-            p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False)
-            cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
-            if hop["kind"] in ("auto", "sel"):
-                p3 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)")
-                cmds.append((3, "Runtime.evaluate", p3, route.session_id))
-            r = await _frame_cdp(route, cmds)
-            reply1 = r.get(1) or {}
-    if lookup_ctx is not None and reply1.get("exceptionDetails"):
-        det = reply1["exceptionDetails"]
-        exc = ((det.get("exception") or {}).get("description")
-               or (det.get("exception") or {}).get("value")
-               or det.get("text") or "unknown error")
-        exc_str = _frame_label(str(exc).splitlines()[0].strip() if str(exc).strip() else exc, 120)
-        raise _FrameError(f"frame lookup failed in cdpilot's isolated world: {exc_str}")
+            cmds.append((3, "Runtime.evaluate", p3, route.session_id))
+        r = await _frame_cdp(route, cmds)
+        reply1 = r.get(1) or {}
+        if lookup_ctx is not None and _cdp_error_reply(reply1):
+            route.worlds.pop((None, None), None)
+            lookup_ctx = await _frame_first_hop_world(route)
+            if lookup_ctx is not None:
+                p1["contextId"] = lookup_ctx
+                cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
+                if js_kind == "sel":
+                    p3 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)")
+                    p3["contextId"] = lookup_ctx
+                    cmds.append((3, "Runtime.evaluate", p3, route.session_id))
+                r = await _frame_cdp(route, cmds)
+                reply1 = r.get(1) or {}
+            else:
+                _frame_lookup_fallback_note()
+                p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, {json.dumps(scroll)})", by_value=False)
+                cmds = [(1, "Runtime.evaluate", p1, route.session_id)]
+                if js_kind == "sel":
+                    p3 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false, true)")
+                    cmds.append((3, "Runtime.evaluate", p3, route.session_id))
+                r = await _frame_cdp(route, cmds)
+                reply1 = r.get(1) or {}
+        if lookup_ctx is not None and reply1.get("exceptionDetails"):
+            det = reply1["exceptionDetails"]
+            exc = ((det.get("exception") or {}).get("description")
+                   or (det.get("exception") or {}).get("value")
+                   or det.get("text") or "unknown error")
+            exc_str = _frame_label(str(exc).splitlines()[0].strip() if str(exc).strip() else exc, 120)
+            raise _FrameError(f"frame lookup failed in cdpilot's isolated world: {exc_str}")
     obj = r.get(1, {}).get("result", {})
     oid = obj.get("objectId")
-    shown = f"#{hop['value']}" if hop["kind"] == "index" else hop["value"]
+    node = own = None
+    by_url = False
+    if not oid and kind in ("auto", "url"):
+        hit = await _frame_url_match(route, hop["value"], lookup_ctx, allow_oopif)
+        if hit is not None:
+            oid, obj, node, own = hit
+            by_url = True
+            if scroll:
+                await _frame_cdp(route, [(6, "Runtime.callFunctionOn", {
+                    "objectId": oid, "functionDeclaration": _FRAME_SCROLL_FN}, route.session_id)])
+    shown = f"#{hop['value']}" if kind == "index" else hop["value"]
     if not oid:
         if missing_ok:
             return False
@@ -4887,18 +4974,23 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
         avail = _frame_avail_labels(frames)
         raise _FrameError(f"no iframe matches '{shown}' in {route.describe()}"
                           + (f" (frames: {avail})" if avail else " (it has no iframes)"))
-    d = await _frame_cdp(route, [(2, "DOM.describeNode", {"objectId": oid}, route.session_id)])
-    node = d.get(2, {}).get("node", {})
+    if node is None:
+        d = await _frame_cdp(route, [(2, "DOM.describeNode", {"objectId": oid}, route.session_id)])
+        node = d.get(2, {}).get("node", {})
     frame_id = node.get("frameId")
     if not frame_id:
         raise _FrameError(f"'{shown}' is not a loaded frame in {route.describe()}")
-    attrs = node.get("attributes") or []
-    src = next((attrs[i + 1] for i in range(0, len(attrs) - 1, 2) if attrs[i] == "src"), "")
-    sid, ctx, isolated = await _frame_context_for(route, frame_id, node, allow_oopif)
+    if own:  # out of process: _frame_url_match attached it to read its URL
+        sid, ctx, isolated = own, None, False
+    else:
+        sid, ctx, isolated = await _frame_context_for(route, frame_id, node, allow_oopif)
+    url, loader_id = await _frame_live(route, route.session_id, frame_id, sid)
+    if by_url and not (url and hop["value"] in url):
+        raise _FrameError(f"'{shown}': the frame navigated while it was resolved")
     route.chain.append((route.session_id, oid))
     route.labels.append(_frame_label(obj.get("description") or shown, 60))
-    route.session_id, route.context_id, route.src = sid, ctx, src
-    route.frame_id, route.isolated = frame_id, isolated
+    route.session_id, route.context_id, route.src = sid, ctx, url or ""
+    route.frame_id, route.loader_id, route.isolated = frame_id, loader_id, isolated
     if isolated and not _FRAME_ISOLATED_NOTED[0]:
         _FRAME_ISOLATED_NOTED[0] = True
         print(f"note: frame '{route.labels[-1]}': its page context was not reachable; using an isolated"
@@ -5134,13 +5226,19 @@ async def _probe_route_hop(route, hop):
       kind: 'frame', 'shadow_open', 'shadow_closed', or 'none'.
     """
     lookup_ctx = await _frame_first_hop_world(route) if not route.chain else None
-    args = f"{json.dumps(hop['kind'])}, {json.dumps(hop['value'])}"
-    # 1. First see if _FRAME_OWNER_JS matches an iframe (same-process or out-of-process)
-    p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false)", by_value=False)
-    if lookup_ctx is not None:
-        p1["contextId"] = lookup_ctx
-    r1 = await _frame_cdp(route, [(1, "Runtime.evaluate", p1, route.session_id)])
-    oid1 = r1.get(1, {}).get("result", {}).get("objectId")
+    if hop["kind"] == "url":  # url=: the frames' committed URLs, not their src attributes
+        hit = await _frame_url_match(route, hop["value"], lookup_ctx)
+        if hit is not None:
+            return "frame", hit[0], hit[2]
+        oid1 = None
+    else:
+        args = f"{json.dumps(hop['kind'])}, {json.dumps(hop['value'])}"
+        # 1. First see if _FRAME_OWNER_JS matches an iframe (same-process or out-of-process)
+        p1 = route.eval_params(f"({_FRAME_OWNER_JS})({args}, false)", by_value=False)
+        if lookup_ctx is not None:
+            p1["contextId"] = lookup_ctx
+        r1 = await _frame_cdp(route, [(1, "Runtime.evaluate", p1, route.session_id)])
+        oid1 = r1.get(1, {}).get("result", {}).get("objectId")
     if oid1:
         d = await _frame_cdp(route, [(2, "DOM.describeNode", {"objectId": oid1}, route.session_id)])
         node = d.get(2, {}).get("node", {})
@@ -5307,6 +5405,28 @@ def _frame_aware(kind="css"):
         wrapper.frame_aware = kind
         return wrapper
     return deco
+
+
+async def _frame_input_guard():
+    """Right before an input step (fill, type, smart-fill, smart-select) types into a routed
+    frame: the frame must still be the document the route was resolved to. Its <iframe> is
+    described again (frame id) and its loaderId read again (_frame_live), as agent frame refs
+    are checked (_agent_frame_same): a frame that navigated or was replaced since exits 2 and
+    nothing is typed. No route: nothing to check."""
+    route = _FRAME_ROUTE.get()
+    if route is None or not route.chain:
+        return
+    parent_sid, oid = route.chain[-1]
+    d = await _frame_cdp(route, [(1, "DOM.describeNode", {"objectId": oid}, parent_sid)])
+    frame_id = d.get(1, {}).get("node", {}).get("frameId")
+    same = False
+    if frame_id and frame_id == route.frame_id:
+        url, loader_id = await _frame_live(route, parent_sid, frame_id, route.session_id)
+        same = _agent_frame_same({"loader_id": route.loader_id, "frame_url": route.src}, loader_id, url)
+    if not same:
+        print(f"Error: frame '{route.describe()}' is no longer the document it was resolved to"
+              " (it navigated or was replaced); nothing was typed", file=sys.stderr)
+        sys.exit(2)
 
 
 def _smart_data(raw):
@@ -9165,6 +9285,7 @@ async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
         print(f"Filled: {out.get('tag', '?')} (value not shown)")
         return
     safe_value = json.dumps(value)
+    await _frame_input_guard()  # a routed frame: still the document resolved?
     if entropy:
         # Focus element, field-focus pause, then humanize typing
         js_focus = f"""
@@ -9197,6 +9318,7 @@ async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
         import random as _r
         _fr = _r.Random(int(_ENTROPY_SEED)) if _ENTROPY_SEED else _r.Random()
         await asyncio.sleep(_fr.uniform(0.2, 0.4))
+        await _frame_input_guard()  # the keys follow focus: check again after the pause
         await _humanize_type(ws, value)
         print(f"Filled (entropy): {selector} = {value[:50]}")
     else:
@@ -16073,6 +16195,7 @@ async def cmd_smart_fill(text, value):
             sys.exit(1)
         print(f'Filled: {out.get("tag", "?")} "{text}" (value not shown)')
         return
+    await _frame_input_guard()
     raw = await _smart_eval(ws_url, js, "smart-fill", same_origin_only=True)
     try:
         data = json.loads(raw)
@@ -16201,6 +16324,7 @@ async def cmd_smart_select(text, option_text):
             sys.exit(1)
         print(f'Selected an option in "{text}" (value not shown)')
         return
+    await _frame_input_guard()
     raw = await _smart_eval(ws_url, js, "smart-select", same_origin_only=True)
     try:
         data = json.loads(raw)
@@ -18811,7 +18935,7 @@ async def cmd_agent_observe_frame(frame, full=False, all_=False):
         await _frame_route_close(route)
     # provenance = where the frame IS (live URL), not what its src attribute said
     origin = _agent_frame_origin(live_url, page.get('url', '')) if live_url \
-        else _agent_frame_origin(src, page.get('url', ''))
+        else _agent_frame_origin(src or 'about:blank', page.get('url', ''))
     state = _load_agent_state()
     old = {r: a for r, a in (state.get('frame_actions') or {}).items()
            if a.get('frame_id') == frame_id and a.get('loader_id') == loader_id}
