@@ -2,7 +2,7 @@
 
 All notable changes to cdpilot will be documented in this file.
 
-## [Unreleased]
+## [0.9.12] - 2026-11-15
 
 ### Fixed
 - **Frame fallback notes appear on every request in a warm process.** With `CDPILOT_DAEMON=1` or a warm MCP process, the stderr notes for an isolated-world fallback were printed only for the first request; each request now starts fresh, like a one-shot command.
