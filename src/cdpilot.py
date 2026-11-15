@@ -288,7 +288,10 @@ def _open_output_fd(path, append=False):
     POSIX: O_NOFOLLOW (a symlink planted at the path is refused) and mode 0600 for
     a new file; an existing file must be a regular file owned by this user, so a
     file another local user pre-created in a shared directory such as /tmp is not
-    written. Raises OSError when refused. Windows keeps the plain open().
+    written. It must also have a single link: a hard link to one of your own files
+    (`ln ~you/.zshrc /tmp/shot.png` works across a volume such as /tmp and /Users on
+    macOS) passes the owner check but would be truncated. Raises OSError when
+    refused. Windows keeps the plain open().
     """
     if os.name == "nt":
         return open(path, "ab" if append else "wb")
@@ -301,6 +304,9 @@ def _open_output_fd(path, append=False):
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
             raise PermissionError(
                 f"refusing to write {path}: not a regular file owned by you")
+        if st.st_nlink != 1:
+            raise PermissionError(
+                f"refusing to write {path}: it is a hard link to another file")
         if not append:
             os.ftruncate(fd, 0)
         return os.fdopen(fd, "ab" if append else "wb")
@@ -315,7 +321,7 @@ def _open_output(path):
         return _open_output_fd(path)
     except OSError as e:
         print(f"Cannot write {path}: {e.strerror or e} "
-              "(symlink, or not a file you own; choose another output path)",
+              "(symlink, hard link, or not a file you own; choose another output path)",
               file=sys.stderr)
         sys.exit(1)
 
@@ -605,7 +611,7 @@ def _migrate_legacy_profile():
         new_dir = os.path.join(CDPILOT_HOME, "projects", project_id)
         new_profile = os.path.join(new_dir, "profile")
         if not os.path.exists(new_profile):
-            os.makedirs(new_dir, exist_ok=True)
+            _makedirs_private(new_dir)
             os.rename(legacy_profile, new_profile)
             os.symlink(new_profile, legacy_profile)
 
@@ -1300,7 +1306,7 @@ def _load_sessions():
 
 def _save_sessions(sessions):
     """Write the session registry."""
-    os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
+    _makedirs_private(os.path.dirname(SESSION_FILE))
     with open(SESSION_FILE, 'w') as f:
         json.dump(sessions, f, indent=2)
 
@@ -1330,7 +1336,7 @@ _A11Y_REF_FILE = os.path.join(PROFILE_DIR, 'a11y-refs.json')
 
 def _save_a11y_refs(ref_map):
     """Persist a11y ref map to disk for cross-process access."""
-    os.makedirs(os.path.dirname(_A11Y_REF_FILE), exist_ok=True)
+    _makedirs_private(os.path.dirname(_A11Y_REF_FILE))
     with open(_A11Y_REF_FILE, 'w') as f:
         json.dump(ref_map, f)
 
@@ -1977,7 +1983,7 @@ def _idle_write_activity(project_id=None, now=None):
     path = _idle_activity_path(project_id)
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _makedirs_private(os.path.dirname(path))
         with open(tmp, "w") as f:
             f.write(f"{time.time() if now is None else now:.3f}\n")
         os.replace(tmp, path)  # readers never see a half-written value
@@ -2015,7 +2021,7 @@ def _idle_load_state(port):
 
 def _idle_save_state(port, state):
     path = _idle_state_path(port)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _makedirs_private(os.path.dirname(path))
     tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
         json.dump(state, f)
@@ -2420,7 +2426,7 @@ def _bot_auth_generate_keypair(agent_url, force=False, agent_format="legacy"):
               "run 'cdpilot bot-auth init --agent-url <url> --force' to do it anyway.",
               file=sys.stderr)
         sys.exit(1)
-    os.makedirs(BOT_AUTH_DIR, exist_ok=True)
+    _makedirs_private(BOT_AUTH_DIR)
     try:
         os.chmod(BOT_AUTH_DIR, 0o700)
     except OSError:
@@ -2693,7 +2699,7 @@ def _bot_auth_load_state(port):
 
 
 def _bot_auth_save_state(port, state):
-    os.makedirs(BOT_AUTH_SIGNERS_DIR, exist_ok=True)
+    _makedirs_private(BOT_AUTH_SIGNERS_DIR)
     _atomic_write_json(_bot_auth_state_path(port), state)
 
 
@@ -2727,7 +2733,7 @@ def _bot_auth_drop_stale(port, state, reason):
     if not _bot_auth_clear_state(port, state.get("token")):
         return  # someone else replaced or removed it meanwhile
     try:
-        os.makedirs(BOT_AUTH_SIGNERS_DIR, exist_ok=True)
+        _makedirs_private(BOT_AUTH_SIGNERS_DIR)
         with open(_bot_auth_stale_marker_path(port), "w") as f:
             f.write(json.dumps({"reason": reason, "t": time.time()}) + "\n")
     except OSError:
@@ -3003,7 +3009,7 @@ def _bot_auth_other_clients(port, signer_state):
 
 def _bot_auth_log(port, line):
     try:
-        os.makedirs(BOT_AUTH_SIGNERS_DIR, exist_ok=True)
+        _makedirs_private(BOT_AUTH_SIGNERS_DIR)
         with open(_bot_auth_log_path(port), "a") as f:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
     except OSError:
@@ -3021,7 +3027,7 @@ def _bot_auth_acquire_lock(port, timeout):
     drops it when its holder exits, even by SIGKILL, so there is no
     "take over a dead holder's lock" step that two waiters could both win.
     Returns the held fd, or None on timeout."""
-    os.makedirs(BOT_AUTH_SIGNERS_DIR, exist_ok=True)
+    _makedirs_private(BOT_AUTH_SIGNERS_DIR)
     fd = os.open(_bot_auth_lock_path(port), os.O_RDWR | os.O_CREAT, 0o600)
     deadline = time.time() + timeout
     while True:
@@ -6831,7 +6837,7 @@ def cmd_browser_install(args):
         ver, plat = build['version'], build['platform']
         final_dir = os.path.join(CFT_ROOT, ver)
         binary = os.path.join(final_dir, _cft_binary_relpath(plat))
-        os.makedirs(CFT_ROOT, exist_ok=True)
+        _makedirs_private(CFT_ROOT)
         info = None
         if os.path.isfile(binary):
             print(f"Chrome for Testing {ver} is already installed.")
@@ -6844,7 +6850,7 @@ def cmd_browser_install(args):
             staging = os.path.join(CFT_ROOT, f".staging-{stamp}")
             try:
                 info = _cft_download(build['url'], part)
-                os.makedirs(staging)
+                os.mkdir(staging, 0o700)
                 _cft_extract(part, staging)
                 if not os.path.isfile(os.path.join(staging, _cft_binary_relpath(plat))):
                     raise CftError(f"unexpected zip layout: no {_cft_binary_relpath(plat)}")
@@ -6904,7 +6910,7 @@ def get_dev_extensions():
 
 def save_dev_extensions(extensions):
     """Save dev mode extension paths."""
-    os.makedirs(os.path.dirname(DEV_EXTENSIONS_FILE), exist_ok=True)
+    _makedirs_private(os.path.dirname(DEV_EXTENSIONS_FILE))
     with open(DEV_EXTENSIONS_FILE, 'w') as f:
         json.dump(extensions, f, indent=2)
 
@@ -7095,7 +7101,7 @@ def _proxy_active_name():
 
 def _proxy_save(data):
     """Atomically persist proxy config."""
-    os.makedirs(os.path.dirname(PROXY_CONFIG_FILE), exist_ok=True)
+    _makedirs_private(os.path.dirname(PROXY_CONFIG_FILE))
     _atomic_write_json(PROXY_CONFIG_FILE, data)
 
 
@@ -7492,7 +7498,7 @@ def _sanitize_profile_state(profile_dir):
             with open(prefs_path) as f:
                 prefs = json.load(f)
         else:
-            os.makedirs(os.path.dirname(prefs_path), exist_ok=True)
+            _makedirs_private(os.path.dirname(prefs_path))
             prefs = {}
         prof = prefs.setdefault('profile', {})
         prof['exit_type'] = 'Normal'
@@ -8959,7 +8965,7 @@ def _log_heal(cmd, inp, tried, duration_ms, no_heal=False):
     if not PROJECT_ID:
         return
     path = os.path.join(CDPILOT_HOME, "projects", PROJECT_ID, "heal.jsonl")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _makedirs_private(os.path.dirname(path))
     entry = {
         "ts": _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "cmd": cmd,
@@ -9706,7 +9712,7 @@ def _save_host_cookies(host, cookies):
     Returns the path of the written file.
     """
     d = _cookies_host_dir(host)
-    os.makedirs(d, exist_ok=True)
+    _makedirs_private(d)
     f_path = os.path.join(d, 'cookies.json')
     expires_vals = [c.get('expires', 0) for c in cookies if c.get('expires', 0) > 0]
     expires_soonest = min(expires_vals) if expires_vals else 0
@@ -9888,6 +9894,11 @@ async def cmd_cookies(*args):
             cookies = [c for c in cookies
                        if c.get('domain', '').lstrip('.').endswith(d)]
         with io.TextIOWrapper(_open_output(out_path), encoding='utf-8') as f:
+            if os.name != 'nt':
+                try:  # an existing file (e.g. 0644 from an earlier export) becomes 0600 too
+                    os.fchmod(f.fileno(), 0o600)
+                except OSError:
+                    pass
             json.dump(cookies, f, indent=2)
         print(f'Saved {len(cookies)} cookies -> {out_path}')
         return
@@ -10901,7 +10912,7 @@ def cmd_ext_install(source):
       ext-install /path/to/unpacked-extension-dir/
     """
     ext_dir = os.path.join(PROFILE_DIR, "Default", "Extensions")
-    os.makedirs(ext_dir, exist_ok=True)
+    _makedirs_private(ext_dir)
 
     source = os.path.expanduser(source)
 
@@ -10963,7 +10974,7 @@ def cmd_ext_install(source):
         import hashlib
         ext_id = hashlib.md5(os.path.basename(source).encode()).hexdigest()[:32]
         dest_dir = os.path.join(ext_dir, ext_id)
-        os.makedirs(dest_dir, exist_ok=True)
+        _makedirs_private(dest_dir)
 
         dest = os.path.join(dest_dir, os.path.basename(source))
         shutil.copy2(source, dest)
@@ -11448,7 +11459,7 @@ def cmd_proxy(*args):
     # Legacy single-URL forms (backward compat): `cdpilot proxy http://...` / `off`
     if sub and sub not in ('add', 'remove', 'rm', 'use', 'list', 'ls', 'show', 'status', 'off', ''):
         if sub.startswith('http://') or sub.startswith('https://') or sub.startswith('socks'):
-            os.makedirs(os.path.dirname(PROXY_CONFIG_FILE), exist_ok=True)
+            _makedirs_private(os.path.dirname(PROXY_CONFIG_FILE))
             data = _proxy_config_raw()
             data['proxy'] = args[0]
             data.setdefault('pools', {})
@@ -11559,7 +11570,7 @@ def cmd_headless(state=None):
         print(f'Headless mode: {"on" if current else "off"}')
         return
 
-    os.makedirs(os.path.dirname(HEADLESS_CONFIG_FILE), exist_ok=True)
+    _makedirs_private(os.path.dirname(HEADLESS_CONFIG_FILE))
     enabled = state.lower() in ('on', '1', 'true', 'yes')
     with open(HEADLESS_CONFIG_FILE, 'w') as f:
         json.dump({'headless': enabled}, f)
@@ -11631,7 +11642,7 @@ def cmd_browser(name=None):
             print(f"   Looked at: {candidates[0]}", file=sys.stderr)
         sys.exit(1)
 
-    os.makedirs(os.path.dirname(BROWSER_CONFIG_FILE), exist_ok=True)
+    _makedirs_private(os.path.dirname(BROWSER_CONFIG_FILE))
     with open(BROWSER_CONFIG_FILE, 'w') as f:
         json.dump({'browser': name}, f)
     print(f"Browser preference: {name}")
@@ -11738,7 +11749,7 @@ def get_block_config():
 
 
 def _save_block_config(enabled, patterns):
-    os.makedirs(os.path.dirname(BLOCK_CONFIG_FILE), exist_ok=True)
+    _makedirs_private(os.path.dirname(BLOCK_CONFIG_FILE))
     with open(BLOCK_CONFIG_FILE, 'w') as f:
         json.dump({'enabled': enabled, 'patterns': patterns}, f)
 
@@ -11845,7 +11856,7 @@ def cmd_stealth(state=None):
         print(f"Invalid state: {state}. Use 'on', 'off', or 'status'.", file=sys.stderr)
         sys.exit(1)
     enabled = s in ('on', '1', 'true', 'yes')
-    os.makedirs(os.path.dirname(STEALTH_CONFIG_FILE), exist_ok=True)
+    _makedirs_private(os.path.dirname(STEALTH_CONFIG_FILE))
     with open(STEALTH_CONFIG_FILE, 'w') as f:
         json.dump({'stealth': enabled}, f)
     # Backward-compat bridge to the three-tier model: keep mode.json coherent
@@ -11885,7 +11896,7 @@ def _atomic_write_json(path, data):
     through to the default. For the visual toggle this means glow flickering
     off for a single command. os.replace is POSIX-atomic on the same fs.
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _makedirs_private(os.path.dirname(path))
     # A unique temp name: two writers sharing "<path>.tmp" could replace
     # each other's half-written file.
     fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + '.', suffix='.tmp',
@@ -12625,7 +12636,7 @@ def _captcha_load_config() -> dict:
 
 def _captcha_save_config(cfg: dict) -> None:
     """Write captcha config atomically with chmod 600 (API keys must not be world-readable)."""
-    os.makedirs(CDPILOT_HOME, mode=0o700, exist_ok=True)
+    _makedirs_private(CDPILOT_HOME)
     _atomic_write_json(CAPTCHA_PROVIDERS_FILE, cfg)
     try:
         os.chmod(CAPTCHA_PROVIDERS_FILE, 0o600)
@@ -16921,7 +16932,7 @@ def _load_agent_state():
 
 def _save_agent_state(state):
     path = _agent_state_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _makedirs_private(os.path.dirname(path))
     # Keep the first 8000 refs (AX order). The low refs are the ones observe prints
     # and `agent act` takes; the old cut dropped the first 200 of a page over 1000.
     amap = state.get('actions_map', {})
@@ -19027,7 +19038,7 @@ def _agent_flow_load(path):
 
 
 def _agent_flow_write(path, flow):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _makedirs_private(os.path.dirname(path))
     tmp = path + '.tmp'
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w', encoding='utf-8') as f:
         json.dump(flow, f, indent=2, ensure_ascii=False)
@@ -25147,7 +25158,7 @@ def _slog_append(entry, log_dir=None, day=None):
     day = day or datetime.date.today()
     path = os.path.join(log_dir, f"{day.isoformat()}.jsonl")
     data = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-    os.makedirs(log_dir, mode=0o700, exist_ok=True)
+    _makedirs_private(log_dir)
     first_of_day = not os.path.exists(path)
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
     try:
@@ -25990,7 +26001,7 @@ def cmd_record_start(*args):
         name = f"flow-{now.strftime('%Y%m%d-%H%M%S')}"
 
     rec_dir = _record_dir()
-    os.makedirs(rec_dir, exist_ok=True)
+    _makedirs_private(rec_dir)
     state = {
         "name": name,
         "started_at": now.isoformat(),
@@ -27389,7 +27400,7 @@ def _canvas_dir():
     over 100 bytes moves to a short per-user runtime directory, as bin/cdpilot.js
     daemonSockPath() does for the warm process."""
     d = os.path.join(PROFILE_DIR, 'canvas')
-    os.makedirs(d, mode=0o700, exist_ok=True)
+    _makedirs_private(d)
     try:
         os.chmod(d, 0o700)
     except OSError:
@@ -29046,7 +29057,7 @@ def cmd_canvas_open(args):
     if PROJECT_ID:
         env['CDPILOT_PROJECT_ID'] = PROJECT_ID
     env.pop('CDPILOT_TIMEOUT', None)
-    os.makedirs(CDPILOT_HOME, mode=0o700, exist_ok=True)
+    _makedirs_private(CDPILOT_HOME)
     kwargs = {
         'stdin': subprocess.DEVNULL,
         'stdout': subprocess.DEVNULL,
@@ -30134,6 +30145,14 @@ def _cli_main():
     elif cmd in ('--help', '-h', 'help'):
         print(__doc__)
         sys.exit(0)
+
+    # The home, 0700, before any writer (idle activity, session log, MCP server,
+    # warm process) creates it or projects/<id> under the umask. An existing home
+    # keeps its mode. Best effort: a command that needs no home still runs.
+    try:
+        _makedirs_private(CDPILOT_HOME)
+    except OSError:
+        pass
 
     # `open <url>` is what agents type when they mean `go` (14 times in ~1,225
     # measured sessions). `open` has no other meaning here, so alias it.

@@ -58,7 +58,7 @@ function readPythonCache() {
 }
 function writePythonCache(python) {
   try {
-    fs.mkdirSync(cdpilotHome(), { recursive: true });
+    fs.mkdirSync(cdpilotHome(), { recursive: true, mode: 0o700 });
     fs.writeFileSync(pythonCachePath(),
       JSON.stringify({ python, key: process.env.CDPILOT_PYTHON || '', at: Date.now() }));
   } catch {}
@@ -471,7 +471,7 @@ function runSetup() {
 
   // Create profile directory
   if (!fs.existsSync(config.profileDir)) {
-    fs.mkdirSync(config.profileDir, { recursive: true });
+    fs.mkdirSync(config.profileDir, { recursive: true, mode: 0o700 });
     console.log(`\n  ✓ Created profile: ${config.profileDir}`);
   } else {
     console.log(`\n  ✓ Profile exists: ${config.profileDir}`);
@@ -548,7 +548,7 @@ function preflight() {
 
   // Mark as done
   const dir = path.dirname(markerFile);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   fs.writeFileSync(markerFile, new Date().toISOString());
 
   console.log('\n  Ready!\n');

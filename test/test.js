@@ -2088,18 +2088,23 @@ test('cmd_cookies save: writes JSON array via Network.getCookies', () => {
 // Local file permissions (T2 audit, 15.11.2026): private data is owner-only, default outputs in /tmp
 // cannot be pre-seeded. Browser-free harness: test/fsperm_check.py <cdpilot.py>.
 {
-  const fsperm = (() => {
-    const { spawnSync } = require('child_process');
-    const r = spawnSync(process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3'), [path.join(__dirname, 'fsperm_check.py'), PY_PATH],
-      { encoding: 'utf-8', timeout: 60000 });
-    try { return JSON.parse(r.stdout.trim().split('\n').pop()); } catch (e) { return { crash: `${r.stdout}${r.stderr}` }; }
-  })();
   const names = {
     home_mode: 'fsperm: a new CDPILOT_HOME is 0700, an existing directory keeps its mode',
     watch_frame: 'fsperm: watch dirs are 0700 and screencast frames are written 0600',
     cookies_export: 'fsperm: cookies save <file> writes the export 0600',
+    cookies_export_existing: 'fsperm: cookies save over an existing 0644 file leaves it 0600',
+    cli_home: 'fsperm: real CLI commands and the MCP server leave a new CDPILOT_HOME and every dir under it 0700',
+    hardlink_output: 'fsperm: output helper refuses a hard-linked file, the linked file stays unchanged',
+    output_call_sites: 'fsperm: shot, shot --annotate, pdf, cookies save, debug, describe, watch write through the output helper',
     output_helper: 'fsperm: shot/pdf output helper refuses a symlink and a foreign file, overwrites our own',
   };
+  const wanted = !ONLY || Object.values(names).some((n) => n.includes(ONLY));
+  const fsperm = !wanted || process.platform === 'win32' ? {} : (() => {
+    const { spawnSync } = require('child_process');
+    const r = spawnSync(process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3'), [path.join(__dirname, 'fsperm_check.py'), PY_PATH],
+      { encoding: 'utf-8', timeout: 240000, env: { ...process.env, CDPILOT_TEST_NODE: process.execPath } });
+    try { return JSON.parse(r.stdout.trim().split('\n').pop()); } catch (e) { return { crash: `${r.stdout}${r.stderr}` }; }
+  })();
   for (const [k, n] of Object.entries(names)) {
     testUnix(n, () => { assert(fsperm[k] === 'ok', fsperm[k] || fsperm.crash || 'no result'); });
   }

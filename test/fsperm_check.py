@@ -1,6 +1,7 @@
 """File-permission checks for cdpilot (no browser). Usage: fsperm_check.py <path to cdpilot.py>.
 Prints one JSON object {scenario: "ok" | "FAIL: ..."}; a crash is reported as FAIL too."""
-import asyncio, contextlib, importlib.util, io, json, os, stat, sys, tempfile, traceback
+import asyncio, contextlib, importlib.util, inspect, io, json, os, re, shutil, stat, subprocess, sys
+import tempfile, traceback
 
 PY = sys.argv[1]
 ROOT = tempfile.mkdtemp(prefix="cdpilot-fsperm-")
@@ -68,6 +69,105 @@ def cookies_export():
     check(mode(out) == 0o600, f"cookie export {oct(mode(out))}")
 
 
+def cookies_export_existing():
+    # an export file that already exists (0644, e.g. from an earlier version) becomes 0600
+    out = os.path.join(ROOT, "cookies-existing.json")
+    with open(out, "w") as fh:
+        fh.write("old content")
+    os.chmod(out, 0o644)
+
+    async def fake_send(ws, cmds, *a, **k):
+        return {1: {"cookies": [{"name": "sid", "value": "secret", "domain": "example.com"}]}}
+
+    mod.get_page_ws = lambda *a, **k: ("ws://fake", None)
+    mod.cdp_send = fake_send
+    with contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(mod.cmd_cookies("save", out))
+    check(json.load(open(out))[0]["name"] == "sid", "export content")
+    check(mode(out) == 0o600, f"existing cookie export file stays {oct(mode(out))}")
+
+
+def cli_home():
+    # Real commands in an empty CDPILOT_HOME (CDPILOT_LOG left on): the home, projects/,
+    # projects/<id>/ and every directory created under the home must be 0700.
+    node = os.environ.get("CDPILOT_TEST_NODE") or shutil.which("node")
+    launcher = os.path.join(os.path.dirname(os.path.abspath(PY)), "..", "bin", "cdpilot.js")
+    init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                  "clientInfo": {"name": "fsperm", "version": "0"}}}) + "\n"
+    runs = [([sys.executable, PY, "proxy", "list"], None),
+            ([sys.executable, PY, "status"], None),
+            ([sys.executable, PY, "tabs"], None),
+            ([sys.executable, PY, "mcp"], init)]
+    if node and os.path.isfile(launcher):
+        runs += [([node, launcher, "proxy", "list"], None),
+                 ([node, launcher, "tabs"], None)]
+    for argv, stdin in runs:
+        home = os.path.join(tempfile.mkdtemp(prefix="cdpilot-fsperm-cli-"), "home")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CDPILOT_LOG", "CDPILOT_PROFILE", "CDPILOT_MCP_SESSION")}
+        env.update(CDPILOT_HOME=home, CDP_PORT="19572", CDPILOT_NO_AUTOLAUNCH="1",
+                   CDPILOT_PROJECT_ID="fsperm-cli", CDPILOT_DAEMON="0",
+                   CDPILOT_PYTHON=sys.executable)
+        r = subprocess.run(argv, input=stdin or "", env=env, capture_output=True, text=True,
+                           timeout=60)
+        label = os.path.basename(argv[0]) + " " + " ".join(argv[2:])
+        projects = os.path.join(home, "projects")
+        ids = os.listdir(projects) if os.path.isdir(projects) else []
+        check(os.path.isdir(home), f"{label}: home not created (exit {r.returncode})")
+        # Python: projects/<id>/ (last-activity, session log). The Node launcher derives
+        # the id from the cwd: there every directory found is checked.
+        check(argv[0] == node or "fsperm-cli" in ids,
+              f"{label}: no projects/fsperm-cli (exit {r.returncode}: {r.stderr[-200:]!r})")
+        for top, dirs, _files in os.walk(home):
+            for d in [top] + [os.path.join(top, x) for x in dirs]:
+                if not os.path.islink(d):
+                    rel = os.path.relpath(d, os.path.dirname(home))
+                    check(mode(d) == 0o700, f"{label}: {rel} is {oct(mode(d))}")
+
+
+def hardlink_output():
+    # A hard link to one of your own files planted at the output path (another local user can
+    # `ln ~you/.zshrc /tmp/shot.png` on one volume) is refused; the linked file stays unchanged.
+    d = os.path.join(ROOT, "hardlink")
+    os.mkdir(d)
+    victim = os.path.join(d, "victim-rc")
+    with open(victim, "w") as fh:
+        fh.write("keep me")
+    link = os.path.join(d, "shot.png")
+    os.link(victim, link)
+    for append in (False, True):
+        try:
+            fh = mod._open_output_fd(link, append=append)
+            fh.close()
+            raise AssertionError(f"hard link accepted (append={append})")
+        except OSError:
+            pass
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            mod._open_output(link)
+        raise AssertionError("hard link accepted by _open_output")
+    except SystemExit as e:
+        check(e.code == 1 and "Cannot write" in err.getvalue() and "hard link" in err.getvalue(),
+              f"exit {e.code} / {err.getvalue()!r}")
+    check(open(victim).read() == "keep me", "hard-linked file was written")
+
+
+def output_call_sites():
+    # Each output writer goes through the helper (and none opens its file with a plain open()).
+    sites = {"cmd_shot": "_open_output(", "cmd_shot_annotated": "_open_output(",
+             "cmd_pdf": "_open_output(", "cmd_cookies": "_open_output(",
+             "cmd_debug": "_open_output(", "cmd_describe": "_open_output(",
+             "_watch_save_state": "_open_output_fd(", "_watch_daemon_run": "_open_output_fd("}
+    plain_write = re.compile(r"(?<![\w.])open\([^)\n]*['\"][wax]b?\+?['\"]")
+    for fn, helper in sites.items():
+        src = inspect.getsource(getattr(mod, fn))
+        check(helper in src, f"{fn} does not write through {helper.rstrip('(')}")
+        m = plain_write.search(src)
+        check(not m, f"{fn} opens a file for writing without the helper: {m and m.group(0)!r}")
+
+
 def output_helper():
     d = os.path.join(ROOT, "shared")
     os.mkdir(d)
@@ -118,13 +218,14 @@ def output_helper():
             os.close(fd)
     except AttributeError:
         pass
-    src = open(PY).read()
-    check(src.count("_open_output(") >= 6, "shot, shot annotated, pdf, cookies, debug, describe use the helper")
 
 
 res = {}
 for name, fn in [("home_mode", home_mode), ("watch_frame", watch_frame),
-                 ("cookies_export", cookies_export), ("output_helper", output_helper)]:
+                 ("cookies_export", cookies_export),
+                 ("cookies_export_existing", cookies_export_existing),
+                 ("cli_home", cli_home), ("hardlink_output", hardlink_output),
+                 ("output_call_sites", output_call_sites), ("output_helper", output_helper)]:
     try:
         fn()
         res[name] = "ok"
