@@ -1600,8 +1600,18 @@ async def _control_end(ws_url):
     except Exception:
         pass
 
+def _vfx_numbers(*vals):
+    """True if every value is a finite int/float. x/y can come from a page or
+    a frame (smart-click's frame search returns a frame's own answer): a
+    string there must never become script source in the top page."""
+    return all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+               for v in vals)
+
+
 async def _vfx_ripple(ws_url, x, y):
     """Show click ripple + move cursor at (x, y)."""
+    if not _vfx_numbers(x, y):
+        return
     js = f"if(window.__cdpilot_vfx){{window.__cdpilot_vfx.moveCursor({x},{y});window.__cdpilot_vfx.ripple({x},{y});}}"
     try:
         await cdp_send(ws_url, [(999, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
@@ -1619,6 +1629,8 @@ async def _vfx_keystroke(ws_url, text):
 
 async def _vfx_move_cursor(ws_url, x, y):
     """Move fake cursor to (x, y)."""
+    if not _vfx_numbers(x, y):
+        return
     js = f"if(window.__cdpilot_vfx){{window.__cdpilot_vfx.moveCursor({x},{y});}}"
     try:
         await cdp_send(ws_url, [(999, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
@@ -8460,9 +8472,12 @@ return {{ hit: false }};
                 f"&&_lev(e.innerText.trim().toLowerCase(),{json.dumps(inp.lower())})<3);}})()")
 
         elif s == "stable-attr":
+            # CSS string escape (\ and "), then the whole selector as one JSON
+            # value: a quote in the input can never end a JS string literal.
+            inp_css = inp.replace('\\', '\\\\').replace('"', '\\"')
             for attr in ["data-testid", "data-cy", "name", "id"]:
-                inp_safe = inp.replace('"', '\\"')
-                if await _inject(f'document.querySelector(\'[{attr}="{inp_safe}"]\')'):
+                attr_sel = '[' + attr + '="' + inp_css + '"]'
+                if await _inject(f"document.querySelector({json.dumps(attr_sel)})"):
                     hit = True
                     break
 
@@ -15050,13 +15065,16 @@ async def cmd_extract(selector, output_format="text"):
         """
     elif output_format.startswith("attrs="):
         attr_names = output_format.split("=", 1)[1].split(",")
-        attrs_js = ",".join(f'"{a}": el.getAttribute("{a}")' for a in attr_names)
+        # The names travel as one JSON array (data), never as JS source.
         js = f"""
         (function() {{
+          var names = {json.dumps(attr_names)};
           var els = document.querySelectorAll({safe_sel});
           if (!els.length) return JSON.stringify([]);
           return JSON.stringify(Array.from(els).slice(0, 100).map(function(el) {{
-            return {{ {attrs_js} }};
+            var row = {{}};
+            names.forEach(function(n) {{ row[n] = el.getAttribute(n); }});
+            return row;
           }}));
         }})()
         """
@@ -16200,11 +16218,14 @@ async def cmd_assert_count(selector, expected_count):
     ws_url, _ = get_page_ws()
     safe_sel = json.dumps(selector)
     exp = int(expected_count)
+    # The selector is one JSON value (a JS variable), never pasted inside a
+    # quoted JS string: `[a="'+(...)+'"]` is valid CSS and must stay data.
     js = f"""(function() {{
-      var count = document.querySelectorAll({safe_sel}).length;
+      var sel = {safe_sel};
+      var count = document.querySelectorAll(sel).length;
       var exp = {exp};
-      if (count === exp) return 'PASS: Found ' + count + ' element(s) matching {safe_sel} (expected ' + exp + ')';
-      return 'FAIL: Expected ' + exp + ' \"{selector}\" but found ' + count;
+      if (count === exp) return 'PASS: Found ' + count + ' element(s) matching "' + sel + '" (expected ' + exp + ')';
+      return 'FAIL: Expected ' + exp + ' "' + sel + '" but found ' + count;
     }})()"""
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
     result = r.get(1, {}).get("result", {}).get("value", "ERROR")
@@ -22185,7 +22206,8 @@ class MCPServer:
             "browser_fill": lambda a: ["fill", a.get("selector", ""), a.get("value", "")],
             "browser_launch": lambda a: ["launch"],
             "browser_close": lambda a: ["close"] + (["--force"] if a.get("force") else []) + (["--keep"] if a.get("keep_browser") else []),
-            "browser_extract": lambda a: ["extract", a.get("selector", "")] + ([f"--{a['format']}"] if a.get("format") and a["format"] != "text" else []),
+            # Only the inputSchema enum: any other format (e.g. attrs=...) is not passed on.
+            "browser_extract": lambda a: ["extract", a.get("selector", "")] + ([f"--{a['format']}"] if a.get("format") in ("json", "list") else []),
             "browser_observe": lambda a: ["observe"],
             "browser_agent_observe": lambda a: ["agent", "observe"] + (["--diff"] if a.get("diff") else [])
             + (["--frame", str(a["frame"])] if isinstance(a.get("frame"), int) else [])

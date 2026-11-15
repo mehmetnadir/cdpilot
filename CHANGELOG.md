@@ -4,6 +4,12 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- **`assert-count` keeps the selector as data.** A selector with a quote (for example `[a="'+(...)+'"]`, valid CSS) could end the JS string of the PASS/FAIL message and run script in the page, also from a replayed flow. The message text is unchanged for normal selectors.
+- **The selector ladder's stable-attribute step (`data-testid`, `data-cy`, `name`, `id`) passes the value as one CSS string.** A quote in a `click` / `fill` / `type` / `hover` / `submit` target can no longer run script in the page; a backslash or quote in the value now matches the attribute literally.
+- **`extract --attrs=` passes the attribute names as data**, and the MCP `browser_extract` tool passes on only the formats its schema lists (`json`, `list`; anything else is plain text).
+- **The visual-feedback cursor takes numbers only.** smart-click's frame search returns a frame's own answer; a cross-origin frame could put script in the reported position and have it run in the top page.
+
 ### Changed
 - **`blog publish` / `blog regenerate` read their output folder from `CDPILOT_BLOG_DIR`.** The folder was a hard-coded maintainer path; without the variable both commands now exit 2 with a message and write nothing. `day-NNN` sources are looked up in `CDPILOT_BLOG_PLAN_DIR` (default: the current directory). Maintainer notes, social-media drafts and the X bot are no longer in the repository.
 
