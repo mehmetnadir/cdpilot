@@ -12115,6 +12115,146 @@ print(json.dumps(out))
     } finally { fake.stop(); }
   });
 
+  // ── Over MCP a CDPILOT_VAR_<NAME> value needs the operator's opt-in (2026-11-15 review) ──
+  // `agent run` fills {{name}} from CDPILOT_VAR_<NAME>, "a value the model never saw"; over MCP
+  // the model that ran the flow could read the typed field back (browser_eval, assert-value
+  // "but got", a screenshot) and send it on. MCP commands get no CDPILOT_VAR_* value unless
+  // the server runs with CDPILOT_MCP_ALLOW_VARS=1 — child process and warm run alike; the CLI
+  // is unchanged.
+  const VARS_PLANTED = 'zq-mcp-planted-7741';
+  function varsFlow(home) {
+    const flowPath = path.join(home, 'projects', 'proj', 'flows', 'login.json');
+    fs.mkdirSync(path.dirname(flowPath), { recursive: true });
+    const rec = { host: 'user.example', origin: 'https://user.example' };
+    fs.writeFileSync(flowPath, JSON.stringify({
+      version: 1, name: 'login', host: 'user.example', vars: { token: { step: 2 } },
+      steps: [
+        { n: 1, kind: 'go', url: 'https://user.example/inbox' },
+        { n: 2, kind: 'act', action: 'fill', anchor: { role: 'textbox', name: 'Password', nth: 0 }, text: '{{token}}',
+          before: rec, after: { host: 'user.example' } },
+      ],
+    }));
+  }
+  const varsEnv = (home, port, extra) => {
+    const env = isoEnv(home, port, 'proj', { CDPILOT_WEBMCP: '0', CDPILOT_MCP_TOOLS: '' });
+    for (const k of Object.keys(env)) if (k.toUpperCase().startsWith('CDPILOT_VAR_') || k === 'CDPILOT_MCP_ALLOW_VARS') delete env[k];
+    return { ...env, CDPILOT_VAR_TOKEN: VARS_PLANTED, CDPILOT_VAR_HOSTS: 'user.example', ...extra };
+  };
+
+  test('mcp vars gate: browser_agent_run gets no CDPILOT_VAR_* value without CDPILOT_MCP_ALLOW_VARS=1 — refused with the hint, the value in no response and no browser call; with the opt-in it runs (fake browser)', () => {
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_WATCH: VARS_PLANTED });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      varsFlow(home);
+      const mcp = (allow) => {
+        const input = [{ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+          { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'browser_agent_run', arguments: { flow: 'login' } } }]
+          .map((m) => JSON.stringify(m)).join('\n') + '\n';
+        const r = spawnSync(process.execPath, [CLI, 'mcp'], { input, encoding: 'utf-8', timeout: 90000,
+          env: varsEnv(home, fake.port, { CDPILOT_DAEMON: '', CDPILOT_MCP_ALLOW_VARS: allow }) });
+        assert.strictEqual(r.status, 0, r.stderr);
+        const res = r.stdout.trim().split('\n').map((l) => JSON.parse(l)).find((m) => m.id === 10);
+        return { out: r.stdout, res, text: res.result.content.map((c) => c.text).join('\n') };
+      };
+      const off = mcp('');
+      assert.strictEqual(off.res.result.isError, true, `ran without the opt-in: ${off.text}`);
+      assert(/missing variables/.test(off.text) && /"token"/.test(off.text) && off.text.includes('CDPILOT_MCP_ALLOW_VARS=1'),
+        off.text);
+      assert(!off.out.includes(VARS_PLANTED), `the value reached an MCP response: ${off.out}`);
+      assert(!fake.entries().some((e) => e.watch), 'the value reached the browser');
+      assert(!fake.methods().includes('Page.navigate'), 'refused before the first step');
+      const on = mcp('1');
+      assert.strictEqual(on.res.result.isError, false, on.text);
+      assert.strictEqual(JSON.parse(on.res.result.content.find((c) => c.text.trim().startsWith('{')).text).status, 'ok', on.text);
+      const carried = fake.entries().filter((e) => e.watch);
+      assert(carried.length === 1 && carried[0].method === 'Runtime.callFunctionOn',
+        `with the opt-in the value is typed in one call: ${JSON.stringify(carried)}`);
+    } finally { fake.stop(); }
+  });
+
+  test('mcp vars gate: warm (CDPILOT_DAEMON=1) — browser_agent_run in the server process gets no CDPILOT_VAR_* value either; with the opt-in it runs (fake browser)', () => {
+    if (process.platform === 'win32') return;
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_WATCH: VARS_PLANTED });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      varsFlow(home);
+      const env = varsEnv(home, fake.port, { CDPILOT_DAEMON: '1' });
+      const script = `
+import importlib.util, json, os, subprocess, sys
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+spawned, real_run = [], subprocess.run
+def no_spawn(argv, **kw):
+    if isinstance(argv, (list, tuple)) and len(argv) > 1 and argv[1] == mod.__file__:
+        spawned.append(list(argv[2:]))
+        raise RuntimeError("spawned")
+    return real_run(argv, **kw)
+subprocess.run = no_spawn
+srv = mod.MCPServer(None)
+out = {"off": srv._execute_tool(1, "browser_agent_run", {"flow": "login"})}
+os.environ["CDPILOT_MCP_ALLOW_VARS"] = "1"
+out["on"] = srv._execute_tool(2, "browser_agent_run", {"flow": "login"})
+out["spawned"] = spawned
+out["served"] = mod._DAEMON["served"]
+print(json.dumps(out))
+`;
+      const probe = cli(['record', 'status'], env);
+      assert.strictEqual(probe.status, 0, probe.stderr);
+      const PYB = JSON.parse(fs.readFileSync(path.join(home, 'python.json'), 'utf-8')).python;
+      const r = spawnSync(PYB, ['-c', script], { encoding: 'utf-8', timeout: 60000, env });
+      assert.strictEqual(r.status, 0, r.stderr);
+      const o = JSON.parse(r.stdout.trim().split('\n').pop());
+      const text = (res) => res.result.content.map((c) => c.text).join('\n');
+      assert.deepStrictEqual([o.spawned, o.served], [[], 2], 'both calls ran in the server process');
+      assert.strictEqual(o.off.result.isError, true, `ran without the opt-in: ${text(o.off)}`);
+      assert(/missing variables/.test(text(o.off)) && text(o.off).includes('CDPILOT_MCP_ALLOW_VARS=1'), text(o.off));
+      assert(!JSON.stringify(o.off).includes(VARS_PLANTED), 'the value reached the response');
+      assert.strictEqual(o.on.result.isError, false, text(o.on));
+      const carried = fake.entries().filter((e) => e.watch);
+      assert(carried.length === 1 && carried[0].method === 'Runtime.callFunctionOn', JSON.stringify(carried));
+    } finally { fake.stop(); }
+  });
+
+  test('mcp vars gate: _env_var_value reads CDPILOT_VAR_<NAME> in the CLI, never in an MCP session without CDPILOT_MCP_ALLOW_VARS=1; MCP children get no CDPILOT_VAR_* but CDPILOT_VAR_HOSTS', () => {
+    const home = mkHome();
+    const script = `
+import importlib.util, json, os, subprocess
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+out = {"cli": [mod._env_var_value("token"), mod._env_var_values()]}
+os.environ["CDPILOT_MCP_SESSION"] = "1"
+out["mcp"] = [mod._env_var_value("token"), mod._env_var_values()]
+os.environ["CDPILOT_MCP_ALLOW_VARS"] = "1"
+out["mcp_allow"] = mod._env_var_value("TOKEN")
+del os.environ["CDPILOT_MCP_SESSION"], os.environ["CDPILOT_MCP_ALLOW_VARS"]
+mod.IS_MCP_SESSION = True  # the MCP server's own process (MCPServer.__init__), no marker in its environment
+out["server"] = mod._env_var_value("TOKEN")
+mod.IS_MCP_SESSION = False
+seen = []
+def fake_run(argv, **kw):
+    seen.append(sorted(k for k in kw["env"] if k.upper().startswith("CDPILOT_VAR_")))
+    return subprocess.CompletedProcess(argv, 0, "ok", "")
+subprocess.run = fake_run
+srv = mod.MCPServer(None)
+srv._execute_tool(1, "browser_tabs", {})
+os.environ["CDPILOT_MCP_ALLOW_VARS"] = "1"
+srv._execute_tool(2, "browser_tabs", {})
+out["children"] = seen
+print(json.dumps(out))
+`;
+    const env = varsEnv(home, freePort(), { CDPILOT_DAEMON: '' });
+    const r = spawnSync(PY_BIN, ['-c', script], { encoding: 'utf-8', timeout: 60000, env });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const o = JSON.parse(r.stdout.trim().split('\n').pop());
+    assert.deepStrictEqual(o.cli, [VARS_PLANTED, { TOKEN: VARS_PLANTED }], 'the CLI reads the value as before');
+    assert.deepStrictEqual(o.mcp, [null, {}], 'an MCP command reads none');
+    assert.strictEqual(o.mcp_allow, VARS_PLANTED, 'CDPILOT_MCP_ALLOW_VARS=1 opts in');
+    assert.strictEqual(o.server, null, 'the MCP server process reads none (the warm path)');
+    assert.deepStrictEqual(o.children, [['CDPILOT_VAR_HOSTS'], ['CDPILOT_VAR_HOSTS', 'CDPILOT_VAR_TOKEN']], JSON.stringify(o.children));
+  });
+
   // ── eval: a missing or failed browser reply is an error, not `{}` (11.11, cdpilot-site smoke) ──
 
   test('eval reply (fake browser): a CDP error reply exits 1 with the reason; a real {} value still prints {}', () => {
@@ -16994,6 +17134,22 @@ print(json.dumps(res))
       varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED }));
     assert.strictEqual(r.status, 2, r.stderr);
     assert.strictEqual(r.stdout, '');
+    noSecret(r);
+  });
+
+  test('replay: env var — in an MCP session (CDPILOT_MCP_SESSION=1) a CDPILOT_VAR value is missing unless CDPILOT_MCP_ALLOW_VARS=1, with the hint', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envmcp-'));
+    const flowPath = writeFlow(home, [{ cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 0 }]);
+    const base = { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com', CDPILOT_MCP_SESSION: '1' };
+    let r = runCli(['replay', flowPath, '--dry-run'], varEnv(home, { ...base, CDPILOT_MCP_ALLOW_VARS: '' }));
+    assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+    assert.strictEqual(r.stdout, '');
+    const e = errJson(r);
+    assert.deepStrictEqual(e.missing, ['password'], JSON.stringify(e));
+    assert(e.hint.includes('CDPILOT_MCP_ALLOW_VARS=1'), e.hint);
+    noSecret(r);
+    r = runCli(['replay', flowPath, '--dry-run'], varEnv(home, { ...base, CDPILOT_MCP_ALLOW_VARS: '1' }));
+    assert.strictEqual(r.status, 0, r.stderr);
     noSecret(r);
   });
 
