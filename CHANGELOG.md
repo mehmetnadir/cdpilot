@@ -4,6 +4,11 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- **MCP tools open only http, https and about:blank URLs.** `browser_navigate`, and the `url` argument of `browser_console`, `browser_network`, `browser_agent_act` and `browser_watch_start`, refuse `file:`, `chrome:`, `javascript:`, `data:` and other schemes with an error and a hint, so a model steered by page text cannot open local files and read them back. Set `CDPILOT_MCP_ALLOW_FILE=1` for the MCP server to allow `file:` as well. The CLI (`cdpilot go`) still opens any URL.
+- **`serve --api` refuses requests from web pages.** A request whose `Host` is not `127.0.0.1`, `localhost` or `[::1]` with the server's port (DNS rebinding), with a non-loopback `Origin`, or with `Sec-Fetch-Site: cross-site` gets 403. A POST must send `Content-Type: application/json` (otherwise 415), also a bodyless `POST /v1/sessions/{id}/release`. No token is required.
+- **The trace viewer (`trace open`) serves only files inside the run's folder** (a sibling folder whose name starts with the run id was reachable) and refuses a non-loopback `Host` with 403.
+
 ### Changed
 - **`blog publish` / `blog regenerate` read their output folder from `CDPILOT_BLOG_DIR`.** The folder was a hard-coded maintainer path; without the variable both commands now exit 2 with a message and write nothing. `day-NNN` sources are looked up in `CDPILOT_BLOG_PLAN_DIR` (default: the current directory). Maintainer notes, social-media drafts and the X bot are no longer in the repository.
 

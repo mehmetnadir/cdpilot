@@ -2672,6 +2672,103 @@ test('Browserbase session dict shape contains required fields', () => {
   fs.rmSync(apiTestHome, { recursive: true, force: true });
 })();
 
+// ── serve --api loopback guard (DNS rebinding, cross-site requests) ──
+// The API binds 127.0.0.1, but a web page can still reach it: by DNS
+// rebinding (the Host header carries the attacker's name) or by a plain
+// cross-site request. BrowserbaseHandler runs in-process on 127.0.0.1:0
+// (TEST_MODE: no browser) and each case reports its HTTP status.
+(function() {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const HARNESS = `
+import importlib.util, json, sys, threading, http.client
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+srv = m.ThreadingHTTPServer(("127.0.0.1", 0), m.BrowserbaseHandler)
+port = srv.server_address[1]
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+def req(method, path, headers=None, body=None, host=True):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    h = {"Host": f"127.0.0.1:{port}"} if host else {}
+    h.update({k: v.replace("PORT", str(port)) for k, v in (headers or {}).items()})
+    if host:
+        c.request(method, path, body=body, headers=h)
+    else:
+        c.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+        c.endheaders()
+    r = c.getresponse()
+    r.read()
+    c.close()
+    return r.status
+J = {"Content-Type": "application/json"}
+print(json.dumps({
+    "loopback_get": req("GET", "/healthz"),
+    "localhost_get": req("GET", "/healthz", {"Host": "localhost:PORT"}),
+    "ipv6_get": req("GET", "/healthz", {"Host": "[::1]:PORT"}),
+    "loopback_origin": req("GET", "/v1/sessions", {"Origin": "http://localhost:PORT"}),
+    "fetch_site_none": req("GET", "/v1/sessions", {"Sec-Fetch-Site": "none"}),
+    "evil_host": req("GET", "/v1/sessions", {"Host": "evil.example:PORT"}),
+    "evil_host_noport": req("GET", "/healthz", {"Host": "evil.example"}),
+    "wrong_port": req("GET", "/healthz", {"Host": "127.0.0.1:1"}),
+    "no_host": req("GET", "/healthz", host=False),
+    "evil_origin": req("GET", "/v1/sessions", {"Origin": "http://evil.example"}),
+    "null_origin": req("GET", "/v1/sessions", {"Origin": "null"}),
+    "cross_site": req("GET", "/v1/sessions", {"Sec-Fetch-Site": "cross-site"}),
+    "post_evil_origin": req("POST", "/v1/sessions", dict(J, Origin="http://evil.example"), "{}"),
+    "delete_evil_host": req("DELETE", "/v1/sessions/sess_x", {"Host": "evil.example:PORT"}),
+    "post_no_ct": req("POST", "/v1/sessions", {}, "{}"),
+    "post_text": req("POST", "/v1/sessions", {"Content-Type": "text/plain"}, "{}"),
+    "post_form": req("POST", "/v1/sessions", {"Content-Type": "application/x-www-form-urlencoded"}, "a=1"),
+    "release_no_ct": req("POST", "/v1/sessions/sess_x/release"),
+    "post_json": req("POST", "/v1/sessions", J, "{}"),
+    "release_json_charset": req("POST", "/v1/sessions/sess_x/release",
+                                {"Content-Type": "application/json; charset=utf-8"}, "{}"),
+    "delete_loopback": req("DELETE", "/v1/sessions/sess_x"),
+}))
+`;
+  let res = null;
+  function results() {
+    if (res) return res;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-api-guard-'));
+    try {
+      const r = spawnSync(PYB, ['-c', HARNESS, PY_PATH], {
+        encoding: 'utf-8', timeout: 20000,
+        env: { ...process.env, CDPILOT_HOME: home, CDPILOT_API_TEST_MODE: '1', CDP_PORT: '19222',
+               CDPILOT_NO_AUTOLAUNCH: '1', CDPILOT_LOG: '0' },
+      });
+      assert.strictEqual(r.status, 0, r.stderr);
+      res = JSON.parse(r.stdout.trim().split('\n').pop());
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+    return res;
+  }
+  const expect = (cases, code) => {
+    const got = results();
+    for (const c of cases) assert.strictEqual(got[c], code, `${c}: HTTP ${got[c]}, want ${code}`);
+  };
+
+  test('serve api loopback guard: a DNS-rebinding Host (not loopback:port) gets 403', () => {
+    expect(['evil_host', 'evil_host_noport', 'wrong_port', 'no_host', 'delete_evil_host'], 403);
+  });
+
+  test('serve api loopback guard: a cross-site Origin or Sec-Fetch-Site gets 403', () => {
+    expect(['evil_origin', 'null_origin', 'cross_site', 'post_evil_origin'], 403);
+  });
+
+  test('serve api loopback guard: a POST without Content-Type application/json gets 415', () => {
+    expect(['post_no_ct', 'post_text', 'post_form', 'release_no_ct'], 415);
+  });
+
+  test('serve api loopback guard: loopback Host, loopback Origin and JSON POST still work', () => {
+    expect(['loopback_get', 'localhost_get', 'ipv6_get', 'loopback_origin', 'fetch_site_none'], 200);
+    expect(['post_json'], 201);
+    expect(['release_json_charset', 'delete_loopback'], 404);  // passed the guard, no such session
+  });
+})();
+
 // ── Port registry cleanup regression (vaat-denetimi-2026-09-27) ──
 // _allocate_port() used to trust every registry entry forever, even ones
 // whose port was long dead (browser closed, process exited, machine
@@ -3075,6 +3172,97 @@ test('test runner: cmd_trace_list defined in cdpilot.py', () => {
 test('test runner: cmd_trace_open defined in cdpilot.py', () => {
   assert(PY_CONTENT.includes('def cmd_trace_open('), 'Should define cmd_trace_open');
 });
+
+// trace viewer: cmd_trace_open's server runs in-process on 127.0.0.1:0 over a
+// throwaway CDPILOT_HOME (ThreadingHTTPServer swapped for a subclass that
+// keeps the instance, to read the port). A sibling dir `<run>-x` shares the
+// run dir's string prefix; a raw `/../` path must not reach it.
+(function() {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const HARNESS = `
+import importlib.util, json, os, sys, threading, time, http.client
+home = os.path.realpath(os.environ["CDPILOT_HOME"])
+with open(os.path.join(home, "cwdfile.txt"), "w") as fh:  # the server's cwd is home
+    fh.write("x")
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+if not os.path.realpath(m.TRACES_DIR).startswith(home + os.sep):
+    sys.exit("TRACES_DIR is outside the test home")
+for d, f, text in (("run1", "meta.json", '{"passed": 1, "failed": 0}'), ("run1-x", "secret.txt", "TOPSECRET")):
+    os.makedirs(os.path.join(m.TRACES_DIR, d), exist_ok=True)
+    with open(os.path.join(m.TRACES_DIR, d, f), "w") as fh:
+        fh.write(text)
+servers = []
+class Keep(m.ThreadingHTTPServer):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        servers.append(self)
+m.ThreadingHTTPServer = Keep
+threading.Thread(target=m.cmd_trace_open, args=("run1", 0), daemon=True).start()
+end = time.time() + 5
+while not servers and time.time() < end:
+    time.sleep(0.02)
+port = servers[0].server_address[1]
+def get(path, host=None, method="GET"):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request(method, path, headers={"Host": host or f"127.0.0.1:{port}"})
+    r = c.getresponse()
+    body = r.read().decode("utf-8", "replace")
+    c.close()
+    return {"status": r.status, "secret": "TOPSECRET" in body, "meta": '"passed"' in body}
+print(json.dumps({
+    "inside": get("/meta.json"),
+    "viewer": get("/"),
+    "sibling": get("/../run1-x/secret.txt"),
+    "evil_host": get("/meta.json", f"evil.example:{port}"),
+    "evil_host_viewer": get("/", "evil.example"),
+    "head_cwd": get("/cwdfile.txt", method="HEAD"),
+}))
+`;
+  let res = null;
+  function results() {
+    if (res) return res;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-trace-guard-'));
+    try {
+      const r = spawnSync(PYB, ['-c', HARNESS, PY_PATH], {
+        encoding: 'utf-8', timeout: 20000, cwd: home,
+        env: { ...process.env, CDPILOT_HOME: home, CDPILOT_NO_AUTOLAUNCH: '1', CDPILOT_LOG: '0' },
+      });
+      assert.strictEqual(r.status, 0, r.stderr);
+      res = JSON.parse(r.stdout.trim().split('\n').pop());
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+    return res;
+  }
+
+  test('trace viewer: a sibling dir sharing the run name prefix is not served', () => {
+    const { sibling } = results();
+    assert(!sibling.secret, `served a file outside the run dir (HTTP ${sibling.status})`);
+    assert.strictEqual(sibling.status, 403);
+  });
+
+  test('trace viewer: a file inside the run dir and the viewer page are served', () => {
+    const { inside, viewer } = results();
+    assert.strictEqual(inside.status, 200);
+    assert(inside.meta, 'meta.json body');
+    assert.strictEqual(viewer.status, 200);
+  });
+
+  test('trace viewer: a non-loopback Host (DNS rebinding) gets 403', () => {
+    const { evil_host, evil_host_viewer } = results();
+    assert.strictEqual(evil_host.status, 403);
+    assert(!evil_host.meta, 'trace data must not be served to a foreign Host');
+    assert.strictEqual(evil_host_viewer.status, 403);
+  });
+
+  test('trace viewer: HEAD does not answer for files of the current directory', () => {
+    assert.strictEqual(results().head_cwd.status, 405);
+  });
+})();
 
 test('test runner: cmd_trace_clean defined in cdpilot.py', () => {
   assert(PY_CONTENT.includes('def cmd_trace_clean('), 'Should define cmd_trace_clean');
@@ -14509,6 +14697,46 @@ test('mcp profile: calling a tool outside the profile returns the enable hint', 
   const r = byId(msgs, 3).result;
   assert.strictEqual(r.isError, true);
   assert.strictEqual(r.content[0].text, 'tool not enabled; call browser_tools enable');
+});
+
+// MCP URL schemes: a model steered by page text must not open file:, chrome:,
+// javascript: or data: and read the result back through content/screenshot.
+// CDP_PORT=1 and CDPILOT_NO_AUTOLAUNCH=1: a URL that passes the check fails
+// with "no browser", nothing launches and nothing navigates.
+const mcpUrlCall = (id, name, url) => ({ jsonrpc: '2.0', id, method: 'tools/call',
+  params: { name, arguments: { url } } });
+const MCP_NO_BROWSER = { CDP_PORT: '1', CDPILOT_NO_AUTOLAUNCH: '1', CDPILOT_DAEMON: '',
+  CDPILOT_MCP_ALLOW_FILE: '' };
+const mcpRefused = (msg) => msg.result.isError === true
+  && msg.result.content.some((c) => c.text.includes('CDPILOT_MCP_ALLOW_FILE'));
+
+test('mcp url scheme: browser_navigate refuses file:, javascript:, data:, chrome: and disguised forms', () => {
+  const urls = ['file:///etc/hosts', 'javascript:alert(1)', 'data:text/html,<h1>x</h1>',
+    'chrome://settings', ' FILE:///etc/hosts', 'fi\tle:///etc/hosts', 'view-source:file:///etc/hosts',
+    'etc/hosts'];
+  const msgs = mcpSession([], MCP_NO_BROWSER, urls.map((u, i) => mcpUrlCall(10 + i, 'browser_navigate', u)));
+  urls.forEach((u, i) => {
+    const m = byId(msgs, 10 + i);
+    assert(mcpRefused(m), `${JSON.stringify(u)} not refused: ${JSON.stringify(m.result)}`);
+  });
+});
+
+test('mcp url scheme: every MCP tool that navigates refuses file: (watch_start, console, network, agent_act)', () => {
+  const tools = ['browser_watch_start', 'browser_console', 'browser_network', 'browser_agent_act'];
+  const msgs = mcpSession([], MCP_NO_BROWSER, tools.map((t, i) => mcpUrlCall(10 + i, t, 'file:///etc/hosts')));
+  tools.forEach((t, i) => assert(mcpRefused(byId(msgs, 10 + i)), `${t} not refused`));
+});
+
+test('mcp url scheme: http(s) and about:blank pass the check; CDPILOT_MCP_ALLOW_FILE=1 adds file: only', () => {
+  const ok = ['http://127.0.0.1:1/', 'HTTPS://127.0.0.1:1/', 'about:blank'];
+  let msgs = mcpSession([], MCP_NO_BROWSER, ok.map((u, i) => mcpUrlCall(10 + i, 'browser_navigate', u)));
+  ok.forEach((u, i) => assert(!mcpRefused(byId(msgs, 10 + i)), `${u} refused`));
+  msgs = mcpSession([], { ...MCP_NO_BROWSER, CDPILOT_MCP_ALLOW_FILE: '1' }, [
+    mcpUrlCall(10, 'browser_navigate', 'file:///etc/hosts'),
+    mcpUrlCall(11, 'browser_navigate', 'javascript:alert(1)'),
+  ]);
+  assert(!mcpRefused(byId(msgs, 10)), 'file: refused although CDPILOT_MCP_ALLOW_FILE=1');
+  assert(mcpRefused(byId(msgs, 11)), 'javascript: allowed by CDPILOT_MCP_ALLOW_FILE=1');
 });
 
 // ── HAR Export Tests ──
