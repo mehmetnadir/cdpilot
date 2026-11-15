@@ -127,7 +127,7 @@ Exit codes: 0 ok, 1 error (batch / run: a step failed), 124 --timeout;
   4 agent run: drift (page observation on stdout).
 """
 
-__version__ = "0.9.9"
+__version__ = "0.9.10"
 
 import asyncio
 import struct

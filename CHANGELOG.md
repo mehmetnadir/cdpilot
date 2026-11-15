@@ -2,7 +2,7 @@
 
 All notable changes to cdpilot will be documented in this file.
 
-## [Unreleased]
+## [0.9.10] - 2026-11-15
 
 ### Added
 - **`agent act --type/--fill` works on `agent observe --frame` refs:** types or fills text inside an iframe (in the frame's own session, both out-of-process and same-process; non-editable targets and detached/navigated frames are refused; not in the flow trail). Placeholders (`{{name}}`) are refused before browser interaction, matching main `agent act`.
