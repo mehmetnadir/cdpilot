@@ -5964,7 +5964,7 @@ print(json.dumps([run(k, a) for k, a in json.load(sys.stdin)]))
   test('frames: URL text names a frame by host or path of its http(s) URL, never by its query or fragment', () => {
     // The page sets a frame's query and fragment: <iframe src="/pixel?js.stripe.com"> or
     // about:blank#js.stripe.com must not take the value meant for the Stripe card frame.
-    const src = 'import re as _re, urllib.parse\n' + pyFuncs(['_frame_url_text_match']) + `
+    const src = 'import re as _re, urllib.parse\n' + pyFuncs(['_frame_url_text_host', '_frame_url_text_match']) + `
 import json, sys
 print(json.dumps([_frame_url_text_match(u, v) for u, v in json.load(sys.stdin)]))
 `;
@@ -5990,6 +5990,8 @@ print(json.dumps([_frame_url_text_match(u, v) for u, v in json.load(sys.stdin)])
       [['https://xn--bcher-kva.example/', 'xn--bcher-kva.example'], true],
       [['http://127.0.0.1:8762/form', '127.0.0.1:8762'], true],
       [['http://127.0.0.1:8763/form', '127.0.0.1:8762'], false],
+      [['http://localhost:8762/form', 'localhost:8762'], true],
+      [['http://[::1]:8080/x', '[::1]:8080'], true],
       [['https://pay.example/', 'pay.example:443'], true],
       [['https://pay.example:8443/', 'pay.example'], true],
       [['http://a.test/inner.html', 'inner.html'], false],
@@ -6007,8 +6009,6 @@ print(json.dumps([_frame_url_text_match(u, v) for u, v in json.load(sys.stdin)])
       [['https://shop.example/beacon?next=/v3/elements', '/v3/elements'], false],
       [['https://shop.example/x#/v3/elements', '/v3/elements'], false],
       [['http://a.test/inner.html', '/inner.html'], true],
-      [['http://localhost:8762/form', 'localhost:8762'], true],
-      [['http://[::1]:8080/x', '[::1]:8080'], true],
       [['https://shop.example/pixel?js.stripe.com', 'pixel?js'], false],
       [['https://shop.example/pixel', 'pixel'], true],
       [['https://shop.example:99999/', 'shop'], false],
@@ -6018,18 +6018,55 @@ print(json.dumps([_frame_url_text_match(u, v) for u, v in json.load(sys.stdin)])
   });
 
   test('frames: a --frame value that names a host is URL text first (selectors with # [ space never are)', () => {
-    const src = 'import re as _re\n' + pyFuncs(['_frame_url_text_names_host']) + `
+    const src = 'import re as _re\n' + pyFuncs(['_frame_url_text_host', '_frame_url_text_names_host']) + `
 import json, sys
 print(json.dumps([_frame_url_text_names_host(v) for v in json.load(sys.stdin)]))
 `;
     const cases = [
       ['js.stripe.com', true], ['stripe.com/v3', true], ['https://js.stripe.com/v3', true],
       ['127.0.0.1:8762', true], ['iframe.card', true], ['#card', false], ['iframe#card', false],
-      ['card-frame', false], ['/pay.html', false], ['localhost:8762', false], ['0', false],
+      ['card-frame', false], ['/pay.html', false], ['localhost:8762', true], ['0', false],
       ["iframe[title='a.b']", false], ['div.box > iframe', false], ['js.stripe.com?x', false],
     ];
     const got = pyCases(src, cases);
     cases.forEach((c, i) => assert.strictEqual(got[i], c[1], c[0]));
+  });
+
+  test('frames: localhost[:port] and an IPv6 literal [..][:port] name a host — a path decoy (https://evil.test/[::1]:8762) no longer matches', () => {
+    // These values have no dot: they matched as a substring of scheme://host[:port]/path, so a
+    // frame the page made with the text in its path took the value meant for the local frame.
+    const match = [
+      [['https://evil.test/[::1]:8762', '[::1]:8762'], false],
+      [['https://evil.test/localhost:8762', 'localhost:8762'], false],
+      [['https://evil.test/x/localhost', 'localhost'], false],
+      [['https://localhost.evil.test/', 'localhost'], false],
+      [['https://evil.test/[::1]:8762/card', '[::1]:8762/card'], false],
+      [['https://evil.test/127.0.0.1:8762', '127.0.0.1:8762'], false],
+      [['http://localhost:8762/form', 'localhost:8762'], true],
+      [['http://localhost:8762/form', 'Localhost:8762'], true],
+      [['http://app.localhost:8762/', 'localhost:8762'], true],
+      [['http://localhost/form', 'localhost'], true],
+      [['http://localhost:8763/form', 'localhost:8762'], false],
+      [['http://127.0.0.1:8762/form', 'localhost:8762'], false],
+      [['http://[::1]:8762/x', '[::1]:8762'], true],
+      [['http://[::1]:8762/x', '[0:0:0:0:0:0:0:1]:8762'], true],
+      [['http://[::1]:8762/card/x', '[::1]:8762/card'], true],
+      [['http://[::1]:8763/x', '[::1]:8762'], false],
+      [['http://[::2]:8762/x', '[::1]:8762'], false],
+      [['http://127.0.0.1:8762/x', '[::1]:8762'], false],
+    ];
+    const hosts = [['localhost', true], ['localhost:8762', true], ['LOCALHOST:8762', true], ['[::1]', true],
+      ['[::1]:8762', true], ['[2001:db8::1]:443/v3', true], ['127.0.0.1:8762', true],
+      ['[name]', false], ['[data-x]:hover', false], ['[a:b]', false], ['localhost-card', false],
+      ['iframe#localhost', false]];
+    const data = JSON.stringify({ match: match.map((c) => c[0]), hosts: hosts.map((c) => c[0]) });
+    const r = secPy(secHome(), `d = json.loads(${JSON.stringify(data)})
+print(json.dumps({"match": [m._frame_url_text_match(u, v) for u, v in d["match"]],
+                  "hosts": [m._frame_url_text_names_host(v) for v in d["hosts"]]}))`);
+    const out = JSON.parse((r.stdout || '').trim().split('\n').pop() || 'null');
+    assert(out, r.stdout + r.stderr);
+    match.forEach((c, i) => assert.strictEqual(out.match[i], c[1], JSON.stringify(c[0])));
+    hosts.forEach((c, i) => assert.strictEqual(out.hosts[i], c[1], c[0]));
   });
 
   test('frames: rewrite sends Runtime/DOM into the frame and maps mouse x/y by the frame scale and offset', () => {
@@ -6188,14 +6225,25 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     const s = r.dotted_selector_flag;
     assert.deepStrictEqual(s.res, ['ok', null], s.stderr);
     assert.deepStrictEqual(s.value_in, ['card'], 'no host is iframe.card: still a selector');
-    assert.strictEqual(s.stderr, '');
     // Residual (README: prefer url=): with no frame on that host the old order still applies,
-    // selector (a wrapper) first, then name/id.
+    // selector (a wrapper) first, then name/id (the stderr note: next test).
     const w = r.attr_decoy_only;
     assert.deepStrictEqual(w.value_in, ['wrapdecoy'], 'no js.stripe.com frame: the selector match');
-    assert.strictEqual(w.stderr,
-      "note: 'js.stripe.com' is not an iframe; using the iframe inside it\n");
+    assert(w.stderr.endsWith("note: 'js.stripe.com' is not an iframe; using the iframe inside it\n"), w.stderr);
     assert.deepStrictEqual(r.attr_id_only.value_in, ['iddecoy'], 'then the iframe id');
+  });
+
+  test('frames (fake CDP): live frame identity — a host-shaped --frame value with no frame on that host says on stderr that it used the page-set selector or name/id match (no note when a frame on the host matched)', () => {
+    const r = fake('frame_identity');
+    const note = (host, label) => `note: no frame on host ${host}; used the page-set selector or name/id match `
+      + `'${label}' (write --frame url=${host} to require the host)\n`;
+    assert.strictEqual(r.attr_decoy_only.stderr, note('js.stripe.com', 'iframe#w')
+      + "note: 'js.stripe.com' is not an iframe; using the iframe inside it\n");
+    assert.strictEqual(r.attr_id_only.stderr, note('js.stripe.com', 'iframe#js.stripe.com'));
+    assert.strictEqual(r.dotted_selector_flag.stderr, note('iframe.card', 'iframe#card'));
+    for (const key of ['attr_decoy_flag', 'attr_id_flag', 'decoy_flag', 'host_suffix_flag', 'honest_fill', 'path_flag']) {
+      assert.strictEqual(r[key].stderr, '', `${key}: a frame on the host matched, or not host-shaped: no note`);
+    }
   });
 
   test('frames (fake CDP): live frame identity — an input step refuses (exit 2) when the routed frame changed after it was resolved', () => {
@@ -14537,7 +14585,8 @@ print(json.dumps(out))
     // names whose run is dead, and in a connected browser only a tab cdpilot opened there
     assert(/tab, marker = _ENV_RUN_LIVE\.get\('tab'\), _ENV_RUN_LIVE\.get\('marker'\)[\s\S]*?closed = _env_tab_close\(tab, popups or \(\)\)/
       .test(bodies._env_run_close_on_exit || ''), "_env_run_close_on_exit closes only this process's run tab");
-    assert(/if _pid_alive\(data\.get\('pid'\)\):\s*\n\s*continue\s*\n\s*tid = data\.get\('tab'\)\s*\n[^\n]*not \(_is_external\(\) and tid not in _external_own_tabs\(\)\):\s*\n\s*if not _env_tab_close\(tid, _env_tab_popups\(tid\) or \(\)\):/
+    // (a tab it may not close in a connected browser keeps its marker: `continue` before the close)
+    assert(/if _pid_alive\(data\.get\('pid'\)\):\s*\n\s*continue\s*\n\s*tid = data\.get\('tab'\)\s*\n\s*if isinstance\(tid, str\) and tid:\s*\n\s*if _is_external\(\) and tid not in _external_own_tabs\(\):\s*\n\s*continue\b[^\n]*\n\s*if not _env_tab_close\(tid, _env_tab_popups\(tid\) or \(\)\):\s*\n\s*continue\s*\n/
       .test(bodies._env_run_sweep || ''), '_env_run_sweep closes only the tab of a dead run\'s marker');
     for (const h of hits._watch_refuse_late_env_run || []) {
       assert(/^proc\.(terminate|kill)\(\)$/.test(h), `_watch_refuse_late_env_run may only stop the daemon it is given: ${h}`);
@@ -18998,6 +19047,44 @@ print(json.dumps(res))
     }
   });
 
+  // A run that died in cdpilot's own browser, then `cdpilot connect`: the sweep may not close that
+  // tab in the connected browser (not one cdpilot opened there, or /json/version did not answer and
+  // the own-tab set came back empty). Removing the marker then left the tab open with nothing
+  // naming it; the marker stays for a sweep in the browser the run used.
+  test('replay/agent: env var — in a connected browser the orphan sweep keeps the marker of a tab it may not close (not cdpilot\'s there, or no browser id): nothing closed, marker kept; its own tab is closed', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envsweepext-'));
+    const r = spawnSync(PYB, ['-c', [
+      'import sys, os, json; sys.path.insert(0, "src")',
+      'import cdpilot',
+      'd = cdpilot._env_run_marker_dir()',
+      'os.makedirs(d, exist_ok=True)',
+      'calls = []',
+      'def ws_call(method, params, timeout=10):',
+      '    calls.append((method, params.get("targetId")))',
+      '    return {"targetInfos": []} if method == "Target.getTargets" else {}',
+      'cdpilot._browser_ws_call = ws_call',
+      'cdpilot.cdp_cache_invalidate = lambda: None',
+      'cdpilot._pid_alive = lambda pid: False  # every run is gone',
+      'cdpilot._is_external = lambda: True',
+      'out = {}',
+      'for key, own in (("not_own", {"MINE"}), ("no_browser_id", set()), ("own", {"RUNTAB"})):',
+      '    calls.clear()',
+      '    cdpilot._external_own_tabs = lambda own=own: set(own)',
+      '    p = os.path.join(d, "env-run-%s.json" % key)',
+      '    cdpilot._atomic_write_json(p, {"pid": 2147483646, "started": 1, "tab": "RUNTAB"})',
+      '    cdpilot._env_run_sweep()',
+      '    out[key] = {"closed": [t for m, t in calls if m == "Target.closeTarget"], "kept": os.path.exists(p)}',
+      '    if os.path.exists(p):',
+      '        os.replace(p, p + ".seen")  # out of the next case',
+      'print(json.dumps(out))'].join('\n')],
+    { cwd: REPO, encoding: 'utf-8', timeout: 30000, env: varEnv(home, { CDPILOT_PROJECT_ID: 'rep-sweepext' }) });
+    const out = JSON.parse((r.stdout || '').trim().split('\n').pop() || 'null');
+    assert(out, r.stdout + r.stderr);
+    assert.deepStrictEqual(out.not_own, { closed: [], kept: true }, `not cdpilot's tab there: ${JSON.stringify(out)}`);
+    assert.deepStrictEqual(out.no_browser_id, { closed: [], kept: true }, `cannot judge: ${JSON.stringify(out)}`);
+    assert.deepStrictEqual(out.own, { closed: ['RUNTAB'], kept: false }, `a tab cdpilot opened there: ${JSON.stringify(out)}`);
+  });
+
   test('replay/agent: env var — the MCP server runs the orphan sweep right after it kills a tool call at its time limit (the child skipped its finally)', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-mcp-envsweep-'));
     const r = spawnSync(PYB, ['-c', [
@@ -19117,6 +19204,61 @@ print(json.dumps(res))
     } finally {
       fake.stop();
     }
+  });
+
+  // With no session tab during a run, a page the run's tab opened (openerId = run tab; a
+  // same-origin popup reads opener.document) was adopted as the session tab; so was the run's tab
+  // itself between Target.createTarget and the marker naming it, and a session record naming a run
+  // tab was used as is. While a marker exists the session tab is a new tab.
+  test('replay/agent: env var — while a run marker exists the session tab is a new tab: never the run tab\'s popup, never a run tab not yet in its marker; a session record naming a run tab is dropped', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envpopup-'));
+    const r = spawnSync(PYB, ['-c', [
+      'import sys, os, io, json; sys.path.insert(0, "src")',
+      'import cdpilot',
+      'd = cdpilot._env_run_marker_dir()',
+      'os.makedirs(d, exist_ok=True)',
+      'marker = os.path.join(d, "env-run-%d.json" % os.getpid())  # this process stands in for a live run',
+      'page = lambda tid, url, **k: dict({"id": tid, "type": "page", "url": url, "webSocketDebuggerUrl": "ws://x/" + tid}, **k)',
+      'RUN, OTHER = page("RUN", "https://bank.example/login"), page("OTHER", "https://a.example/")',
+      'POPUP = page("POPUP", "https://bank.example/popup", openerId="RUN")',
+      'tabs, made = [], []',
+      'def urlopen(req, timeout=None):  # /json/new: a new tab',
+      '    tid = "NEW%d" % (len(made) + 1)',
+      '    made.append(tid)',
+      '    tabs.insert(0, page(tid, "about:blank"))',
+      '    return io.BytesIO(json.dumps({"id": tid}).encode())',
+      'cdpilot.urllib.request.urlopen = urlopen',
+      'cdpilot.cdp_get = lambda p, no_cache=False: list(tabs) if p == "/json" else {"Browser": "x"}',
+      'cdpilot.get_tabs = lambda: list(tabs)',
+      'cdpilot.time.sleep = lambda s: None',
+      'out = {}',
+      'cdpilot._atomic_write_json(marker, {"pid": os.getpid(), "started": 1, "tab": "RUN"})',
+      'tabs[:] = [POPUP, RUN]',
+      'out["popup"] = cdpilot._create_session_window()',
+      'cdpilot._save_sessions({})',
+      'cdpilot._atomic_write_json(marker, {"pid": os.getpid(), "started": 1})  # the tab exists, not yet recorded',
+      'tabs[:] = [RUN]',
+      'out["race"] = cdpilot._create_session_window()',
+      'cdpilot._atomic_write_json(marker, {"pid": os.getpid(), "started": 1, "tab": "RUN"})',
+      'tabs[:] = [RUN, OTHER]',
+      'cdpilot._save_sessions({cdpilot._get_session_id(): {"target_id": "RUN", "created": "x", "last_used": cdpilot.time.time()}})',
+      'out["record"] = cdpilot.get_page_ws()[1]["id"]',
+      'out["record_after"] = cdpilot._get_session_window_target_id()',
+      'os.replace(marker, marker + ".done")  # the run ended: an open page is reused again',
+      'cdpilot._save_sessions({})',
+      'tabs[:] = [OTHER]',
+      'out["no_marker"] = cdpilot._create_session_window()',
+      'out["made"] = made',
+      'print(json.dumps(out))'].join('\n')],
+    { cwd: REPO, encoding: 'utf-8', timeout: 30000, env: varEnv(home, { CDPILOT_PROJECT_ID: 'rep-popup' }) });
+    const out = JSON.parse((r.stdout || '').trim().split('\n').pop() || 'null');
+    assert(out, r.stdout + r.stderr);
+    assert.strictEqual(out.popup, 'NEW1', `the run tab's popup became the session tab: ${JSON.stringify(out)}`);
+    assert.strictEqual(out.race, 'NEW2', `the run's tab (not yet in its marker) became the session tab: ${JSON.stringify(out)}`);
+    assert.strictEqual(out.record, 'NEW3', `a session record naming the run's tab was used: ${JSON.stringify(out)}`);
+    assert.strictEqual(out.record_after, 'NEW3', JSON.stringify(out));
+    assert.strictEqual(out.no_marker, 'OTHER', `no marker: an open page is still reused: ${JSON.stringify(out)}`);
+    assert.deepStrictEqual(out.made, ['NEW1', 'NEW2', 'NEW3'], JSON.stringify(out));
   });
 
   // L4: the run writes its marker, then reads the watch state; watch start read the markers, then
