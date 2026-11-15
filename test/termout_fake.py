@@ -250,6 +250,20 @@ def scenario_reporter_junit(mod):
     return got
 
 
+def scenario_reporter_junit_name(mod):
+    """A test name with ", & and < (the author's text) is escaped as an XML attribute."""
+    import xml.etree.ElementTree as ET
+    got = _reporter(mod, "junit", name='checkout "a" & <b>')
+    out = {"stdout": got["pipe"]["stdout"]}
+    try:
+        root = ET.fromstring(got["pipe"]["stdout"])
+        out["names"] = [e.get("name") for e in root.iter("testcase")]
+        out["xml_ok"] = True
+    except ET.ParseError as e:
+        out["xml_ok"] = str(e)
+    return out
+
+
 def scenario_pty(mod):
     """`content` written to a real pseudo-terminal (no isatty stand-in)."""
     if sys.platform == "win32":
@@ -358,6 +372,7 @@ SCENARIOS = {
     "webmcp": scenario_webmcp,
     "reporter": scenario_reporter,
     "reporter_junit": scenario_reporter_junit,
+    "reporter_junit_name": scenario_reporter_junit_name,
     "pty": scenario_pty,
     "daemon": scenario_daemon,
     "agent_json": scenario_agent_json,

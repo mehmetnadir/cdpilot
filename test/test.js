@@ -13253,6 +13253,12 @@ print(json.dumps(out))
     assert(j.pipe.stdout.includes('<testcase name="checkout works" time="0.002">'), j.pipe.stdout);
   });
 
+  test('terminal output (fake CDP, in-process): JUnit output escapes a test name with ", & and < as an XML attribute; the XML parses and the name round-trips', () => {
+    const j = termScenario('reporter_junit_name');
+    assert.strictEqual(j.xml_ok, true, `${j.xml_ok}\n${JSON.stringify(j.stdout)}`);
+    assert.deepStrictEqual(j.names, ['ok', 'checkout "a" & <b>']);
+  });
+
   test('terminal output (fake CDP, in-process): wait, wait-for, wait-for-text, extract (text, list, JSON), observe, frame eval and frame shadow show page control characters as \\xNN on a terminal; piped output is byte-identical', () => {
     const c = termScenario('followup');
     for (const [k, v] of Object.entries(c)) {
@@ -14097,8 +14103,10 @@ print(json.dumps(out))
     // its own signal handlers; `canvas open` kills only the host it just spawned; `canvas close`
     // signals only a pid whose command line is this canvas's host (B2 D8).
     // Connect: _external_abandon_own_tab closes the tab get_page_ws opened a moment earlier.
+    // Env-value runs: _env_tab_close closes the run's own tab (_env_tab_open made it) and the
+    // pages that tab opened (_env_tab_popups: openerId chain from that tab).
     const OWN_BY_CONSTRUCTION = ['_CanvasHost', '_canvas_host_entry', 'cmd_canvas_open',
-      '_canvas_close_one', '_external_abandon_own_tab'];
+      '_canvas_close_one', '_external_abandon_own_tab', '_env_tab_close'];
     const known = new Set([...GUARDED, ...Object.keys(VIA_GUARDED_HELPER), ...NOT_A_BROWSER,
       ...OWN_CONTEXT_ONLY, ...OWN_BY_CONSTRUCTION]);
     for (const h of hits._CanvasHost || []) {
@@ -14131,6 +14139,20 @@ print(json.dumps(out))
     assert.deepStrictEqual(abandonCallers, ['get_page_ws'], `_external_abandon_own_tab callers: ${abandonCallers}`);
     assert(/new_target_id = _create_session_window\(\) if version else None[\s\S]*?_external_abandon_own_tab\(new_target_id\)/
       .test(bodies.get_page_ws), 'get_page_ws abandons only the tab it just created');
+    for (const h of hits._env_tab_close || []) {
+      assert(/^_browser_ws_call\('Target\.closeTarget', \{'targetId': t\}, timeout=5\)$/.test(h),
+        `_env_tab_close may only close the targets it is given: ${h}`);
+    }
+    const envCloseCallers = Object.keys(bodies).filter((f) => f !== '_env_tab_close'
+      && /_env_tab_close\(/.test(bodies[f])).sort();
+    assert.deepStrictEqual(envCloseCallers, ['_env_run_end', '_env_tab_open'],
+      `_env_tab_close callers: ${envCloseCallers}`);
+    assert(/tid = _external_create_tab\(\)[\s\S]*?tid = \(_browser_ws_call\('Target\.createTarget'[\s\S]*?_env_tab_close\(tid\)/
+      .test(bodies._env_tab_open || ''), '_env_tab_open closes only the tab it just created');
+    assert(/popups = _env_tab_popups\(st\['tab'\]\)\s*\n\s*_env_tab_close\(st\['tab'\], popups or \(\)\)/
+      .test(bodies._env_run_end || ''), "_env_run_end closes the run's tab and the pages that tab opened");
+    assert(/kids\.setdefault\(i\['openerId'\][\s\S]*?todo = \[\], \[tid\]|out, todo = \[\], \[tid\]/
+      .test(bodies._env_tab_popups || ''), '_env_tab_popups walks the openerId chain from the run tab');
     for (const f of OWN_CONTEXT_ONLY) {
       for (const h of hits[f] || []) {
         assert(/Target\.disposeBrowserContext/.test(h), `${f} may only dispose its own context: ${h}`);

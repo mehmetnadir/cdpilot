@@ -23480,7 +23480,9 @@ def cmd_test(files=None, watch=False, parallel=1, reporter='default', trace='def
             lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<testsuites>']
             for r in all_results:
                 for t in r.get('tests', []):
-                    lines.append(f'  <testcase name="{t.get("name", "")}" time="{t.get("duration_ms", 0)/1000:.3f}">')
+                    name = (_term_text(t.get('name', '')).replace('&', '&amp;').replace('<', '&lt;')
+                            .replace('"', '&quot;'))  # an XML attribute: ", & and < are escaped
+                    lines.append(f'  <testcase name="{name}" time="{t.get("duration_ms", 0)/1000:.3f}">')
                     if t.get('status') != 'passed':
                         # page text: control characters are invalid in XML 1.0, so always \xNN here
                         err = _term_text(t.get('error') or '').replace('&', '&amp;').replace('<', '&lt;')
