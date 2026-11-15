@@ -1323,7 +1323,10 @@ if (cmd === 'status') {
     const sockPath = daemonSockPath(daemonKey(env, python));
     // env: the daemon applies the caller's environment to the request (proxy
     // and solver keys, PATH, TZ … are read when a command runs, not at import).
-    const payload = { argv: args, cwd: process.cwd(), env, tty: process.stdout.isTTY === true };
+    // tty / etty: the daemon's streams are a socket, so these flags tell it whether stdout /
+    // stderr are a terminal (page text is shown with visible escapes there, raw when piped).
+    const payload = { argv: args, cwd: process.cwd(), env, tty: process.stdout.isTTY === true,
+      etty: process.stderr.isTTY === true };
     const stdin = daemonStdin(cmd, args);
     if (stdin !== undefined) payload.stdin = stdin;
     daemonRequest(sockPath, payload, (m) => {

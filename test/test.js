@@ -8496,6 +8496,39 @@ print(json.dumps(out))  # ASCII: Windows stdout is cp1252 and mangles « »
     assert.deepStrictEqual(logFileLines(home), before, '`log` must not log itself');
   });
 
+  test('log: page text with control characters is shown as \\xNN in the table and --md; --md puts titles, results and errors in code spans; --json unchanged', () => {
+    // A page title or an MCP session's summary came back raw: ESC / C1 reached the terminal, and
+    // page-written Markdown / HTML rendered in a pasted report.
+    const home = newHome();
+    fs.mkdirSync(logDir(home), { recursive: true });
+    const E = '\x1b';
+    const entries = [
+      { ts: `${localDay()}T10:00:00.000`, cmd: 'go', args: ['https://x.test/'], exit: 0, duration_ms: 5,
+        url: `https://x.test/${E}[8m`, title: `T${E}]0;pwned\x07 <img src=x> **b**`,
+        summary: `S${E}[8mhidden\x9b2J [l](https://evil.test)`, error: null, files: [] },
+      { ts: `${localDay()}T10:00:01.000`, cmd: 'eval', args: ['x'], exit: 1, duration_ms: 6, url: null, title: null,
+        summary: null, error: `Err${E}[2K\x85 <b>x</b> | y`, files: [] },
+    ];
+    const file = path.join(logDir(home), `${localDay()}.jsonl`);
+    const raw = entries.map((e) => JSON.stringify(e)).join('\n') + '\n';
+    fs.writeFileSync(file, raw);
+    const RAW = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]/;
+    const t = cli(home, ['log']);
+    assert.strictEqual(t.status, 0, t.stderr);
+    assert(!RAW.test(t.stdout), JSON.stringify(t.stdout));
+    assert(t.stdout.includes('S\\x1b[8mhidden\\x9b2J') && t.stdout.includes('! Err\\x1b[2K'), t.stdout);
+    const md = cli(home, ['log', '--md']);
+    assert.strictEqual(md.status, 0, md.stderr);
+    assert(!RAW.test(md.stdout), JSON.stringify(md.stdout));
+    assert(md.stdout.includes('· `T\\x1b]0;pwned\\x07 <img src=x> **b**` — `https://x.test/\\x1b[8m`'), md.stdout);
+    assert(md.stdout.includes('| `S\\x1b[8mhidden\\x9b2J [l](https://evil.test)` |'), md.stdout);
+    assert(md.stdout.includes('| `Err\\x1b[2K <b>x</b> \\| y` |'), md.stdout);
+    assert(md.stdout.includes('— exit 1: `Err\\x1b[2K <b>x</b> | y`'), md.stdout);
+    const j = cli(home, ['log', '--json']);
+    assert.strictEqual(j.status, 0, j.stderr);
+    assert.deepStrictEqual(lines(j.stdout), lines(raw), '--json prints the file lines unchanged');
+  });
+
   test('log: retention deletes day files older than CDPILOT_LOG_DAYS on the first write of a day', () => {
     const home = newHome();
     const dir = logDir(home);
@@ -9963,6 +9996,32 @@ print("ok")
 `;
     const r = spawnSync(PY_BIN, ['-I', '-c', script],
       { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0', CDPILOT_JSON: '', CDP_PORT: '19555', CDPILOT_NO_AUTOLAUNCH: '1' } });
+    assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert(/^ok/m.test(r.stdout), r.stdout);
+  });
+
+  test('agent JSON format (unit): DEL, C1 and U+2028/U+2029 in page text are \\u escapes in the JSON text (compact and pretty); json.loads gives the same value', () => {
+    // ensure_ascii=False printed them raw: a terminal obeys C1 (U+009B is CSI) like ESC.
+    const { spawnSync } = require('child_process');
+    const script = `
+import io, json, os, sys, importlib.util
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+obj = {"v": "a\\x7fb\\x85c\\x9bd\\u2028e\\u2029f\\x1bg", "t": "Arşivle ✓", "k\\x9b": 1}
+for mode in ("compact", "pretty"):
+    os.environ["CDPILOT_JSON"] = mode
+    out = io.StringIO(); sys.stdout = out
+    mod._agent_json(dict(obj))
+    sys.stdout = sys.__stdout__
+    text = out.getvalue()
+    bad = [hex(ord(ch)) for ch in text if 0x7f <= ord(ch) <= 0x9f or ord(ch) in (0x1b, 0x2028, 0x2029)]
+    assert not bad, (mode, bad, repr(text))
+    assert json.loads(text) == obj, (mode, repr(text))
+    assert "Arşivle ✓" in text and "\\\\u007f" in text and "\\\\u009b" in text and "\\\\u2028" in text, (mode, repr(text))
+print("ok")
+`;
+    const r = spawnSync(PY_BIN, ['-I', '-c', script],
+      { encoding: 'utf8', timeout: 30000, env: { ...process.env, CDPILOT_HOME: mkHome(), CDPILOT_LOG: '0', CDP_PORT: '19579', CDPILOT_NO_AUTOLAUNCH: '1', PYTHONIOENCODING: 'utf-8' } });
     assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`);
     assert(/^ok/m.test(r.stdout), r.stdout);
   });
@@ -12819,6 +12878,134 @@ print(json.dumps(out))
       assert.deepStrictEqual(f.mcp_throw, { content: [{ type: 'text', text: text.trim() }], isError: true });
       assert.deepStrictEqual(f.mcp_shot, { content: [{ type: 'text', text: 'stderr: Screenshot failed' }], isError: true });
     }
+  });
+
+  // Terminal output: a page's ESC / other C0 / DEL / C1 characters (SGR conceal, OSC 52 clipboard, cursor
+  // erase, C1 CSI) reach a person's terminal only as visible \xNN text; piped output keeps the page's bytes.
+  let termoutCache = null;
+  const termout = () => {
+    if (!termoutCache) {
+      const out = execFileSync(PY_BIN, [path.join(__dirname, 'termout_fake.py'), path.join(__dirname, '..', 'src', 'cdpilot.py')],
+        { encoding: 'utf-8', timeout: 120000 });
+      termoutCache = JSON.parse(out.trim().split('\n').pop());
+    }
+    return termoutCache;
+  };
+  // what a terminal must not receive raw: C0 except tab and newline (CR only right before LF), DEL, C1, U+2028/9
+  const TERM_RAW = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]|\r(?!\n)/;
+  const E = '\x1b';
+  const PAGE_CONTENT = `A${E}[8mB\x07C\x7fD\x9b2JE\u2028F\tG\r\nH\rIşğ🙂`;
+  const TTY_CONTENT = 'A\\x1b[8mB\\x07C\\x7fD\\x9b2JE F\tG\r\nH\\x0dIşğ🙂';
+  const termScenario = (name) => {
+    const s = termout()[name];
+    assert(typeof s.error !== 'string', `${name} crashed:\n${s.error}`);
+    return s;
+  };
+
+  test('terminal output (fake CDP, in-process): content, html, go, network, a11y, a11y-snapshot, describe, tabs, console, debug, storage, eval, assert family and check show page control characters as \\xNN on a terminal; piped output is byte-identical', () => {
+    const c = termScenario('commands');
+    for (const [k, v] of Object.entries(c)) {
+      if (!v || !v.tty) continue;
+      for (const s of ['stdout', 'stderr']) {
+        assert(!TERM_RAW.test(v.tty[s]), `${k} ${s} on a terminal: ${JSON.stringify(v.tty[s])}`);
+      }
+      // plain text: \xNN; JSON text (eval of an object): \u00NN, so it still parses
+      assert(/\\x(1b|9b)|\\u00(7f|85|9b)/.test(v.tty.stdout + v.tty.stderr), `${k}: the escape is shown: ${JSON.stringify(v.tty)}`);
+      assert(TERM_RAW.test(v.pipe.stdout + v.pipe.stderr), `${k}: piped keeps the page's bytes: ${JSON.stringify(v.pipe)}`);
+      assert.deepStrictEqual(v.tty.res, v.pipe.res, `${k}: same exit either way`);
+    }
+    assert.strictEqual(c.content.tty.stdout, TTY_CONTENT + '\n');
+    assert.strictEqual(c.content.pipe.stdout, PAGE_CONTENT + '\n');
+    assert.strictEqual(c.html.pipe.stdout, `<p>${E}]52;c;aGk=\x07x</p>\n`);
+    assert.strictEqual(c.html.tty.stdout, '<p>\\x1b]52;c;aGk=\\x07x</p>\n');
+    assert.strictEqual(c.go.pipe.stdout, `body ${E}[8mhidden\n`);
+    assert.strictEqual(c.go.tty.stdout, 'body \\x1b[8mhidden\n');
+    assert.strictEqual(c.network.pipe.stdout, `=== Network Requests ===\n  ✗ [404]        XHR https://x.test/${E}[8m\n`
+      + `\nTotal: 1 requests\n\n=== Content (first 3000 chars) ===\nbody ${E}[8mhidden\n`);
+    assert.strictEqual(c.network.tty.stdout, '=== Network Requests ===\n  ✗ [404]        XHR https://x.test/\\x1b[8m\n'
+      + '\nTotal: 1 requests\n\n=== Content (first 3000 chars) ===\nbody \\x1b[8mhidden\n');
+    assert.strictEqual(c.a11y.pipe.stdout, `Accessibility tree (1 nodes, 0 skipped):\n  [button] 'Buy${E}[8mhidden\x9b'\n`);
+    assert.strictEqual(c.a11y.tty.stdout, "Accessibility tree (1 nodes, 0 skipped):\n  [button] 'Buy\\x1b[8mhidden\\x9b'\n");
+    assert.strictEqual(c.a11y_find.tty.stdout, "1 elements with role 'button':\n  - 'Buy\\x1b[8mhidden\\x9b'\n");
+    assert.strictEqual(c.a11y_snapshot.pipe.stdout, `@1 [button] "Buy${E}[8mhidden\x9b"\n\n[1 interactive, 1 total shown]\n`);
+    assert.strictEqual(c.a11y_snapshot.tty.stdout, '@1 [button] "Buy\\x1b[8mhidden\\x9b"\n\n[1 interactive, 1 total shown]\n');
+    assert(c.describe.pipe.stdout.includes(`Title: Pg${E}]0;pwned\x07\n`) && c.describe.pipe.stdout.endsWith(PAGE_CONTENT + '\n'),
+      c.describe.pipe.stdout);
+    assert(c.describe.tty.stdout.includes('Title: Pg\\x1b]0;pwned\\x07\n') && c.describe.tty.stdout.endsWith(TTY_CONTENT + '\n'),
+      c.describe.tty.stdout);
+    assert.strictEqual(c.tabs.pipe.stdout, `  🟢 [0] Tab${E}[8mhidden\x9b\n       https://x.test/a${E}[2J\n\n1 pages, 1 targets\n`);
+    assert.strictEqual(c.tabs.tty.stdout, '  🟢 [0] Tab\\x1b[8mhidden\\x9b\n       https://x.test/a\\x1b[2J\n\n1 pages, 1 targets\n');
+    assert.strictEqual(c.console.pipe.stdout, `=== Console ===\n  📝 [LOG] c${E}]0;pwned\x07!\n  ❌ [ERROR] e${E}[2K\x9b8m\n`
+      + `\n=== Content (first 3000 chars) ===\nbody ${E}[8mhidden\n`);
+    assert.strictEqual(c.console.tty.stdout, '=== Console ===\n  📝 [LOG] c\\x1b]0;pwned\\x07!\n  ❌ [ERROR] e\\x1b[2K\\x9b8m\n'
+      + '\n=== Content (first 3000 chars) ===\nbody \\x1b[8mhidden\n');
+    assert.strictEqual(c.storage.pipe.stdout, `  k${E}[8m: v${E}]52;c;eA==\x07\n\n1 entries\n`);
+    assert.strictEqual(c.eval_str.pipe.stdout, `e${E}[8mhidden\n`);
+    assert.strictEqual(c.eval_str.tty.stdout, 'e\\x1b[8mhidden\n');
+    assert.strictEqual(c.eval_obj.pipe.stdout, c.eval_obj_expected_pipe);
+    assert.deepStrictEqual(JSON.parse(c.eval_obj.tty.stdout), c.eval_obj_value, 'eval JSON on a terminal still parses');
+    assert.deepStrictEqual([c.eval_throw.pipe.res, c.eval_throw.pipe.stdout], [['exit', 1], `Error: Uncaught ${E}[8m — Error: \x9b2J\n`]);
+    assert.strictEqual(c.eval_throw.tty.stdout, 'Error: Uncaught \\x1b[8m — Error: \\x9b2J\n');
+    assert.strictEqual(c.assert.pipe.stdout, `FAIL: Expected text "ok" not found in: ${E}[8mhidden\n`);
+    assert.strictEqual(c.assert.pipe.stderr, `note: '#x' found inside the shadow root of div#h${E}[8m\n`);
+    assert.strictEqual(c.assert.tty.stderr, "note: '#x' found inside the shadow root of div#h\\x1b[8m\n");
+    assert.strictEqual(c.check.pipe.stdout, `Test Report: 0 passed, 1 failed\n${'─'.repeat(40)}\n  1. FAIL: Not found: ${E}[8m\n`);
+  });
+
+  test('terminal output (fake CDP, in-process): WebMCP tools list / call (text, JSON, page error on stderr) escaped on a terminal, JSON still parses; piped unchanged', () => {
+    const w = termScenario('webmcp');
+    for (const [k, v] of Object.entries(w)) {
+      for (const s of ['stdout', 'stderr']) assert(!TERM_RAW.test(v.tty[s]), `${k} ${s}: ${JSON.stringify(v.tty[s])}`);
+      assert.deepStrictEqual(v.tty.res, v.pipe.res, k);
+    }
+    assert.strictEqual(w.list.pipe.stdout, `1 WebMCP tool on https://shop.test/${E}[8m:\n  buy${E}[8m  "Buy${E}]0;pwned\x07"\n    d\x9b2J\n`);
+    assert.strictEqual(w.list.tty.stdout, '1 WebMCP tool on https://shop.test/\\x1b[8m:\n  buy\\x1b[8m  "Buy\\x1b]0;pwned\\x07"\n    d\\x9b2J\n');
+    assert(w.list_json.pipe.stdout.includes('"description": "d\x9b2J"'), w.list_json.pipe.stdout);
+    assert.deepStrictEqual(JSON.parse(w.list_json.tty.stdout), JSON.parse(w.list_json.pipe.stdout));
+    assert.strictEqual(w.call_text.pipe.stdout, `plain ${E}[8mhidden\n`);
+    assert.strictEqual(w.call_text.tty.stdout, 'plain \\x1b[8mhidden\n');
+    assert.strictEqual(w.call_json.pipe.stdout, '{\n  "r": "x\x7fy\x9bz"\n}\n');
+    assert.deepStrictEqual(JSON.parse(w.call_json.tty.stdout), { r: 'x\x7fy\x9bz' });
+    assert.deepStrictEqual(w.call_error.pipe.res, ['exit', 1]);
+    assert.strictEqual(w.call_error.pipe.stderr, `Error: tool 'buy${E}[8m' failed: E${E}[8m: m${E}]52;c;eA==\x07\n`);
+    assert.strictEqual(w.call_error.tty.stderr, "Error: tool 'buy\\x1b[8m' failed: E\\x1b[8m: m\\x1b]52;c;eA==\\x07\n");
+    assert.strictEqual(w.not_found.pipe.stderr, `Error: tool 'nope' not found on this page (tools: buy${E}[8m)\n`);
+    assert.strictEqual(w.not_found.tty.stderr, "Error: tool 'nope' not found on this page (tools: buy\\x1b[8m)\n");
+  });
+
+  test('terminal output (fake CDP, in-process): the test reporter keeps its own colours and escapes the page error text', () => {
+    const r = termScenario('reporter');
+    const sgr = (s) => s.replace(/\x1b\[(?:3[12]|0)m/g, '');
+    assert.deepStrictEqual(r.tty.res, ['exit', 1]);
+    assert(!TERM_RAW.test(sgr(r.tty.stdout)), JSON.stringify(r.tty.stdout));
+    assert.strictEqual(r.tty.stdout, `${E}[32m  ✓${E}[0m ok (1ms)\n${E}[31m  ✗${E}[0m t\\x1b[8m (2ms)\n`
+      + `    ${E}[31mFAIL: \\x1b]52;c;aGk=\\x07 got \\x1b[8mhidden${E}[0m\n\n  1 passed, 1 failed\n`);
+    assert.strictEqual(r.pipe.stdout, `${E}[32m  ✓${E}[0m ok (1ms)\n${E}[31m  ✗${E}[0m t${E}[8m (2ms)\n`
+      + `    ${E}[31mFAIL: ${E}]52;c;aGk=\x07 got ${E}[8mhidden${E}[0m\n\n  1 passed, 1 failed\n`);
+  });
+
+  test('terminal output (fake CDP, in-process): a real pseudo-terminal; the warm path follows the launcher tty / etty flags for that request only; _term_text keeps tab, newline, CRLF, Turkish letters and emoji', () => {
+    const h = termScenario('helper');
+    assert.deepStrictEqual(h, {
+      content: TTY_CONTENT, plain: 'Arşivle ✓ 🙂\ttab\nline', nul: 'a\\x00b\\x1fc\\x80d\\x9fe',
+      crlf: 'a\r\nb\\x0dc\\x0d', num: '42',
+    });
+    if (process.platform === 'win32') {
+      console.log('  - skipped (Windows: no pty, no warm process): terminal output pty and warm path');
+      return;
+    }
+    assert.strictEqual(termScenario('pty').stdout, TTY_CONTENT + '\n', 'real pty');
+    const d = termScenario('daemon');
+    assert.deepStrictEqual([d.content_tty.code, d.content_tty.stdout], [0, TTY_CONTENT + '\n']);
+    assert.strictEqual(d.content_pipe.stdout, PAGE_CONTENT + '\n');
+    assert.strictEqual(d.content_none.stdout, PAGE_CONTENT + '\n', 'MCP warm calls carry no flag: exact bytes');
+    assert.deepStrictEqual([d.go_tty.code, d.go_tty.stdout], [0, 'body \\x1b[8mhidden\n'], 'warm go on a terminal');
+    assert.strictEqual(d.go_pipe.stdout, `body ${E}[8mhidden\n`, 'warm go piped: exact bytes');
+    assert.deepStrictEqual([d.tools_etty.code, d.tools_etty.stderr], [1, "Error: tool 't' failed: E: m\\x1b[8mhidden\n"]);
+    assert.strictEqual(d.tools_no_etty.stderr, `Error: tool 't' failed: E: m${E}[8mhidden\n`, 'stderr piped: exact bytes');
+    assert.deepStrictEqual(d.flags_left, [null, null], 'no flag left behind');
+    const bin = fs.readFileSync(CLI, 'utf8');
+    assert(/etty: process\.stderr\.isTTY === true/.test(bin), 'the launcher sends the stderr TTY flag');
   });
 
   test('external guard: connect refuses over a live cdpilot-launched browser (no orphan)', () => {
