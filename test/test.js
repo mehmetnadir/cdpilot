@@ -5957,6 +5957,62 @@ print(json.dumps([run(k, a) for k, a in json.load(sys.stdin)]))
     cases.forEach((c, i) => assert.deepStrictEqual(got[i], c[1], `${JSON.stringify(c[0])}`));
   });
 
+  test('frames: URL text names a frame by host or path of its http(s) URL, never by its query or fragment', () => {
+    // The page sets a frame's query and fragment: <iframe src="/pixel?js.stripe.com"> or
+    // about:blank#js.stripe.com must not take the value meant for the Stripe card frame.
+    const src = 'import re as _re, urllib.parse\n' + pyFuncs(['_frame_url_text_match']) + `
+import json, sys
+print(json.dumps([_frame_url_text_match(u, v) for u, v in json.load(sys.stdin)]))
+`;
+    const CARD = 'https://js.stripe.com/v3/elements-inner-card.html';
+    const cases = [
+      // only http(s) frames match URL text
+      [['about:blank#js.stripe.com', 'js.stripe.com'], false],
+      [['about:srcdoc', 'srcdoc'], false],
+      [['about:blank', 'about:blank'], false],
+      [['data:text/html,js.stripe.com', 'js.stripe.com'], false],
+      [['blob:https://js.stripe.com/5f2c', 'js.stripe.com'], false],
+      [['javascript:void(0)//js.stripe.com', 'js.stripe.com'], false],
+      // host-shaped: the frame's host is it or a subdomain of it
+      [[CARD, 'js.stripe.com'], true],
+      [[CARD, 'stripe.com'], true],
+      [[CARD, 'JS.Stripe.COM'], true],
+      [['https://evilstripe.com/v3/elements', 'stripe.com'], false],
+      [['https://stripe.com.evil.test/v3/elements', 'stripe.com'], false],
+      [['https://shop.example/pixel?js.stripe.com', 'js.stripe.com'], false],
+      [['https://shop.example/x#js.stripe.com', 'js.stripe.com'], false],
+      [['https://shop.example/js.stripe.com/v3', 'js.stripe.com'], false],
+      [['https://js.stripe.com@shop.example/', 'js.stripe.com'], false],
+      [['https://xn--bcher-kva.example/', 'xn--bcher-kva.example'], true],
+      [['http://127.0.0.1:8762/form', '127.0.0.1:8762'], true],
+      [['http://127.0.0.1:8763/form', '127.0.0.1:8762'], false],
+      [['https://pay.example/', 'pay.example:443'], true],
+      [['https://pay.example:8443/', 'pay.example'], true],
+      [['http://a.test/inner.html', 'inner.html'], false],
+      // a host then a path: that host rule, and the path starts there
+      [[CARD, 'stripe.com/v3'], true],
+      [['https://shop.example/stripe.com/v3/x', 'stripe.com/v3'], false],
+      [[CARD, 'js.stripe.com/v2'], false],
+      // scheme://host[:port]/path: that origin exactly, path prefix
+      [[CARD, 'https://js.stripe.com/v3'], true],
+      [['https://shop.example/https://js.stripe.com/v3', 'https://js.stripe.com/v3'], false],
+      [[CARD, 'http://js.stripe.com/v3'], false],
+      [[CARD, 'https://stripe.com'], false],
+      // anything else: a substring of scheme://host[:port]/path
+      [[CARD, '/v3/elements'], true],
+      [['https://shop.example/beacon?next=/v3/elements', '/v3/elements'], false],
+      [['https://shop.example/x#/v3/elements', '/v3/elements'], false],
+      [['http://a.test/inner.html', '/inner.html'], true],
+      [['http://localhost:8762/form', 'localhost:8762'], true],
+      [['http://[::1]:8080/x', '[::1]:8080'], true],
+      [['https://shop.example/pixel?js.stripe.com', 'pixel?js'], false],
+      [['https://shop.example/pixel', 'pixel'], true],
+      [['https://shop.example:99999/', 'shop'], false],
+    ];
+    const got = pyCases(src, cases);
+    cases.forEach((c, i) => assert.strictEqual(got[i], c[1], `${JSON.stringify(c[0])}`));
+  });
+
   test('frames: rewrite sends Runtime/DOM into the frame and maps mouse x/y by the frame scale and offset', () => {
     const src = extractPyFunc(PY_CONTENT, '_frame_route_rewrite');
     assert(src, '_frame_route_rewrite must be extractable');
@@ -6079,6 +6135,26 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.deepStrictEqual(r.honest_fill.value_in, ['card']);
   });
 
+  test('frames (fake CDP): live frame identity — a query, fragment or about:blank decoy ahead of the card frame takes nothing', () => {
+    // A script on the shop page inserts <iframe src="/pixel?js.stripe.com"> and
+    // <iframe src="about:blank#js.stripe.com"> (same origin: it reads what is typed there)
+    // before the real https://js.stripe.com/v3/… frame.
+    const r = fake('frame_identity');
+    for (const key of ['query_decoy_flag', 'query_decoy_arrow', 'fragment_decoy_flag',
+      'host_suffix_flag', 'path_flag', 'lookalike_flag']) {
+      const c = r[key];
+      assert.deepStrictEqual(c.res, ['ok', null], `${key}: ${c.stderr}`);
+      assert.deepStrictEqual(c.value_in, ['card'],
+        `${key}: the card number goes only to the js.stripe.com frame`);
+      assert.deepStrictEqual(c.open_sessions, [], `${key}: every session detached`);
+      assert.strictEqual(c.stderr, '', key);
+    }
+    const q = r.query_only;
+    assert.deepStrictEqual(q.res, ['exit', 1], 'decoys alone: no frame matches');
+    assert.deepStrictEqual(q.value_in, [], 'nothing typed anywhere');
+    assert(/^Error: no iframe matches 'js\.stripe\.com' in top document/.test(q.stderr), q.stderr);
+  });
+
   test('frames (fake CDP): live frame identity — an input step refuses (exit 2) when the routed frame changed after it was resolved', () => {
     const r = fake('frame_identity');
     for (const key of ['changed_fill_sel', 'changed_fill_index', 'changed_fill_url', 'changed_fill_arrow',
@@ -6092,6 +6168,23 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
         .test(c.stderr), `${key}: ${JSON.stringify(c.stderr)}`);
       assert.deepStrictEqual(c.open_sessions, [], key);
     }
+  });
+
+  test('frames (fake CDP): fill with --entropy (asked or adaptive) into a frame sets the value in one call, no key events', () => {
+    // Key events go wherever focus is: a script of the page around the frame could focus its own
+    // field between keys and get the card number.
+    const r = fake('frame_entropy');
+    const note = 'note: humanized typing (--entropy) is off inside a frame: the value is set in one'
+      + ' step (key events follow focus, which the page around the frame can move)\n';
+    for (const key of ['frame_flag', 'frame_adaptive']) {
+      const c = r[key];
+      assert.deepStrictEqual(c.res, ['ok', null], `${key}: ${c.stderr}`);
+      assert.strictEqual(c.keys, 0, `${key}: no Input.dispatchKeyEvent`);
+      assert.deepStrictEqual(c.value_in, ['card'], `${key}: the whole value, in one call`);
+      assert.strictEqual(c.stderr, note, key);
+    }
+    assert.strictEqual(r.page_flag.keys, 4, 'the top page still types key by key (down + up)');
+    assert.strictEqual(r.page_flag.stderr, '', 'no note outside a frame');
   });
 
   test('frames (fake CDP): "Next >>>", "Home >>> Products" run as written; failure adds the note line', () => {

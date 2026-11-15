@@ -39,13 +39,14 @@ class Frame:
 
     def __init__(self, fid, origin="http://a.test", oop=False, elem_id="", name="",
                  src="", visible=True, box=(0, 0), finder=None, slow=False, children=(),
-                 wrappers=(), scale=1.0, url=None):
+                 wrappers=(), scale=1.0, url=None, fragment=None):
         self.fid, self.origin, self.oop = fid, origin, oop
         self.wrappers = list(wrappers)  # selectors of elements around the <iframe>
         self.elem_id, self.name, self.src, self.visible = elem_id, name, src, visible
         # The committed URL (Page.getFrameTree); None: the src attribute, else the origin. A
         # frame navigated away, or a srcdoc frame, has a src attribute that says something else.
         self.url = url
+        self.fragment = fragment  # Frame.urlFragment ("#…"), reported apart from the url
         self.loader = "L-" + fid  # loaderId: a new document (navigation) gets a new one
         self.box, self.finder, self.slow = box, finder or {}, slow
         self.children = list(children)
@@ -216,8 +217,10 @@ class Browser:
             def make_node(f):
                 url = f.url if f.url is not None else (f.src or f.origin)
                 kids = [c for c in f.children if not (self.tree_local_only and c.oop)]
-                return {"frame": {"id": f.fid, "url": url, "loaderId": f.loader},
-                        "childFrames": [make_node(c) for c in kids]}
+                node = {"id": f.fid, "url": url, "loaderId": f.loader}
+                if f.fragment:
+                    node["urlFragment"] = f.fragment
+                return {"frame": node, "childFrames": [make_node(c) for c in kids]}
             return ok({"frameTree": make_node(root)})
         if method == "Runtime.evaluate" and p.get("expression") == "document":
             ctx = p.get("contextId", root.ctx)
@@ -657,7 +660,7 @@ def scenario_routing(mod):
             ("nested", "iframe#card >>> #nested >>> #deep", None),
             ("oopif", "#pay >>> #cc", None),
             ("flag_index", "#cc", "1"),
-            ("flag_src", "#cc", "pay.html"),
+            ("flag_src", "#cc", "/pay.html"),  # a dotted word without "/" names a host
             ("arrow_src_word", "pay.html >>> #cc", None),
         ]:
             mod._FRAME_FLAG = flag
@@ -716,6 +719,39 @@ def scenario_frame_identity(mod):
             Frame("card", elem_id="card", src="http://a.test/inner.html", box=(100, 1000)),
         ])
 
+    def card_frame():
+        return Frame("card", origin="https://js.stripe.com", oop=True, elem_id="stripe-card",
+                     src="https://js.stripe.com/v3/elements-inner-card.html", box=(5, 7))
+
+    def blank_decoy():
+        return Frame("blank", origin="https://shop.example", elem_id="blank",
+                     src="about:blank#js.stripe.com", url="about:blank", fragment="#js.stripe.com")
+
+    def query_decoys(real=True):
+        # A script on the shop page put same-origin decoys ahead of the real card frame: their
+        # committed URLs name the card frame's host (or path) only in the query or the fragment.
+        return Frame("top", origin="https://shop.example", children=[
+            Frame("pixel", origin="https://shop.example", elem_id="pixel",
+                  src="/pixel?js.stripe.com", url="https://shop.example/pixel?js.stripe.com"),
+            blank_decoy(),
+            Frame("beacon", origin="https://shop.example", elem_id="beacon",
+                  src="/beacon?next=/v3/elements",
+                  url="https://shop.example/beacon?next=/v3/elements"),
+        ] + ([card_frame()] if real else []))
+
+    def fragment_decoy():
+        return Frame("top", origin="https://shop.example", children=[blank_decoy(), card_frame()])
+
+    def lookalike_page():
+        # Hosts that contain "stripe.com" without being stripe.com or a subdomain of it.
+        return Frame("top", origin="https://shop.example", children=[
+            Frame("evil1", origin="https://evilstripe.com", oop=True, elem_id="evil1",
+                  src="https://evilstripe.com/v3/elements"),
+            Frame("evil2", origin="https://stripe.com.evil.test", oop=True, elem_id="evil2",
+                  src="https://stripe.com.evil.test/v3/elements"),
+            card_frame(),
+        ])
+
     fill = lambda target: mod.cmd_fill(target, CARD_NUMBER, None, False, False)  # noqa: E731
     out = {}
     for key, page, flag, run_cmd, target, navigate in [
@@ -723,10 +759,19 @@ def scenario_frame_identity(mod):
         ("decoy_arrow", stripe_page, None, fill, "url=js.stripe.com >>> #cardnumber", None),
         ("navigated_flag", navigated_page, "js.stripe.com", fill, "#cardnumber", None),
         ("honest_fill", honest_page, "#card", fill, "#cardnumber", None),
+        # URL text never matches a query, a fragment or a non-http(s) frame; a host-shaped value
+        # matches the host or a subdomain of it, a path-like value scheme://host[:port]/path
+        ("query_decoy_flag", query_decoys, "js.stripe.com", fill, "#cardnumber", None),
+        ("query_decoy_arrow", query_decoys, None, fill, "url=js.stripe.com >>> #cardnumber", None),
+        ("host_suffix_flag", query_decoys, "stripe.com", fill, "#cardnumber", None),
+        ("path_flag", query_decoys, "url=/v3/elements", fill, "#cardnumber", None),
+        ("fragment_decoy_flag", fragment_decoy, "js.stripe.com", fill, "#cardnumber", None),
+        ("query_only", lambda: query_decoys(False), "js.stripe.com", fill, "#cardnumber", None),
+        ("lookalike_flag", lookalike_page, "stripe.com", fill, "#cardnumber", None),
         # the frame navigates (new loaderId, same URL) after the route was resolved
         ("changed_fill_sel", honest_page, "#card", fill, "#cardnumber", "card"),
         ("changed_fill_index", honest_page, "0", fill, "#cardnumber", "card"),
-        ("changed_fill_url", honest_page, "inner.html", fill, "#cardnumber", "card"),
+        ("changed_fill_url", honest_page, "/inner.html", fill, "#cardnumber", "card"),
         ("changed_fill_arrow", honest_page, None, fill, "#card >>> #cardnumber", "card"),
         ("changed_smart_fill", honest_page, "0", lambda t: mod.cmd_smart_fill(t, CARD_NUMBER),
          "Card number", "card"),
@@ -753,6 +798,39 @@ def scenario_frame_identity(mod):
             return {"res": res, "value_in": value_frames(b, CARD_NUMBER), "navigated": bool(fired),
                     "input": [m["method"] for m in b.log if m["method"].startswith("Input.")],
                     "attached": list(b.attached), "open_sessions": sorted(b.sessions)}
+        _, res, stdout, err = run(mod, page(), body)
+        res.update({"stdout": stdout, "stderr": err})
+        out[key] = res
+    return out
+
+
+def scenario_frame_entropy(mod):
+    """fill / type into a routed frame never types key by key, whether --entropy=on asked for it
+    or adaptive memory turned it on: key events go wherever focus is, and a script of the page
+    around the frame can focus its own field between keys. The value goes in one setValue call."""
+    def page():
+        return Frame("top", children=[
+            Frame("card", elem_id="card", src="http://a.test/inner.html", box=(100, 1000)),
+        ])
+
+    out = {}
+    for key, flag, value, entropy, adaptive in [
+        ("frame_flag", "#card", CARD_NUMBER, True, False),
+        ("frame_adaptive", "#card", CARD_NUMBER, None, True),
+        ("page_flag", None, "qz", True, False),  # the top page: key by key, as before
+    ]:
+        async def body(b, flag=flag, value=value, entropy=entropy, adaptive=adaptive):
+            real = mod._entropy_enabled
+            if adaptive:
+                mod._entropy_enabled = lambda *a, **k: True
+            mod._FRAME_FLAG = flag
+            try:
+                res = await call(mod.cmd_fill, "#cardnumber", value, None, False, entropy)
+            finally:
+                mod._FRAME_FLAG = None
+                mod._entropy_enabled = real
+            keys = [m for m in b.log if m["method"] == "Input.dispatchKeyEvent"]
+            return {"res": res, "value_in": value_frames(b, value), "keys": len(keys)}
         _, res, stdout, err = run(mod, page(), body)
         res.update({"stdout": stdout, "stderr": err})
         out[key] = res
@@ -985,7 +1063,7 @@ def scenario_text_hops(mod):
             ("text_page_of", text_cmd, "Page 1 of 3 >>> Next page", None),
             ("text_selector", text_cmd, "iframe#card >>> Pay now", None),
             ("text_wrapper", text_cmd, "#card-element >>> Pay now", None),
-            ("text_url", text_cmd, "url=inner.html >>> Pay now", None),
+            ("text_url", text_cmd, "url=/inner.html >>> Pay now", None),
             ("css_wrapper", css_cmd, "main >>> #btn", None),
             ("css_frame", css_cmd, "#card >>> #btn", None),
             ("flag_wrapper", css_cmd, "#btn", "#card-element"),
@@ -1969,6 +2047,7 @@ SCENARIOS = {
     "commands": scenario_commands,
     "routing": scenario_routing,
     "frame_identity": scenario_frame_identity,
+    "frame_entropy": scenario_frame_entropy,
     "literal": scenario_literal,
     "pool_restore": scenario_pool_restore,
     "smart_order": scenario_smart_order,

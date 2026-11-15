@@ -4332,9 +4332,9 @@ def _cdp_reply(r, cid, method, timeout=15):
 # given. contentDocument cannot be used (blocked cross-origin), so each hop
 # is resolved over CDP:
 #   1. find the <iframe> element in the current frame (CSS selector, index,
-#      name/id, or a substring of the frame's committed URL from
-#      Page.getFrameTree, never its src attribute); DOM.describeNode gives
-#      its child frameId;
+#      name/id, or URL text naming the host or path of the frame's committed
+#      http(s) URL from Page.getFrameTree, never its src attribute, query or
+#      fragment); DOM.describeNode gives its child frameId;
 #   2. same-process frame -> its main-world execution context:
 #      DOM.resolveNode on the frame's document (from DOM.describeNode's
 #      contentDocument) gives a main-world object whose id carries the
@@ -4533,11 +4533,12 @@ def _parse_frame_hop(hop, implicit=False):
     """One hop -> {'kind': 'index'|'url'|'auto'|'sel', 'value': ...}.
 
     '2' = third <iframe>/<frame> of the document (same order as `frame list`);
-    'url=stripe.com' = substring of the frame's committed URL (not its src
-    attribute). Otherwise a CSS selector (or a wrapper element around one
-    iframe), then a name/id; `--frame` values ('auto') also fall back to a
-    committed-URL substring, hops written with `>>>` ('sel',
-    implicit=True) do not, so ordinary words are not mistaken for frames.
+    'url=stripe.com' = the host or path of the frame's committed http(s) URL
+    (_frame_url_text_match; not its src attribute, query or fragment).
+    Otherwise a CSS selector (or a wrapper element around one iframe), then a
+    name/id; `--frame` values ('auto') also fall back to that URL text match,
+    hops written with `>>>` ('sel', implicit=True) do not, so ordinary words
+    are not mistaken for frames.
     """
     hop = hop.strip()
     if hop.isdigit():
@@ -4865,8 +4866,58 @@ async def _frame_live(route, parent_sid, frame_id, own_sid=None, tree=None):
     return url, fr.get("loaderId")
 
 
+def _frame_url_text_match(url, value):
+    """Whether URL text (url=<text>, or a --frame value no selector or name/id matched) names
+    the frame whose committed URL is `url`. The page sets a frame's query and fragment (a
+    same-origin <iframe src="/pixel?js.stripe.com">, about:blank#js.stripe.com), so only
+    http(s) frames match and the query and fragment are never part of the match:
+      js.stripe.com, host:port   the frame's host is it or a subdomain of it
+      stripe.com/v3              that host rule, and the frame's path starts with /v3
+      https://js.stripe.com/v3   that scheme, host and port, and the path starts with /v3
+      /checkout/embed, card-x    a substring of scheme://host[:port]/path
+    Hosts compare case-insensitively, as the browser reports them (an IDN host as punycode);
+    a port in the text is compared with the frame's (its scheme's default when it has none).
+    """
+    if not isinstance(url, str) or not isinstance(value, str) or not value:
+        return False
+    try:
+        u = urllib.parse.urlsplit(url)
+        host, port = u.hostname or "", u.port
+    except ValueError:
+        return False
+    scheme = u.scheme.lower()
+    if scheme not in ("http", "https") or not host or "?" in value or "#" in value:
+        return False
+    eff_port = port if port is not None else (443 if scheme == "https" else 80)
+    path = u.path or "/"
+    if _re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", value):  # an origin, maybe a path
+        try:
+            v = urllib.parse.urlsplit(value)
+            v_port = v.port
+        except ValueError:
+            return False
+        v_scheme = v.scheme.lower()
+        if v_port is None:
+            v_port = {"https": 443, "http": 80}.get(v_scheme)
+        return (v_scheme == scheme and (v.hostname or "") == host and v_port == eff_port
+                and path.startswith(v.path))
+    head, slash, rest = value.partition("/")
+    hm = _re.fullmatch(r"([^:@\[\]\s]+)(?::(\d+))?", head)
+    if hm and "." in hm.group(1):  # host-shaped, maybe a path after it
+        v_host = hm.group(1).lower()
+        if not (host == v_host or host.endswith("." + v_host)):
+            return False
+        if hm.group(2) is not None and int(hm.group(2)) != eff_port:
+            return False
+        return not slash or path.startswith("/" + rest)
+    shown_host = f"[{host}]" if ":" in host else host
+    return value in f"{scheme}://{shown_host}{'' if port is None else ':' + str(port)}{path}"
+
+
 async def _frame_url_match(route, value, lookup_ctx, allow_oopif=True):
-    """The first <iframe>/<frame> in DOM order whose committed URL contains `value`, or None.
+    """The first <iframe>/<frame> in DOM order whose committed URL the URL text `value`
+    names (_frame_url_text_match: http(s) only, by host or path, never query or fragment),
+    or None.
 
     Returns (objectId, remote object, DOM.describeNode node, flat session or None). The URL
     is the browser's (_frame_live), never the src attribute: a page can give a srcdoc decoy,
@@ -4901,7 +4952,7 @@ async def _frame_url_match(route, value, lookup_ctx, allow_oopif=True):
                 route.sessions.append(own)
                 route.attached[frame_id] = own
         url, _ = await _frame_live(route, route.session_id, frame_id, own, tree)
-        if url and value in url:
+        if _frame_url_text_match(url, value):
             return oid, obj, node, own
 
 
@@ -4912,7 +4963,8 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     A hop that matched an element wrapping the iframe (Stripe's
     #card-element) still works, with one stderr note. URL text (url=, or a
     --frame value no selector or name/id matched) is matched against each
-    frame's committed URL, never its src attribute (_frame_url_match).
+    frame's committed URL, never its src attribute (_frame_url_match,
+    _frame_url_text_match).
     route.src / route.loader_id are the frame's committed URL and loaderId as
     resolved: _frame_input_guard reads them again before anything is typed.
     """
@@ -4994,7 +5046,7 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     else:
         sid, ctx, isolated = await _frame_context_for(route, frame_id, node, allow_oopif)
     url, loader_id = await _frame_live(route, route.session_id, frame_id, sid)
-    if by_url and not (url and hop["value"] in url):
+    if by_url and not _frame_url_text_match(url, hop["value"]):
         raise _FrameError(f"'{shown}': the frame navigated while it was resolved")
     route.chain.append((route.session_id, oid))
     route.labels.append(_frame_label(obj.get("description") or shown, 60))
@@ -9266,6 +9318,14 @@ async def cmd_fill(selector, value, ladder=None, no_heal=False, entropy=None):
         except Exception:
             _h = None
         entropy = _entropy_enabled(_get_project_id(), host=_h)
+    _route = _FRAME_ROUTE.get()
+    if entropy and _route is not None and _route.chain:
+        # Key events go wherever focus is: a script of the page around the frame can focus its
+        # own field between keys and get the value. Set it in one call inside the frame instead.
+        print("note: humanized typing (--entropy) is off inside a frame: the value is set in one"
+              " step (key events follow focus, which the page around the frame can move)",
+              file=sys.stderr)
+        entropy = False
     t0 = time.time()
     res_sel, tried = await _resolve_selector_ladder(ws, selector, ladder)
     dur = (time.time() - t0) * 1000
