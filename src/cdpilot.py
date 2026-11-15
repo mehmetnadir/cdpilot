@@ -26681,7 +26681,7 @@ def _daemon_reset_state():
     _SLOG.clear()
     _SLOG.update(active=False, warned=False)
     _AUTOLAUNCH.update(cmd=None, attempted=False, failure=None)
-    for coll in (_CLICK_MISSES, _PRESS_MS_WARNED, _SHADOW_NOTES_PRINTED, _IDLE_WARNED):
+    for coll in (_CLICK_MISSES, _PRESS_MS_WARNED, _SHADOW_NOTES_PRINTED, _IDLE_WARNED, _AGENT_TYPED_SECRETS):
         coll.clear()
     _FRAME_ISOLATED_NOTED[0] = False
     _FRAME_LOOKUP_FALLBACK_NOTED[0] = False
