@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **MCP tool descriptions are shorter: `tools/list` costs 22% fewer tokens.** `all` (default) 7,027 → 5,423 tokens, `core` 1,395 → 1,088 (tiktoken `o200k_base`, compact JSON). Only description strings changed: names, parameters, types, defaults and profiles are identical. The unmeasured "~500 tokens vs ~250K for screenshots" line left `browser_a11y`.
+
 ### Fixed
 - **MCP `browser_agent_find` searches a text that starts with `--`.** The text was passed as a plain CLI word, so `--max 5` or `--rows` was read as a flag and dropped (usage error, or every entry of the role). The tool now passes it after `--`, and `agent find -- <text>` takes the word after `--` as the text (jury note, 0.9.9).
 
