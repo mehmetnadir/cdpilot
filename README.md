@@ -328,14 +328,16 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
   are never part of the match: the page sets those too, so a same-origin
   `<iframe src="/pixel?js.stripe.com">` or `about:blank#js.stripe.com` placed
   before the card frame does not match `js.stripe.com`.
-  - A host (it has a dot and no `/`: `js.stripe.com`, `127.0.0.1:8762`)
+  - A host (it has a dot and no `/`: `js.stripe.com`, `127.0.0.1:8762`;
+    or `localhost:8762`, or an IPv6 address in brackets: `[::1]:8762`)
     matches the frame's host or a subdomain of it: `stripe.com` matches
-    `js.stripe.com`, not `evilstripe.com` or `stripe.com.evil.test`. A port,
+    `js.stripe.com`, not `evilstripe.com` or `stripe.com.evil.test`, and
+    `[::1]:8762` does not match `https://evil.test/[::1]:8762`. A port,
     when given, must match too.
   - A host and a path (`stripe.com/v3`): that host rule, and the frame's
     path starts with `/v3`. `https://js.stripe.com/v3`: that scheme, host
     and port exactly, and the path starts with `/v3`.
-  - Anything else (`/checkout/embed`, `localhost:8762`) matches as a
+  - Anything else (`/checkout/embed`, `card-frame`) matches as a
     substring of `scheme://host[:port]/path`. A frame the page made can match
     such text, so name a card or sign-in frame by its host. A file name is a
     path: `url=/card.html` (`url=card.html` is read as a host).
@@ -348,8 +350,9 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
   (`<iframe id="js.stripe.com">`). Only when no frame's URL matches is it
   tried as a selector, then a `name`/`id`, so `--frame iframe.card` still
   works; that fallback can still pick a frame the page made while the real
-  one is missing, so for a card or sign-in frame write
-  `--frame url=js.stripe.com`. Other bare values (`#card`, `card-frame`) are
+  one is missing, and says so on stderr (`note: no frame on host
+  js.stripe.com; used the page-set selector or name/id match '…'`), so for
+  a card or sign-in frame write `--frame url=js.stripe.com`. Other bare values (`#card`, `card-frame`) are
   a selector, then a `name`/`id`, then URL text.
   `>>>` inside quotes or `[...]` is literal. A selector that matches an
   element *wrapping* an iframe (Stripe's `#card-element`) enters the iframe

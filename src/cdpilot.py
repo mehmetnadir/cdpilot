@@ -3614,13 +3614,14 @@ def _create_session_window():
             _save_sessions(sessions)
         return target_id
 
-    # Check existing tabs — reuse if already open, but never an environment-value
-    # run's tab (a project marker names it, live run or not): a new tab instead
+    # Check existing tabs — reuse if already open, but not while the project has
+    # an environment-value run marker (live run or not): the first page could be
+    # the run's tab before the marker names it (the marker is written first), or
+    # a page that tab opened (a same-origin popup reads opener.document). A new
+    # tab instead. Markers are read after /json, so that list predates the run's tab.
     tabs = cdp_get("/json")
-    if tabs:
-        run_tabs = _env_run_marker_tabs()
-        pages = [t for t in tabs if t.get("type") == "page" and not _is_canvas_page(t)
-                 and t.get("id") not in run_tabs]
+    if tabs and not _env_run_markers():
+        pages = [t for t in tabs if t.get("type") == "page" and not _is_canvas_page(t)]
         if pages:
             # A page is already open, no need to create a new tab
             target_id = pages[0].get("id")
@@ -3885,6 +3886,11 @@ def get_page_ws(prefer_url=None):
 
     # Get target ID for the current session window
     session_target_id = _get_session_window_target_id()
+    if session_target_id and session_target_id in _env_run_marker_tabs():
+        # An environment-value run's tab recorded as the session tab: never used.
+        # Drop the record; a new tab is opened below (_create_session_window).
+        _forget_session_target(session_target_id)
+        session_target_id = None
     external = _is_external()
     if external and not _session_target_usable(session_target_id):
         session_target_id = None  # never a user tab of a connected browser
@@ -4866,12 +4872,31 @@ async def _frame_live(route, parent_sid, frame_id, own_sid=None, tree=None):
     return url, fr.get("loaderId")
 
 
+def _frame_url_text_host(head):
+    """(host, port text or None, is IPv6) when URL text before its first "/" names a host:
+    a dotted name or IPv4 address (js.stripe.com, 127.0.0.1:8762), localhost, or a bracketed
+    IPv6 literal ([::1]:8762), each with an optional port; else None. Dot-less hosts read as
+    hosts too, or a same-origin path decoy (https://evil.test/[::1]:8762) would match them."""
+    hm = _re.fullmatch(r"([^:@\[\]\s]+)(?::(\d+))?", head)
+    if hm and ("." in hm.group(1) or hm.group(1).lower() == "localhost"):
+        return hm.group(1).lower(), hm.group(2), False
+    hm = _re.fullmatch(r"\[([0-9A-Fa-f:.]+)\](?::(\d+))?", head)
+    if hm:
+        import ipaddress as _ip
+        try:
+            return _ip.IPv6Address(hm.group(1)).compressed, hm.group(2), True
+        except ValueError:
+            return None
+    return None
+
+
 def _frame_url_text_match(url, value):
     """Whether URL text (url=<text>, or a --frame value no selector or name/id matched) names
     the frame whose committed URL is `url`. The page sets a frame's query and fragment (a
     same-origin <iframe src="/pixel?js.stripe.com">, about:blank#js.stripe.com), so only
     http(s) frames match and the query and fragment are never part of the match:
       js.stripe.com, host:port   the frame's host is it or a subdomain of it
+      localhost:8762, [::1]:8762 the same (_frame_url_text_host); an IPv6 address exactly
       stripe.com/v3              that host rule, and the frame's path starts with /v3
       https://js.stripe.com/v3   that scheme, host and port, and the path starts with /v3
       /checkout/embed, card-x    a substring of scheme://host[:port]/path
@@ -4902,12 +4927,16 @@ def _frame_url_text_match(url, value):
         return (v_scheme == scheme and (v.hostname or "") == host and v_port == eff_port
                 and path.startswith(v.path))
     head, slash, rest = value.partition("/")
-    hm = _re.fullmatch(r"([^:@\[\]\s]+)(?::(\d+))?", head)
-    if hm and "." in hm.group(1):  # host-shaped, maybe a path after it
-        v_host = hm.group(1).lower()
-        if not (host == v_host or host.endswith("." + v_host)):
+    named = _frame_url_text_host(head)
+    if named:  # host-shaped, maybe a path after it
+        v_host, v_port, v6 = named
+        if v6:
+            same = ":" in host and _frame_url_text_host(f"[{host}]") == (v_host, None, True)
+        else:
+            same = host == v_host or host.endswith("." + v_host)
+        if not same:
             return False
-        if hm.group(2) is not None and int(hm.group(2)) != eff_port:
+        if v_port is not None and int(v_port) != eff_port:
             return False
         return not slash or path.startswith("/" + rest)
     shown_host = f"[{host}]" if ":" in host else host
@@ -4915,14 +4944,14 @@ def _frame_url_text_match(url, value):
 
 
 def _frame_url_text_names_host(value):
-    """Whether URL text names a host (_frame_url_text_match's js.stripe.com, stripe.com/v3 and
-    https://js.stripe.com/v3 forms): only frames on that host can match it."""
+    """Whether URL text names a host (_frame_url_text_match's js.stripe.com, localhost:8762,
+    [::1]:8762, stripe.com/v3 and https://js.stripe.com/v3 forms): only frames on that host
+    can match it."""
     if not isinstance(value, str) or "?" in value or "#" in value:
         return False
     if _re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", value):
         return True
-    hm = _re.fullmatch(r"([^:@\[\]\s]+)(?::(\d+))?", value.partition("/")[0])
-    return bool(hm and "." in hm.group(1))
+    return _frame_url_text_host(value.partition("/")[0]) is not None
 
 
 async def _frame_url_match(route, value, lookup_ctx, allow_oopif=True):
@@ -4978,7 +5007,8 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
     _frame_url_text_match). A --frame value that names a host (js.stripe.com)
     is URL text first: a frame on that host wins over a selector or name/id
     match, which the page sets (<iframe id="js.stripe.com">); the selector and
-    name/id are used only when no frame's URL matches (iframe.card).
+    name/id are used only when no frame's URL matches (iframe.card), with one
+    stderr note.
     route.src / route.loader_id are the frame's committed URL and loaderId as
     resolved: _frame_input_guard reads them again before anything is typed.
     """
@@ -5075,6 +5105,11 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
         print(f"note: frame '{route.labels[-1]}': its page context was not reachable; using an isolated"
               " world (same DOM, no page JS globals)", file=sys.stderr)
     route.dirty = True
+    if url_first and not by_url:  # no frame on that host: the page-set match is used, say so
+        shown_host = _frame_label(hop["value"], 120)
+        print(f"note: no frame on host {shown_host}; used the page-set selector or name/id match "
+              f"'{route.labels[-1]}' (write --frame url={shown_host} to require the host)",
+              file=sys.stderr)
     if not by_url and r.get(3, {}).get("result", {}).get("value") is True:
         print(f"note: '{hop['value']}' is not an iframe; using the iframe inside it", file=sys.stderr)
     return True
@@ -20442,7 +20477,8 @@ def _env_run_active():
 
 def _env_run_marker_tabs():
     """Ids of the tabs the project's markers name, live run or not: never a
-    session tab or a fallback page (_create_session_window, get_page_ws)."""
+    session tab or a fallback page (get_page_ws; _create_session_window reuses
+    no page at all while a marker exists)."""
     return {d['tab'] for _p, d in _env_run_markers() if isinstance(d.get('tab'), str) and d['tab']}
 
 
@@ -20467,12 +20503,17 @@ def _env_run_sweep():
     by a timeout or a signal before its finally), then remove the marker. A
     live run's marker is never touched; a tab not confirmed closed keeps its
     marker for the next sweep. In a connected browser only a tab cdpilot opened
-    there (_external_own_tabs) is closed."""
+    there (_external_own_tabs) is closed; any other tab keeps its marker (the
+    run may have used cdpilot's own browser, or /json/version did not answer):
+    the tab may still be open with the value, and the marker keeps it from
+    becoming the shared tab until a sweep in that browser closes it."""
     for path, data in _env_run_markers():
         if _pid_alive(data.get('pid')):
             continue
         tid = data.get('tab')
-        if isinstance(tid, str) and tid and not (_is_external() and tid not in _external_own_tabs()):
+        if isinstance(tid, str) and tid:
+            if _is_external() and tid not in _external_own_tabs():
+                continue  # not ours to close here, or cannot judge: the marker stays
             if not _env_tab_close(tid, _env_tab_popups(tid) or ()):
                 continue
         try:
