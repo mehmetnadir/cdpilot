@@ -18082,12 +18082,12 @@ async def cmd_agent_observe_frame(frame, full=False, all_=False):
     _agent_json(res)
 
 
-async def _agent_perform_frame(ref, fa, action, ws_url):
-    """`agent act --ref` on a frame ref: click inside that frame. The frame is opened again by
+async def _agent_perform_frame(ref, fa, action, ws_url, text=None):
+    """`agent act --ref` on a frame ref: click, type or fill inside that frame. The frame is opened again by
     its index and must still be the frame the ref came from (frame id); the node is resolved in
     that frame's own session only. Anything else is the stale-ref error, never another element."""
-    if action != 'click':
-        print(json.dumps({'error': f'{ref} is an element inside an iframe: only click is supported there'}),
+    if action not in ('click', 'type', 'fill'):
+        print(json.dumps({'error': f'{ref} is an element inside an iframe: only click, type and fill are supported there'}),
               file=sys.stderr)
         sys.exit(1)
     what = 'Could not reach the iframe of'
@@ -18108,34 +18108,62 @@ async def _agent_perform_frame(ref, fa, action, ws_url):
         r = await _frame_cdp(route, [(2, 'DOM.resolveNode', {'backendNodeId': fa['backend_node_id']}, sid)])
         oid = r.get(2, {}).get('object', {}).get('objectId')
         if not oid:
-            _stale_ref_exit(ref, 'Could not find in its iframe')
-        r = await _frame_cdp(route, [(3, 'Runtime.callFunctionOn', {
-            'objectId': oid, 'returnByValue': True,
-            'functionDeclaration': "function(){if(!this.isConnected)return false;"
-                                   "this.scrollIntoView({block:'center',inline:'center',behavior:'instant'});return true;}"},
-            sid)])
-        if r.get(3, {}).get('result', {}).get('value') is not True:
-            _stale_ref_exit(ref, 'Could not find in its iframe')
-        try:
-            await _frame_route_settle(route)
-            boxes = await _frame_route_boxes(route)
-            r = await _frame_cdp(route, [(4, 'Runtime.callFunctionOn', {
-                'objectId': oid, 'functionDeclaration': _CENTER_FN, 'returnByValue': True}, sid)])
-            c = r.get(4, {}).get('result', {}).get('value')
-            if not (isinstance(c, list) and len(c) == 4):
+            if action in ('type', 'fill'):
+                _stale_ref_exit(ref, 'Could not focus')
+            else:
                 _stale_ref_exit(ref, 'Could not find in its iframe')
-            px, py = _frame_points(boxes, c[0], c[1])[0]
-            m = await _frame_cdp(route, [(5, 'Page.getLayoutMetrics', {}, None)])
-            if _viewport_contains(m.get(5), px, py) is False:
-                print(f"Error: Element {ref} is outside the viewport after scrolling", file=sys.stderr)
+        if action in ('type', 'fill'):
+            r = await _frame_cdp(route, [(3, 'Runtime.callFunctionOn', {
+                'objectId': oid, 'returnByValue': True,
+                'functionDeclaration': (
+                    "function(){"
+                    "if(!this.isConnected)return false;"
+                    "var tag=(this.tagName||'').toUpperCase();"
+                    "var type=(this.type||'').toLowerCase();"
+                    "var isText=(tag==='INPUT'&&['text','password','email','tel','number','search','url'].indexOf(type)!==-1)||"
+                    "tag==='TEXTAREA'||Boolean(this.isContentEditable);"
+                    "if(!isText)return'not_editable';"
+                    "if(typeof this.scrollIntoView==='function')this.scrollIntoView({block:'center',inline:'center',behavior:'instant'});"
+                    "if(typeof this.focus==='function')this.focus();"
+                    "if(this.ownerDocument&&this.ownerDocument.activeElement!==this)return false;"
+                    "return true;"
+                    "}"
+                )}, sid)])
+            val = r.get(3, {}).get('result', {}).get('value')
+            if val == 'not_editable':
+                print(json.dumps({'error': f'{ref} in iframe is not a text field'}), file=sys.stderr)
                 sys.exit(1)
-            with contextlib.redirect_stdout(io.StringIO()):
-                how, _, _ = await _pointer_click(route, oid, f"{ref} in iframe {fa.get('frame', '')}")
-        except _FrameError:
-            _stale_ref_exit(ref, 'Could not click in its iframe')
-        if how in PRESSED_PREFIX:  # pressed, release elsewhere: said on stderr, exit 3 like click-ref
-            _CLICK_MISSES.append(how)
-            _click_missed_exit()
+            if val is not True:
+                _stale_ref_exit(ref, 'Could not focus')
+            await _frame_cdp(route, [(4, 'Input.insertText', {'text': text or ''}, sid)])
+        else:
+            r = await _frame_cdp(route, [(3, 'Runtime.callFunctionOn', {
+                'objectId': oid, 'returnByValue': True,
+                'functionDeclaration': "function(){if(!this.isConnected)return false;"
+                                       "this.scrollIntoView({block:'center',inline:'center',behavior:'instant'});return true;}"},
+                sid)])
+            if r.get(3, {}).get('result', {}).get('value') is not True:
+                _stale_ref_exit(ref, 'Could not find in its iframe')
+            try:
+                await _frame_route_settle(route)
+                boxes = await _frame_route_boxes(route)
+                r = await _frame_cdp(route, [(4, 'Runtime.callFunctionOn', {
+                    'objectId': oid, 'functionDeclaration': _CENTER_FN, 'returnByValue': True}, sid)])
+                c = r.get(4, {}).get('result', {}).get('value')
+                if not (isinstance(c, list) and len(c) == 4):
+                    _stale_ref_exit(ref, 'Could not find in its iframe')
+                px, py = _frame_points(boxes, c[0], c[1])[0]
+                m = await _frame_cdp(route, [(5, 'Page.getLayoutMetrics', {}, None)])
+                if _viewport_contains(m.get(5), px, py) is False:
+                    print(f"Error: Element {ref} is outside the viewport after scrolling", file=sys.stderr)
+                    sys.exit(1)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    how, _, _ = await _pointer_click(route, oid, f"{ref} in iframe {fa.get('frame', '')}")
+            except _FrameError:
+                _stale_ref_exit(ref, 'Could not click in its iframe')
+            if how in PRESSED_PREFIX:  # pressed, release elsewhere: said on stderr, exit 3 like click-ref
+                _CLICK_MISSES.append(how)
+                _click_missed_exit()
     finally:
         _FRAME_ROUTE.reset(token)
         await _frame_route_close(route)
@@ -18247,7 +18275,7 @@ async def _agent_perform(ref, action, text, old_map):
     if ref not in old_map:
         fa = (_load_agent_state().get('frame_actions') or {}).get(ref)
         if fa:
-            return await _agent_perform_frame(ref, fa, action, get_page_ws()[0])
+            return await _agent_perform_frame(ref, fa, action, get_page_ws()[0], text=text)
         print(json.dumps({'error': f'Unknown ref {ref}. Run: cdpilot agent observe'}), file=sys.stderr)
         sys.exit(1)
     bid = old_map[ref]['backend_node_id']

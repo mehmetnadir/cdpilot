@@ -9298,12 +9298,197 @@ try:
         asyncio.run(mod.cmd_agent_act(ref=accept["ref"], action="type", text="x"))
 except SystemExit as e:
     assert e.code == 1
+try:
+    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(mod.cmd_agent_act(ref=accept["ref"], action="hover"))
+except SystemExit as e:
+    assert e.code == 1
 print("OK")
 `;
     try {
       const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
         { encoding: 'utf8', timeout: 60000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
       assert(/OK\s*$/.test(r.stdout), `frame observe unit test failed: ${r.stderr || r.stdout}`);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('agent act --type/--fill on frame ref (unit, fake frame route): resolves and inserts text in frame session (OOPIF and same-process), refuses non-editable fields, exits on stale or navigated frame, leaves trail empty', () => {
+    const { spawnSync } = require('child_process');
+    const os = require('os');
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-actframe-'));
+    const script = `
+import asyncio, contextlib, importlib.util, io, json, sys
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+def node(i, role, name, bid):
+    return {"nodeId": str(i), "ignored": False, "role": {"value": role}, "name": {"value": name},
+            "backendDOMNodeId": bid, "childIds": []}
+
+# Main page has a text input with bid 17
+MAIN = [node(1, "RootWebArea", "Page", 1), node(2, "textbox", "Search box", 17)]
+# Frame has a text input with bid 17, and a button with bid 18
+FRAME = [node(1, "RootWebArea", "Frame", 1), node(2, "textbox", "Card number", 17), node(3, "button", "Submit", 18)]
+PAGE = {"url": "https://shop.example/pay", "title": "Pay"}
+
+async def fake_snap():
+    state = mod._load_agent_state()
+    actions = mod._snapshot_to_actions(MAIN, state)
+    state["actions_map"] = {a["ref"]: a for a in actions}
+    state["hidden_refs"] = []
+    return PAGE, MAIN, actions, state, mod._agent_text_view(MAIN, {})
+mod._agent_full_snapshot = fake_snap
+mod.get_page_ws = lambda: ("ws://fake", PAGE)
+
+class Route:
+    session_id, frame_id, src = "S1", "F1", "/card-frame.html"
+    sessions = ["S1"]
+    root_ws = "ws://fake"
+ROUTE = Route()
+MODE = {"open_error": False, "resolve": True, "connected": True, "focus_ok": True, "url": "https://payment.example/card", "loader": "L1"}
+async def fake_open(ws_url, index, scroll=False):
+    if MODE["open_error"]: raise mod._FrameError("no iframe matches '#%d'" % index)
+    return ROUTE
+async def fake_nodes(route): return FRAME
+async def fake_close(route): pass
+
+calls = []
+async def fake_frame_cdp(route, commands, timeout=10):
+    out = {}
+    for c in commands:
+        sid = c[3] if len(c) > 3 else None
+        calls.append((c[1], sid, c[2]))
+        if c[1] == "DOM.resolveNode":
+            out[c[0]] = {"object": {"objectId": "%s-oid-%s" % (sid, c[2]["backendNodeId"])}} if MODE["resolve"] else {}
+        elif c[1] == "Runtime.callFunctionOn":
+            fn = c[2].get("functionDeclaration", "")
+            oid = c[2].get("objectId", "")
+            if "not_editable" in fn:
+                if not MODE["connected"]:
+                    out[c[0]] = {"result": {"value": False}}
+                elif "oid-18" in oid:  # button
+                    out[c[0]] = {"result": {"value": "not_editable"}}
+                elif not MODE["focus_ok"]:
+                    out[c[0]] = {"result": {"value": False}}
+                else:
+                    out[c[0]] = {"result": {"value": True}}
+            else:
+                out[c[0]] = {"result": {"value": True}}
+        elif c[1] == "Page.getFrameTree":
+            out[c[0]] = {"frameTree": {"frame": {"id": "TOP"}, "childFrames": [
+                {"frame": {"id": ROUTE.frame_id, "url": MODE["url"], "loaderId": MODE["loader"]}}]}}
+        else:
+            out[c[0]] = {}
+    return out
+
+async def noop(*a, **k): pass
+mod._agent_frame_open, mod._agent_frame_nodes, mod._frame_route_close = fake_open, fake_nodes, fake_close
+mod._frame_cdp = fake_frame_cdp
+mod._agent_settle = noop
+
+def out(coro):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        asyncio.run(coro)
+    return json.loads(buf.getvalue())
+
+out(mod.cmd_agent_reset())
+main = out(mod.cmd_agent_observe())
+main_ref = main["actions"][0]["ref"]
+assert main["actions"][0]["name"] == "Search box"
+
+r = out(mod.cmd_agent_observe_frame(0))
+card = next(a for a in r["actions"] if a["name"] == "Card number")
+btn = next(a for a in r["actions"] if a["name"] == "Submit")
+card_ref, btn_ref = card["ref"], btn["ref"]
+assert card_ref != main_ref
+
+# 1. Fill OOPIF: DOM.resolveNode and Input.insertText with session S1, text '4242'
+calls.clear()
+res = out(mod.cmd_agent_act(ref=card_ref, action='fill', text='4242'))
+assert any(c[0] == "DOM.resolveNode" and c[1] == "S1" and c[2].get("backendNodeId") == 17 for c in calls), calls
+assert any(c[0] == "Input.insertText" and c[1] == "S1" and c[2].get("text") == "4242" for c in calls), calls
+assert not any(c[1] is None and c[0] in ("DOM.resolveNode", "Input.insertText") for c in calls), "no main document resolve or insert"
+assert (mod._load_agent_state().get("trail") or []) == [], "trail must stay empty"
+
+# 2. Type same-process frame: session_id is None, Input.insertText has session None
+calls.clear()
+ROUTE.session_id = None
+res = out(mod.cmd_agent_act(ref=card_ref, action='type', text='1234'))
+assert any(c[0] == "Input.insertText" and c[1] is None and c[2].get("text") == "1234" for c in calls), calls
+ROUTE.session_id = "S1"
+assert (mod._load_agent_state().get("trail") or []) == [], "trail must stay empty"
+
+# 3. Non-editable element (button) -> exit 1 + JSON error "<ref> in iframe is not a text field"
+err = io.StringIO()
+try:
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(mod.cmd_agent_act(ref=btn_ref, action='fill', text='nope'))
+except SystemExit as e:
+    assert e.code == 1, ("non-editable exit code", e.code)
+    err_json = json.loads(err.getvalue().strip())
+    assert err_json.get("error") == f"{btn_ref} in iframe is not a text field", err.getvalue()
+else:
+    raise AssertionError("fill on button should exit 1")
+
+# 4. Stale: isConnected false / could not focus -> exit 1 + stale ref message
+MODE["connected"] = False
+err = io.StringIO()
+try:
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(mod.cmd_agent_act(ref=card_ref, action='fill', text='4242'))
+except SystemExit as e:
+    assert e.code == 1, ("disconnected exit code", e.code)
+    assert "stale ref" in err.getvalue() and "Could not focus" in err.getvalue(), err.getvalue()
+else:
+    raise AssertionError("disconnected should exit 1")
+MODE["connected"] = True
+
+# 5. Stale: navigated (loaderId changed) -> exit 1 + stale ref message
+MODE["loader"] = "L2"
+err = io.StringIO()
+try:
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(mod.cmd_agent_act(ref=card_ref, action='fill', text='4242'))
+except SystemExit as e:
+    assert e.code == 1, ("navigated exit code", e.code)
+    assert "the iframe navigated since the snapshot (stale ref)" in err.getvalue(), err.getvalue()
+else:
+    raise AssertionError("navigated iframe should exit 1")
+MODE["loader"] = "L1"
+
+# 6. Hover on frame ref -> exit 1 + new message "only click, type and fill are supported there"
+err = io.StringIO()
+try:
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(mod.cmd_agent_act(ref=card_ref, action='hover'))
+except SystemExit as e:
+    assert e.code == 1, ("hover exit code", e.code)
+    err_json = json.loads(err.getvalue().strip())
+    assert err_json.get("error") == f"{card_ref} is an element inside an iframe: only click, type and fill are supported there", err.getvalue()
+else:
+    raise AssertionError("hover on frame ref should exit 1")
+
+# 7. Submit on frame ref -> exit 1 + new message "only click, type and fill are supported there"
+err = io.StringIO()
+try:
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(mod.cmd_agent_act(ref=card_ref, action='submit'))
+except SystemExit as e:
+    assert e.code == 1, ("submit exit code", e.code)
+    err_json = json.loads(err.getvalue().strip())
+    assert err_json.get("error") == f"{card_ref} is an element inside an iframe: only click, type and fill are supported there", err.getvalue()
+else:
+    raise AssertionError("submit on frame ref should exit 1")
+
+print("OK")
+`;
+    try {
+      const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
+        { encoding: 'utf8', timeout: 60000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
+      assert(/OK\s*$/.test(r.stdout), `agent act frame fill unit test failed: ${r.stderr || r.stdout}`);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
