@@ -520,7 +520,7 @@ cdpilot agent observe --full          # every entry, nothing hidden, no size lim
 cdpilot agent observe --all           # default view without the 400-entry limit (CDPILOT_OBSERVE_MAX=N sets it, 0 = none)
 cdpilot agent find "Stalingrad" --role link   # {ref, role, name} of up to 20 matches + total_matches; refs work with act
 cdpilot agent observe --rows          # entries as [ref, role, name, value?] arrays
-cdpilot agent observe --frame 1       # the entries of iframe 1 (index from `frames`); act --ref clicks inside it
+cdpilot agent observe --frame 1       # the entries of iframe 1 (index from `frames`); act --ref clicks, types or fills inside it
 cdpilot agent stats | agent reset
 ```
 
