@@ -17662,7 +17662,7 @@ def _agent_text_view(nodes, vis=None):
             'removed': len(gone), 'parts': [t for _r, t, _h in cut + keep], 'show': show}
 
 
-def _agent_text_fields(view, nodes, state, out):
+def _agent_text_fields(view, nodes, state, out, frame=False):
     """Write one observation's text side into `out`: text, then injection_suspect, hidden_removed
     (how many text nodes left `text`; always, so a cut is never silent), and with
     CDPILOT_AGENT_HIDDEN=1 hidden_text and hidden_check, each only when it has something; push the
@@ -17679,7 +17679,9 @@ def _agent_text_fields(view, nodes, state, out):
         out['hidden_text'] = view['hidden_text']
     if view.get('show') and view.get('hidden_check'):
         out['hidden_check'] = view['hidden_check']
-    _agent_taint_push(state, nodes, list(view.get('parts') or ()) + names, hidden=view.get('why'))
+    # a frame's links never clear the page's older taint (third-party content, J1 0.9.10)
+    _agent_taint_push(state, nodes, list(view.get('parts') or ()) + names, hidden=view.get('why'),
+                      wash=not frame)
     return out
 
 
@@ -18131,7 +18133,7 @@ async def cmd_agent_observe_frame(frame, full=False, all_=False):
     if trunc:
         res['truncated'] = trunc
     view = _agent_text_view(nodes, vis)
-    _agent_text_fields(view, nodes, state, res)
+    _agent_text_fields(view, nodes, state, res, frame=True)
     _save_agent_state(state)
     res['token_estimate'] = _estimate_tokens(res)
     _agent_json(res)
@@ -18820,13 +18822,15 @@ def _agent_link_hosts(nodes, hidden=None):
     return hosts
 
 
-def _agent_taint_push(state, nodes, texts, hidden=None):
+def _agent_taint_push(state, nodes, texts, hidden=None, wash=True):
     """state['taint_hosts']: per observation (the last AGENT_TAINT_OBS) the hosts its hidden_text and
     injection_suspect texts name that no shown link points to (_agent_link_hosts with `hidden`);
-    <= AGENT_TAINT_MAX in all, oldest dropped first. A host this page links to leaves the older entries too."""
+    <= AGENT_TAINT_MAX in all, oldest dropped first. A host this page links to leaves the older entries too,
+    unless wash=False (an iframe's observation: its links clear only its own new entry)."""
     links = _agent_link_hosts(nodes, hidden)
     new = [h for h in _agent_text_hosts(texts) if h not in links]
-    entries = [[h for h in e if h not in links] for e in (state.get('taint_hosts') or []) if isinstance(e, list)]
+    entries = [[h for h in e if not wash or h not in links]
+               for e in (state.get('taint_hosts') or []) if isinstance(e, list)]
     entries = entries[-(AGENT_TAINT_OBS - 1):] + [new]
     while sum(len(e) for e in entries) > AGENT_TAINT_MAX:
         next(e for e in entries if e).pop(0)
@@ -23673,7 +23677,7 @@ def _extract_timeout(argv, env=None):
     while i < len(argv):
         a = argv[i]
         if a == "--" and cmd is not None:
-            # everything after `--` is literal (`agent find -- "--timeout 0"`, `network -- <url>`):
+            # everything after `--` is literal (`agent find -- --timeout 0`, `network -- <url>`):
             # a text the model passes there must not set or disable the time limit (T1 15.11)
             rest.extend(argv[i:])
             break

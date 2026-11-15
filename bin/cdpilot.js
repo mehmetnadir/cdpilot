@@ -760,8 +760,8 @@ function showHelp() {
 
   GLOBAL OPTIONS
     --timeout <s>      Abort the command after <s> seconds (exit 124). Before or
-                       after the command; env CDPILOT_TIMEOUT sets a default
-                       (the flag wins, 0 disables).
+                       after the command (not after a --, which ends options);
+                       env CDPILOT_TIMEOUT sets a default (the flag wins, 0 disables).
     Page commands start the browser if it is not running
                        (set CDPILOT_NO_AUTOLAUNCH=1 to get an error instead).
     An auto-launched (or MCP-launched) browser closes after 15 min without a
@@ -962,7 +962,7 @@ function showHelp() {
                        "frames" lists visible iframes (an iframe that covers
                        the page adds a hint); --frame <i> = the entries of
                        iframe <i> (names its live origin as frame; no --diff/--rows); agent act
-                       --ref on one clicks inside that frame
+                       --ref on one clicks, types or fills inside that frame
     agent find "<text>" [--role <role>] [--max 20] [--rows] [--objects]
                        Entries of the whole page whose name contains <text>
                        (any case): {ref, role, name} + total_matches; the

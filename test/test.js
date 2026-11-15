@@ -5934,6 +5934,32 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
       }
     });
 
+    test('frames e2e: agent act --fill on a frame ref types into the field (same-origin and OOPIF); a button is refused', () => {
+      const { c, p1, p2 } = needE2E();
+      const child = `http://localhost:${p2}/inner.html`;
+      for (const url of [`http://127.0.0.1:${p1}/top.html`,
+        `http://127.0.0.1:${p1}/top.html?child=${encodeURIComponent(child)}`]) {
+        c('go', url);
+        c('agent', 'reset');
+        // top.html: [0] hidden-frame, [1] iframe#card (below the fold; inner.html, OOPIF with ?child=)
+        let fr = null;
+        for (let i = 0; i < 20 && !(fr && fr.actions && fr.actions.some((a) => a.name === 'Card number')); i++) {
+          fr = JSON.parse(c('agent', 'observe', '--frame', '1').stdout || '{}');
+        }
+        const field = (fr.actions || []).find((a) => a.name === 'Card number' && a.role === 'textbox');
+        assert(field, `iframe#card lists the card field (${url}): ${JSON.stringify(fr)}`);
+        const r = c('agent', 'act', '--ref', field.ref, '--action', 'fill', '--text', '4242 4242');
+        assert.strictEqual(r.status, 0, `fill ${url}: ${r.stdout}${r.stderr}`);
+        ok(c('frame', 'eval', '--frame', '#card', 'document.getElementById("cc").value'), /4242 4242/,
+          `the frame field holds the text (${url})`);
+        const btn = fr.actions.find((a) => a.name === 'Pay now');
+        assert(btn, `iframe#card lists Pay now: ${JSON.stringify(fr.actions)}`);
+        const b = c('agent', 'act', '--ref', btn.ref, '--action', 'fill', '--text', 'x');
+        assert.strictEqual(b.status, 1, `a button is no text field (${url}): ${b.stdout}${b.stderr}`);
+        ok(b, /is not a text field/, `non-field message (${url})`);
+      }
+    });
+
     test('frames e2e: frame list without --frame prints the old output', () => {
       const { c, p1, p2 } = needE2E();
       c('go', crossPage(p1, p2));
@@ -9487,6 +9513,9 @@ print("OK")
       const r = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-I', '-c', script],
         { encoding: 'utf8', timeout: 60000, env: { ...process.env, CDPILOT_HOME: home, CDPILOT_LOG: '0' } });
       assert(/OK\s*$/.test(r.stdout), `observe --frame text protection test failed: ${r.stderr || r.stdout}`);
+      // J1 0.9.10: the frame's observation never washes the page's older taint with the frame's links
+      assert(/async def cmd_agent_observe_frame[\s\S]*?_agent_text_fields\(view, nodes, state, res, frame=True\)/.test(PY_CONTENT),
+        'cmd_agent_observe_frame passes frame=True');
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
@@ -10359,6 +10388,10 @@ assert sum(map(len, st["taint_hosts"])) == 20, st
 st = {"taint_hosts": [["collect.evil.example"]]}
 mod._agent_taint_push(st, link("https://collect.evil.example/form", 6), [])
 assert st["taint_hosts"] == [[], []], st                                     # the page now links to it
+# J1 0.9.10: an iframe observation (wash=False) never clears the page's older taint with its own links
+st = {"taint_hosts": [["collect.evil.example"]]}
+mod._agent_taint_push(st, link("https://collect.evil.example/form", 7), ["see collect.evil.example"], wash=False)
+assert st["taint_hosts"] == [["collect.evil.example"], []], st
 # the guard
 V = "s3cr3t-session-value-0123456789"
 COOKIES = [{"name": "sid", "value": V, "domain": ".bank.example.co.uk"},

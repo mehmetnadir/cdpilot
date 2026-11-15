@@ -526,13 +526,16 @@ cdpilot agent stats | agent reset
 
 `agent observe` never saw into iframes, so a cookie layer in a full-screen iframe (theguardian.com, weather.com) left the model
 with 400 entries of a page it could not click. It now adds `frames` (at most 5 visible iframes: `{i, origin, w, h, cover,
-blocking}`, read in the main document with one `Runtime.evaluate`) and, when one covers the page, a `frames_hint`. Top-level
+blocking}`, read in cdpilot's isolated world, so a page that replaces `getBoundingClientRect` or `elementFromPoint` cannot
+hide or invent one) and, when one covers the page, a `frames_hint`. Top-level
 `frames[].origin` is read from the iframe's `src` attribute (not the post-redirect address) and is not a trust signal; the
 `frame` field in `agent observe --frame <i>` output comes from the live frame URL. `agent observe
 --frame <i>` lists that frame's entries and names the frame's live origin as `frame`; they pass the same tag-character cleaning and
-`injection_suspect` scan as page text (a frame is third-party content). A frame ref belongs to its frame and never resolves in the main
-document; if the frame is gone or replaced, `agent act --ref` gives the stale-ref error. Only `click` works on a frame ref, and
-such a click is not part of a saved flow's trail.
+`injection_suspect` scan as page text (a frame is third-party content), and its text passes the same hidden-text cut
+(`hidden_removed`); hosts its hidden text names feed the guard's `url_from_hidden`. A frame ref belongs to its frame and never resolves in the main
+document; if the frame is gone or replaced, `agent act --ref` gives the stale-ref error. `click`, `type` and `fill` work on a frame ref
+(`type`/`fill` only on a text field, inside the frame's own session); `hover` and `submit` do not, and frame acts are not part
+of a saved flow's trail.
 
 The agent commands (`agent observe`, `agent act`, `agent run`, `agent flow list|show`) print compact
 UTF-8 JSON when stdout is not a terminal (an agent, a pipe, an MCP tool call) and indented JSON in a
