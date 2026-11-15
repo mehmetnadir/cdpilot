@@ -12448,14 +12448,19 @@ import importlib.util, json, os, subprocess
 spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
 mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
 out = {"cli": [mod._env_var_value("token"), mod._env_var_values()]}
-os.environ["CDPILOT_MCP_SESSION"] = "1"
+os.environ["CDPILOT_MCP_SESSION"] = "1"  # a \`cdpilot run\` script line: not MCP
+mod.IS_MCP_SESSION = True
+out["run_line"] = mod._env_var_value("token")
+del os.environ["CDPILOT_MCP_SESSION"]
+mod.IS_MCP_SESSION = False
+os.environ["CDPILOT_MCP_TOOL_CALL"] = "1"  # a tool call of the MCP server (child or warm run)
 out["mcp"] = [mod._env_var_value("token"), mod._env_var_values()]
 os.environ["CDPILOT_MCP_ALLOW_VARS"] = "1"
 out["mcp_allow"] = mod._env_var_value("TOKEN")
-del os.environ["CDPILOT_MCP_SESSION"], os.environ["CDPILOT_MCP_ALLOW_VARS"]
-mod.IS_MCP_SESSION = True  # the MCP server's own process (MCPServer.__init__), no marker in its environment
+del os.environ["CDPILOT_MCP_TOOL_CALL"], os.environ["CDPILOT_MCP_ALLOW_VARS"]
+mod.MCP_SERVER_PROCESS = True  # the MCP server's own process (MCPServer.__init__), no marker in its environment
 out["server"] = mod._env_var_value("TOKEN")
-mod.IS_MCP_SESSION = False
+mod.MCP_SERVER_PROCESS = False
 seen = []
 def fake_run(argv, **kw):
     seen.append(sorted(k for k in kw["env"] if k.upper().startswith("CDPILOT_VAR_")))
@@ -12473,6 +12478,7 @@ print(json.dumps(out))
     assert.strictEqual(r.status, 0, r.stderr);
     const o = JSON.parse(r.stdout.trim().split('\n').pop());
     assert.deepStrictEqual(o.cli, [VARS_PLANTED, { TOKEN: VARS_PLANTED }], 'the CLI reads the value as before');
+    assert.strictEqual(o.run_line, VARS_PLANTED, 'CDPILOT_MCP_SESSION=1 alone (a cdpilot run script line) still reads the value');
     assert.deepStrictEqual(o.mcp, [null, {}], 'an MCP command reads none');
     assert.strictEqual(o.mcp_allow, VARS_PLANTED, 'CDPILOT_MCP_ALLOW_VARS=1 opts in');
     assert.strictEqual(o.server, null, 'the MCP server process reads none (the warm path)');
@@ -17442,10 +17448,10 @@ print(json.dumps(res))
     noSecret(r);
   });
 
-  test('replay: env var — in an MCP session (CDPILOT_MCP_SESSION=1) a CDPILOT_VAR value is missing unless CDPILOT_MCP_ALLOW_VARS=1, with the hint', () => {
+  test('replay: env var — in an MCP tool call (CDPILOT_MCP_TOOL_CALL=1) a CDPILOT_VAR value is missing unless CDPILOT_MCP_ALLOW_VARS=1, with the hint; CDPILOT_MCP_SESSION=1 alone is not MCP', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envmcp-'));
     const flowPath = writeFlow(home, [{ cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 0 }]);
-    const base = { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com', CDPILOT_MCP_SESSION: '1' };
+    const base = { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'example.com', CDPILOT_MCP_TOOL_CALL: '1' };
     let r = runCli(['replay', flowPath, '--dry-run'], varEnv(home, { ...base, CDPILOT_MCP_ALLOW_VARS: '' }));
     assert.strictEqual(r.status, 2, r.stdout + r.stderr);
     assert.strictEqual(r.stdout, '');
@@ -17455,6 +17461,10 @@ print(json.dumps(res))
     noSecret(r);
     r = runCli(['replay', flowPath, '--dry-run'], varEnv(home, { ...base, CDPILOT_MCP_ALLOW_VARS: '1' }));
     assert.strictEqual(r.status, 0, r.stderr);
+    noSecret(r);
+    r = runCli(['replay', flowPath, '--dry-run'], varEnv(home,
+      { ...base, CDPILOT_MCP_TOOL_CALL: '', CDPILOT_MCP_SESSION: '1', CDPILOT_MCP_ALLOW_VARS: '' }));
+    assert.strictEqual(r.status, 0, `a cdpilot run script line (CDPILOT_MCP_SESSION=1) lost the value: ${r.stderr}`);
     noSecret(r);
   });
 

@@ -189,6 +189,9 @@ REGISTRY_FILE = os.path.join(CDPILOT_HOME, "registry.json")
 CDPILOT_PORT_RANGE_START = 9222
 CDPILOT_PORT_RANGE_END = 9322
 IS_MCP_SESSION = os.environ.get("CDPILOT_MCP_SESSION") == "1"
+# True only in the `cdpilot mcp` server process (MCPServer.__init__). CDPILOT_MCP_SESSION
+# alone is not MCP: `cdpilot run` sets it for its script lines, users for the visual layer.
+MCP_SERVER_PROCESS = False
 
 
 def _get_project_id():
@@ -19283,9 +19286,10 @@ MCP_VARS_HINT = (f'over MCP, CDPILOT_VAR_<NAME> values are off unless the MCP se
 
 
 def _env_vars_blocked() -> bool:
-    """True in an MCP session (the MCP server process, or a command it runs with
-    CDPILOT_MCP_SESSION=1) whose server was not started with CDPILOT_MCP_ALLOW_VARS=1."""
-    mcp = IS_MCP_SESSION or os.environ.get('CDPILOT_MCP_SESSION') == '1'
+    """True in the MCP server process or a tool call it runs (MCP_TOOL_CALL_ENV=1,
+    child or warm run) when the server was not started with CDPILOT_MCP_ALLOW_VARS=1.
+    CDPILOT_MCP_SESSION=1 alone (a `cdpilot run` script line) does not count."""
+    mcp = MCP_SERVER_PROCESS or os.environ.get(MCP_TOOL_CALL_ENV) == '1'
     return mcp and os.environ.get(MCP_ALLOW_VARS_ENV, '').strip() != '1'
 
 
@@ -22478,8 +22482,9 @@ class MCPServer:
         self._canvas_open = _canvas_any_open()  # what the last tools/list could show
         # A tool call that runs in this process (CDPILOT_DAEMON=1, _run_warm)
         # must see what its own process saw with CDPILOT_MCP_SESSION=1 set.
-        global IS_MCP_SESSION
+        global IS_MCP_SESSION, MCP_SERVER_PROCESS
         IS_MCP_SESSION = True
+        MCP_SERVER_PROCESS = True
 
     def _run_warm(self, cli_args, env):
         """CDPILOT_DAEMON=1: run the tool call in the server process, the way
