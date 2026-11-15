@@ -762,7 +762,7 @@ def _maybe_print_shadow_note(sel, host_desc):
     key = (sel, host_desc)
     if key not in _SHADOW_NOTES_PRINTED:
         _SHADOW_NOTES_PRINTED.add(key)
-        print(_shadow_deep_fallback_note(sel, host_desc), file=sys.stderr)
+        print(_tty_text(_shadow_deep_fallback_note(sel, host_desc), err=True), file=sys.stderr)
 
 
 WAIT_AND_QUERY_JS = _SHADOW_QUERY_JS + """
@@ -7850,8 +7850,8 @@ def cmd_tabs(reap=False, max_tabs=1, include_real=False, dry_run=False):
     for i, p in enumerate(pages):
         url = p.get("url", "")
         icon = "🔵" if url.startswith("chrome://") else "🟢"
-        print(f"  {icon} [{i}] {p.get('title', '')[:70]}")
-        print(f"       {url[:120]}")
+        print(f"  {icon} [{i}] {_tty_text(p.get('title', '')[:70])}")
+        print(f"       {_tty_text(url[:120])}")
     print(f"\n{len(pages)} pages, {len(tabs)} targets")
     if hidden:
         print(f"{hidden} tab(s) of your connected browser not listed over MCP "
@@ -7918,7 +7918,7 @@ async def cmd_go(url):
 
     try:
         content, _ = await navigate_collect(active_ws, url)
-        print(content)
+        print(_tty_text(content))
 
         # One Runtime.evaluate for the three post-load probes (hostname,
         # friction rung, CAPTCHA) instead of four round trips; each consumer
@@ -8048,7 +8048,7 @@ async def cmd_content():
     content = _cdp_reply(r, 1, "Runtime.evaluate", 15).get("result", {}).get("value", "(empty)")
     acc = [0, [], 0]
     shown = _tag_clean_text(content, acc)
-    print(shown)
+    print(_tty_text(shown))
     _tag_clean_notice(acc)
     if len(content) >= 1048576:
         print("[Output truncated at 1MB]")
@@ -8061,7 +8061,7 @@ async def cmd_html():
         "returnByValue": True,
     })])
     html_content = _cdp_reply(r, 1, "Runtime.evaluate", 15).get("result", {}).get("value", "(empty)")
-    print(html_content)
+    print(_tty_text(html_content))
     if len(html_content) >= 1048576:
         print("[Output truncated at 1MB]")
 
@@ -8421,7 +8421,7 @@ async def cmd_eval(js_code):
     result = _cdp_reply(r, 1, "Runtime.evaluate", 15)
     if "exceptionDetails" in result:
         exc = result["exceptionDetails"]
-        print(f"Error: {exc.get('text', '')} — {exc.get('exception', {}).get('description', '')}")
+        print(_tty_text(f"Error: {exc.get('text', '')} — {exc.get('exception', {}).get('description', '')}"))
         sys.exit(1)  # a page-side exception is a failure (stdout text kept for compatibility)
     else:
         val = result.get("result", {})
@@ -8429,9 +8429,10 @@ async def cmd_eval(js_code):
             print("(undefined)")
         elif val.get("value") is not None:
             v = val["value"]
-            print(json.dumps(v, indent=2, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v))
+            print(_tty_json(json.dumps(v, indent=2, ensure_ascii=False)) if isinstance(v, (dict, list))
+                  else _tty_text(str(v)))
         else:
-            print(json.dumps(val, indent=2, ensure_ascii=False))
+            print(_tty_json(json.dumps(val, indent=2, ensure_ascii=False)))
 
 
 async def cmd_eval_batch(exprs_json):
@@ -9655,7 +9656,7 @@ async def cmd_network(url=None, har=None):
         har_dict = _har_from_events(events, page, __version__)
         entry_count = len(har_dict.get("log", {}).get("entries", []))
         if har == "-":
-            har_json = json.dumps(har_dict, indent=2, ensure_ascii=False)
+            har_json = _tty_json(json.dumps(har_dict, indent=2, ensure_ascii=False))
             sys.stdout.write(har_json + "\n")
             sys.stdout.flush()
             print(f"har: {entry_count} entries -> -", file=sys.stderr)
@@ -9668,9 +9669,9 @@ async def cmd_network(url=None, har=None):
     for req in events["network"]:
         s = req.get("status", "?")
         m = "✓" if str(s).startswith("2") else "✗" if str(s).startswith(("4", "5")) else "→"
-        print(f"  {m} [{s}] {req.get('type',''):>10} {req['url']}")
+        print(f"  {m} [{s}] {req.get('type',''):>10} {_tty_text(req['url'])}")
     print(f"\nTotal: {len(events['network'])} requests")
-    print(f"\n=== Content (first 3000 chars) ===\n{content[:3000]}")
+    print(f"\n=== Content (first 3000 chars) ===\n{_tty_text(content[:3000])}")
 
 
 async def cmd_console(url=None):
@@ -9684,10 +9685,10 @@ async def cmd_console(url=None):
     icons = {"log": "📝", "error": "❌", "warning": "⚠️", "info": "ℹ️"}
     for log in events["console"]:
         lvl = log.get("type", "log")
-        print(f"  {icons.get(lvl, '📝')} [{lvl.upper()}] {log['text']}")
+        print(f"  {icons.get(lvl, '📝')} [{lvl.upper()}] {_tty_text(log['text'])}")
     if not events["console"]:
         print("  (empty)")
-    print(f"\n=== Content (first 3000 chars) ===\n{content[:3000]}")
+    print(f"\n=== Content (first 3000 chars) ===\n{_tty_text(content[:3000])}")
 
 
 # ─── Per-host cookie persistence helpers ───
@@ -10143,10 +10144,10 @@ async def cmd_storage():
     try:
         data = json.loads(val)
         for k, v in data.items():
-            print(f"  {k}: {v[:120]}")
+            print(f"  {_tty_text(k)}: {_tty_text(v[:120])}")
         print(f"\n{len(data)} entries")
     except:
-        print(val)
+        print(_tty_text(val))
 
 
 async def cmd_wipe(*args):
@@ -10452,7 +10453,7 @@ async def cmd_debug(url=None):
     if url is None:
         url = page.get("url", "")
 
-    print(f"🔍 Debug: {url}")
+    print(f"🔍 Debug: {_tty_text(url)}")
     print("=" * 60)
 
     content, events = await navigate_collect(ws, url, network=True, console=True, glow=True)
@@ -10464,10 +10465,10 @@ async def cmd_debug(url=None):
     if errors:
         for log in errors:
             icon = "❌" if log["type"] == "error" else "⚠️"
-            print(f"  {icon} {log['text']}")
+            print(f"  {icon} {_tty_text(log['text'])}")
     elif all_logs:
         for log in all_logs[:10]:
-            print(f"  📝 {log['text']}")
+            print(f"  📝 {_tty_text(log['text'])}")
     else:
         print("  ✅ Clean (no errors)")
 
@@ -10476,14 +10477,14 @@ async def cmd_debug(url=None):
     failed = [r for r in events["network"] if str(r.get("status", "")).startswith(("4", "5"))]
     if failed:
         for req in failed:
-            print(f"  ❌ [{req['status']}] {req['url']}")
+            print(f"  ❌ [{req['status']}] {_tty_text(req['url'])}")
     else:
         print("  ✅ All requests successful")
     slow = [r for r in events["network"] if r.get("type") in ("XHR", "Fetch", "Document")]
     if slow:
         print(f"  📊 API/Document requests: {len(slow)}")
         for r in slow[:5]:
-            print(f"     [{r.get('status','?')}] {r.get('type','')} {r['url'][:100]}")
+            print(f"     [{r.get('status','?')}] {r.get('type','')} {_tty_text(r['url'][:100])}")
 
     print("\n⚡ PERFORMANCE")
     print("-" * 40)
@@ -10520,10 +10521,10 @@ async def cmd_debug(url=None):
 
     print(f"\n📄 PAGE CONTENT (first 2000 chars)")
     print("-" * 40)
-    print(content[:2000])
+    print(_tty_text(content[:2000]))
 
     print(f"\n{'=' * 60}")
-    print(f"Debug complete: {url}")
+    print(f"Debug complete: {_tty_text(url)}")
 
 
 # ─── Owned-Tab Tracking ───
@@ -15151,7 +15152,7 @@ async def cmd_a11y(subcmd=""):
                 out += f" value='{val}'"
             if desc:
                 out += f" description='{desc}'"
-            print(_tag_clean_text(out, acc))
+            print(_tty_text(_tag_clean_text(out, acc)))
         _tag_clean_notice(acc)
 
     elif sub == "summary":
@@ -15177,7 +15178,7 @@ async def cmd_a11y(subcmd=""):
             acc = [0, [], 0]
             for n in found:
                 name = _tag_clean_text(get_prop(n, "name"), acc)
-                print(f"  - '{name or '(unnamed)'}'")
+                print(f"  - '{_tty_text(name or '(unnamed)')}'")
             _tag_clean_notice(acc)
     else:
         print("Usage: a11y [full|summary|find <role>]")
@@ -15196,8 +15197,8 @@ async def cmd_describe():
     ws_url, page = get_page_ws()
 
     print("=== Page Description ===")
-    print(f"URL: {page.get('url', 'N/A')}")
-    print(f"Title: {page.get('title', 'N/A')}")
+    print(f"URL: {_tty_text(page.get('url', 'N/A'))}")
+    print(f"Title: {_tty_text(page.get('title', 'N/A'))}")
     print()
 
     # ── Accessibility Snapshot ──────────────────────────────────────────────
@@ -15316,7 +15317,7 @@ async def cmd_describe():
 
     acc = [0, [], 0]
     for line in output_lines:
-        print(_tag_clean_text(line, acc))
+        print(_tty_text(_tag_clean_text(line, acc)))
     print(f"\n[{interactive_count} interactive, {ref_count} total shown]")
     _tag_clean_notice(acc)
     print()
@@ -15341,7 +15342,7 @@ async def cmd_describe():
         "returnByValue": True
     })])
     page_text = eval_res.get(3, {}).get("result", {}).get("value", "")
-    print(page_text[:2000])
+    print(_tty_text(page_text[:2000]))
 
 
 # ─── Data Extraction & Observation Commands ───
@@ -16334,9 +16335,9 @@ async def cmd_assert(selector, expected_text=None, check_visible=True):
     if isinstance(val, dict):
         if val.get("shadowHost"):
             _maybe_print_shadow_note(selector, val["shadowHost"])
-        print(val.get("msg", "ERROR"))
+        print(_tty_text(val.get("msg", "ERROR")))
     else:
-        print(val or "ERROR")
+        print(_tty_text(val or "ERROR"))
 
 
 async def cmd_wait_for(selector, timeout_ms=5000):
@@ -16500,7 +16501,7 @@ async def cmd_check(checks_json=None):
     print(f"Test Report: {passed} passed, {failed} failed")
     print("─" * 40)
     for line in results:
-        print(line)
+        print(_tty_text(line))
 
 
 async def cmd_assert_url(expected_url):
@@ -16515,7 +16516,7 @@ async def cmd_assert_url(expected_url):
     }})()"""
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
     result = r.get(1, {}).get("result", {}).get("value", "ERROR")
-    print(result)
+    print(_tty_text(result))
 
 
 async def cmd_assert_title(expected_title):
@@ -16530,7 +16531,7 @@ async def cmd_assert_title(expected_title):
     }})()"""
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
     result = r.get(1, {}).get("result", {}).get("value", "ERROR")
-    print(result)
+    print(_tty_text(result))
 
 
 async def cmd_assert_count(selector, expected_count):
@@ -16549,7 +16550,7 @@ async def cmd_assert_count(selector, expected_count):
     }})()"""
     r = await cdp_send(ws_url, [(1, "Runtime.evaluate", {"expression": js, "returnByValue": True})])
     result = r.get(1, {}).get("result", {}).get("value", "ERROR")
-    print(result)
+    print(_tty_text(result))
 
 
 async def cmd_assert_value(selector, expected_value):
@@ -16571,7 +16572,7 @@ async def cmd_assert_value(selector, expected_value):
         if out.get('refused'):
             _replay_strict_refuse('assert-value', out['refused'])
         if not out.get('ok'):
-            print(out.get('missing') or f'FAIL: Element not found: {selector}')
+            print(_tty_text(out.get('missing') or f'FAIL: Element not found: {selector}'))
         elif out.get('equal'):
             print(f'PASS: Value matches ({selector}, value not shown)')
         else:
@@ -16594,9 +16595,9 @@ async def cmd_assert_value(selector, expected_value):
     if isinstance(val, dict):
         if val.get("shadowHost"):
             _maybe_print_shadow_note(selector, val["shadowHost"])
-        print(val.get("msg", "ERROR"))
+        print(_tty_text(val.get("msg", "ERROR")))
     else:
-        print(val or "ERROR")
+        print(_tty_text(val or "ERROR"))
 
 
 async def cmd_assert_attr(selector, attr, expected):
@@ -16621,9 +16622,9 @@ async def cmd_assert_attr(selector, attr, expected):
     if isinstance(val, dict):
         if val.get("shadowHost"):
             _maybe_print_shadow_note(selector, val["shadowHost"])
-        print(val.get("msg", "ERROR"))
+        print(_tty_text(val.get("msg", "ERROR")))
     else:
-        print(val or "ERROR")
+        print(_tty_text(val or "ERROR"))
 
 
 async def cmd_assert_visible(selector, should_be_visible=True):
@@ -16655,9 +16656,9 @@ async def cmd_assert_visible(selector, should_be_visible=True):
     if isinstance(val, dict):
         if val.get("shadowHost"):
             _maybe_print_shadow_note(selector, val["shadowHost"])
-        print(val.get("msg", "ERROR"))
+        print(_tty_text(val.get("msg", "ERROR")))
     else:
-        print(val or "ERROR")
+        print(_tty_text(val or "ERROR"))
 
 
 async def cmd_screenshot_diff(path1, path2):
@@ -16804,7 +16805,7 @@ async def cmd_a11y_snapshot():
 
     acc = [0, [], 0]
     for line in output_lines:
-        print(_tag_clean_text(line, acc))
+        print(_tty_text(_tag_clean_text(line, acc)))
     print(f"\n[{interactive_count} interactive, {ref_count} total shown]")
     _tag_clean_notice(acc)
 
@@ -17120,6 +17121,52 @@ def _estimate_tokens(obj):
 # CDPILOT_JSON=pretty|compact overrides. In the warm process stdout is a socket,
 # so the launcher sends its own TTY flag; _OUT_TTY holds it for that request only.
 _OUT_TTY = None
+_ERR_TTY = None  # the same for stderr (the launcher's etty flag)
+
+# Page text printed for a person (content, titles, console messages, values): a page can put ESC,
+# other C0 controls, DEL and C1 (0x80-0x9F; U+009B is CSI) in it, and a terminal obeys them (SGR
+# conceal, cursor movement and erase, OSC title / hyperlink / clipboard) and can hide cdpilot's own
+# lines. _term_text shows each one as the visible text \xNN (ESC -> the 4 characters \x1b); tab,
+# newline and a CR right before a newline stay, U+2028 / U+2029 become spaces, all else is kept.
+# Print sites apply it only when the stream is a terminal (_tty_text): piped output (MCP, scripts,
+# `> file`) keeps the page's exact bytes.
+_TERM_CTRL_RE = _re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]|\r(?!\n)')
+# JSON text: json.dumps escapes C0 itself; with ensure_ascii=False, DEL, C1 and U+2028 / U+2029 stay raw
+_JSON_CTRL_RE = _re.compile('[\x7f-\x9f\u2028\u2029]')
+
+
+def _term_text(s):
+    """s for a terminal (see _TERM_CTRL_RE); a non-string is str()-ed first."""
+    s = s if isinstance(s, str) else str(s)
+    if not _TERM_CTRL_RE.search(s):
+        return s
+    return _TERM_CTRL_RE.sub(lambda m: ' ' if m.group() in '\u2028\u2029' else f'\\x{ord(m.group()):02x}', s)
+
+
+def _stream_tty(err=False):
+    """True when stdout (err: stderr) is a terminal; in the warm process, the launcher's flag."""
+    flag = _ERR_TTY if err else _OUT_TTY
+    if flag is not None:
+        return flag
+    try:
+        return (sys.stderr if err else sys.stdout).isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _tty_text(s, err=False):
+    """Page text for print: _term_text on a terminal, unchanged when piped."""
+    return _term_text(s) if _stream_tty(err) else s
+
+
+def _json_ctrl_escape(text):
+    """JSON text with DEL, C1 and U+2028 / U+2029 as \\u escapes: the same JSON value, no raw control."""
+    return _JSON_CTRL_RE.sub(lambda m: f'\\u{ord(m.group()):04x}', text)
+
+
+def _tty_json(text):
+    """JSON text of page data for print: _json_ctrl_escape on a terminal, unchanged when piped."""
+    return _json_ctrl_escape(text) if _stream_tty() else text
 
 
 def _agent_json_pretty():
@@ -17238,7 +17285,7 @@ def _agent_json(obj):
         text.encode(getattr(sys.stdout, 'encoding', None) or 'utf-8')
     except UnicodeEncodeError:  # a non-UTF-8 console: escape instead of failing
         text = json.dumps(obj, ensure_ascii=True, **kw)
-    print(text)
+    print(_json_ctrl_escape(text))  # page text: no raw DEL / C1 for a terminal or a model
 
 
 # Page text that addresses the agent instead of the user: the classic shape of
@@ -22337,21 +22384,21 @@ async def cmd_tools_list(as_json=False):
     tools, facts, error, _ = await _webmcp_list(ws)
     if tools:
         if as_json:
-            print(json.dumps({"tools": tools, "url": facts.get("url")}, indent=2,
-                             ensure_ascii=False))
+            print(_tty_json(json.dumps({"tools": tools, "url": facts.get("url")}, indent=2,
+                                       ensure_ascii=False)))
             return
         print(f"{len(tools)} WebMCP tool{'s' if len(tools) != 1 else ''} on "
-              f"{facts.get('url') or 'this page'}:")
+              f"{_tty_text(facts.get('url') or 'this page')}:")
         for t in tools:
-            print("\n".join(_webmcp_format_tool(t)))
+            print(_tty_text("\n".join(_webmcp_format_tool(t))))
         return
     reason, hint = _webmcp_diagnose(facts, error, mode_on=get_webmcp_config(),
                                     browser=_webmcp_browser_name())
     if as_json:
-        print(json.dumps({"tools": [], "url": facts.get("url"), "available": reason == "no-tools",
-                          "reason": reason, "hint": hint}, indent=2, ensure_ascii=False))
+        print(_tty_json(json.dumps({"tools": [], "url": facts.get("url"), "available": reason == "no-tools",
+                                    "reason": reason, "hint": hint}, indent=2, ensure_ascii=False)))
     else:
-        print(f"No WebMCP tools on {facts.get('url') or 'this page'}.\n  {hint}")
+        print(f"No WebMCP tools on {_tty_text(facts.get('url') or 'this page')}.\n  {hint}")
 
 
 def _webmcp_call_budget():
@@ -22372,7 +22419,7 @@ async def cmd_tools_call(name, call_args, frame=None):
     if not tools and (error or not facts.get("api")):
         _, hint = _webmcp_diagnose(facts, error, mode_on=get_webmcp_config(),
                                    browser=_webmcp_browser_name())
-        print(f"Error: cannot call '{name}': {hint}", file=sys.stderr)
+        print(_tty_text(f"Error: cannot call '{name}': {hint}", err=True), file=sys.stderr)
         sys.exit(1)
     matches = [t for t in (tools or []) if t["name"] == name]
     doc_url = lambda t: t.get("frame") or facts.get("url") or ""  # noqa: E731
@@ -22385,19 +22432,19 @@ async def cmd_tools_call(name, call_args, frame=None):
         matches = [t for t in matches if t.get("frame") is None][:1] or matches
     if len(matches) > 1:
         where = ", ".join(doc_url(t) for t in matches)
-        print(f"Error: tool '{name}' is registered in several frames ({where}); "
-              f"pick one with --frame <url-part>", file=sys.stderr)
+        print(_tty_text(f"Error: tool '{name}' is registered in several frames ({where}); "
+                        f"pick one with --frame <url-part>", err=True), file=sys.stderr)
         sys.exit(1)
     if not matches:
         known = ", ".join(sorted({t["name"] for t in tools or []})) or "none"
         where = f" in a frame matching '{frame}'" if frame is not None else ""
-        print(f"Error: tool '{name}' not found{where} on this page (tools: {known})",
+        print(_tty_text(f"Error: tool '{name}' not found{where} on this page (tools: {known})", err=True),
               file=sys.stderr)
         sys.exit(1)
     tool = matches[0]
     ok, err = _webmcp_validate_args(tool.get("inputSchema"), call_args)
     if not ok:
-        print(f"Error: {err}", file=sys.stderr)
+        print(_tty_text(f"Error: {err}", err=True), file=sys.stderr)
         sys.exit(1)
     budget = _webmcp_call_budget()
     if tool.get("declarative") and not tool.get("autosubmit"):
@@ -22412,7 +22459,8 @@ async def cmd_tools_call(name, call_args, frame=None):
     val = val or {}
     status = val.get("status")
     if exc or status is None:
-        print(f"Error: tool '{name}': {exc or 'no result from the page'}", file=sys.stderr)
+        print(_tty_text(f"Error: tool '{name}': {exc or 'no result from the page'}", err=True),
+              file=sys.stderr)
         sys.exit(1)
     if status in ("gone", "unavailable"):
         print(f"Error: tool '{name}' is no longer registered on this page", file=sys.stderr)
@@ -22424,7 +22472,7 @@ async def cmd_tools_call(name, call_args, frame=None):
               f"aborted (executeTool signal)", file=sys.stderr)
         sys.exit(TIMEOUT_EXIT_CODE)
     if status != "ok":
-        print(f"Error: tool '{name}' failed: {val.get('name')}: {val.get('message')}",
+        print(_tty_text(f"Error: tool '{name}' failed: {val.get('name')}: {val.get('message')}", err=True),
               file=sys.stderr)
         sys.exit(1)
     result = val.get("result")
@@ -22437,9 +22485,9 @@ async def cmd_tools_call(name, call_args, frame=None):
     try:
         parsed = json.loads(result)
     except (TypeError, ValueError):
-        print(result)
+        print(_tty_text(result))
         return
-    print(json.dumps(parsed, indent=2, ensure_ascii=False))
+    print(_tty_json(json.dumps(parsed, indent=2, ensure_ascii=False)))
 
 
 # ─── MCP Server ───
@@ -23179,9 +23227,10 @@ def cmd_test(files=None, watch=False, parallel=1, reporter='default', trace='def
             tf += r.get('failed', 0)
             for t in r.get('tests', []):
                 sym = "\033[32m  ✓\033[0m" if t.get('status') == 'passed' else "\033[31m  ✗\033[0m"
-                print(f"{sym} {t.get('name', '?')} ({t.get('duration_ms', 0)}ms)")
+                # name and error carry page text: escaped on a terminal; the colours are ours
+                print(f"{sym} {_tty_text(t.get('name', '?'))} ({t.get('duration_ms', 0)}ms)")
                 if t.get('status') != 'passed' and t.get('error'):
-                    print(f"    \033[31m{t.get('error')}\033[0m")
+                    print(f"    \033[31m{_tty_text(t.get('error'))}\033[0m")
         print(f"\n  {tp} passed, {tf} failed")
 
     def run_suite():
@@ -25727,7 +25776,7 @@ def _slog_read(log_dir, days, today=None):
 
 
 def _slog_cell(text, width, middle=False):
-    text = " ".join(str(text or "").split())
+    text = _term_text(" ".join(str(text or "").split()))  # stored page text: no raw control character
     if middle and len(text) > width:  # URLs: keep the host and the end of the path
         head = width // 3
         text = text[:head] + "…" + text[len(text) - (width - head - 1):]
@@ -25769,8 +25818,9 @@ def _slog_format_table(entries, project, days):
 
 
 def _slog_md(text, table=False):
-    """Inline code for Markdown: no backticks inside; pipes escaped in tables."""
-    text = " ".join(str(text or "").split()).replace("`", "'")
+    """Inline code for Markdown: no backticks inside; pipes escaped in tables; control characters
+    shown as \\xNN (_term_text)."""
+    text = _term_text(" ".join(str(text or "").split())).replace("`", "'")
     return text.replace("|", "\\|") if table else text
 
 
@@ -25795,8 +25845,10 @@ def _slog_format_md(entries, project, days, today):
            f"{period} · {len(entries)} command(s) · {len(failed)} failed · "
            f"{len(files)} file(s) · {total_s:.1f}s in commands", "",
            "### Pages visited", ""]
+    # page-written fields (title, result, error) go in code spans like URLs: their Markdown / HTML
+    # does not render in a pasted report
     for e in pages:
-        title = f" {_slog_md(e['title'])} —" if e.get("title") else ""
+        title = f" `{_slog_md(e['title'])}` —" if e.get("title") else ""
         out.append(f"- {_slog_entry_time(e, with_date)} ·{title} `{_slog_md(e['url'])}`")
     if not pages:
         out.append("_None recorded._")
@@ -25807,17 +25859,19 @@ def _slog_format_md(entries, project, days, today):
             via = " (mcp)" if str(e.get("via") or "").startswith("mcp") else ""
             warm = " (warm)" if e.get("warm") else ""
             result = e.get("error") if _slog_failed(e) and e.get("error") else e.get("summary")
+            result = _slog_md(_slog_clip(str(result or ''), 120), True)
+            result = f"`{result}`" if result else ""  # an empty code span would show two backticks
             out.append(f"| {n} | {_slog_entry_time(e, with_date)} | "
                        f"`{_slog_md(_slog_clip(_slog_command_text(e), 120), True)}`{via}{warm} | "
                        f"{'' if e.get('exit') is None else e.get('exit')} | "
                        f"{e.get('duration_ms') if e.get('duration_ms') is not None else ''} | "
-                       f"{_slog_md(_slog_clip(str(result or ''), 120), True)} |")
+                       f"{result} |")
     else:
         out.append("_No commands logged._")
     out += ["", "### Errors", ""]
     for e in failed:
         out.append(f"- {_slog_entry_time(e, with_date)} `{_slog_md(_slog_command_text(e))}` "
-                   f"— exit {e.get('exit')}: {_slog_md(e.get('error') or '(no error line)')}")
+                   f"— exit {e.get('exit')}: `{_slog_md(e.get('error') or '(no error line)')}`")
     if not failed:
         out.append("_None._")
     out += ["", "### Files produced", ""]
@@ -25894,10 +25948,11 @@ def cmd_log(*args):
             _slog_print(raw)
         return
     entries = sorted((e for _, e in rows), key=lambda e: str(e.get("ts") or ""))
+    # human views: no raw control character from any stored field, on a terminal or not (--json is raw)
     if fmt == "md":
-        _slog_print(_slog_format_md(entries, PROJECT_ID, days, today))
+        _slog_print(_term_text(_slog_format_md(entries, PROJECT_ID, days, today)))
     else:
-        _slog_print(_slog_format_table(entries, PROJECT_ID, days))
+        _slog_print(_term_text(_slog_format_table(entries, PROJECT_ID, days)))
 
 
 # ─── Record & Replay (issue #5) ───
@@ -27504,7 +27559,7 @@ def _daemon_execute(req, out, err, refuse, on_run=None):
         at_end.append((fn, a, k))
         return fn
 
-    global _OUT_TTY
+    global _OUT_TTY, _ERR_TTY
     code = None  # set once the command ran
     try:
         env = req.get("env")  # the caller's environment, as a fresh process would see it
@@ -27542,6 +27597,7 @@ def _daemon_execute(req, out, err, refuse, on_run=None):
         sys.stdout, sys.stderr = out, err
         _DAEMON["gone"] = False
         _OUT_TTY = req.get("tty") is True  # the caller's terminal, this request only
+        _ERR_TTY = req.get("etty") is True  # its stderr (_DaemonStream.isatty() is always False)
         code = 0
         try:
             if on_run is not None:
@@ -27558,7 +27614,7 @@ def _daemon_execute(req, out, err, refuse, on_run=None):
                 pass
             code = 1
     finally:
-        _OUT_TTY = None
+        _OUT_TTY = _ERR_TTY = None
         if code is not None:
             for fn, a, k in reversed(at_end):  # session log line, record step, idle stamp
                 try:
