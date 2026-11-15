@@ -4291,8 +4291,8 @@ _MOUSE_PROBE_FN = """function () {
 }"""
 _MOUSE_PROBE_READ_FN = "function (stop) { return this(stop); }"
 MOUSE_PROBE_TRIES = 4
-# The isolated-world fallback note: once per process, i.e. once per CLI
-# command (MCP tool calls run the CLI as a subprocess too).
+# The isolated-world fallback notes: once per process. A one-shot CLI command is one process; a warm
+# process (CDPILOT_DAEMON=1, MCP) prints each note only on its first fallback.
 _FRAME_ISOLATED_NOTED = [False]
 _FRAME_LOOKUP_FALLBACK_NOTED = [False]
 
@@ -5090,7 +5090,7 @@ async def _frame_resolve_target(ws_url, flag_hops, target, kind="css"):
                 rem_selector = " >>> ".join(names[i:] + [inner])
                 return route, rem_selector, None
             else:
-                frames = await _frame_list(route)  # top document: isolated world (_frame_list)
+                frames = await _frame_list(route)  # isolated world only when route is at the top document
                 labels = [_strip_tag_chars(f.get("id") or f.get("name") or f.get("src") or "")[0][:60] for f in frames]
                 avail = "; ".join(f"[{f['index']}] {lbl}" for f, lbl in zip(frames, labels))
                 raise _FrameError(f"no iframe matches '{hop_name}' in {route.describe()}"

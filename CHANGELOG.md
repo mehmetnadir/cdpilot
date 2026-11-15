@@ -4,12 +4,14 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 - **`frame list` numbers `<frame>` elements too**, as `--frame <i>` does, so a listed index is the one `--frame` resolves (iframe-only pages print the same list as before).
+
+### Fixed
 - **Frame-not-found error message sanitizes iframe id and name.** The list of available frames in the `no iframe matches` error message strips Unicode tag characters (and the other hidden characters agent output removes) from `id` and `name` and cuts them to 60 characters.
 
 ### Security
-- **The first hop of every `--frame` / `>>>` route and `frame list` resolves in an isolated world.** The iframe index and selector lookup now evaluates `_FRAME_OWNER_JS` and `_FRAME_LIST_JS` in cdpilot's isolated world (`Page.createIsolatedWorld`, matching the `frames` hint), protecting against pages that monkey-patch `document.querySelectorAll` to point to a different frame. If isolated world creation fails, resolution falls back to the main world.
+- **Frames are looked up in cdpilot's isolated world, not with the page's own JS.** The first hop of every `--frame` / `>>>` route (index, selector, `agent observe --frame`, frame-ref `agent act`, the smart-click/smart-fill frame search) and the top-page `frame list` run in the same isolated world as the `frames` hint, so a page that replaces `document.querySelectorAll` cannot point an index or selector at another frame. Hops inside a child frame still use that frame's own page context. If the isolated world cannot be made, cdpilot falls back to the page's JS and prints one note on stderr.
 - **Element bounding box for `shot --element=<selector>` is read in an isolated world.** A page that overrides `getBoundingClientRect`, `scrollX`, `scrollY`, or `scrollIntoView` can no longer tamper with element crop coordinates or detect automation through those methods; falls back to the main world only when the isolated world cannot be used.
 
 ## [0.9.10] - 2026-11-15

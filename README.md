@@ -336,7 +336,7 @@ cdpilot frame eval --frame "#card" "document.title"       # runs in the frame's 
   page's own origin, so a typed value never lands in a third-party frame (an
   ad, chat or payment widget) by accident; reach a cross-origin frame with
   `>>>` or `--frame`. `smart-click` searches all visible frames.
-- The first hop of every `--frame` / `>>>` route and `frame list` resolves in cdpilot's isolated world (`Page.createIsolatedWorld`), protecting the frame lookup against monkey-patched DOM methods in the page's main world; `frame list` without `--frame` prints the same list as before.
+- The first hop of every `--frame` / `>>>` route and `frame list` resolves in cdpilot's isolated world (`Page.createIsolatedWorld`), protecting the frame lookup against monkey-patched DOM methods in the page's main world (hops inside a child frame use that frame's own context); `frame list` without `--frame` prints the same list as before on iframe-only pages and now numbers `<frame>` elements too.
 
 ### Debugging
 

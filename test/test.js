@@ -13172,7 +13172,8 @@ print(json.dumps(out))
       c('eval', 'location.reload()');
       const reloaded = settle(c, 'reload', shop.t0);  // a new document, not the old one
       assert(/shop\.html$/.test(reloaded.url), reloaded.url);
-      const again = until(() => listJson(c), (o) => o.tools.length === 4, 'tools after reload');
+      const again = until(() => listJson(c), (o) => o.tools.length === 4, 'tools after reload', 30000,
+        reloadFrames(c, 'shop after reload'));
       assert(again.tools.some((t) => t.name === 'add_to_cart'));
       ok(c('click', '#next'), /Clicked/, 'click link');
       const two = settle(c, 'page two', reloaded.t0);
@@ -13193,7 +13194,7 @@ print(json.dumps(out))
       const { c, httpPort } = needE2E();
       c('go', `http://127.0.0.1:${httpPort}/shop.html`);
       settle(c, 'shop again');
-      until(() => listJson(c), (o) => o.tools.length === 4, 'shop again');
+      until(() => listJson(c), (o) => o.tools.length === 4, 'shop again', 30000, reloadFrames(c, 'shop again'));
       for (const [args, re] of [[['{"sku":"B1"}'], /missing required argument: qty/],
         [['{"sku":"B1","qty":true}'], /qty: expected integer, got boolean/],
         [['{"sku":"B1","qty":"2"}'], /qty: expected integer, got string/],
