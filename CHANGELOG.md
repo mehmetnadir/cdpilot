@@ -2,6 +2,11 @@
 
 All notable changes to cdpilot will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **MCP `browser_agent_find` searches a text that starts with `--`.** The text was passed as a plain CLI word, so `--max 5` or `--rows` was read as a flag and dropped (usage error, or every entry of the role). The tool now passes it after `--`, and `agent find -- <text>` takes the word after `--` as the text (jury note, 0.9.9).
+
 ## [0.9.9] - 2026-11-15
 
 ### Added

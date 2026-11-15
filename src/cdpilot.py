@@ -19651,6 +19651,11 @@ def _dispatch_agent_cmd(args):
                 role = tok.split('=', 1)[1]; i += 1
             elif tok.startswith('--max=') and tok[6:].isdigit():
                 max_n = int(tok[6:]); i += 1
+            elif tok == '--' and i + 1 < len(rest):
+                # end of options: the next word is the text even if it starts with "--"
+                if text is None:
+                    text = rest[i + 1]
+                i += 2
             elif text is None and not tok.startswith('--'):
                 text = tok; i += 1
             else:
@@ -21901,9 +21906,10 @@ class MCPServer:
             + (["--frame", str(a["frame"])] if isinstance(a.get("frame"), int) else [])
             + (["--full"] if a.get("full") else [])
             + (["--all"] if a.get("all") else []),
-            "browser_agent_find": lambda a: ["agent", "find", a.get("text", "")]
+            "browser_agent_find": lambda a: ["agent", "find"]
                 + (["--role", a["role"]] if a.get("role") else [])
-                + (["--max", str(int(a["max"]))] if a.get("max") else []),
+                + (["--max", str(int(a["max"]))] if a.get("max") else [])
+                + ["--", a.get("text", "")],
             "browser_agent_act": lambda a: ["agent", "act"]
                 + (["--url", a["url"]] if a.get("url") else ["--ref", a.get("ref", "")])
                 + (["--action", a["action"]] if a.get("action") else [])

@@ -9543,6 +9543,8 @@ print("ok")
         { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'browser_agent_act', arguments: { url: 'https://user.example/inbox' } } },
         { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'browser_agent_find', arguments: { text: 'arşivle', role: 'button', max: 1 } } },
         { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'browser_agent_observe', arguments: { all: true } } },
+        // a text that starts with "--" is the text, not a flag (passed after "--")
+        { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'browser_agent_find', arguments: { text: '--max 5' } } },
       ]);
       const byId = (id) => msgs.find((m) => m.id === id);
       const tools = byId(2).result.tools;
@@ -9556,6 +9558,8 @@ print("ok")
       assert.strictEqual(f.matches[0].role, 'button');
       assert(f.total_matches >= 1);
       assert(Array.isArray(json(12).actions) && !('truncated' in json(12)));
+      assert(!byId(13).result.isError, JSON.stringify(byId(13)));
+      assert.deepStrictEqual([json(13).matches.length, json(13).total_matches], [0, 0], JSON.stringify(json(13)));
       const core = call('core', [{ jsonrpc: '2.0', id: 2, method: 'tools/list' }]);
       const names = core.find((m) => m.id === 2).result.tools.map((t) => t.name);
       assert(!names.includes('browser_agent_find') && !names.includes('browser_agent_observe'), names.join());
