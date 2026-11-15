@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- **`replay` no longer passes `CDPILOT_VAR_*` to the commands it runs.** A flow without `{{NAME}}` placeholders was not limited to the safe command list, yet each step inherited every `CDPILOT_VAR_*` value (and `CDPILOT_VAR_HOSTS`); an `agent run` or nested `replay` step could then type a secret on its own rules and a later `eval` read it back. Each step now gets only the value `replay` itself fills into that step. An `agent run` or `replay` step inside a flow that relied on inherited `CDPILOT_VAR_*` values now stops with "missing variables"; run those commands directly or pass `--var`.
+
 ### Changed
 - **`blog publish` / `blog regenerate` read their output folder from `CDPILOT_BLOG_DIR`.** The folder was a hard-coded maintainer path; without the variable both commands now exit 2 with a message and write nothing. `day-NNN` sources are looked up in `CDPILOT_BLOG_PLAN_DIR` (default: the current directory). Maintainer notes, social-media drafts and the X bot are no longer in the repository.
 

@@ -16511,6 +16511,90 @@ print(json.dumps(res))
     noSecret(h);
   });
 
+  // 2026-11-15 audit: a flow with no {{NAME}} is not an environment flow, so its steps are not
+  // limited, yet every child inherited CDPILOT_VAR_*; `agent run` (or a nested replay) then typed
+  // the value on its own rules and a later eval read the field. No child gets CDPILOT_VAR_* now.
+  test('replay: env var — no child gets CDPILOT_VAR_* (agent run, eval, the typing step); only the value replay substituted', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envchild-'));
+    const out = path.join(home, 'child-env.json');
+    const childEnv = (steps, urls) => {
+      const r = spawnSync(PYB, ['-c', [
+        'import sys, json, subprocess; sys.path.insert(0, "src")',
+        'import cdpilot',
+        'calls = []',
+        'def run(argv, **kw):',
+        '    env = kw.get("env") or {}',
+        '    calls.append({"argv": argv[2:], "var": sorted(k for k in env if k.upper().startswith("CDPILOT_VAR_")),',
+        '                  "values": {k: v for k, v in env.items() if k.startswith("CDPILOT_REPLAY_VALUE_")}})',
+        '    return subprocess.CompletedProcess(argv, 0, "", "")',
+        'cdpilot.subprocess.run = run',
+        'urls = iter(json.loads(sys.argv[2]))',
+        'cdpilot._replay_live_url = lambda: next(urls)',
+        'code = 0',
+        'try:',
+        '    cdpilot.cmd_replay(sys.argv[1], "--delay", "none")',
+        'except SystemExit as e:',
+        '    code = e.code',
+        'json.dump({"code": code, "calls": calls}, open(sys.argv[3], "w"))',
+      ].join('\n'), writeFlow(home, steps), JSON.stringify(urls), out],
+      { cwd: REPO, encoding: 'utf-8', timeout: 30000,
+        env: varEnv(home, { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_X: 'zq-x-4417', CDPILOT_VAR_HOSTS: 'bank.example' }) });
+      assert.strictEqual(r.status, 0, r.stderr);
+      return JSON.parse(fs.readFileSync(out, 'utf-8'));
+    };
+    // no placeholder: not an environment flow, every step runs, none inherits a value
+    let h = childEnv([{ cmd: 'agent', args: ['run', 'login'], t_ms: 0 },
+      { cmd: 'eval', args: ['document.querySelector("#password").value'], t_ms: 1 },
+      { cmd: 'replay', args: ['inner.json'], t_ms: 2 }], []);
+    assert.strictEqual(h.code, 0, JSON.stringify(h));
+    assert.strictEqual(h.calls.length, 3);
+    assert(h.calls.every((c) => c.var.length === 0), `a child inherits CDPILOT_VAR_*: ${JSON.stringify(h.calls)}`);
+    // an environment flow: the typing step gets the value replay put in, still no CDPILOT_VAR_*
+    h = childEnv([{ cmd: 'go', args: ['https://bank.example/login'], t_ms: 0 },
+      { cmd: 'fill', args: ['#password', '{{password}}'], t_ms: 1 }], Array(3).fill('https://bank.example/login'));
+    assert.strictEqual(h.code, 0, JSON.stringify(h));
+    assert(h.calls.every((c) => c.var.length === 0), `a child inherits CDPILOT_VAR_*: ${JSON.stringify(h.calls)}`);
+    assert.deepStrictEqual(Object.values(h.calls[1].values), [PLANTED], JSON.stringify(h.calls[1].values));
+  });
+
+  test('replay: env var — a nested replay or agent run step cannot draw on CDPILOT_VAR_*; run directly they still can', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envnest-'));
+    const env = { CDPILOT_VAR_PASSWORD: PLANTED, CDPILOT_VAR_HOSTS: 'bank.example' };
+    // nested replay (browser-free: --dry-run settles the values first)
+    const inner = path.join(home, 'inner.json');
+    fs.writeFileSync(inner, JSON.stringify({ cdpilot_flow: 1, name: 'inner', vars: {},
+      steps: [{ cmd: 'fill', args: ['#pw', '{{password}}'], t_ms: 0 }] }));
+    let r = runCli(['replay', inner, '--dry-run'], varEnv(home, env));
+    assert.strictEqual(r.status, 0, 'run directly, the environment value fills: ' + r.stdout + r.stderr);
+    r = runCli(['replay', writeFlow(home, [{ cmd: 'replay', args: [inner, '--dry-run'], t_ms: 0 }]), '--delay', 'none'],
+      varEnv(home, env));
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert(/\[1\/1\] replay .* \.\.\. failed \(2\)/.test(r.stdout), r.stdout);
+    assert(/missing required variable\(s\): password/.test(r.stderr), r.stderr);
+    noSecret(r);
+    // agent run: a saved flow typing {{password}} on bank.example (fake CDP: the step needs a page)
+    const fake = startFakeCdp();
+    try {
+      const flows = path.join(home, 'projects', 'rep-var', 'flows');
+      fs.mkdirSync(flows, { recursive: true });
+      fs.writeFileSync(path.join(flows, 'login.json'), JSON.stringify({ name: 'login', host: 'bank.example',
+        vars: { password: { step: 1 } }, steps: [{ n: 1, kind: 'act', action: 'fill', text: '{{password}}',
+          anchor: { role: 'textbox', name: 'Password', nth: 0 },
+          before: { host: 'bank.example', origin: 'https://bank.example' } }] }));
+      r = runCli(['agent', 'run', 'login', '--dry-run'], fakeEnv(home, fake.port, env));
+      assert.strictEqual(r.status, 0, 'run directly, agent run takes the value: ' + r.stdout + r.stderr);
+      assert.strictEqual(JSON.parse(r.stdout).dry_run, true, r.stdout);
+      r = runCli(['replay', writeFlow(home, [{ cmd: 'agent', args: ['run', 'login', '--dry-run'], t_ms: 0 }]),
+        '--delay', 'none'], fakeEnv(home, fake.port, env));
+      assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+      assert(r.stdout.includes('[1/1] agent run login --dry-run ... failed (2)'), r.stdout);
+      assert(/missing variables/.test(r.stderr) && /"password"/.test(r.stderr), r.stderr);
+      noSecret(r);
+    } finally {
+      fake.stop();
+    }
+  });
+
   test('replay: env var — the child swaps a sentinel only with its token and value; without them it fails closed (fake CDP)', () => {
     const fake = startFakeCdp({ FAKE_CDP_WATCH: PLANTED, FAKE_CDP_DOM: '1' });
     try {
