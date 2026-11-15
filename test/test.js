@@ -3290,6 +3290,106 @@ test('blog: slug validation enforces kebab-case pattern', () => {
     'Should validate slug with kebab-case pattern');
 });
 
+// ─── Path-traversal regressions (T2 security audit) ───
+function secEnv(home, extra = {}) {
+  return { ...process.env, CDPILOT_HOME: home, CDPILOT_PROFILE: path.join(home, 'profile'),
+    CDPILOT_NO_AUTOLAUNCH: '1', CDPILOT_LOG: '0', CDP_PORT: '19584', ...extra };
+}
+function secCli(home, args, extra = {}) {
+  return require('child_process').spawnSync(process.execPath, [CLI, ...args],
+    { encoding: 'utf-8', timeout: 30000, env: secEnv(home, extra) });
+}
+function secHome() {
+  return fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-sec-'));
+}
+
+test('security: ext-remove refuses ids that escape the Extensions dir', () => {
+  const home = secHome();
+  const extRoot = path.join(home, 'profile', 'Default', 'Extensions');
+  fs.mkdirSync(extRoot, { recursive: true });
+  const marker = path.join(home, 'profile', 'Default', 'marker');
+  fs.mkdirSync(marker, { recursive: true });
+  fs.writeFileSync(path.join(marker, 'keep.txt'), 'x');
+  const r = secCli(home, ['ext-remove', '../marker']);
+  assert.strictEqual(r.status, 2, `exit ${r.status}: ${r.stdout}${r.stderr}`);
+  assert(fs.existsSync(path.join(marker, 'keep.txt')), 'marker dir must survive');
+  const abs = secCli(home, ['ext-remove', marker]);
+  assert.strictEqual(abs.status, 2, `abs exit ${abs.status}`);
+  assert(fs.existsSync(path.join(marker, 'keep.txt')), 'marker dir must survive (absolute id)');
+  const good = 'abcdefghijklmnopabcdefghijklmnop';
+  fs.mkdirSync(path.join(extRoot, good, '1.0'), { recursive: true });
+  const ok = secCli(home, ['ext-remove', good]);
+  assert.strictEqual(ok.status, 0, `valid id exit ${ok.status}: ${ok.stderr}`);
+  assert(!fs.existsSync(path.join(extRoot, good)), 'valid extension dir is removed');
+});
+
+test('security: cookies clear --host rejects dot-dot and keeps CDPILOT_HOME', () => {
+  const home = secHome();
+  fs.writeFileSync(path.join(home, 'registry.json'), '{}');
+  for (const bad of ['..', '.', '', '.hidden', '../x', 'a/b']) {
+    const r = secCli(home, ['cookies', 'clear', '--host', bad]);
+    assert.strictEqual(r.status, 2, `host '${bad}' exit ${r.status}: ${r.stdout}${r.stderr}`);
+    assert(fs.existsSync(path.join(home, 'registry.json')), `CDPILOT_HOME must survive '${bad}'`);
+  }
+  const hostDir = path.join(home, 'cookies', 'example.com');
+  fs.mkdirSync(hostDir, { recursive: true });
+  fs.writeFileSync(path.join(hostDir, 'cookies.json'), '{}');
+  const ok = secCli(home, ['cookies', 'clear', '--host', 'example.com']);
+  assert.strictEqual(ok.status, 0, ok.stderr);
+  assert(!fs.existsSync(hostDir), 'normal host store is cleared');
+});
+
+test('security: cookie auto-save domain match needs a dot boundary', () => {
+  const py = `
+import importlib.util
+s = importlib.util.spec_from_file_location('cdp', ${JSON.stringify(PY_PATH)})
+m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+f = m._cookie_domain_matches
+print([f('bank.com', 'ank.com'), f('bank.com', '.bank.com'), f('www.bank.com', '.bank.com'),
+       f('bank.com', 'bank.com'), f('bank.com', '')])
+`;
+  const home = secHome();
+  const r = require('child_process').spawnSync('python3', ['-c', py],
+    { encoding: 'utf-8', env: secEnv(home) });
+  assert.strictEqual(r.stdout.trim(), '[False, True, True, True, False]', r.stdout + r.stderr);
+});
+
+test('security: blog regenerate rejects a slug that is not kebab-case', () => {
+  const home = secHome();
+  const blog = path.join(home, 'blog');
+  fs.mkdirSync(blog);
+  fs.writeFileSync(path.join(home, 'x.md'), 'source_tweet: "https://x.com/a/status/1"\n');
+  const r = secCli(home, ['blog', 'regenerate', '../x'], { CDPILOT_BLOG_DIR: blog });
+  assert.strictEqual(r.status, 2, `exit ${r.status}: ${r.stdout}${r.stderr}`);
+  assert(fs.existsSync(path.join(home, 'x.md')), 'file outside BLOG_DIR must survive');
+});
+
+test('security: blog regenerate keeps the old post when publish fails', () => {
+  const home = secHome();
+  const blog = path.join(home, 'blog');
+  fs.mkdirSync(blog);
+  const post = path.join(blog, 'my-post.md');
+  fs.writeFileSync(post, 'source_tweet: "not a tweet url"\n');
+  secCli(home, ['blog', 'regenerate', 'my-post'], { CDPILOT_BLOG_DIR: blog });
+  assert(fs.existsSync(post) && fs.readFileSync(post, 'utf-8').includes('source_tweet'),
+    'failed regenerate must not lose the original post');
+});
+
+test('security: MCP browser_screenshot_diff confines paths to SCREENSHOT_DIR', () => {
+  const home = secHome();
+  const outside = path.join(home, 'secret.png');
+  fs.writeFileSync(outside, 'abc');
+  const input = [{ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+    { jsonrpc: '2.0', method: 'notifications/initialized' },
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'browser_screenshot_diff',
+      arguments: { path1: outside, path2: outside } } }].map((m) => JSON.stringify(m)).join('\n') + '\n';
+  const r = require('child_process').spawnSync(process.execPath, [CLI, 'mcp'],
+    { input, encoding: 'utf-8', timeout: 60000, env: secEnv(home, { CDPILOT_WEBMCP: '0' }) });
+  const msg = r.stdout.trim().split('\n').map((l) => JSON.parse(l)).find((m) => m.id === 2);
+  assert(msg && msg.result && msg.result.isError === true, JSON.stringify(msg));
+  assert(!/MATCH|DIFF/.test(JSON.stringify(msg.result.content)), 'no equality oracle for outside paths');
+});
+
 test('blog: FAQ section minimum 3 items enforced', () => {
   assert(PY_CONTENT.includes('def _blog_generate_faq'), 'Should define _blog_generate_faq helper');
   assert(PY_CONTENT.includes('## FAQ'), 'Should emit ## FAQ section header');

@@ -7979,7 +7979,7 @@ async def cmd_go(url):
                 r2 = await cdp_send(active_ws, [(912, 'Network.getCookies', {})])
                 all_c = r2.get(912, {}).get('cookies', [])
                 host_c = [c for c in all_c
-                          if expected_host.endswith(c.get('domain', '').lstrip('.'))]
+                          if _cookie_domain_matches(expected_host, c.get('domain', ''))]
                 if host_c:
                     _save_host_cookies(expected_host, host_c)
                     sys.stderr.write(f"🍪 Cookie auto: saved {len(host_c)} cookies for {expected_host}\n")
@@ -9639,9 +9639,28 @@ async def cmd_console(url=None):
 
 # ─── Per-host cookie persistence helpers ───
 
+def _cookie_domain_matches(host, domain):
+    """True when a cookie domain covers host: equal, or host is a subdomain (dot boundary)."""
+    d = (domain or '').lstrip('.').lower()
+    h = (host or '').lower()
+    return bool(d) and (h == d or h.endswith('.' + d))
+
+
+_COOKIES_HOST_RE = _re.compile(r'^[A-Za-z0-9][A-Za-z0-9.\-]*([:_][0-9]{1,5})?$')
+
+
+def _cookies_host_valid(host):
+    """A hostname (optional :port) that cannot name '.', '..' or leave COOKIES_DIR."""
+    return bool(host) and bool(_COOKIES_HOST_RE.match(host)) and '..' not in host
+
+
 def _cookies_safe_host(host):
     """Make a hostname safe for use as a filesystem directory name."""
-    return host.replace(':', '_').replace('/', '_')
+    safe = host.replace(':', '_').replace('/', '_')
+    if not _cookies_host_valid(host):
+        print(f"Error: invalid host for the cookie store: {host!r}", file=sys.stderr)
+        sys.exit(2)
+    return safe
 
 
 def _cookies_host_dir(host):
@@ -10952,7 +10971,14 @@ def cmd_ext_remove(ext_id):
             print('   Restart the browser (stop → launch).')
             return
 
-    ext_dir = os.path.join(PROFILE_DIR, "Default", "Extensions", ext_id)
+    if not _re.fullmatch(r'[a-p]{32}', ext_id):
+        print(f"Error: not a Chrome extension id (32 characters a-p): {ext_id}", file=sys.stderr)
+        sys.exit(2)
+    ext_root = os.path.realpath(os.path.join(PROFILE_DIR, "Default", "Extensions"))
+    ext_dir = os.path.realpath(os.path.join(ext_root, ext_id))
+    if os.path.commonpath([ext_root, ext_dir]) != ext_root or ext_dir == ext_root:
+        print(f"Error: extension path leaves the Extensions folder: {ext_id}", file=sys.stderr)
+        sys.exit(2)
     if not os.path.isdir(ext_dir):
         print(f"Extension not found: {ext_id}", file=sys.stderr)
         sys.exit(1)
@@ -22325,6 +22351,15 @@ class MCPServer:
         if tool_name not in tool_map:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}}
 
+        if tool_name == "browser_screenshot_diff":
+            shot_root = os.path.realpath(SCREENSHOT_DIR)
+            for key in ("path1", "path2"):
+                p = os.path.realpath(os.path.join(shot_root, str(args.get(key, ""))))
+                if p == shot_root or os.path.commonpath([shot_root, p]) != shot_root:
+                    return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{
+                        "type": "text",
+                        "text": f"Error: {key} must be inside {SCREENSHOT_DIR}"}], "isError": True}}
+                args[key] = p
         cli_args = [a for a in tool_map[tool_name](args) if a]
         _idle_write_activity()  # a tool call is use of the browser (idle auto-close)
         # The tool call runs as a CLI process, which writes its own session log
@@ -23036,6 +23071,10 @@ def cmd_blog_list():
 
 def cmd_blog_regenerate(slug):
     """Re-generate a blog post from its original source_tweet frontmatter field."""
+    if not _re.match(r'^[a-z0-9]+(-[a-z0-9]+)*$', slug or ''):
+        print(f"Error: invalid slug (lowercase letters, digits and single dashes): {slug!r}",
+              file=sys.stderr)
+        sys.exit(2)
     out_path = os.path.join(BLOG_DIR, f'{slug}.md')
     if not os.path.exists(out_path):
         print(f"Error: blog post not found: {out_path}", file=sys.stderr)
@@ -23049,9 +23088,20 @@ def cmd_blog_regenerate(slug):
         print("Error: could not find source_tweet in frontmatter", file=sys.stderr)
         sys.exit(1)
 
-    # Remove existing file so publish doesn't hit collision guard
-    os.remove(out_path)
-    cmd_blog_publish(s_m.group(1))
+    # Move the old file aside so publish doesn't hit the collision guard; restore it
+    # if publish fails, drop it once the new post is written.
+    backup = out_path + '.regen-bak'
+    os.replace(out_path, backup)
+    try:
+        cmd_blog_publish(s_m.group(1))
+    except BaseException:
+        if not os.path.exists(out_path):
+            os.replace(backup, out_path)
+        raise
+    if os.path.exists(out_path):
+        os.remove(backup)
+    else:
+        os.replace(backup, out_path)
 
 
 def _dispatch_blog_cmd(args):
