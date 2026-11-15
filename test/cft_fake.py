@@ -32,7 +32,17 @@ import tempfile
 import threading
 import traceback
 import zipfile
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import socketserver
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _StdThreadingHTTPServer
+
+
+class ThreadingHTTPServer(_StdThreadingHTTPServer):
+    """No reverse DNS lookup at bind (HTTPServer.server_bind calls getfqdn: ~30 s on macOS CI)."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
 
 CDPILOT = os.path.abspath(sys.argv[1])
 SCENARIO = sys.argv[2] if len(sys.argv) > 2 else 'install'
