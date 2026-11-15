@@ -974,9 +974,11 @@ function showHelp() {
     agent flow save <name> [--last N] | list | show <name> | delete <name>
                        Save the acts since the last navigation as a replayable
                        flow
-    agent run <name> [--var k=v] [--dry-run] [--full] [--all] [--rows] [--objects]
+    agent run <name> [--var k=v] [--dry-run] [--trust-flow] [--full] [--all] [--rows] [--objects]
                        Replay by anchors, no model; exit 4 on drift with the
-                       page, 2 for a missing or refused variable
+                       page, 2 for a missing or refused variable; --trust-flow
+                       types --var / CDPILOT_VAR_* values into a flow an MCP
+                       session saved (written_by: mcp)
     canvas open|set|patch|stream|watch|events|list|close [--name N] [--allow-net host]
                        Live canvas tab an agent writes HTML into (experimental,
                        not on Windows)

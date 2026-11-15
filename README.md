@@ -165,7 +165,22 @@ Commands the MCP server runs get no `CDPILOT_VAR_<NAME>` value unless the server
 back from the page (`browser_eval`, an assert, a screenshot) and send it on. Without the opt-in, a flow
 that needs such a value fails before its first step with `missing variables` and a hint; the model can
 pass its own values in `vars`. With the opt-in, the model can read a typed value back from the page.
-The CLI (`cdpilot agent run`, `cdpilot replay`) always uses `CDPILOT_VAR_*`.
+The CLI (`cdpilot agent run`, `cdpilot replay`) always uses `CDPILOT_VAR_*` (for `agent run` of a flow an
+MCP session saved, only with `--trust-flow`; see below).
+
+### Flows an MCP session saves
+
+The CLI and an MCP server started in the same directory share the project's flows. `agent flow save`
+records who wrote a flow: `written_by` is `mcp` when an MCP tool call saves it or made the saved acts,
+otherwise `cli` (a file from an older version counts as `cli`; so does a `cdpilot run` script line or a
+shell with `CDPILOT_MCP_SESSION=1`, which only keeps the visual layer on). `agent flow list` and
+`agent run --dry-run` show it. An MCP session cannot overwrite a flow written from the terminal:
+`browser_agent_flow_save` fails (exit 2, nothing written) with a hint to save under another name; it can
+re-save its own flows (drift repair). From the terminal, `cdpilot agent run` types no `--var` or
+`CDPILOT_VAR_*` value into an `mcp` flow unless you pass `--trust-flow`, because a model chose the pages
+its `{{placeholder}}` steps type on. The error (exit 2, nothing typed) lists each value step and its
+origin in `value_steps`; `--dry-run` shows them without the flag. A flow that needs no value runs as
+before. A save that changes a flow's steps starts its run counts (`runs`, `ok`, `drift`) again.
 
 ### Smaller MCP tool list
 
@@ -612,16 +627,21 @@ on Wikipedia, still far above the `agent run` result. When a site has a flow, `a
 **Drift stops, never guesses.** If a step's anchor is gone, or the step lands on another host than it did
 when recorded, `agent run` exits 4 and prints that page's full observation (`status:"drift"`, `step`,
 `expected`, `actions`, `text`): the agent acts on those refs, finishes the task, and `agent flow save <name>`
-rewrites the flow. Exit 2: unknown flow or a `{{variable}}` without a value (checked before any step runs);
+rewrites the flow (over MCP only a flow an MCP session saved; new steps start the run counts again).
+Exit 2: unknown flow or a `{{variable}}` without a value (checked before any step runs);
 `--dry-run` prints the steps with placeholders, never values. Values typed into secret-named fields
 (password, one-time code, API key, PIN, card number, …) or token-shaped values are placeholders on disk; the
 same fields show `«masked»` as their value in `observe` output. Masking goes by field name or token shape: a
 secret typed into a field named otherwise is stored in clear, so review a flow before sharing it (flow files
 and `agent-state.json` are 0600). A `{{placeholder}}` typed into `agent act --text` or `--url` is refused
-(exit 2): placeholders are cdpilot's own, so a flow replays only values the user recorded, and a step that
-types one runs only on the origin (scheme, host, port) it was recorded on (old flows without an origin fall
-back to host); another origin or an opaque page is a drift. `--var` values are visible in the process list for the
-duration of the call and are redacted in the session log; an environment value never enters argv.
+(exit 2): placeholders are cdpilot's own. A model can still make one over MCP by filling a secret-named
+field, so an MCP session cannot overwrite a flow saved from the terminal, and from the terminal `agent run`
+types a value into a flow an MCP session saved only with `--trust-flow`
+([Flows an MCP session saves](#flows-an-mcp-session-saves)): a flow replays your values only on pages you
+recorded or chose to trust. A step that types a placeholder runs only on the origin (scheme, host, port) it
+was recorded on (old flows without an origin fall back to host); another origin or an opaque page is a drift.
+`--var` values are visible in the process list for the duration of the call and are redacted in the session
+log; an environment value never enters argv.
 `CDPILOT_VAR_<NAME>` is used only by a step recorded on a host named in `CDPILOT_VAR_HOSTS` (comma-separated,
 subdomains included), on that same origin over https (http only on loopback), and never inside a URL — so a flow
 that a prompt-injected model records on another site cannot draw on the environment's secrets; anything else is

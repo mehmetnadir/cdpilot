@@ -11885,7 +11885,8 @@ print("ok %.1f" % best)
       const flow2 = JSON.parse(fs.readFileSync(path.join(home, 'projects', 'proj', 'flows', 'acts_only.json'), 'utf-8'));
       assert(flow2.steps[0].kind === 'go' && flow2.steps[0].url === 'https://example.com/', JSON.stringify(flow2.steps));
       assert.deepStrictEqual(flow2.steps[1].anchor, { role: 'link', name: 'More information...', nth: 0 });
-      assert(flow2.stats.runs === 1 && flow2.stats.drift === 1, 'stats survive a re-save: ' + JSON.stringify(flow2.stats));
+      // the repair changed the steps: the old record (1 run, 1 drift) is not this flow's (2026-11-15 review)
+      assert(flow2.stats.runs === 0 && flow2.stats.drift === 0, 'stats reset with new steps: ' + JSON.stringify(flow2.stats));
       // show / delete / unknown
       assert.strictEqual(JSON.parse(ok(['agent', 'flow', 'show', 'inbox_triage']).stdout).name, 'inbox_triage');
       ok(['agent', 'flow', 'delete', 'inbox_triage']);
@@ -11995,6 +11996,164 @@ print("ok %.1f" % best)
       const pw = since.filter((x) => x.var_target);
       assert.strictEqual(pw.length, 1, JSON.stringify(since.map((x) => x.method)));
     } finally { b.fake.stop(); }
+  });
+
+  // ── Flow provenance (2026-11-15 review) ──
+  // The CLI and an MCP server in the same directory share one flows/ folder. A model could
+  // re-save the operator's "login" flow with its own {{password}} step pinned to its own page;
+  // the operator's next `agent run login --var password=…` then typed the value there.
+  test('learned flows (fake browser): flow provenance — flow save records written_by (mcp only for an MCP tool call, CDPILOT_MCP_SESSION=1 alone is cli; a legacy file counts as cli); an MCP session cannot overwrite a terminal flow (exit 2, file unchanged; also through cdpilot mcp) but re-saves its own; stats kept for equal steps, reset when they change', () => {
+    const fake = startFake();
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      // what the MCP server gives each tool call; CDPILOT_MCP_SESSION=1 alone is a `cdpilot run` script line
+      const mcpEnv = { ...env, CDPILOT_MCP_SESSION: '1', CDPILOT_MCP_TOOL_CALL: '1' };
+      const scriptEnv = { ...env, CDPILOT_MCP_SESSION: '1' };
+      const flows = path.join(home, 'projects', 'proj', 'flows');
+      const file = (n) => path.join(flows, `${n}.json`);
+      const read = (n) => JSON.parse(fs.readFileSync(file(n), 'utf-8'));
+      const ok = (args, e) => {
+        const r = cli(args, e || env);
+        assert.strictEqual(r.status, 0, `${args.join(' ')} exit ${r.status}: ${r.stderr}\n${r.stdout}`);
+        return r;
+      };
+      const teach = (e) => {  // a navigation and a click on Archive
+        ok(['agent', 'act', '--url', 'https://user.example/inbox'], e);
+        const byName = Object.fromEntries(JSON.parse(ok(['agent', 'observe'], e).stdout).actions.map((a) => [a.name, a]));
+        ok(['agent', 'act', '--ref', byName.Archive.ref, '--action', 'click'], e);
+        return byName;
+      };
+      // the operator records "login" in the terminal
+      const byName = teach(env);
+      const saved = JSON.parse(ok(['agent', 'flow', 'save', 'login']).stdout);
+      assert.strictEqual(saved.written_by, 'cli', JSON.stringify(saved));
+      assert.strictEqual(read('login').written_by, 'cli');
+      // stats: a re-save with the same steps keeps them; changed steps reset them
+      const withStats = read('login');
+      withStats.stats = { runs: 7, ok: 6, drift: 1, last_run: '2026-11-01T00:00:00+00:00' };
+      fs.writeFileSync(file('login'), JSON.stringify(withStats));
+      ok(['agent', 'flow', 'save', 'login']);
+      assert.deepStrictEqual(read('login').stats, withStats.stats, 'equal steps keep the stats');
+      ok(['agent', 'act', '--ref', byName.Search.ref, '--action', 'fill', '--text', 'cdpilot']);
+      ok(['agent', 'flow', 'save', 'login']);
+      const changed = read('login');
+      assert.strictEqual(changed.steps.length, 3, JSON.stringify(changed.steps));
+      assert.deepStrictEqual(changed.stats, { runs: 0, ok: 0, drift: 0 }, 'changed steps reset the stats');
+      // a `cdpilot run` script line (CDPILOT_MCP_SESSION=1, no tool-call marker) is the terminal's: cli, may overwrite
+      teach(scriptEnv);
+      const script = JSON.parse(ok(['agent', 'flow', 'save', 'login'], scriptEnv).stdout);
+      assert.deepStrictEqual([script.written_by, read('login').written_by, script.steps], ['cli', 'cli', 2], JSON.stringify(script));
+      // an MCP tool call cannot overwrite it: exit 2, the file byte for byte the same
+      const before = fs.readFileSync(file('login'), 'utf-8');
+      teach(mcpEnv);
+      const refused = cli(['agent', 'flow', 'save', 'login'], mcpEnv);
+      assert.strictEqual(refused.status, 2, refused.stdout + refused.stderr);
+      const e = JSON.parse(refused.stderr);
+      assert(/saved from the terminal/.test(e.error) && /another name/.test(e.hint) && /agent flow show/.test(e.hint), refused.stderr);
+      assert.strictEqual(fs.readFileSync(file('login'), 'utf-8'), before, 'the terminal flow is unchanged');
+      assert.strictEqual(cli(['agent', 'flow', 'save', 'Login'], mcpEnv).status, 2, 'the same slug spelled otherwise');
+      // … the same through the MCP server, as a child process and as a warm run (CDPILOT_DAEMON=1)
+      for (const daemon of ['', '1']) {
+        const input = [{ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+          { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'browser_agent_flow_save', arguments: { name: 'login' } } }]
+          .map((m) => JSON.stringify(m)).join('\n') + '\n';
+        const r = spawnSync(process.execPath, [CLI, 'mcp'], { input, encoding: 'utf-8', timeout: 60000,
+          env: { ...env, CDPILOT_WEBMCP: '0', CDPILOT_MCP_TOOLS: '', CDPILOT_DAEMON: daemon } });
+        assert.strictEqual(r.status, 0, r.stderr);
+        const res = r.stdout.trim().split('\n').map((l) => JSON.parse(l)).find((m) => m.id === 10);
+        const text = res.result.content.map((c) => c.text).join('\n');
+        assert(res.result.isError === true && /saved from the terminal/.test(text), `daemon=${daemon}: ${text}`);
+        assert.strictEqual(fs.readFileSync(file('login'), 'utf-8'), before, `daemon=${daemon}: the terminal flow is unchanged`);
+      }
+      // its own flow an MCP session saves and re-saves (drift repair)
+      const m1 = JSON.parse(ok(['agent', 'flow', 'save', 'login_mcp'], mcpEnv).stdout);
+      assert.strictEqual(m1.written_by, 'mcp', JSON.stringify(m1));
+      assert.strictEqual(read('login_mcp').written_by, 'mcp');
+      ok(['agent', 'flow', 'save', 'login_mcp', '--last', '1'], mcpEnv);
+      assert.strictEqual(read('login_mcp').steps.length, 1, 'MCP over MCP rewrote the flow');
+      // a file from an older version (no written_by) counts as the terminal's
+      const legacy = read('login');
+      delete legacy.written_by;
+      legacy.name = 'legacy';
+      fs.writeFileSync(file('legacy'), JSON.stringify(legacy));
+      const lr = cli(['agent', 'flow', 'save', 'legacy'], mcpEnv);
+      assert.strictEqual(lr.status, 2, lr.stdout + lr.stderr);
+      assert.strictEqual(fs.readFileSync(file('legacy'), 'utf-8'), JSON.stringify(legacy), 'the legacy flow is unchanged');
+      // agent flow list shows who wrote each flow
+      const list = Object.fromEntries(JSON.parse(ok(['agent', 'flow', 'list']).stdout).map((f) => [f.name, f.written_by]));
+      assert.deepStrictEqual(list, { legacy: 'cli', login: 'cli', login_mcp: 'mcp' }, JSON.stringify(list));
+      // a terminal save may overwrite anything; acts an MCP session left in the trail keep their mark,
+      // so saving them from the terminal still says written_by mcp — the model chose those pages
+      const relabel = JSON.parse(ok(['agent', 'flow', 'save', 'login_mcp']).stdout);
+      assert.strictEqual(relabel.written_by, 'mcp', JSON.stringify(relabel));
+      teach(env);
+      const own = JSON.parse(ok(['agent', 'flow', 'save', 'login_mcp']).stdout);
+      assert.strictEqual(own.written_by, 'cli', JSON.stringify(own));
+      assert.strictEqual(read('login_mcp').written_by, 'cli');
+    } finally { fake.stop(); }
+  });
+
+  test('learned flows (fake browser): from the terminal, agent run types no --var / CDPILOT_VAR_* value into a flow an MCP session saved unless --trust-flow (exit 2, each value origin listed, no browser call); --dry-run works without it and shows written_by and the origins; a flow with no values runs as before', () => {
+    const typed = 'zq-flowprov-planted-5521';
+    const fake = startFake('full', 'guid-user', { FAKE_CDP_WATCH: typed });
+    try {
+      const home = mkHome();
+      writeRegistry(home, { proj: externalEntry(fake.port) });
+      const env = isoEnv(home, fake.port, 'proj');
+      const mcpEnv = { ...env, CDPILOT_MCP_SESSION: '1', CDPILOT_MCP_TOOL_CALL: '1' };  // an MCP tool call
+      const ok = (args, e) => {
+        const r = cli(args, e || env);
+        assert.strictEqual(r.status, 0, `${args.join(' ')} exit ${r.status}: ${r.stderr}\n${r.stdout}`);
+        return r;
+      };
+      const observe = (e) => Object.fromEntries(JSON.parse(ok(['agent', 'observe'], e).stdout).actions.map((a) => [a.name, a]));
+      // the model fills a field named Password: the flow gets {{password}}, pinned to the model's page
+      ok(['agent', 'act', '--url', 'https://user.example/inbox'], mcpEnv);
+      ok(['agent', 'act', '--ref', observe(mcpEnv).Password.ref, '--action', 'fill', '--text', 'model-made-up'], mcpEnv);
+      const saved = JSON.parse(ok(['agent', 'flow', 'save', 'login'], mcpEnv).stdout);
+      assert.deepStrictEqual([saved.written_by, saved.vars], ['mcp', ['password']], JSON.stringify(saved));
+      // and a flow with no value: a navigation and a click
+      ok(['agent', 'act', '--url', 'https://user.example/inbox'], mcpEnv);
+      ok(['agent', 'act', '--ref', observe(mcpEnv).Archive.ref, '--action', 'click'], mcpEnv);
+      ok(['agent', 'flow', 'save', 'archive'], mcpEnv);
+      const origins = [{ step: 2, vars: ['password'], origin: 'https://user.example' }];
+      const mark = fake.entries().length;
+      for (const [args, extra] of [
+        [['agent', 'run', 'login', '--var', `password=${typed}`], {}],
+        [['agent', 'run', 'login'], { CDPILOT_VAR_PASSWORD: typed, CDPILOT_VAR_HOSTS: 'user.example' }],
+        // a `cdpilot run` script line (CDPILOT_MCP_SESSION=1 without the tool-call marker) is the terminal too
+        [['agent', 'run', 'login', '--var', `password=${typed}`], { CDPILOT_MCP_SESSION: '1' }],
+      ]) {
+        const r = cli(args, { ...env, ...extra });
+        assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+        const e = JSON.parse(r.stderr);
+        assert(e.written_by === 'mcp' && /--trust-flow/.test(e.error) && /agent flow show login/.test(e.hint), r.stderr);
+        assert.deepStrictEqual(e.value_steps, origins, r.stderr);
+        assert(!(r.stdout + r.stderr).includes(typed), 'no value printed');
+      }
+      const since = fake.entries().slice(mark);
+      assert(!since.some((x) => x.watch), 'the value reached the browser');
+      assert(!since.some((x) => x.method === 'Page.navigate'), 'refused before the first step');
+      // a dry run needs no flag: it shows who wrote the flow and where each value would go
+      const dry = ok(['agent', 'run', 'login', '--dry-run', '--var', `password=${typed}`]);
+      const d = JSON.parse(dry.stdout);
+      assert(d.dry_run === true && d.written_by === 'mcp' && !dry.stdout.includes(typed), dry.stdout);
+      assert.deepStrictEqual(d.value_steps, origins, dry.stdout);
+      // with --trust-flow the operator vouches for those origins: it runs, the value in one checked call
+      const m2 = fake.entries().length;
+      const run = JSON.parse(ok(['agent', 'run', 'login', '--var', `password=${typed}`, '--trust-flow']).stdout);
+      assert.strictEqual(run.status, 'ok', JSON.stringify(run));
+      const carried = fake.entries().slice(m2).filter((x) => x.watch);
+      assert(carried.length === 1 && carried[0].method === 'Runtime.callFunctionOn', JSON.stringify(carried));
+      // the MCP session runs its own flow as before; a flow with no value runs from the terminal as before
+      assert.strictEqual(JSON.parse(ok(['agent', 'run', 'login', '--var', `password=${typed}`], mcpEnv).stdout).status, 'ok');
+      assert.strictEqual(JSON.parse(ok(['agent', 'run', 'archive']).stdout).status, 'ok');
+      // the flag is documented in both help texts
+      assert(/agent run <name>[^\n]*--trust-flow/.test(cli(['agent'], env).stderr), 'agent usage lists --trust-flow');
+      assert(/--trust-flow/.test(cli(['--help'], env).stdout), 'bin --help lists --trust-flow');
+    } finally { fake.stop(); }
   });
 
   test('mcp: browser_agent_observe/act/flow_save/run map to the agent commands (fake browser)', () => {

@@ -19087,6 +19087,28 @@ def _agent_flow_load(path):
     return flow
 
 
+def _agent_flow_author(flow):
+    """Who wrote a flow: "mcp" (an MCP session, or acts it left in the trail) or
+    "cli" — also for any other value and for files older than the field."""
+    return 'mcp' if flow.get('written_by') == 'mcp' else 'cli'
+
+
+def _agent_flow_value_steps(flow):
+    """[{step, vars, origin}] for each step that types a {{placeholder}} value:
+    the origin it is pinned to (an act step's recorded page, a go step's URL),
+    '' when it has none — where `agent run` would put the value."""
+    out = []
+    for step in flow.get('steps') or []:
+        names = _AGENT_VAR_RE.findall(step.get('text') or step.get('url') or '')
+        if not names:
+            continue
+        before = step.get('before') or {}
+        origin = (_agent_origin(step.get('url')) if step.get('kind') == 'go'
+                  else before.get('origin') or before.get('host') or '')
+        out.append({'step': step.get('n'), 'vars': sorted(set(names)), 'origin': origin})
+    return out
+
+
 def _agent_flow_write(path, flow):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + '.tmp'
@@ -19153,6 +19175,14 @@ def _env_vars_blocked() -> bool:
     CDPILOT_MCP_SESSION=1) whose server was not started with CDPILOT_MCP_ALLOW_VARS=1."""
     mcp = IS_MCP_SESSION or os.environ.get('CDPILOT_MCP_SESSION') == '1'
     return mcp and os.environ.get(MCP_ALLOW_VARS_ENV, '').strip() != '1'
+
+
+def _mcp_tool_call() -> bool:
+    """True while a command runs for an MCP tool call: the MCP server sets
+    CDPILOT_MCP_TOOL_CALL=1 for each (child process and warm run alike) and nothing
+    else does. Not CDPILOT_MCP_SESSION: `cdpilot run` sets that for every script
+    line, and users set it to keep the visual layer on."""
+    return os.environ.get('CDPILOT_MCP_TOOL_CALL') == '1'
 
 
 def _env_var_value(name: str) -> str | None:
@@ -19739,6 +19769,8 @@ async def _replay_strict_act(ws_url, find_js, value, rule, kind):
 
 
 def _agent_trail_push(state, entry):
+    if _mcp_tool_call():  # a flow saved from these acts, even in the terminal, is written_by "mcp"
+        entry = dict(entry, mcp=True)
     trail = state.setdefault('trail', [])
     trail.append(entry)
     del trail[:-AGENT_TRAIL_MAX]
@@ -19835,18 +19867,31 @@ async def cmd_agent_flow_save(name, last=None):
             vars_dict.setdefault(m.group(1), {'step': n, 'hint': f"{step.get('action', 'go')} {label}"})
         host = host or _agent_host_path(e.get('url_after'))[0]
         steps.append(step)
+    # Provenance (2026-11-15 review): the CLI and an MCP server in the same directory
+    # share this folder. An MCP session never replaces a flow written from the
+    # terminal — its own placeholder steps, pinned to a page the model chose, would
+    # then take the operator's --var value. A file without the field is "cli".
+    written_by = 'mcp' if _mcp_tool_call() or any(e.get('mcp') for e in src) else 'cli'
     stats = {'runs': 0, 'ok': 0, 'drift': 0}
-    if os.path.isfile(path):
+    if os.path.exists(path):
         try:
-            stats = _agent_flow_load(path).get('stats') or stats
+            old = _agent_flow_load(path)
         except (OSError, ValueError):
-            pass
+            old = {}  # unreadable: nothing to keep, and for MCP it counts as the terminal's
+        if _mcp_tool_call() and _agent_flow_author(old) != 'mcp':
+            print(json.dumps({'error': f'flow {slug!r} was saved from the terminal; an MCP session cannot overwrite it',
+                              'hint': f'save under another name; the user can review it with '
+                                      f'`cdpilot agent flow show <name>` and record {slug!r} again'}),
+                  file=sys.stderr)
+            sys.exit(2)
+        if old.get('steps') == steps:  # the same flow: its record stands; new steps start at 0
+            stats = old.get('stats') or stats
     flow = {'name': slug, 'version': AGENT_FLOW_VERSION,
             'created': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
-            'host': host, 'steps': steps, 'vars': vars_dict, 'stats': stats}
+            'written_by': written_by, 'host': host, 'steps': steps, 'vars': vars_dict, 'stats': stats}
     _agent_flow_write(path, flow)
     print(json.dumps({'saved': slug, 'steps': len(steps), 'host': host,
-                      'vars': sorted(vars_dict), 'path': path}))
+                      'vars': sorted(vars_dict), 'written_by': written_by, 'path': path}))
 
 
 async def cmd_agent_flow_list():
@@ -19858,6 +19903,7 @@ async def cmd_agent_flow_list():
             continue
         st = flow.get('stats') or {}
         out.append({'name': flow.get('name') or fn[:-5], 'host': flow.get('host', ''),
+                    'written_by': _agent_flow_author(flow),
                     'steps': len(flow.get('steps') or []), 'vars': sorted(flow.get('vars') or {}),
                     'runs': st.get('runs', 0), 'ok': st.get('ok', 0), 'drift': st.get('drift', 0),
                     'last_run': st.get('last_run')})
@@ -19887,7 +19933,8 @@ async def cmd_agent_flow_delete(name):
     print(json.dumps({'deleted': slug}))
 
 
-async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=False, objects=False, all_=False):
+async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=False, objects=False, all_=False,
+                        trust_flow=False):
     """Replay a saved flow by anchors, no model in the loop.
 
     Exit 0: every step found its anchor (one result JSON: url, title, ms,
@@ -19907,6 +19954,19 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
     except ValueError as e:
         print(json.dumps({'error': f'{path}: {e}'}), file=sys.stderr)
         sys.exit(1)
+    # A flow an MCP session wrote types its values on pages a model chose: outside MCP
+    # no --var / CDPILOT_VAR_* value goes into it without --trust-flow (2026-11-15
+    # review). A dry run shows the origins; a flow with no value runs as before.
+    value_steps = _agent_flow_value_steps(flow)
+    if value_steps and _agent_flow_author(flow) == 'mcp' and not (dry_run or trust_flow or _mcp_tool_call()):
+        print(json.dumps({'error': f'flow {slug!r} was saved by an MCP session, so a model chose the pages its '
+                                   'values are typed on; no --var or CDPILOT_VAR_* value goes into it '
+                                   'without --trust-flow',
+                          'flow': slug, 'written_by': 'mcp', 'value_steps': value_steps,
+                          'hint': f'check where each value would go (value_steps, `cdpilot agent flow show {slug}`); '
+                                  'record the flow again from the terminal, or pass --trust-flow to trust these origins'}),
+              file=sys.stderr)
+        sys.exit(2)
     # Values: --var (the caller holds them) always; CDPILOT_VAR_<NAME> only for an
     # act step whose recorded host is named in CDPILOT_VAR_HOSTS, never for a URL.
     # Everything is settled here, before any step runs (exit 2 otherwise).
@@ -19957,6 +20017,8 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
     if dry_run:
         # Placeholders stay placeholders: a dry run never prints a value.
         print(json.dumps(_agent_clean_tags({'flow': slug, 'dry_run': True, 'host': flow.get('host', ''),
+                                            'written_by': _agent_flow_author(flow),
+                                            **({'value_steps': value_steps} if value_steps else {}),
                                             'steps': flow['steps'], 'vars': sorted(needed)}),
                          indent=2, ensure_ascii=False))
         return
@@ -20122,7 +20184,7 @@ def _dispatch_agent_flow(rest):
 
 
 def _dispatch_agent_run(rest):
-    name, var_values, dry_run = None, {}, False
+    name, var_values, dry_run, trust_flow = None, {}, False, False
     full, rows, objects, all_ = '--full' in rest, '--rows' in rest, '--objects' in rest, '--all' in rest
     i = 0
     while i < len(rest):
@@ -20144,15 +20206,19 @@ def _dispatch_agent_run(rest):
         elif tok == '--dry-run':
             dry_run = True
             i += 1
+        elif tok == '--trust-flow':
+            trust_flow = True
+            i += 1
         elif name is None and not tok.startswith('--'):
             name = tok
             i += 1
         else:
             i += 1
     if not name:
-        print("Usage: agent run <flow> [--var name=value …] [--dry-run]", file=sys.stderr)
+        print("Usage: agent run <flow> [--var name=value …] [--dry-run] [--trust-flow]", file=sys.stderr)
         sys.exit(1)
-    return cmd_agent_run(name, var_values=var_values, dry_run=dry_run, full=full, rows=rows, objects=objects, all_=all_)
+    return cmd_agent_run(name, var_values=var_values, dry_run=dry_run, full=full, rows=rows, objects=objects, all_=all_,
+                         trust_flow=trust_flow)
 
 
 def _dispatch_agent_observe_frame(rest):
@@ -20267,7 +20333,7 @@ def _dispatch_agent_cmd(args):
     print(f"  agent act --url URL           navigates silently, prints the diff", file=sys.stderr)
     print(f"  agent flow save <name> [--last N]   save the acts since the last navigation as a replayable flow", file=sys.stderr)
     print(f"  agent flow list | show <name> | delete <name>", file=sys.stderr)
-    print(f"  agent run <name> [--var k=v …] [--dry-run] [--full] [--all] [--rows] [--objects]   replay by anchors, no model; exit 4 + page on drift", file=sys.stderr)
+    print(f"  agent run <name> [--var k=v …] [--dry-run] [--trust-flow] [--full] [--all] [--rows] [--objects]   replay by anchors, no model; exit 4 + page on drift; --trust-flow = type --var / CDPILOT_VAR_* values into a flow an MCP session saved (`agent flow list` shows written_by)", file=sys.stderr)
     print(f"  agent reset", file=sys.stderr)
     print(f"  agent stats", file=sys.stderr)
     print(f"  agent twitter --help", file=sys.stderr)
@@ -22677,6 +22743,7 @@ class MCPServer:
         try:
             env = os.environ.copy()
             env["CDPILOT_MCP_SESSION"] = "1"
+            env["CDPILOT_MCP_TOOL_CALL"] = "1"  # only a tool call has it (flow provenance, _mcp_tool_call)
             if _env_vars_blocked():  # defence in depth: _env_var_value refuses them too
                 for k in [k for k in env if k.upper().startswith("CDPILOT_VAR_")
                           and k.upper() != AGENT_VAR_HOSTS_ENV]:
