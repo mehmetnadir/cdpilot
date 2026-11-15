@@ -16889,6 +16889,197 @@ print(json.dumps({
     assert.deepStrictEqual(res.state.steps[1].args, ['#email', 'a@b.c']);
   });
 
+  // A model's step in the operator's recording ran in the operator's profile at
+  // replay and took the operator's --var value for the same placeholder name.
+  test('record: an MCP tool call (child, warm run or the server itself) writes no step; CDPILOT_MCP_SESSION alone still records', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-mcp-unit-'));
+    const script = `
+import json, os, io, contextlib, datetime, importlib.util
+os.environ["CDPILOT_HOME"] = ${JSON.stringify(tmpHome)}
+os.environ["CDPILOT_LOG"] = "0"
+for k in ("CDPILOT_MCP_TOOL_CALL", "CDPILOT_MCP_SESSION", "CDPILOT_REPLAY_ACTIVE", "CDPILOT_RECORD_SKIP"):
+    os.environ.pop(k, None)
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+def steps():
+    with open(m._record_active_path(), encoding="utf-8") as f:
+        return [" ".join([s["cmd"]] + s["args"]) for s in json.load(f)["steps"]]
+
+now = datetime.datetime.now().astimezone()
+with contextlib.redirect_stdout(io.StringIO()):
+    m.cmd_record_start()
+out = {}
+os.environ["CDPILOT_MCP_TOOL_CALL"] = "1"
+m._record_hook_step("fill", ["#password", "dummy"], 0)
+m._slog_record_external(["fill", "#password", "dummy"], 124, now, 5, "timed out", "mcp:browser_fill")
+out["tool_call"] = steps()
+del os.environ["CDPILOT_MCP_TOOL_CALL"]
+m.MCP_SERVER_PROCESS = True  # the server's own line for a call that timed out or raised
+m._slog_record_external(["go", "https://x.example/"], 124, now, 5, "timed out", "mcp:browser_navigate")
+out["server"] = steps()
+m.MCP_SERVER_PROCESS = False
+m._slog_record_external(["eval", "1"], 1, now, 5, "raised", "mcp:browser_eval")  # via alone
+out["via_only"] = steps()
+os.environ["CDPILOT_MCP_SESSION"] = "1"  # negative control: no tool-call marker, no via
+m._record_hook_step("fill", ["#password", "dummy"], 0)
+m._slog_record_external(["entropy", "on"], 0, now, 5, None, None)
+out["session_only"] = steps()
+del os.environ["CDPILOT_MCP_SESSION"]
+m._record_hook_step("block", ["on"], 0)
+out["operator"] = steps()
+os.environ["CDPILOT_MCP_TOOL_CALL"] = "1"
+m._slog_begin(["block", "on"])
+out["begin_rec_wants"] = bool(m._SLOG.get("rec_wants"))
+print(json.dumps(out))
+`;
+    const res = JSON.parse(execFileSync(PYB, ['-c', script], { encoding: 'utf-8', timeout: 15000 })
+      .trim().split('\n').pop());
+    assert.deepStrictEqual(res.tool_call, [], `tool call recorded: ${JSON.stringify(res.tool_call)}`);
+    assert.deepStrictEqual(res.server, [], `server line recorded: ${JSON.stringify(res.server)}`);
+    assert.deepStrictEqual(res.via_only, [], `via mcp:<tool> recorded: ${JSON.stringify(res.via_only)}`);
+    assert.deepStrictEqual(res.session_only, ['fill #password {{password}}', 'entropy on']);
+    assert.deepStrictEqual(res.operator, ['fill #password {{password}}', 'entropy on', 'block on']);
+    assert.strictEqual(res.begin_rec_wants, false, '_slog_begin must not plan a record step in a tool call');
+  });
+
+  test('record: MCP stdio tool calls, fresh and warm, never reach the active recording', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-mcp-stdio-'));
+    const env = { ...makeIsolatedEnv(home), CDP_PORT: '19578' };
+    const activeSteps = () => JSON.parse(fs.readFileSync(path.join(home, 'record', 'active.json'), 'utf-8'))
+      .steps.map((s) => [s.cmd, ...s.args].join(' '));
+    let r = runCli(['record', 'start', '--name', 'operator-flow'], env);
+    assert.strictEqual(r.status, 0, r.stderr);
+    const input = [
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'browser_mode', arguments: {} } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'browser_fill', arguments: { selector: '#password', value: 'model-value' } } },
+    ].map((x) => JSON.stringify(x)).join('\n') + '\n';
+    const modes = process.platform === 'win32' ? ['0'] : ['0', '1'];  // 1: tool calls run in the server process
+    for (const daemon of modes) {
+      const mcp = spawnSync(process.execPath, [CLI, 'mcp'], {
+        input, encoding: 'utf-8', timeout: 60000, env: { ...env, CDPILOT_DAEMON: daemon },
+      });
+      assert.strictEqual(mcp.status, 0, mcp.stderr);
+      const replies = mcp.stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      assert.strictEqual(replies.find((x) => x.id === 1).result.isError, false, mcp.stdout);
+      assert.deepStrictEqual(activeSteps(), [], `CDPILOT_DAEMON=${daemon}: MCP tool calls were recorded`);
+    }
+    r = runCli(['block', 'on'], env);
+    assert.strictEqual(r.status, 0, r.stderr);
+    r = runCli(['record', 'stop'], env);
+    assert.strictEqual(r.status, 0, r.stderr);
+    const flow = JSON.parse(r.stdout);
+    assert.deepStrictEqual(flow.steps.map((s) => s.cmd), ['block'], 'the operator\'s own command is recorded');
+    assert.deepStrictEqual(flow.vars, {});
+  });
+
+  test('record: a recording keeps only the commands of the project that started it; record status names it', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-proj-'));
+    const env = { ...makeIsolatedEnv(home), CDP_PORT: '19578' };
+    const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-projA-'));
+    const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-projB-'));
+    const at = (cwd, args) => spawnSync(process.execPath, [CLI, ...args], { cwd, env, encoding: 'utf-8', timeout: 15000 });
+    let r = at(dirA, ['record', 'start', '--name', 'proj-flow']);
+    assert.strictEqual(r.status, 0, r.stderr);
+    r = at(dirB, ['block', 'on']);  // another project's terminal or MCP server
+    assert.strictEqual(r.status, 0, r.stderr);
+    r = at(dirA, ['entropy', 'on']);
+    assert.strictEqual(r.status, 0, r.stderr);
+    r = at(dirA, ['record', 'status']);
+    assert.strictEqual(r.status, 0, r.stderr);
+    const idA = path.basename(dirA).replace(/[^a-zA-Z0-9-]/g, '').slice(0, 20);
+    assert(new RegExp(`Recording active: proj-flow \\(1 steps, started .*, project ${idA}-[0-9a-f]{6}\\)`).test(r.stdout), r.stdout);
+    r = at(dirA, ['record', 'stop']);
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.deepStrictEqual(JSON.parse(r.stdout).steps.map((s) => s.cmd), ['entropy'],
+      'a command of another project was recorded');
+  });
+
+  test('record: run <script> during a recording records the run step once, not each line again', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-run-'));
+    const env = { ...makeIsolatedEnv(home), CDP_PORT: '19578' };
+    const scriptPath = path.join(home, 'steps.cdp');
+    fs.writeFileSync(scriptPath, '# two browser-free lines\nblock on\nentropy on\n');
+    let r = runCli(['record', 'start', '--name', 'run-flow'], env);
+    assert.strictEqual(r.status, 0, r.stderr);
+    r = runCli(['run', scriptPath], env);
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert(/Result: 2 passed, 0 failed/.test(r.stdout), r.stdout);
+    r = runCli(['record', 'stop'], env);
+    assert.strictEqual(r.status, 0, r.stderr);
+    const flow = JSON.parse(r.stdout);
+    assert.deepStrictEqual(flow.steps.map((s) => [s.cmd, ...s.args]), [['run', scriptPath]],
+      `a replay would run the lines twice: ${JSON.stringify(flow.steps)}`);
+  });
+
+  test('record: stop and cancel wait for a step writer; a writer never brings active.json back after a stop', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rec-lock-'));
+    const script = `
+import json, os, io, threading, time, contextlib, importlib.util
+os.environ["CDPILOT_HOME"] = ${JSON.stringify(tmpHome)}
+for k in ("CDPILOT_MCP_TOOL_CALL", "CDPILOT_REPLAY_ACTIVE", "CDPILOT_RECORD_SKIP"):
+    os.environ.pop(k, None)
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", ${JSON.stringify(PY_PATH)})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+real = m._record_detect_placeholders
+
+def scenario(which):
+    if os.path.exists(m._record_active_path()):
+        os.remove(m._record_active_path())  # a previous scenario's leftover
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.cmd_record_start()
+    entered, gate = threading.Event(), threading.Event()
+    def paused(*a, **k):  # the writer has read active.json and waits before writing it back
+        entered.set()
+        gate.wait(5)
+        return real(*a, **k)
+    m._record_detect_placeholders = paused
+    writer = threading.Thread(target=m._record_hook_step, args=("block", ["on"], 0))
+    writer.start()
+    entered.wait(5)
+    save = os.path.join(${JSON.stringify(tmpHome)}, which + ".json")
+    def stopper():
+        try:
+            if which == "stop":
+                m.cmd_record_stop("--save", save)
+            elif which == "cancel":
+                m.cmd_record_cancel()
+            else:  # removed by something that holds no lock
+                os.remove(m._record_active_path())
+        except SystemExit:
+            pass
+    res = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        s = threading.Thread(target=stopper)
+        s.start()
+        time.sleep(0.4)
+        res["stop_waited"] = s.is_alive()
+        gate.set()
+        writer.join(5)
+        s.join(5)
+    m._record_detect_placeholders = real
+    res["active_after"] = os.path.exists(m._record_active_path())
+    if which == "stop":
+        with open(save, encoding="utf-8") as f:
+            res["saved"] = [st["cmd"] for st in json.load(f)["steps"]]
+    return res
+
+print(json.dumps({w: scenario(w) for w in ("stop", "cancel", "unlocked")}))
+`;
+    const res = JSON.parse(execFileSync(PYB, ['-c', script], { encoding: 'utf-8', timeout: 30000 })
+      .trim().split('\n').pop());
+    for (const w of ['stop', 'cancel', 'unlocked']) {
+      assert.strictEqual(res[w].active_after, false, `${w}: a writer re-created active.json: ${JSON.stringify(res)}`);
+    }
+    if (process.platform !== 'win32') {  // flock: POSIX only
+      assert.strictEqual(res.stop.stop_waited, true, 'record stop must wait for the writer\'s lock');
+      assert.strictEqual(res.cancel.stop_waited, true, 'record cancel must wait for the writer\'s lock');
+      assert.deepStrictEqual(res.stop.saved, ['block'], 'the step the writer held is in the saved flow');
+    }
+  });
+
   test('record & replay: placeholders — fill "#password" hunter2 -> {{password}} + vars entry, fill "#email" a@b.c kept verbatim', () => {
     const script = `
 import json, sys, importlib.util
