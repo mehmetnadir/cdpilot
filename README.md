@@ -158,6 +158,15 @@ decide that. Run `cdpilot connect` yourself in a terminal instead: MCP tools the
 browser. `browser_disconnect` needs no opt-in. While a browser is connected, `browser_tabs` lists
 only the tabs cdpilot opened in it and counts yours; `cdpilot tabs` in a terminal lists every tab.
 
+### Environment values over MCP
+
+Commands the MCP server runs get no `CDPILOT_VAR_<NAME>` value unless the server runs with
+`CDPILOT_MCP_ALLOW_VARS=1`. A model that ran a flow (`browser_agent_run`) could read the typed value
+back from the page (`browser_eval`, an assert, a screenshot) and send it on. Without the opt-in, a flow
+that needs such a value fails before its first step with `missing variables` and a hint; the model can
+pass its own values in `vars`. With the opt-in, the model can read a typed value back from the page.
+The CLI (`cdpilot agent run`, `cdpilot replay`) always uses `CDPILOT_VAR_*`.
+
 ### Smaller MCP tool list
 
 `cdpilot mcp --tools core` (or `CDPILOT_MCP_TOOLS=core`; the flag wins) lists 10 core
@@ -616,7 +625,9 @@ duration of the call and are redacted in the session log; an environment value n
 `CDPILOT_VAR_<NAME>` is used only by a step recorded on a host named in `CDPILOT_VAR_HOSTS` (comma-separated,
 subdomains included), on that same origin over https (http only on loopback), and never inside a URL — so a flow
 that a prompt-injected model records on another site cannot draw on the environment's secrets; anything else is
-refused before the first step (exit 2, `refused` says why) or is a drift. `agent run` sets a placeholder value on
+refused before the first step (exit 2, `refused` says why) or is a drift. Over MCP, commands get no
+`CDPILOT_VAR_*` value unless the server runs with `CDPILOT_MCP_ALLOW_VARS=1`: the model could read a typed value
+back from the page ([Environment values over MCP](#environment-values-over-mcp)). `agent run` sets a placeholder value on
 the recorded field in one browser call that first checks the field (editable, in the top-level page, not an
 iframe; for an environment value not a search or url field) and the page's origin; a failed check exits 2 and types nothing.
 

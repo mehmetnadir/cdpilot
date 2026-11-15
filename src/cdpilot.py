@@ -72,6 +72,9 @@ Environment:
   CDPILOT_MCP_ALLOW_CONNECT=1  Let the MCP browser_connect tool connect this
                        project to your own browser (refused by default; the
                        CLI `cdpilot connect` always works)
+  CDPILOT_MCP_ALLOW_VARS=1  Let commands `cdpilot mcp` runs use CDPILOT_VAR_*
+                       values (off by default: the model could read a typed
+                       value back from the page; the CLI always uses them)
   CDPILOT_NO_AUTOLAUNCH=1  Do not start the browser when a page command
                        finds it not running (print the error instead)
   CDPILOT_IDLE_CLOSE   Minutes without a cdpilot command or page change before
@@ -19105,6 +19108,36 @@ def _agent_origin(url):
 
 
 AGENT_VAR_HOSTS_ENV = 'CDPILOT_VAR_HOSTS'
+# Over MCP a CDPILOT_VAR_<NAME> value needs the operator's opt-in (2026-11-15
+# review): the model that ran a flow could read the typed field back (eval,
+# assert-value, a screenshot) and send it on. Every read of a value goes
+# through _env_var_value / _env_var_values, so a command the MCP server runs as
+# a child and one it runs in its own process (CDPILOT_DAEMON=1) are both covered.
+MCP_ALLOW_VARS_ENV = 'CDPILOT_MCP_ALLOW_VARS'
+MCP_VARS_HINT = (f'over MCP, CDPILOT_VAR_<NAME> values are off unless the MCP server runs with '
+                 f'{MCP_ALLOW_VARS_ENV}=1 (the model could read a typed value back from the page)')
+
+
+def _env_vars_blocked() -> bool:
+    """True in an MCP session (the MCP server process, or a command it runs with
+    CDPILOT_MCP_SESSION=1) whose server was not started with CDPILOT_MCP_ALLOW_VARS=1."""
+    mcp = IS_MCP_SESSION or os.environ.get('CDPILOT_MCP_SESSION') == '1'
+    return mcp and os.environ.get(MCP_ALLOW_VARS_ENV, '').strip() != '1'
+
+
+def _env_var_value(name: str) -> str | None:
+    """CDPILOT_VAR_<NAME> (name upper-cased); None when unset or off over MCP."""
+    if _env_vars_blocked():
+        return None
+    return os.environ.get(f'CDPILOT_VAR_{name.upper()}')
+
+
+def _env_var_values() -> dict[str, str]:
+    """Every CDPILOT_VAR_<NAME> but CDPILOT_VAR_HOSTS as {NAME: value}; {} when off over MCP."""
+    if _env_vars_blocked():
+        return {}
+    return {k[len('CDPILOT_VAR_'):]: v for k, v in os.environ.items()
+            if k.startswith('CDPILOT_VAR_') and k != AGENT_VAR_HOSTS_ENV}
 
 
 def _var_host_entries(raw=None):
@@ -19858,7 +19891,7 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
         for k in names:  # checked on every step that types the name, never cached across steps
             if k in cli_values:
                 continue
-            env_v = os.environ.get(f'CDPILOT_VAR_{k.upper()}')
+            env_v = _env_var_value(k)
             if env_v is None:
                 if k not in missing:
                     missing.append(k)
@@ -19872,12 +19905,14 @@ async def cmd_agent_run(name, var_values=None, dry_run=False, full=False, rows=F
                 env_by_step.setdefault(step['n'], {})[k] = env_v
     for k in sorted(needed):  # catalogued but typed in no step: a value must still exist
         if k not in cli_values and k not in missing and not any(r['var'] == k for r in refused) \
-                and os.environ.get(f'CDPILOT_VAR_{k.upper()}') is None:
+                and _env_var_value(k) is None:
             missing.append(k)
     if missing or refused:
         err = {'error': 'missing variables', 'missing': sorted(set(missing)),
                'hint': f'--var name=value, or CDPILOT_VAR_<NAME> with {AGENT_VAR_HOSTS_ENV}=<host,...> '
                        'naming the host the value was recorded on'}
+        if missing and _env_vars_blocked():
+            err['hint'] += '; ' + MCP_VARS_HINT
         if refused:
             err['refused'] = refused
         print(json.dumps(err), file=sys.stderr)
@@ -22612,6 +22647,10 @@ class MCPServer:
         try:
             env = os.environ.copy()
             env["CDPILOT_MCP_SESSION"] = "1"
+            if _env_vars_blocked():  # defence in depth: _env_var_value refuses them too
+                for k in [k for k in env if k.upper().startswith("CDPILOT_VAR_")
+                          and k.upper() != AGENT_VAR_HOSTS_ENV]:
+                    del env[k]
             env[SLOG_VIA_ENV] = via
             # Both ends in UTF-8: with the locale default a child writing one
             # code page and a parent reading another raised here, and the
@@ -26612,10 +26651,9 @@ def cmd_replay(*args):
     # to any host through go / eval / a fill after `go https://evil`).
     # The two sources stay in separate dicts; nothing here prints a value.
     env_vars = {}
-    for env_k, env_v in os.environ.items():
-        if env_k.startswith("CDPILOT_VAR_") and env_k != AGENT_VAR_HOSTS_ENV:
-            env_vars[env_k[len("CDPILOT_VAR_"):]] = env_v
-            env_vars.setdefault(env_k[len("CDPILOT_VAR_"):].lower(), env_v)
+    for env_k, env_v in _env_var_values().items():  # {} over MCP without the opt-in
+        env_vars[env_k] = env_v
+        env_vars.setdefault(env_k.lower(), env_v)
 
     def _lookup(src, name):
         for k in (name, name.lower(), name.upper()):
@@ -26653,6 +26691,8 @@ def cmd_replay(*args):
     hint = (f"--var name=value, or CDPILOT_VAR_<NAME> with {AGENT_VAR_HOSTS_ENV}=<host,...> "
             "for the value of an input step (" + ", ".join(sorted(RECORD_INPUT_CMDS)) + ") "
             "in a flow made only of: " + ", ".join(sorted(REPLAY_ENV_FLOW_CMDS)))
+    if missing and _env_vars_blocked():
+        hint += "; " + MCP_VARS_HINT
     if missing or refused:
         parts = []
         if missing:
