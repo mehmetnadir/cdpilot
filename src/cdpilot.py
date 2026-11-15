@@ -169,7 +169,21 @@ import io
 import signal
 import threading
 import weakref
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _StdThreadingHTTPServer
+
+
+class ThreadingHTTPServer(_StdThreadingHTTPServer):
+    """http.server's ThreadingHTTPServer without the reverse DNS lookup at bind.
+
+    HTTPServer.server_bind() sets server_name = socket.getfqdn(host), a PTR query
+    for 127.0.0.1. A resolver that does not answer it blocks for ~30 s (the macOS
+    CI runner did), so `serve --api` and `trace open` started that late. Nothing
+    here reads server_name; it keeps the address, as getfqdn does when it fails."""
+
+    def server_bind(self):
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def _utcnow():

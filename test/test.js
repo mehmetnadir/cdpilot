@@ -817,7 +817,8 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_response(200); self.end_headers(); self.wfile.write(b"x" * (3 * 1024 * 1024))
         else:
             self.send_response(200); self.end_headers(); self.wfile.write(b"IMG")
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+# cdpilot's server class: the stdlib one does a reverse DNS lookup at bind (~30 s on macOS CI)
+srv = mod.ThreadingHTTPServer(("127.0.0.1", 0), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 port = srv.server_address[1]
 orig = mod._captcha_img_host_ok
@@ -857,7 +858,8 @@ def server(redirect_to=None):
                 self.send_response(302); self.send_header("Location", redirect_to()); self.end_headers()
             else:
                 self.send_response(200); self.end_headers(); self.wfile.write(b"IMG")
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    # cdpilot's server class: the stdlib one does a reverse DNS lookup at bind (~30 s on macOS CI)
+    srv = mod.ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, srv.server_address[1], hits
 
@@ -3169,6 +3171,57 @@ test('Browserbase session dict shape contains required fields', () => {
   fs.rmSync(apiTestHome, { recursive: true, force: true });
 })();
 
+// http.server's HTTPServer.server_bind() sets server_name = socket.getfqdn(host),
+// a reverse (PTR) lookup of 127.0.0.1. On the macOS CI runner it blocked ~30 s:
+// `serve --api` and `trace open` started that late and every harness that
+// waited for them timed out. The lookup is recorded here, never sent.
+test('serve api + trace viewer: the HTTP server binds 127.0.0.1 without a reverse DNS lookup', () => {
+  const { spawnSync } = require('child_process');
+  const os = require('os');
+  const PYB = process.env.CDPILOT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const HARNESS = `
+import importlib.util, io, json, os, socket, sys, threading, time
+spec = importlib.util.spec_from_file_location("cdpilot_under_test", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+out, sys.stdout = sys.stdout, io.StringIO()  # cmd_serve prints after it binds, from its thread
+lookups = []
+def no_lookup(name="", *a):
+    lookups.append(name)
+    raise OSError("reverse lookup")
+socket.getfqdn = lambda name="": (lookups.append(name), name)[1]
+socket.gethostbyaddr = no_lookup
+servers = []
+class Keep(m.ThreadingHTTPServer):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        servers.append(self)
+m.ThreadingHTTPServer = Keep
+os.makedirs(os.path.join(m.TRACES_DIR, "run1"), exist_ok=True)
+threading.Thread(target=m.cmd_serve, args=(True, 0), daemon=True).start()
+threading.Thread(target=m.cmd_trace_open, args=("run1", 0), daemon=True).start()
+end = time.time() + 10
+while len(servers) < 2 and time.time() < end:
+    time.sleep(0.02)
+out.write(json.dumps({"servers": [s.server_address[0] for s in servers], "lookups": lookups}) + "\\n")
+out.flush()
+`;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-bind-'));
+  try {
+    const r = spawnSync(PYB, ['-c', HARNESS, PY_PATH], {
+      encoding: 'utf-8', timeout: 20000, cwd: home,
+      env: { ...process.env, CDPILOT_HOME: home, CDPILOT_API_TEST_MODE: '1', CDP_PORT: '19222',
+             CDPILOT_NO_AUTOLAUNCH: '1', CDPILOT_LOG: '0' },
+    });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const got = JSON.parse(r.stdout.trim().split('\n').pop());
+    assert.deepStrictEqual(got.servers, ['127.0.0.1', '127.0.0.1'], 'serve --api and trace open both bind');
+    assert.deepStrictEqual(got.lookups, [], `reverse DNS lookups at bind: ${JSON.stringify(got.lookups)}`);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // ── serve --api loopback guard (DNS rebinding, cross-site requests) ──
 // The API binds 127.0.0.1, but a web page can still reach it: by DNS
 // rebinding (the Host header carries the attacker's name) or by a plain
@@ -3702,6 +3755,8 @@ threading.Thread(target=m.cmd_trace_open, args=("run1", 0), daemon=True).start()
 end = time.time() + 5
 while not servers and time.time() < end:
     time.sleep(0.02)
+if not servers:
+    sys.exit("the trace viewer server did not bind within 5 s")
 port = servers[0].server_address[1]
 def get(path, host=None, method="GET"):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
