@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`--frame` with a CSS class selector no longer prints a misleading "no frame on host" note.** A value that starts with `.` or `#`, or holds CSS characters (`[ ] > ~ + * = ( )`, quotes, spaces), is never read as a host; a `tag.class` value such as `div.card` is still tried as URL text first but gets no note when it matches as a selector.
+
 ## [0.9.13] - 2026-11-15
 
 ### Security

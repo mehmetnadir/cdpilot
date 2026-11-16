@@ -759,7 +759,9 @@ def scenario_frame_identity(mod):
         # A host-shaped --frame value that is a CSS selector of the frame: no frame's host
         # matches it, so it still selects the <iframe class="card">.
         return Frame("top", children=[
-            Frame("card", elem_id="card", selectors=["iframe.card"], src="http://a.test/inner.html",
+            Frame("card", elem_id="card",
+                  selectors=["iframe.card", ".card-frame", "div.card"],
+                  src="http://a.test/inner.html",
                   box=(100, 1000)),
         ])
 
@@ -797,6 +799,8 @@ def scenario_frame_identity(mod):
         ("attr_id_only", lambda: attr_decoys(False, False), "js.stripe.com", fill, "#cardnumber",
          None),
         ("dotted_selector_flag", dotted_selector_page, "iframe.card", fill, "#cardnumber", None),
+        ("class_dot_flag", dotted_selector_page, ".card-frame", fill, "#cardnumber", None),
+        ("tag_class_flag", dotted_selector_page, "div.card", fill, "#cardnumber", None),
         # the frame navigates (new loaderId, same URL) after the route was resolved
         ("changed_fill_sel", honest_page, "#card", fill, "#cardnumber", "card"),
         ("changed_fill_index", honest_page, "0", fill, "#cardnumber", "card"),
