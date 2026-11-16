@@ -19753,6 +19753,13 @@ print(json.dumps(res))
       assert.strictEqual(r.status, 2, diag);
       assert(/refused \(environment value\): never (with humanized typing|inside a frame)/.test(r.stderr), diag);
     }
+    // the same values the replay parent reads as "humanized typing asked" (T1 k0242 L1)
+    for (const [args, extra] of [[['fill', '#pw', 'x', '--entropy'], {}], [['type', '#pw', 'x'], { CDPILOT_ENTROPY: '1' }],
+      [['fill', '#pw', 'x'], { CDPILOT_ENTROPY: 'true' }]]) {
+      const r = runCli(args, { ...env, ...extra });
+      assert.strictEqual(r.status, 2, `${args.join(' ')} ${JSON.stringify(extra)}: status=${r.status} ${r.stderr}`);
+      assert(/never with humanized typing/.test(r.stderr), r.stderr);
+    }
   });
 
   test('replay: env var — a selector that reacts to the typed value ([value…], @value, :placeholder-shown, :valid…) refuses the flow', () => {
