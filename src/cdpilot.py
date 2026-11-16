@@ -31376,7 +31376,7 @@ def _cli_main():
     if _replay_strict_rule() is not None:
         if cmd in FRAME_AWARE_CMDS and (_FRAME_FLAG or any(isinstance(a, str) and FRAME_SEP in a for a in args)):
             _replay_strict_refuse('fill' if cmd == 'type' else cmd, 'never inside a frame (>>>, --frame)')
-        if cmd in ('fill', 'type') and ('--entropy=on' in args or os.environ.get('CDPILOT_ENTROPY') == 'on'):
+        if cmd in ('fill', 'type') and _replay_entropy_asked(args):
             _replay_strict_refuse('fill', 'never with humanized typing (--entropy=on)')
 
     if cmd == "network":
