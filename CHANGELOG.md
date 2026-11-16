@@ -4,6 +4,12 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- **MCP screenshots are confined to a private per-user directory.** `browser_screenshot` writes to and `browser_screenshot_diff` confines comparisons to `<tmp>/cdpilot-shots-<uid>` on POSIX (`%TEMP%\cdpilot-shots` on Windows), created mode 0700 and validated to prevent temp-file probing across users.
+
+### Changed
+- **MCP screenshots now go to the per-user folder** (`<tmp>/cdpilot-shots-<uid>` on POSIX, `%TEMP%\cdpilot-shots` on Windows) instead of the shared temporary directory.
+
 ## [0.9.13] - 2026-11-15
 
 ### Security
