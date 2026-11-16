@@ -4,6 +4,12 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- **MCP screenshots are confined to a private per-user directory.** `browser_screenshot` writes to and `browser_screenshot_diff` confines comparisons to `<tmp>/cdpilot-shots-<uid>` on POSIX (`%TEMP%\cdpilot-shots` on Windows), created mode 0700 and validated to prevent temp-file probing across users.
+
+### Changed
+- **MCP screenshots now go to the per-user folder** (`<tmp>/cdpilot-shots-<uid>` on POSIX, `%TEMP%\cdpilot-shots` on Windows) instead of the shared temporary directory.
+
 ### Fixed
 - **`--frame` with a CSS class selector no longer prints a misleading "no frame on host" note.** A value that starts with `.` or `#`, or holds CSS characters (`[ ] > ~ + * = ( )`, quotes, spaces), is never read as a host; a `tag.class` value such as `div.card` is still tried as URL text first but gets no note when it matches as a selector.
 

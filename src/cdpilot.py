@@ -650,6 +650,49 @@ if platform.system() == "Windows":
 else:
     SCREENSHOT_DIR = "/tmp"
 
+
+def _mcp_shot_dir():
+    r"""Return the per-user MCP screenshot folder path after ensuring it is safe.
+    POSIX: <tempfile.gettempdir()>/cdpilot-shots-<uid>
+    Windows: <SCREENSHOT_DIR>\cdpilot-shots
+    Creates it with mode 0700 (os.mkdir(path, 0o700)). If it exists it must be a
+    real directory (not a symlink: check with os.lstat), owned by the current uid (POSIX),
+    and mode & 0o077 == 0; otherwise raises ValueError.
+    """
+    if platform.system() == "Windows":
+        path = os.path.join(SCREENSHOT_DIR, "cdpilot-shots")
+    else:
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        path = os.path.join(tempfile.gettempdir(), f"cdpilot-shots-{uid}")
+
+    if not os.path.exists(path) and not os.path.islink(path):
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        except OSError as e:
+            raise ValueError(f"cannot create screenshot directory {path}: {e}")
+
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        raise ValueError(f"cannot stat screenshot directory {path}: {e}")
+
+    if stat.S_ISLNK(st.st_mode):
+        raise ValueError(f"screenshot directory {path} is a symlink")
+    if not stat.S_ISDIR(st.st_mode):
+        raise ValueError(f"screenshot directory {path} is not a directory")
+
+    if platform.system() != "Windows":
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            raise ValueError(f"screenshot directory {path} is owned by uid {st.st_uid}, expected {os.getuid()}")
+        if (st.st_mode & 0o077) != 0:
+            raise ValueError(
+                f"screenshot directory {path} has mode {oct(st.st_mode & 0o777)}, must not be accessible to group/others (mode & 0o077 == 0)"
+            )
+
+    return path
+
 DEV_EXTENSIONS_FILE = os.path.join(PROFILE_DIR, 'dev-extensions.json')
 
 # ─── Auto-Wait JS Helper ───────────────────────────────────────────────────────
@@ -23523,19 +23566,19 @@ class MCPServer:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
 
     @staticmethod
-    def _safe_filename(name):
+    def _safe_filename(name, shot_dir=None):
         import re
         base = os.path.basename(name)
         base = re.sub(r'[^\w.\-]', '_', base)
         if not base.lower().endswith('.png'):
             base += '.png'
-        return os.path.join(SCREENSHOT_DIR, base)
+        return os.path.join(shot_dir or SCREENSHOT_DIR, base)
 
     def _execute_tool(self, req_id, tool_name, args):
         import io, subprocess
         tool_map = {
             "browser_navigate": lambda a: ["go", a.get("url", "")],
-            "browser_screenshot": lambda a: ["shot"] + ([self._safe_filename(a["filename"])] if a.get("filename") else []) + ([f"--element={a['element']}"] if a.get("element") else []) + ([f"--quality={a['quality']}"] if a.get("quality") else []),
+            "browser_screenshot": lambda a: ["shot", a.get("_target_path") or self._safe_filename(a.get("filename") or "screenshot.png")] + ([f"--element={a['element']}"] if a.get("element") else []) + ([f"--quality={a['quality']}"] if a.get("quality") else []),
             "browser_click": lambda a: ["click", a.get("selector", "")],
             "browser_type": lambda a: ["type", a.get("selector", ""), a.get("text", "")],
             "browser_content": lambda a: ["content"],
@@ -23619,8 +23662,19 @@ class MCPServer:
                 return {"jsonrpc": "2.0", "id": req_id, "result": {
                     "content": [{"type": "text", "text": why}], "isError": True}}
 
+        if tool_name in ("browser_screenshot", "browser_screenshot_diff"):
+            try:
+                shot_dir = _mcp_shot_dir()
+            except Exception as e:
+                return {"jsonrpc": "2.0", "id": req_id, "result": {
+                    "content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}}
+
+        if tool_name == "browser_screenshot":
+            fn = args.get("filename") or "screenshot.png"
+            args["_target_path"] = self._safe_filename(fn, shot_dir)
+
         if tool_name == "browser_screenshot_diff":
-            shot_root = os.path.realpath(SCREENSHOT_DIR)
+            shot_root = os.path.realpath(shot_dir)
             for key in ("path1", "path2"):
                 p = os.path.realpath(os.path.join(shot_root, str(args.get(key, ""))))
                 try:
@@ -23630,7 +23684,7 @@ class MCPServer:
                 if outside:
                     return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{
                         "type": "text",
-                        "text": f"Error: {key} must be inside {SCREENSHOT_DIR}"}], "isError": True}}
+                        "text": f"Error: {key} must be inside {shot_dir}"}], "isError": True}}
                 args[key] = p
         cli_args = [a for a in tool_map[tool_name](args) if a]
         _idle_write_activity()  # a tool call is use of the browser (idle auto-close)

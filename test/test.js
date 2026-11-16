@@ -4265,6 +4265,138 @@ test('security: MCP browser_screenshot_diff confines paths to SCREENSHOT_DIR', (
   assert(!/MATCH|DIFF/.test(JSON.stringify(msg.result.content)), 'no equality oracle for outside paths');
 });
 
+test('security: MCP browser_screenshot_diff confines to per-user folder and rejects outside /tmp file', () => {
+  const home = secHome();
+  const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-sec-tmp-'));
+  try {
+    const outside = path.join(tmpDir, 'leak.png');
+    fs.writeFileSync(outside, 'secret');
+    const r = secPy(home, `
+import os, tempfile
+os.environ['TMPDIR'] = ${JSON.stringify(tmpDir)}
+tempfile.tempdir = None
+# In unpatched code SCREENSHOT_DIR was tempdir; set it if unpatched to simulate /tmp behavior
+if not hasattr(m, '_mcp_shot_dir'):
+    m.SCREENSHOT_DIR = ${JSON.stringify(tmpDir)}
+srv = m.MCPServer.__new__(m.MCPServer)
+# (a) file outside per-user folder
+res_out = srv._execute_tool(1, 'browser_screenshot_diff', {'path1': ${JSON.stringify(outside)}, 'path2': ${JSON.stringify(outside)}})
+
+# (b) file inside per-user folder
+shot_dir = m._mcp_shot_dir() if hasattr(m, '_mcp_shot_dir') else ${JSON.stringify(tmpDir)}
+inside = os.path.join(shot_dir, 'inside.png')
+with open(inside, 'w') as f:
+    f.write('same')
+res_in = srv._execute_tool(2, 'browser_screenshot_diff', {'path1': inside, 'path2': inside})
+
+print(json.dumps({'outside': res_out, 'inside': res_in}))
+`);
+    assert.strictEqual(r.status, 0, r.stderr);
+    const out = JSON.parse(r.stdout.trim().split('\n').pop());
+    // (a) outside file must be refused
+    assert.strictEqual(out.outside.result.isError, true, 'outside file must return isError');
+    assert(!/MATCH|DIFF/.test(JSON.stringify(out.outside.result.content)), 'no oracle for outside files');
+    assert(/must be inside/i.test(JSON.stringify(out.outside.result.content)), 'must name confinement');
+
+    // (b) inside file must be accepted
+    assert.strictEqual(out.inside.result.isError, false, 'inside file must be accepted');
+    assert(/MATCH/.test(JSON.stringify(out.inside.result.content)), 'inside files are compared');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('security: MCP screenshot tools refuse symlink, mode 0755 or non-owner folder', () => {
+  const home = secHome();
+  const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-sec-tmp-'));
+  try {
+    const r = secPy(home, `
+import os, tempfile
+srv = m.MCPServer.__new__(m.MCPServer)
+uid = os.getuid() if hasattr(os, 'getuid') else 0
+res = {}
+
+# 1. Symlink
+d1 = os.path.join(${JSON.stringify(tmpDir)}, 'case1')
+os.makedirs(d1, exist_ok=True)
+os.environ['TMPDIR'] = d1
+tempfile.tempdir = None
+bad_sym = os.path.join(d1, f'cdpilot-shots-{uid}')
+os.symlink('/tmp', bad_sym)
+res['symlink_diff'] = srv._execute_tool(1, 'browser_screenshot_diff', {'path1': 'a.png', 'path2': 'b.png'})
+res['symlink_shot'] = srv._execute_tool(2, 'browser_screenshot', {'filename': 'a.png'})
+
+# 2. Mode 0755
+d2 = os.path.join(${JSON.stringify(tmpDir)}, 'case2')
+os.makedirs(d2, exist_ok=True)
+os.environ['TMPDIR'] = d2
+tempfile.tempdir = None
+bad_mode = os.path.join(d2, f'cdpilot-shots-{uid}')
+os.mkdir(bad_mode, 0o755)
+res['mode_diff'] = srv._execute_tool(3, 'browser_screenshot_diff', {'path1': 'a.png', 'path2': 'b.png'})
+res['mode_shot'] = srv._execute_tool(4, 'browser_screenshot', {'filename': 'a.png'})
+
+# 3. Non-owner (simulated by monkeypatching os.getuid)
+d3 = os.path.join(${JSON.stringify(tmpDir)}, 'case3')
+os.makedirs(d3, exist_ok=True)
+os.environ['TMPDIR'] = d3
+tempfile.tempdir = None
+other_dir = os.path.join(d3, f'cdpilot-shots-99999')
+os.mkdir(other_dir, 0o700)
+real_getuid = getattr(os, 'getuid', None)
+if real_getuid is not None:
+    os.getuid = lambda: 99999
+    try:
+        res['owner_diff'] = srv._execute_tool(5, 'browser_screenshot_diff', {'path1': 'a.png', 'path2': 'b.png'})
+        res['owner_shot'] = srv._execute_tool(6, 'browser_screenshot', {'filename': 'a.png'})
+    finally:
+        os.getuid = real_getuid
+
+print(json.dumps(res))
+`);
+    assert.strictEqual(r.status, 0, r.stderr);
+    const res = JSON.parse(r.stdout.trim().split('\n').pop());
+    assert.strictEqual(res.symlink_diff.result.isError, true, 'symlink diff must be error');
+    assert.strictEqual(res.symlink_shot.result.isError, true, 'symlink shot must be error');
+    assert(/symlink/i.test(JSON.stringify(res.symlink_diff)), 'symlink error message');
+
+    assert.strictEqual(res.mode_diff.result.isError, true, 'mode 0755 diff must be error');
+    assert.strictEqual(res.mode_shot.result.isError, true, 'mode 0755 shot must be error');
+    assert(/mode/i.test(JSON.stringify(res.mode_diff)), 'mode error message');
+
+    if (res.owner_diff) {
+      assert.strictEqual(res.owner_diff.result.isError, true, 'owner diff must be error');
+      assert.strictEqual(res.owner_shot.result.isError, true, 'owner shot must be error');
+      assert(/owned by uid/i.test(JSON.stringify(res.owner_diff)), 'owner error message');
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('security: MCP screenshot folder is created with mode 0700', () => {
+  const home = secHome();
+  const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-sec-tmp-'));
+  try {
+    const r = secPy(home, `
+import os, tempfile, stat
+os.environ['TMPDIR'] = ${JSON.stringify(tmpDir)}
+tempfile.tempdir = None
+p = m._mcp_shot_dir()
+st = os.lstat(p)
+is_dir = stat.S_ISDIR(st.st_mode)
+mode = st.st_mode & 0o777
+print(json.dumps({'path': p, 'is_dir': is_dir, 'mode': oct(mode)}))
+`);
+    assert.strictEqual(r.status, 0, r.stderr);
+    const res = JSON.parse(r.stdout.trim().split('\n').pop());
+    assert.strictEqual(res.is_dir, true, 'must be a directory');
+    assert.strictEqual(res.mode, '0o700', 'must have mode 0700');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('blog: FAQ section minimum 3 items enforced', () => {
   assert(PY_CONTENT.includes('def _blog_generate_faq'), 'Should define _blog_generate_faq helper');
   assert(PY_CONTENT.includes('## FAQ'), 'Should emit ## FAQ section header');

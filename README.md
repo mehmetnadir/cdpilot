@@ -182,6 +182,10 @@ its `{{placeholder}}` steps type on. The error (exit 2, nothing typed) lists eac
 origin in `value_steps`; `--dry-run` shows them without the flag. A flow that needs no value runs as
 before. A save that changes a flow's steps starts its run counts (`runs`, `ok`, `drift`) again.
 
+### Where MCP screenshots are written
+
+MCP tools (`browser_screenshot`, `browser_screenshot_diff`) save and compare screenshots in a private per-user directory: `<tempfile.gettempdir()>/cdpilot-shots-<uid>` on POSIX and `%TEMP%\cdpilot-shots` on Windows. The folder is created with mode 0700 (owner-only access) and verified to be a real directory owned by the current user and not accessible to group or others. The CLI commands (`cdpilot shot`, `cdpilot screenshot-diff`) keep their defaults.
+
 ### Smaller MCP tool list
 
 `cdpilot mcp --tools core` (or `CDPILOT_MCP_TOOLS=core`; the flag wins) lists 10 core
@@ -1736,7 +1740,7 @@ Future paid offerings:
 ## Security
 
 - **Isolated browser profile** — cdpilot runs in `~/.cdpilot/profile`, separate from your daily browser. Your cookies, passwords, and history are never exposed.
-- **No arbitrary file access** — MCP screenshot filenames are sanitized and restricted to the screenshots directory. Path traversal is blocked.
+- **No arbitrary file access** — MCP screenshot filenames are sanitized and restricted to a per-user screenshot directory (`<tmp>/cdpilot-shots-<uid>` on POSIX, `<TEMP>\cdpilot-shots` on Windows, mode 0700). Path traversal is blocked.
 - **Safe CSS selectors** — All selectors passed to `querySelector` are JSON-escaped to prevent injection.
 - **No terminal escapes from pages** — on a terminal, page text (titles, console messages, extracted text, `run`/`replay` step output) shows control characters as `\x1b`-style text, so a page cannot move your cursor, rewrite earlier lines or set the window title; piped output is unchanged.
 - **No network exposure** — CDP listens on `127.0.0.1` only. Remote connections are not possible by default.
