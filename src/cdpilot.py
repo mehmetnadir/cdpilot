@@ -4891,9 +4891,8 @@ def _frame_url_text_host(head):
     a dotted name or IPv4 address (js.stripe.com, 127.0.0.1:8762), localhost, or a bracketed
     IPv6 literal ([::1]:8762), each with an optional port; else None. Dot-less hosts read as
     hosts too, or a same-origin path decoy (https://evil.test/[::1]:8762) would match them."""
-    hm = _re.fullmatch(r"([^:@\[\]\s]+)(?::(\d+))?", head)
-    if hm and ("." in hm.group(1) or hm.group(1).lower() == "localhost"):
-        return hm.group(1).lower(), hm.group(2), False
+    if not isinstance(head, str) or not head or head[0] in ".#":
+        return None
     hm = _re.fullmatch(r"\[([0-9A-Fa-f:.]+)\](?::(\d+))?", head)
     if hm:
         import ipaddress as _ip
@@ -4901,6 +4900,11 @@ def _frame_url_text_host(head):
             return _ip.IPv6Address(hm.group(1)).compressed, hm.group(2), True
         except ValueError:
             return None
+    if _re.search(r'[\[\]>~+*=\(\)"\'\s]', head):
+        return None
+    hm = _re.fullmatch(r"([^:@\[\]\s]+)(?::(\d+))?", head)
+    if hm and ("." in hm.group(1) or hm.group(1).lower() == "localhost"):
+        return hm.group(1).lower(), hm.group(2), False
     return None
 
 
@@ -5008,6 +5012,12 @@ async def _frame_url_match(route, value, lookup_ctx, allow_oopif=True):
         url, _ = await _frame_live(route, route.session_id, frame_id, own, tree)
         if _frame_url_text_match(url, value):
             return oid, obj, node, own
+
+
+_FRAME_TAG_CLASS_RE = _re.compile(
+    r"(?i)^(?:div|span|section|main|article|aside|header|footer|nav|form|p|ul|li|a|"
+    r"iframe|frame|body|html|table|td|tr|label|button|input|img|figure|object|embed)\.[a-z0-9_-]+$"
+)
 
 
 async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oopif=True):
@@ -5120,8 +5130,8 @@ async def _frame_route_push(route, hop, scroll=True, missing_ok=False, allow_oop
               " world (same DOM, no page JS globals)", file=sys.stderr)
     route.dirty = True
     # no frame on that host: the page-set match is used, say so (not for a selector on the frame
-    # element itself, such as iframe.card, which names no host)
-    if url_first and not by_url and not _re.match(r'(?i)i?frame\.', hop["value"]):
+    # element itself, such as iframe.card, or a tag.class selector, which names no host)
+    if url_first and not by_url and not _FRAME_TAG_CLASS_RE.match(hop["value"]):
         shown_host = _frame_label(hop["value"], 120)
         print(f"note: no frame on host {shown_host}; used the page-set selector or name/id match "
               f"'{route.labels[-1]}' (write --frame url={shown_host} to require the host)",

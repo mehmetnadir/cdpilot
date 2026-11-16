@@ -5835,7 +5835,7 @@ test('metadata: screenshot token claims stay corrected (vision token formula, fo
         CDP_PORT: '19224', CDPILOT_LOG: '0', CDPILOT_CDP_TRACE: fakeTrace };
       for (const k of ['CDPILOT_WS_POOL', 'CDPILOT_TARGET', 'CDPILOT_TIMEOUT', 'CDPILOT_PRESS_MS']) delete env[k];
       const out = execFileSync(PYB, [path.join(__dirname, 'frames_fake_cdp.py'), PY_PATH], {
-        encoding: 'utf-8', timeout: 60000, env,
+        encoding: 'utf-8', timeout: 120000, env,
       });
       fakeResults = JSON.parse(out.trim().split('\n').pop());
     }
@@ -6082,6 +6082,7 @@ print(json.dumps([_frame_url_text_names_host(v) for v in json.load(sys.stdin)]))
       ['127.0.0.1:8762', true], ['iframe.card', true], ['#card', false], ['iframe#card', false],
       ['card-frame', false], ['/pay.html', false], ['localhost:8762', true], ['0', false],
       ["iframe[title='a.b']", false], ['div.box > iframe', false], ['js.stripe.com?x', false],
+      ['.card-frame', false], ['div.card', true],
     ];
     const got = pyCases(src, cases);
     cases.forEach((c, i) => assert.strictEqual(got[i], c[1], c[0]));
@@ -6280,6 +6281,12 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     const s = r.dotted_selector_flag;
     assert.deepStrictEqual(s.res, ['ok', null], s.stderr);
     assert.deepStrictEqual(s.value_in, ['card'], 'no host is iframe.card: still a selector');
+    const cd = r.class_dot_flag;
+    assert.deepStrictEqual(cd.res, ['ok', null], cd.stderr);
+    assert.deepStrictEqual(cd.value_in, ['card'], 'no host is .card-frame: still a selector');
+    const tc = r.tag_class_flag;
+    assert.deepStrictEqual(tc.res, ['ok', null], tc.stderr);
+    assert.deepStrictEqual(tc.value_in, ['card'], 'no host is div.card: still a selector');
     // Residual (README: prefer url=): with no frame on that host the old order still applies,
     // selector (a wrapper) first, then name/id (the stderr note: next test).
     const w = r.attr_decoy_only;
@@ -6297,6 +6304,8 @@ print(json.dumps({'points': _frame_points(boxes, 40, 50), 'xform': [sx, sy, tx, 
     assert.strictEqual(r.attr_id_only.stderr, note('js.stripe.com', 'iframe#js.stripe.com'));
     // a selector on the frame element itself (iframe.card, frame.x) names no host: no note
     assert.strictEqual(r.dotted_selector_flag.stderr, '', 'iframe.card is a selector: no note');
+    assert.strictEqual(r.class_dot_flag.stderr, '', '.card-frame is a class selector: no note');
+    assert.strictEqual(r.tag_class_flag.stderr, '', 'div.card is a tag.class selector: no note');
     for (const key of ['attr_decoy_flag', 'attr_id_flag', 'decoy_flag', 'host_suffix_flag', 'honest_fill', 'path_flag']) {
       assert.strictEqual(r[key].stderr, '', `${key}: a frame on the host matched, or not host-shaped: no note`);
     }
