@@ -4307,6 +4307,8 @@ print(json.dumps({'outside': res_out, 'inside': res_in}))
 });
 
 test('security: MCP screenshot tools refuse symlink, mode 0755 or non-owner folder', () => {
+  // POSIX ownership, mode and symlink checks; Windows uses %TEMP%\\cdpilot-shots without them
+  if (process.platform === 'win32') return;
   const home = secHome();
   const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-sec-tmp-'));
   try {
@@ -4375,6 +4377,8 @@ print(json.dumps(res))
 });
 
 test('security: MCP screenshot folder is created with mode 0700', () => {
+  // POSIX ownership, mode and symlink checks; Windows uses %TEMP%\\cdpilot-shots without them
+  if (process.platform === 'win32') return;
   const home = secHome();
   const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdpilot-sec-tmp-'));
   try {
