@@ -12,6 +12,7 @@ All notable changes to cdpilot will be documented in this file.
 
 ### Fixed
 - **`--frame` with a CSS class selector no longer prints a misleading "no frame on host" note.** A value that starts with `.` or `#`, or holds CSS characters (`[ ] > ~ + * = ( )`, quotes, spaces), is never read as a host; a `tag.class` value such as `div.card` is still tried as URL text first but gets no note when it matches as a selector.
+- **Replayed environment-value steps with frame selectors (`>>>`, `--frame`) or `--entropy=on` refuse immediately.** The child process now exits 2 before opening a CDP connection or looking up browser targets, eliminating a socket hang on cleanup in CI. Steps that type such a value no longer draw the control overlay into the page, as they run no other page script either.
 
 ## [0.9.13] - 2026-11-15
 
