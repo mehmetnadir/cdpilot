@@ -31371,6 +31371,14 @@ def _cli_main():
             print(f"cdpilot: {_e}", file=sys.stderr)
             sys.exit(2)
 
+    # A replayed environment value may never run inside a frame or with
+    # humanized typing; refuse immediately before any CDP connection or lookup.
+    if _replay_strict_rule() is not None:
+        if cmd in FRAME_AWARE_CMDS and (_FRAME_FLAG or any(isinstance(a, str) and FRAME_SEP in a for a in args)):
+            _replay_strict_refuse('fill' if cmd == 'type' else cmd, 'never inside a frame (>>>, --frame)')
+        if cmd in ('fill', 'type') and ('--entropy=on' in args or os.environ.get('CDPILOT_ENTROPY') == 'on'):
+            _replay_strict_refuse('fill', 'never with humanized typing (--entropy=on)')
+
     if cmd == "network":
         for _i, _a in enumerate(args):
             if _a == "--":
@@ -31707,7 +31715,7 @@ def _cli_main():
     _cleanup_idle_sessions()
 
     if cmd in async_map:
-        if cmd in NO_CONTROL_CMDS or _agent_browserless:
+        if cmd in NO_CONTROL_CMDS or _agent_browserless or _replay_strict_rule() is not None:
             asyncio.run(async_map[cmd]())
             _update_session_timestamp()
             _enforce_tab_budget()

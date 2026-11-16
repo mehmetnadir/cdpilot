@@ -19586,12 +19586,31 @@ print(json.dumps(res))
       for (const args of [['fill', '#pw', 'x', '--entropy=on'], ['type', 'iframe#w >>> #pw', 'x'],
         ['smart-fill', 'Password', 'x', '--frame', '#w'], ['smart-select', 'Main >>> Country', 'x']]) {
         r = runCli(args, strict);
-        assert.strictEqual(r.status, 2, `${args.join(' ')}: status=${r.status} signal=${r.signal} `
-          + `error=${r.error} (${r.duration_ms}ms): ${r.stdout}${r.stderr}`);
-        assert(/refused \(environment value\): never (with humanized typing|inside a frame)/.test(r.stderr), r.stderr);
+        const diag = `${args.join(' ')}: status=${r.status} signal=${r.signal} elapsed=${r.duration_ms}ms `
+          + `stdout(last 400)=${JSON.stringify((r.stdout || '').slice(-400))} `
+          + `stderr(last 400)=${JSON.stringify((r.stderr || '').slice(-400))}`;
+        assert.strictEqual(r.status, 2, diag);
+        assert(/refused \(environment value\): never (with humanized typing|inside a frame)/.test(r.stderr), diag);
       }
     } finally {
       fake.stop();
+    }
+  });
+
+  test('replay: env var — strict frame and entropy steps refuse before any CDP connection or browser lookup', () => {
+    // Regress: in strict mode with CDP unreachable, frame-chained selectors and --entropy=on
+    // must refuse immediately (exit 2) without attempting CDP connection (which would fail with exit 1).
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdpilot-rep-envrefuse-'));
+    const env = varEnv(home, { CDP_PORT: '19999', CDPILOT_NO_AUTOLAUNCH: '1',
+      CDPILOT_REPLAY_STRICT_TARGET: '1', CDPILOT_REPLAY_ALLOWED_HOSTS: 'example.com' });
+    for (const args of [['fill', '#pw', 'x', '--entropy=on'], ['type', 'iframe#w >>> #pw', 'x'],
+      ['smart-fill', 'Password', 'x', '--frame', '#w'], ['smart-select', 'Main >>> Country', 'x']]) {
+      const r = runCli(args, env);
+      const diag = `${args.join(' ')}: status=${r.status} signal=${r.signal} elapsed=${r.duration_ms}ms `
+        + `stdout(last 400)=${JSON.stringify((r.stdout || '').slice(-400))} `
+        + `stderr(last 400)=${JSON.stringify((r.stderr || '').slice(-400))}`;
+      assert.strictEqual(r.status, 2, diag);
+      assert(/refused \(environment value\): never (with humanized typing|inside a frame)/.test(r.stderr), diag);
     }
   });
 

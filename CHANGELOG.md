@@ -4,6 +4,9 @@ All notable changes to cdpilot will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Replayed environment-value steps with frame selectors (`>>>`, `--frame`) or `--entropy=on` refuse immediately.** The child process now exits 2 before opening a CDP connection or looking up browser targets, eliminating a socket hang on cleanup in CI. Steps that type such a value no longer draw the control overlay into the page, as they run no other page script either.
+
 ## [0.9.13] - 2026-11-15
 
 ### Security
